@@ -12,6 +12,7 @@ vi.mock('../../providers/index.js', async (importOriginal) => {
     ...actual,
     getProvider: () => fakeProvider,
     resolveProvider: () => fakeProvider,
+    buildProviderFor: () => fakeProvider,
   };
 });
 

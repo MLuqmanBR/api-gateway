@@ -63,6 +63,7 @@ export function initDb(dbPath?: string): Database.Database {
   // (drives the realistic "Est. savings" analytics stat).
   applyModelPricing(db);
   migrateEmbeddingsV1(db);
+  migrateCustomProvidersV24(db);
   ensureUnifiedKey(db);
 
   console.log(`Database initialized at ${resolvedPath}`);
@@ -101,6 +102,14 @@ function createTables(db: Database.Database) {
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       last_checked_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS custom_providers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      slug TEXT NOT NULL UNIQUE,
+      display_name TEXT NOT NULL,
+      base_url TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
     CREATE TABLE IF NOT EXISTS requests (
@@ -1869,6 +1878,42 @@ function migrateEmbeddingsV1(db: Database.Database) {
   if (!def) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('embeddings_default_family', 'gemini-embedding-001')").run();
   }
+}
+// Custom providers V24: promote the special-cased 'custom' platform to a real
+// custom_providers row. Pre-existing api_keys (with their base_url) and models
+// rows (with their key_id binding) get re-pointed to the new slug 'legacy-custom',
+// preserving every URL and credential without any user action. After this runs,
+// 'custom' is no longer a magic value — the runtime looks up the base URL from
+// custom_providers for ANY platform string, and built-ins just happen to have
+// hardcoded base URLs in providers/index.ts.
+//
+// Idempotent: a re-run sees no 'custom' rows and exits quietly.
+function migrateCustomProvidersV24(db: Database.Database) {
+  const legacy = db.prepare(
+    "SELECT id, base_url FROM api_keys WHERE platform = 'custom' ORDER BY id LIMIT 1"
+  ).get() as { id: number; base_url: string | null } | undefined;
+
+  if (!legacy) return; // fresh DB or already migrated
+
+  const baseUrl = legacy.base_url ?? '';
+  if (!baseUrl) {
+    // Defensive: a 'custom' key with no base_url is unroutable. Don't create
+    // a provider for it; just clear the magic value so future inserts work.
+    db.prepare("UPDATE api_keys SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+    db.prepare("UPDATE models SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+    return;
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO custom_providers (slug, display_name, base_url)
+      VALUES ('legacy-custom', 'Imported custom provider', ?)
+    `).run(baseUrl);
+
+    db.prepare("UPDATE api_keys SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+    db.prepare("UPDATE models SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+  });
+  tx();
 }
 
 /** Append any models not yet in the fallback chain, lowest priority, ordered by
