@@ -9,6 +9,7 @@ import {
   validateSession,
   deleteSession,
 } from '../services/auth.js';
+import { isTrustedRequest } from '../lib/ip-trust.js';
 
 export const authRouter = Router();
 
@@ -52,11 +53,16 @@ function bearer(req: Request): string | undefined {
 }
 
 // Has the dashboard been set up yet, and is this caller authenticated?
+// LAN/loopback callers are treated as authenticated even without a session
+// token, mirroring the requireAuth gate; remote callers must hold a valid
+// session. The `email` field stays null for the LAN case — there is no
+// user identity, just network-trust — which keeps the client free to omit
+// any "signed in as X" UI.
 authRouter.get('/status', (req: Request, res: Response) => {
   const session = validateSession(bearer(req));
   res.json({
     needsSetup: userCount() === 0,
-    authenticated: !!session,
+    authenticated: !!session || isTrustedRequest(req),
     email: session?.email ?? null,
   });
 });

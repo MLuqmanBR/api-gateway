@@ -12,7 +12,6 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { AuthGate } from '@/components/auth-gate'
-import { logout } from '@/lib/api'
 import KeysPage from '@/pages/KeysPage'
 import PlaygroundPage from '@/pages/PlaygroundPage'
 import FallbackPage from '@/pages/FallbackPage'
@@ -96,8 +95,11 @@ function Brand() {
 
 // True when the dashboard runs inside the desktop shell (Electron preload
 // sets this). The navbar then doubles as the window title bar: draggable,
-// padded for the macOS traffic lights, and without the web-only Sign out.
-const isDesktopApp = typeof window !== 'undefined' && (window as any).__FREEAPI_DESKTOP__ === true
+// padded for the macOS traffic lights, and the page background is glass.
+// Set by the desktop app's preload script (desktop/src/preload.ts).
+interface FreeLLMApiWindow { __FREEAPI_DESKTOP__?: boolean }
+const isDesktopApp = typeof window !== 'undefined'
+  && (window as FreeLLMApiWindow).__FREEAPI_DESKTOP__ === true
 
 // The preload's own early classList.add can be lost (it may run before this
 // document exists), so the client claims the class itself at module load —
@@ -143,11 +145,6 @@ function Navbar() {
           style={isDesktopApp ? ({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) : undefined}
         >
           <DarkModeToggle dark={dark} onToggle={toggle} />
-          {!isDesktopApp && (
-            <Button variant="ghost" size="sm" onClick={() => logout()}>
-              Sign out
-            </Button>
-          )}
         </div>
         <div className="ml-auto md:hidden">
           <DropdownMenu>
@@ -175,9 +172,6 @@ function Navbar() {
                   <span>Theme</span>
                   {dark ? <Sun /> : <Moon />}
                 </DropdownMenuItem>
-                {!isDesktopApp && (
-                  <DropdownMenuItem onClick={() => logout()}>Sign out</DropdownMenuItem>
-                )}
               </DropdownMenuGroup>
             </DropdownMenuContent>
           </DropdownMenu>

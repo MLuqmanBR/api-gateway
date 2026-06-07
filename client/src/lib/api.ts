@@ -36,9 +36,3 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
   }
   return res.json();
 }
-
-export async function logout(): Promise<void> {
-  try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch { /* ignore */ }
-  clearToken();
-  window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
-}

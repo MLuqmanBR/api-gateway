@@ -1,16 +1,35 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb } from '../../db/index.js';
 
-async function call(app: Express, method: string, path: string, body?: any, token?: string) {
+// Tests in this file deliberately simulate a REMOTE caller (off the LAN) so
+// the dashboard session gate fires the way it would for an off-network
+// operator. We opt the test app into trusting `X-Forwarded-For` (single hop)
+// and tag every request with a TEST-NET-3 source — that address is in none of
+// the trusted ranges, so `requireAuth` falls through to session-token check
+// and the auth behavior under test (401, setup, login, logout) is exactly
+// what a real off-network caller would see.
+const REMOTE_IP = '203.0.113.1'; // RFC 5737 TEST-NET-3 — unrouteable.
+const ORIGINAL_TRUST_PROXY = process.env.TRUST_PROXY;
+
+async function call(
+  app: Express,
+  method: string,
+  path: string,
+  body?: unknown,
+  token?: string,
+) {
   const server = app.listen(0);
-  const addr = server.address() as any;
+  const addr = server.address() as { port: number };
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method,
     headers: {
       ...(body ? { 'Content-Type': 'application/json' } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      // Spoof a remote source IP — the server's `requireAuth` honors this
+      // because the test app is configured with `trust proxy = 1`.
+      'X-Forwarded-For': REMOTE_IP,
     },
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -25,8 +44,14 @@ describe('Dashboard auth (#35)', () => {
   let app: Express;
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    process.env.TRUST_PROXY = '1'; // let the test app honor X-Forwarded-For.
     initDb(':memory:');
     app = createApp();
+  });
+
+  afterAll(() => {
+    if (ORIGINAL_TRUST_PROXY === undefined) delete process.env.TRUST_PROXY;
+    else process.env.TRUST_PROXY = ORIGINAL_TRUST_PROXY;
   });
 
   it('reports needsSetup before any account exists', async () => {
