@@ -17,7 +17,7 @@ export const keysRouter = Router();
 const PLATFORMS = [
   'google', 'groq', 'cerebras', 'nvidia', 'mistral',
   'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
-  'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode',
+  'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode', 'ovh',
 ] as const;
 
 // `key` is optional so keyless providers (Kilo's anonymous gateway) can be added

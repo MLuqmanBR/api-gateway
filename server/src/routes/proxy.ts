@@ -13,6 +13,7 @@ import { contentToString, messageHasImage, normalizeOutboundContent } from '../l
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
+import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 
 export const proxyRouter = Router();
 
@@ -626,6 +627,21 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
 
+  // Context handoff only applies to auto-routed requests. Pinned-model requests
+  // are deliberate client choices; injecting "you are taking over" there would
+  // be semantically wrong.
+  const isAutoRouted = !requestedModel || isAutoModel(requestedModel);
+  const handoffMode = isAutoRouted ? getContextHandoffMode() : ('off' as const);
+  const sessionKey = handoffMode !== 'off' ? getSessionKey(messages, sessionIdHeader) : '';
+  if (handoffMode !== 'off' && sessionKey) {
+    recordIncomingMessages(sessionKey, messages);
+  }
+  // A handoff can only fire when a prior model is on record for this session.
+  // Check after recordIncomingMessages, which clears the prior model on a
+  // fresh conversation. Stable across the retry loop (the prior model only
+  // changes on a success, which returns), so compute it once here.
+  const handoffPossible = handoffMode !== 'off' && !!sessionKey && hasPriorModel(sessionKey);
+
   // Explicit `model` field pins routing. If the catalog has no enabled row
   // matching the requested id, return 400 — silently auto-routing to a
   // different model would be surprising to OpenAI-compatible clients.
@@ -697,8 +713,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // ---- Get route ----
     let route: RouteResult;
     try {
+      // When a handoff could fire this turn, pad the token estimate so the router's
+      // context-window and TPM checks account for the extra system message overhead.
+      const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
       route = routeRequest(
-        estimatedTotal,
+        routingEstimate,
         skipKeys.size > 0 ? skipKeys : undefined,
         preferredModel,
         hasImage,
@@ -721,6 +740,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       lastRequestTime = 0;
       console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? `/${globalRetryMax}` : '/∞'})`);
       continue;
+    }
+
+    const modelKey = `${route.platform}:${route.modelId}`;
+    let outboundMessages = messages;
+    // Extra input tokens the injected handoff adds on this turn (0 when not
+    // injected). Folded into the streaming success accounting, where token
+    // counts are estimated; the non-stream path uses the provider's usage,
+    // which already counts the injected message.
+    let injectedHandoffTokens = 0;
+    if (handoffMode !== 'off' && sessionKey) {
+      const handoff = maybeInjectContextHandoff({ mode: handoffMode, sessionKey, messages, selectedModelKey: modelKey });
+      if (handoff.injected) console.log(`[Proxy] Context handoff injected (session ${sessionKey.slice(0, 8)}…, model switch detected)`);
+      outboundMessages = handoff.messages;
+      injectedHandoffTokens = handoff.injectedTokens;
     }
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
@@ -782,7 +815,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         try {
           const gen = route.provider.streamChatCompletion(
-            route.apiKey, messages, route.modelId,
+            route.apiKey, outboundMessages, route.modelId,
             { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
           );
 
@@ -925,10 +958,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.end();
 
           recordRequest(route.platform, route.modelId, route.keyId);
-          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + injectedHandoffTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId, sessionIdHeader);
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           clearExhausted(route.keyId);
           if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
           return;
@@ -951,7 +985,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         }
       } else {
         const result = await route.provider.chatCompletion(
-          route.apiKey, messages, route.modelId,
+          route.apiKey, outboundMessages, route.modelId,
           { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
         );
 
@@ -993,6 +1027,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));

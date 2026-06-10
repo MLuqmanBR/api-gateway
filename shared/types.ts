@@ -25,7 +25,10 @@ export type Platform =
   | 'huggingface'
   // OpenCode Zen — OpenAI-compatible gateway. Free promotional models require a
   // free (no-card) account key from opencode.ai/auth; see migrateModelsV18.
-  | 'opencode';
+  | 'opencode'
+  // OVHcloud AI Endpoints — OpenAI-compatible, keyless anonymous tier
+  // (2 req/min per IP per model); see migrateModelsV26.
+  | 'ovh';
 // NOTE: the literal string 'custom' is no longer a special platform. Users add
 // their own OpenAI-compatible providers (ollama, llama.cpp, LM Studio, vLLM,
 // any base_url) via POST /api/custom-providers, and the resulting slug becomes
