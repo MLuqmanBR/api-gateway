@@ -9,6 +9,11 @@ server/data/
 .env.local
 .DS_Store
 
+# Runtime artifacts
+.api-gateway.pid
+.api-gateway.instances
+server.log
+
 # Personal deployment scripts (contain keys/credentials — kept local)
 deploy-pi.sh
 update-hermes.sh
