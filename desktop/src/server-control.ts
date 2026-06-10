@@ -30,9 +30,9 @@ export function getServerPort(): number | null {
 /** Start from scratch with fresh config. Called on first launch and restart. */
 export async function boot(cfg: DesktopConfig): Promise<number> {
   const userData = app.getPath('userData');
-  dbPath = path.join(userData, 'freeapi.db');
+  dbPath = path.join(userData, 'api-gateway.db');
   const repoRoot =
-    process.env.FREEAPI_REPO ??
+    process.env.API_GATEWAY_REPO ??
     path.resolve(import.meta.dirname ?? __dirname, '../..');
   clientDist = app.isPackaged
     ? path.join(process.resourcesPath, 'client-dist')

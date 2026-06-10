@@ -19,7 +19,7 @@ export function buildTray(): Tray {
   icon.setTemplateImage(true); // auto light/dark tint in the macOS menu bar
 
   tray = new Tray(icon);
-  tray.setToolTip('FreeLLMAPI — local LLM router');
+  tray.setToolTip('API-Gateway — local LLM router');
 
   tray.on('click', () => togglePopover(tray!));
   tray.on('right-click', () => {
@@ -113,7 +113,7 @@ function buildContextMenu(): Menu {
 
   // ── Quit ───────────────────────────────────────────────────────────────
   items.push({
-    label: 'Quit FreeLLMAPI',
+    label: 'Quit API-Gateway',
     click: async () => {
       await stopServer();
       app.quit();

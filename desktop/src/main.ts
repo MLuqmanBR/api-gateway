@@ -14,8 +14,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Lean posture: one instance, menu-bar only. GPU stays ON — vibrancy
 // (the popover/dashboard glass) needs GPU compositing; with hardware
 // acceleration disabled, transparent windows render an opaque white.
-app.setName('FreeLLMAPI');
-app.setPath('userData', path.join(app.getPath('appData'), 'FreeLLMAPI'));
+app.setName('API-Gateway');
+app.setPath('userData', path.join(app.getPath('appData'), 'API-Gateway'));
 
 if (!app.requestSingleInstanceLock()) {
   app.quit();
@@ -26,7 +26,7 @@ if (!app.requestSingleInstanceLock()) {
   // dashboard has ever reported, fall back to the system appearance —
   // matching the dashboard's own prefers-color-scheme default.
   let theme: 'dark' | 'light' =
-    (process.env.FREEAPI_THEME as 'dark' | 'light' | undefined)
+    (process.env.API_GATEWAY_THEME as 'dark' | 'light' | undefined)
     ?? loadConfig().theme
     ?? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
   nativeTheme.themeSource = theme;
@@ -47,7 +47,7 @@ if (!app.requestSingleInstanceLock()) {
 
   // ── popover IPC ────────────────────────────────────────────────────────
 
-  ipcMain.handle('freeapi:snapshot', () => {
+  ipcMain.handle('api-gateway:snapshot', () => {
     const s = todayStats();
     return {
       port: getServerPort(),
@@ -61,39 +61,39 @@ if (!app.requestSingleInstanceLock()) {
     };
   });
 
-  ipcMain.on('freeapi:theme-changed', (_e, next: 'dark' | 'light') => {
+  ipcMain.on('api-gateway:theme-changed', (_e, next: 'dark' | 'light') => {
     theme = next;
     nativeTheme.themeSource = next;
     saveConfig({ ...loadConfig(), theme: next });
   });
 
-  ipcMain.handle('freeapi:open-dashboard', () => {
+  ipcMain.handle('api-gateway:open-dashboard', () => {
     const port = getServerPort();
     if (port != null) openDashboard(port, sessionToken);
   });
 
-  ipcMain.handle('freeapi:copy-base-url', () => {
+  ipcMain.handle('api-gateway:copy-base-url', () => {
     const port = getServerPort();
     if (port != null) clipboard.writeText(`http://127.0.0.1:${port}/v1`);
   });
 
-  ipcMain.handle('freeapi:copy-api-key', () =>
+  ipcMain.handle('api-gateway:copy-api-key', () =>
     clipboard.writeText(getUnifiedApiKey()),
   );
 
-  ipcMain.handle('freeapi:set-login-item', (_e, open: boolean) =>
+  ipcMain.handle('api-gateway:set-login-item', (_e, open: boolean) =>
     app.setLoginItemSettings({ openAtLogin: open }),
   );
 
-  ipcMain.handle('freeapi:quit', async () => {
+  ipcMain.handle('api-gateway:quit', async () => {
     setQuitting();
     await stopServer();
     app.quit();
   });
 
-  ipcMain.handle('freeapi:server-state', () => getServerState());
+  ipcMain.handle('api-gateway:server-state', () => getServerState());
 
-  ipcMain.handle('freeapi:open-at-login', () =>
+  ipcMain.handle('api-gateway:open-at-login', () =>
     app.getLoginItemSettings().openAtLogin,
   );
 
@@ -106,7 +106,7 @@ if (!app.requestSingleInstanceLock()) {
       const port = await boot(loadConfig());
       sessionToken = ensureSessionToken();
       buildTray();
-      console.log(`[desktop] FreeLLMAPI running on http://127.0.0.1:${port}`);
+      console.log(`[desktop] API-Gateway running on http://127.0.0.1:${port}`);
 
       // Periodic notifications: key exhaustion, error spikes.
       setInterval(() => {
@@ -128,7 +128,7 @@ if (!app.requestSingleInstanceLock()) {
       }
 
       // Dev-only UI verification
-      if (process.env.FREEAPI_SHOT && !app.isPackaged) {
+      if (process.env.API_GATEWAY_SHOT && !app.isPackaged) {
         const fs = await import('node:fs');
         const { togglePopover, getPopoverWindow } = await import('./popover.js');
         const { getDashboardWindow } = await import('./window.js');
@@ -138,11 +138,11 @@ if (!app.requestSingleInstanceLock()) {
         // This is dev-only, so a dynamic import is fine.
         const trayMod = await import('./tray.js');
         togglePopover(trayMod.buildTray as unknown as Electron.Tray);
-        if (process.env.FREEAPI_SHOT === 'hold') {
+        if (process.env.API_GATEWAY_SHOT === 'hold') {
           const pop = getPopoverWindow();
           pop?.removeAllListeners('blur');
-          if (pop) fs.writeFileSync('/tmp/freeapi-popover-bounds.json', JSON.stringify(pop.getBounds()));
-          if (!process.env.FREEAPI_THEME) {
+          if (pop) fs.writeFileSync('/tmp/api-gateway-popover-bounds.json', JSON.stringify(pop.getBounds()));
+          if (!process.env.API_GATEWAY_THEME) {
             openDashboard(port, sessionToken);
             await sleep(2500);
             const dashWin = getDashboardWindow();
@@ -150,23 +150,23 @@ if (!app.requestSingleInstanceLock()) {
               dashWin.show();
               dashWin.focus();
               dashWin.moveTop();
-              fs.writeFileSync('/tmp/freeapi-dashboard-bounds.json', JSON.stringify(dashWin.getBounds()));
+              fs.writeFileSync('/tmp/api-gateway-dashboard-bounds.json', JSON.stringify(dashWin.getBounds()));
             }
           }
           return;
         }
         await sleep(1500);
         const pop = getPopoverWindow()?.webContents.capturePage();
-        if (pop) fs.writeFileSync('/tmp/freeapi-popover.png', (await pop).toPNG());
+        if (pop) fs.writeFileSync('/tmp/api-gateway-popover.png', (await pop).toPNG());
         openDashboard(port, sessionToken);
         await sleep(3000);
         const dash = getDashboardWindow()?.webContents.capturePage();
-        if (dash) fs.writeFileSync('/tmp/freeapi-dashboard.png', (await dash).toPNG());
+        if (dash) fs.writeFileSync('/tmp/api-gateway-dashboard.png', (await dash).toPNG());
         app.quit();
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      dialog.showErrorBox('FreeLLMAPI failed to start', msg);
+      dialog.showErrorBox('API-Gateway failed to start', msg);
       app.quit();
     }
   });

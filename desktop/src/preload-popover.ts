@@ -2,13 +2,13 @@
 // popover UI needs — no Node access in the renderer.
 import { contextBridge, ipcRenderer } from 'electron';
 
-contextBridge.exposeInMainWorld('freeapi', {
-  snapshot: () => ipcRenderer.invoke('freeapi:snapshot'),
-  openDashboard: () => ipcRenderer.invoke('freeapi:open-dashboard'),
-  copyBaseUrl: () => ipcRenderer.invoke('freeapi:copy-base-url'),
-  copyApiKey: () => ipcRenderer.invoke('freeapi:copy-api-key'),
-  setLoginItem: (open: boolean) => ipcRenderer.invoke('freeapi:set-login-item', open),
-  serverState: () => ipcRenderer.invoke('freeapi:server-state'),
-  quit: () => ipcRenderer.invoke('freeapi:quit'),
-  onRefresh: (cb: () => void) => ipcRenderer.on('freeapi:refresh', cb),
+contextBridge.exposeInMainWorld('api-gateway', {
+  snapshot: () => ipcRenderer.invoke('api-gateway:snapshot'),
+  openDashboard: () => ipcRenderer.invoke('api-gateway:open-dashboard'),
+  copyBaseUrl: () => ipcRenderer.invoke('api-gateway:copy-base-url'),
+  copyApiKey: () => ipcRenderer.invoke('api-gateway:copy-api-key'),
+  setLoginItem: (open: boolean) => ipcRenderer.invoke('api-gateway:set-login-item', open),
+  serverState: () => ipcRenderer.invoke('api-gateway:server-state'),
+  quit: () => ipcRenderer.invoke('api-gateway:quit'),
+  onRefresh: (cb: () => void) => ipcRenderer.on('api-gateway:refresh', cb),
 });

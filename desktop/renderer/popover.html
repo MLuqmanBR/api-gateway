@@ -165,7 +165,7 @@
         </svg>
       </div>
       <div>
-        <div class="title">FreeLLMAPI</div>
+        <div class="title">API-Gateway</div>
         <div class="addr" id="addr">127.0.0.1:…</div>
       </div>
       <div class="status"><span class="dot"></span>running</div>
@@ -234,7 +234,7 @@
 
   let loginOn = false;
   async function refresh() {
-    const s = await window.freeapi.snapshot();
+    const s = await window['api-gateway'].snapshot();
     document.body.classList.toggle('light', s.theme === 'light');
     $('addr').textContent = '127.0.0.1:' + s.port;
     $('reqs').textContent = fmt(s.requests);
@@ -252,17 +252,17 @@
     setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1100);
   }
 
-  $('open').addEventListener('click', () => window.freeapi.openDashboard());
-  $('copyurl').addEventListener('click', (e) => { window.freeapi.copyBaseUrl(); flash(e.target, 'Copied ✓'); });
-  $('copykey').addEventListener('click', (e) => { window.freeapi.copyApiKey(); flash(e.target, 'Copied ✓'); });
-  $('quit').addEventListener('click', () => window.freeapi.quit());
+  $('open').addEventListener('click', () => window['api-gateway'].openDashboard());
+  $('copyurl').addEventListener('click', (e) => { window['api-gateway'].copyBaseUrl(); flash(e.target, 'Copied ✓'); });
+  $('copykey').addEventListener('click', (e) => { window['api-gateway'].copyApiKey(); flash(e.target, 'Copied ✓'); });
+  $('quit').addEventListener('click', () => window['api-gateway'].quit());
   $('login').addEventListener('click', () => {
     loginOn = !loginOn;
     $('login').classList.toggle('on', loginOn);
-    window.freeapi.setLoginItem(loginOn);
+    window['api-gateway'].setLoginItem(loginOn);
   });
 
-  window.freeapi.onRefresh(refresh);
+  window['api-gateway'].onRefresh(refresh);
   refresh();
 </script>
 </body>

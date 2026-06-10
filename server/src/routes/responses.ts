@@ -7,7 +7,7 @@ import type {
   ChatToolCall,
   ChatToolDefinition,
   ChatToolChoice,
-} from '@freellmapi/shared/types.js';
+} from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { getUnifiedApiKey } from '../db/index.js';

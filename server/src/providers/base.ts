@@ -5,7 +5,7 @@ import type {
   ChatToolDefinition,
   ChatToolChoice,
   Platform,
-} from '@freellmapi/shared/types.js';
+} from '@api-gateway/shared/types.js';
 
 /** A provider HTTP error carrying the upstream status and, when the response
  *  included a Retry-After header, the parsed delay so the router can bench the

@@ -1,4 +1,4 @@
-# Fork Management Rules — FreeLLMAPI
+# Fork Management Rules — API-Gateway
 
 > **Audience:** AI agents + human maintainers. Follow these rules exactly. Order matters.
 > 
@@ -12,8 +12,8 @@
 
 | Role | URL |
 |---|---|
-| **Your fork** (origin) | `https://github.com/MLuqmanBR/freellmapi.git` |
-| **Upstream** (original) | `https://github.com/tashfeenahmed/freellmapi.git` |
+| **Your fork** (origin) | `https://github.com/MLuqmanBR/api-gateway.git` |
+| **Upstream** (original) | `https://github.com/tashfeenahmed/api-gateway.git` |
 
 ```
 upstream/main  ←  the canonical upstream. Never commit here directly.
@@ -284,7 +284,7 @@ single rebase session. Follow them in order.
 13. **Share providers that look similar may be completely different.** Cloudflare
     AI Gateway ≠ Cloudflare Workers AI. Always read the actual provider config
     (base URL, credential format, auth method) before assuming. Pi's credential
-    "sets" (multi-field keys) map to FreeLLMAPI's colon-separated combined key
+    "sets" (multi-field keys) map to API-Gateway's colon-separated combined key
     format — the UI already handles this with `needsAccountId`.
 
 ### 4.1 Conflict Hotspots (files you modify that upstream also touches)
@@ -941,25 +941,25 @@ for (const { platform, label, value } of KEYS) {
 Run with: `npx tsx scripts/import-keys.ts`
 Delete with: `rm scripts/import-keys.ts`
 
-### 12.3 Credential Mapping: pi → FreeLLMAPI
+### 12.3 Credential Mapping: pi → API-Gateway
 
 Pi stores credentials in three formats:
 
-| pi Format | FreeLLMAPI Equivalent |
+| pi Format | API-Gateway Equivalent |
 |---|---|
 | `keys["openrouter"][{name, value: "sk-..."}]` | `api_keys(platform='openrouter', label=name, encrypted_key=encrypt(value))` |
 | `sets["cloudflare-ai"][{name, fields: {accountId, apiKey}}]` | `api_keys(platform='cloudflare', label=name, encrypted_key=encrypt(accountId + ':' + apiKey))` |
-| `tokens["google-antigravity"][{name, access, refresh, extra}]` | Not directly supported. Google uses OAuth in pi, Cloudflare uses API keys in FreeLLMAPI. |
+| `tokens["google-antigravity"][{name, access, refresh, extra}]` | Not directly supported. Google uses OAuth in pi, Cloudflare uses API keys in API-Gateway. |
 
 Cloudflare Workers AI credential "sets" (two fields: accountId + apiKey) map to
-FreeLLMAPI's colon-separated format (`account_id:api_token`). The UI already shows
+API-Gateway's colon-separated format (`account_id:api_token`). The UI already shows
 two separate input fields when Cloudflare is selected in the "Add a provider key"
 form (`needsAccountId = platform === 'cloudflare'`).
 
 ### 12.4 Post-Import Verification
 
 ```bash
-sqlite3 server/data/freeapi.db \
+sqlite3 server/data/api-gateway.db \
   "SELECT platform, COUNT(*) FROM api_keys WHERE enabled=1 GROUP BY platform ORDER BY COUNT(*) DESC"
 ```
 

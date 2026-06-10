@@ -1,7 +1,7 @@
 import { getDb } from '../db/index.js';
 import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
-import type { KeyStatus } from '@freellmapi/shared/types.js';
+import type { KeyStatus } from '@api-gateway/shared/types.js';
 
 const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const CONSECUTIVE_FAILURES_TO_DISABLE = 3;

@@ -32,7 +32,7 @@ export function openDashboard(port: number, token: string): void {
     height: 800,
     minWidth: 720,
     minHeight: 480,
-    title: 'FreeLLMAPI',
+    title: 'API-Gateway',
     // Native feel: traffic lights float over the app's own header (the client
     // adds a drag region + left padding when it detects the desktop shell),
     // and the window carries a sidebar vibrancy — the strong, Finder-style
@@ -52,7 +52,7 @@ export function openDashboard(port: number, token: string): void {
       contextIsolation: true,
       sandbox: false,
       nodeIntegration: false,
-      additionalArguments: [`--freeapi-token=${token}`],
+      additionalArguments: [`--api-gateway-token=${token}`],
     },
   });
 

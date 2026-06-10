@@ -6,7 +6,7 @@ import { fileURLToPath } from 'url';
 import { migrateDbSchema } from './migrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
+const DB_PATH = path.resolve(__dirname, '../../data/api-gateway.db');
 
 let db: Database.Database;
 
@@ -46,7 +46,7 @@ export function getUnifiedApiKey(): string {
 
 export function regenerateUnifiedKey(): string {
   const db = getDb();
-  const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
+  const key = `api-gateway-${crypto.randomBytes(24).toString('hex')}`;
   db.prepare("UPDATE settings SET value = ? WHERE key = 'unified_api_key'").run(key);
   return key;
 }

@@ -1,9 +1,9 @@
-appId: com.freellmapi.desktop
-productName: FreeLLMAPI
+appId: com.api-gateway.desktop
+productName: API-Gateway
 publish:
   provider: github
   owner: MLuqmanBR
-  repo: freellmapi
+  repo: api-gateway
 directories:
   output: dist-electron
 files:
