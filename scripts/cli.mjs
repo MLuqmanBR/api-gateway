@@ -6,25 +6,38 @@ import { fileURLToPath } from 'node:url';
 import http from 'node:http';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const PID_FILE = join(ROOT, '.api-gateway.pid');
+const INSTANCES_FILE = join(ROOT, '.api-gateway.instances');
 const LOG_FILE = join(ROOT, 'server.log');
 
 function usage() {
   console.log(`
 API-Gateway CLI
 
-  api --start           Build and start the server in the background
-  api --stop            Stop the background server
-  api --restart         Stop then start
-  api --status          Show whether the server is running
-  api --port <number>   Set port before starting (writes to .env)
-  api --build           Only build the project, don't start
-  api --logs            Tail the server log
-  api --help            Show this help
+  api --start [--port <number>]   Start the server (uses .env PORT by default)
+  api --stop [--port <number>]    Stop a specific instance, or the only one
+  api --stop --all                Stop all running instances
+  api --restart                   Stop then start (uses .env PORT)
+  api --status                    Show running instances
+  api --list                      List all instances across ports
+  api --build                     Build the project
+  api --logs                      Tail the server log
+  api --help                      Show this help
 
 After --start, the server runs in the background. Access the dashboard
 at http://localhost:3001 and the API at http://localhost:3001/v1.
 `);
+}
+
+function readInstances() {
+  try {
+    return JSON.parse(readFileSync(INSTANCES_FILE, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function writeInstances(inst) {
+  writeFileSync(INSTANCES_FILE, JSON.stringify(inst, null, 2));
 }
 
 function readPort() {
@@ -37,41 +50,27 @@ function readPort() {
   }
 }
 
-function readPid() {
-  try {
-    return parseInt(readFileSync(PID_FILE, 'utf8').trim(), 10);
-  } catch {
-    return null;
-  }
-}
-
 function isRunning(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function setPort(port) {
-  const envPath = join(ROOT, '.env');
-  let env = '';
-  try { env = readFileSync(envPath, 'utf8'); } catch { /* create */ }
-  if (/^PORT=/m.test(env)) {
-    env = env.replace(/^PORT=.*/m, `PORT=${port}`);
-  } else {
-    env += `\nPORT=${port}\n`;
+function cleanInstances() {
+  const inst = readInstances();
+  let changed = false;
+  for (const [port, pid] of Object.entries(inst)) {
+    if (!isRunning(pid)) {
+      delete inst[port];
+      changed = true;
+    }
   }
-  writeFileSync(envPath, env);
-  console.log(`Port set to ${port}.`);
-}
-
-function needsBuild() {
-  if (!existsSync(join(ROOT, 'server', 'dist', 'index.js'))) return true;
-  if (!existsSync(join(ROOT, 'client', 'dist', 'index.html'))) return true;
-  return false;
-}
-
-async function ensureBuilt() {
-  if (needsBuild()) {
-    await build();
+  if (changed) {
+    if (Object.keys(inst).length === 0) {
+      try { unlinkSync(INSTANCES_FILE); } catch {}
+    } else {
+      writeInstances(inst);
+    }
   }
+  return inst;
 }
 
 function build() {
@@ -87,15 +86,27 @@ function build() {
   });
 }
 
-function startServer(port) {
-  const pid = readPid();
-  if (pid && isRunning(pid)) {
-    console.log(`Server is already running (PID ${pid}) on port ${port}.`);
-    printInfo(port);
-    return;
-  }
+function needsBuild() {
+  if (!existsSync(join(ROOT, 'server', 'dist', 'index.js'))) return true;
+  if (!existsSync(join(ROOT, 'client', 'dist', 'index.html'))) return true;
+  return false;
+}
 
-  if (pid) { try { unlinkSync(PID_FILE); } catch {} }
+async function ensureBuilt() {
+  if (needsBuild()) await build();
+}
+
+function startServer(port) {
+  const inst = cleanInstances();
+
+  if (inst[String(port)]) {
+    const pid = inst[String(port)];
+    if (isRunning(pid)) {
+      console.log(`Server is already running on port ${port} (PID ${pid}).`);
+      printInfo(port);
+      return;
+    }
+  }
 
   let out;
   try { out = openSync(LOG_FILE, 'a'); } catch { out = 'ignore'; }
@@ -107,11 +118,30 @@ function startServer(port) {
     env: { ...process.env, PORT: String(port) },
   });
 
+  let crashed = false;
+  child.on('exit', (code) => {
+    if (code !== 0 && code !== null) {
+      crashed = true;
+      const inst = readInstances();
+      delete inst[String(port)];
+      if (Object.keys(inst).length === 0) {
+        try { unlinkSync(INSTANCES_FILE); } catch {}
+      } else {
+        writeInstances(inst);
+      }
+      console.error(`Server on port ${port} exited with code ${code}. Check server.log for details.`);
+    }
+  });
+
   child.unref();
-  writeFileSync(PID_FILE, String(child.pid));
-  console.log(`Starting server (PID ${child.pid}) on port ${port}…`);
+
+  inst[String(port)] = child.pid;
+  writeInstances(inst);
+
+  console.log(`Starting server on port ${port} (PID ${child.pid})…`);
 
   return waitForReady(port).then(() => {
+    if (crashed) return;
     console.log('Server is ready.\n');
     printInfo(port);
   });
@@ -148,52 +178,102 @@ function printInfo(port) {
   console.log(`  API base    http://localhost:${port}/v1`);
   console.log(`  OpenAI SDK  client = OpenAI({ base_url: "http://localhost:${port}/v1", api_key: "…" })`);
   console.log('');
-  console.log(`  Stop:        api --stop`);
+  if (Object.keys(readInstances()).length > 1) {
+    console.log(`  Stop:        api --stop --port ${port}`);
+    console.log(`  Stop all:    api --stop --all`);
+  } else {
+    console.log(`  Stop:        api --stop`);
+  }
   console.log(`  Status:      api --status`);
   console.log(`  Logs:        api --logs`);
 }
 
-function stopServer() {
-  const pid = readPid();
-  if (!pid) { console.log('No server PID found. Not running.'); return; }
-  if (!isRunning(pid)) {
-    console.log(`PID ${pid} is not running. Cleaning up stale PID file.`);
-    try { unlinkSync(PID_FILE); } catch {}
+function stopOne(port) {
+  const inst = readInstances();
+  const key = String(port);
+  const pid = inst[key];
+
+  if (!pid) {
+    console.log(`No server running on port ${port}.`);
     return;
   }
-  console.log(`Stopping server (PID ${pid})…`);
+
+  if (!isRunning(pid)) {
+    console.log(`PID ${pid} on port ${port} is not running. Cleaning up.`);
+    delete inst[key];
+    writeInstances(inst);
+    if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
+    return;
+  }
+
+  console.log(`Stopping server on port ${port} (PID ${pid})…`);
   try { process.kill(pid, 'SIGTERM'); } catch (e) { console.log(`Failed: ${e.message}`); }
 
   let attempts = 0;
   const check = setInterval(() => {
     if (!isRunning(pid)) {
       clearInterval(check);
-      try { unlinkSync(PID_FILE); } catch {}
+      delete inst[key];
+      if (Object.keys(inst).length === 0) {
+        try { unlinkSync(INSTANCES_FILE); } catch {}
+      } else {
+        writeInstances(inst);
+      }
       console.log('Server stopped.');
       return;
     }
     if (++attempts > 10) {
       try { process.kill(pid, 'SIGKILL'); } catch {}
       clearInterval(check);
-      try { unlinkSync(PID_FILE); } catch {}
+      delete inst[key];
+      if (Object.keys(inst).length === 0) {
+        try { unlinkSync(INSTANCES_FILE); } catch {}
+      } else {
+        writeInstances(inst);
+      }
       console.log('Server force-stopped.');
     }
   }, 500);
 }
 
+function stopAll() {
+  const inst = cleanInstances();
+  const ports = Object.keys(inst);
+  if (ports.length === 0) {
+    console.log('No servers running.');
+    return;
+  }
+  for (const port of ports) {
+    stopOne(parseInt(port, 10));
+  }
+}
+
+function showList() {
+  const inst = cleanInstances();
+  const ports = Object.keys(inst);
+  if (ports.length === 0) {
+    console.log('No servers running.');
+    return;
+  }
+  console.log('Running instances:');
+  for (const [port, pid] of Object.entries(inst)) {
+    console.log(`  Port ${port} — PID ${pid}`);
+  }
+}
+
 function showStatus() {
-  const pid = readPid();
-  const port = readPort();
-  if (pid && isRunning(pid)) {
-    console.log(`Server is running (PID ${pid}) on port ${port}.`);
-    printInfo(port);
+  const inst = cleanInstances();
+  const ports = Object.keys(inst);
+  if (ports.length === 0) {
+    console.log('No servers running.');
+    return;
+  }
+  if (ports.length === 1) {
+    const port = ports[0];
+    console.log(`Server is running on port ${port} (PID ${inst[port]}).`);
+    printInfo(parseInt(port, 10));
   } else {
-    if (pid) {
-      console.log(`Server is not running (stale PID ${pid}).`);
-      try { unlinkSync(PID_FILE); } catch {}
-    } else {
-      console.log('Server is not running.');
-    }
+    showList();
   }
 }
 
@@ -203,34 +283,45 @@ function showLogs() {
   tail.on('close', () => process.exit(0));
 }
 
+function parseArgs(argv) {
+  const result = { cmd: null, port: null, all: false };
+  let i = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    if (a === '--port' || a === '-p') {
+      result.port = parseInt(argv[++i], 10);
+      if (!result.port || result.port < 1 || result.port > 65535) {
+        console.error('Invalid port. Must be 1-65535.');
+        process.exit(1);
+      }
+    } else if (a === '--all' || a === '-a') {
+      result.all = true;
+    } else if (a.startsWith('--') || a.startsWith('-')) {
+      if (!result.cmd) result.cmd = a;
+    }
+    i++;
+  }
+  return result;
+}
+
 // ── Main ────────────────────────────────────────────────────────────────
 async function main() {
-  const args = process.argv.slice(2);
+  const argv = process.argv.slice(2);
 
-  if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
+  if (argv.length === 0 || argv.includes('--help') || argv.includes('-h')) {
     usage();
     return;
   }
 
-  const cmd = args[0];
-
-  if (cmd === '--port' || cmd === '-p') {
-    const port = parseInt(args[1], 10);
-    if (!port || port < 1 || port > 65535) {
-      console.error('Invalid port. Must be 1-65535.');
-      process.exit(1);
-    }
-    setPort(port);
-    return;
-  }
+  const { cmd, port, all } = parseArgs(argv);
 
   if (cmd === '--build' || cmd === '-b') {
     try { await build(); console.log('Build complete.'); } catch (e) { console.error(e.message); process.exit(1); }
     return;
   }
 
-  if (cmd === '--stop' || cmd === '--kill') {
-    stopServer();
+  if (cmd === '--list' || cmd === '--ls') {
+    showList();
     return;
   }
 
@@ -244,19 +335,42 @@ async function main() {
     return;
   }
 
+  if (cmd === '--stop' || cmd === '--kill') {
+    if (all) {
+      stopAll();
+    } else if (port) {
+      stopOne(port);
+    } else {
+      const inst = cleanInstances();
+      const ports = Object.keys(inst);
+      if (ports.length === 0) {
+        console.log('No servers running.');
+      } else if (ports.length === 1) {
+        stopOne(parseInt(ports[0], 10));
+      } else {
+        console.log(`Multiple instances running. Use --port or --all:`);
+        showList();
+        process.exit(1);
+      }
+    }
+    return;
+  }
+
   if (cmd === '--restart' || cmd === '-r') {
-    stopServer();
+    // Restart uses .env PORT — find and stop that instance, then start
+    const envPort = readPort();
+    const inst = cleanInstances();
+    if (inst[String(envPort)]) stopOne(envPort);
     await new Promise(r => setTimeout(r, 1500));
-    const port = readPort();
     await ensureBuilt();
-    await startServer(port);
+    await startServer(envPort);
     return;
   }
 
   if (cmd === '--start' || cmd === '-s') {
-    const port = readPort();
+    const startPort = port || readPort();
     await ensureBuilt();
-    await startServer(port);
+    await startServer(startPort);
     return;
   }
 
