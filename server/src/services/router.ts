@@ -7,6 +7,7 @@ import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
   reliabilityPosterior, expectedReliability, sampleBeta,
   speedScore, intelligenceScore, headroomFactor, rateLimitFactor, combineScore,
+  MAX_PENALTY,
 } from './scoring.js';
 import { parseBudget } from '../lib/budget.js';
 import type { BaseProvider } from '../providers/base.js';
@@ -98,7 +99,6 @@ const rateLimitPenalties = new Map<number, { count: number; lastHit: number; pen
 
 // Penalty decays over time so models recover
 const PENALTY_PER_429 = 3;        // each 429 adds this many priority positions
-const MAX_PENALTY = 10;            // cap so a model doesn't sink forever
 const DECAY_INTERVAL_MS = 2 * 60 * 1000; // penalty decays every 2 minutes
 const DECAY_AMOUNT = 1;            // remove this much penalty per decay interval
 
@@ -117,6 +117,11 @@ export function recordRateLimitHit(modelDbId: number) {
   } else {
     rateLimitPenalties.set(modelDbId, { count: 1, lastHit: now, penalty: PENALTY_PER_429 });
   }
+}
+
+/** Clear stale penalty tracking when a model is deleted from the DB. */
+export function clearRateLimitPenalty(modelDbId: number) {
+  rateLimitPenalties.delete(modelDbId);
 }
 
 /**

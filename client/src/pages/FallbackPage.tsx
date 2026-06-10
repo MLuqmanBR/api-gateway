@@ -613,12 +613,6 @@ export default function FallbackPage() {
     queryFn: () => apiFetch('/api/fallback/retry-limit'),
   })
 
-  const retryLimitMutation = useMutation({
-    mutationFn: (limit: number) =>
-      apiFetch('/api/fallback/retry-limit', { method: 'PUT', body: JSON.stringify({ limit }) }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['fallback', 'retry-limit'] }),
-  })
-
   const globalRetryLimit = retryLimitData?.limit ?? 5
 
   const strategy: RoutingStrategy = routing?.strategy ?? 'balanced'
@@ -661,9 +655,6 @@ export default function FallbackPage() {
     setLocalEntries(allEntries.map(e => (e.modelDbId === modelDbId ? { ...e, enabled } : e)))
   }
 
-  function handleSave() {
-    saveMutation.mutate(allEntries.map(e => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled })))
-  }
 
   const activeRetryLimit = pendingRetryLimit ?? globalRetryLimit
   const hasChanges = localEntries !== null || pendingModelEdits.size > 0 || pendingRetryLimit !== null

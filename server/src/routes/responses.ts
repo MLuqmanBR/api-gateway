@@ -9,7 +9,7 @@ import type {
   ChatToolChoice,
 } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
+import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -18,6 +18,7 @@ import {
   isRetryableError,
   isPaymentRequiredError,
   isModelNotFoundError,
+  isModelAccessForbiddenError,
   timingSafeStringEqual,
   extractApiToken,
   getStickyModel,
@@ -511,7 +512,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           if (rescue.detected && !rescue.calls) {
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, `unparseable inline tool-call dialect: ${heldText.slice(0, 120)}`);
             skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-            setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+            setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
             recordRateLimitHit(route.modelDbId);
             lastError = new Error(`unparseable inline tool-call dialect from ${route.displayName}`);
             continue;
@@ -552,7 +553,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         if (msgText.length === 0 && toolAcc.size === 0) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
@@ -624,7 +625,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         if (!text && toolCalls.length === 0) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
@@ -659,13 +660,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
 
       if (isRetryableError(err)) {
-        // Model-level 404: rule out the whole model for this request — its
-        // other keys would 404 the same way. (PR #111, credits @barbotkonv.)
-        if (isModelNotFoundError(err)) skipModels.add(route.modelDbId);
+        // Model-level 404/403: rule out the whole model for this request — its
+        // other keys would 404/403 the same way. (PR #111, credits @barbotkonv.)
+        if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, isPaymentRequiredError(err)
-          ? PAYMENT_REQUIRED_COOLDOWN_MS
-          : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+        if (!isModelNotFoundError(err) && !isModelAccessForbiddenError(err)) {
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
+            isPaymentRequiredError(err),
+            route.platform, route.modelId, route.keyId,
+            { rpd: route.rpdLimit, tpd: route.tpdLimit },
+          ));
+        }
         recordRateLimitHit(route.modelDbId);
         lastError = err;
         continue;

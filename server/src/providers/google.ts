@@ -171,6 +171,11 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
   }
   if (/^https?:\/\//i.test(url)) {
     try {
+      const parsed = new URL(url);
+      // Block internal / private IPs to prevent SSRF probing of local services.
+      // Single-user self-hosted proxy — but the unified API key is portable,
+      // so internal-network requests a leaked key could make are worth blocking.
+      if (isInternalHost(parsed.hostname)) return null;
       const res = await fetch(url);
       if (!res.ok) return null;
       const buf = Buffer.from(await res.arrayBuffer());
@@ -182,6 +187,17 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
     }
   }
   return null;
+}
+
+/** Check whether hostname resolves to a private/internal IP range. */
+function isInternalHost(hostname: string): boolean {
+  // IPv4 loopback / private ranges
+  if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostname)) return true;
+  // IPv6 loopback / link-local / ULA / unique-local
+  if (hostname === '::1' || hostname.startsWith('fe80:') || hostname.startsWith('fc') || hostname.startsWith('fd')) return true;
+  // localhost / .local mDNS
+  if (hostname === 'localhost' || hostname.endsWith('.local')) return true;
+  return false;
 }
 
 // Build Gemini parts for a user message: joined text first, then any images as

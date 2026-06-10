@@ -308,6 +308,21 @@ const TRANSIENT_COOLDOWN_MS = 90 * 1000;
 // on the next 402 after expiry if still unpaid; a restart re-benches on first hit.
 export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
 
+/** Compute the cooldown duration for a retryable error. Encapsulates the
+ *  payment-required vs transient decision so both the proxy and responses
+ *  routers apply the same policy. */
+export function computeRetryCooldownMs(
+  isPaymentRequired: boolean,
+  platform: string,
+  modelId: string,
+  keyId: number,
+  limits: { rpd: number | null; tpd: number | null },
+  retryAfterMs?: number | null,
+): number {
+  if (isPaymentRequired) return PAYMENT_REQUIRED_COOLDOWN_MS;
+  return getCooldownDurationForLimit(platform, modelId, keyId, limits, retryAfterMs);
+}
+
 // Long cooldown for a 403 Forbidden on a key that already passed validateKey
 // (so it is not a dead key — the health checker disables those). A request-time
 // 403 means this key's tier can't reach this specific model (e.g. gpt-4o on
@@ -433,4 +448,19 @@ export function getRateLimitStatus(
     rpd: { used: requestCount(platform, modelId, keyId, DAY, now), limit: limits.rpd },
     tpm: { used: tokenCount(platform, modelId, keyId, MINUTE, now), limit: limits.tpm },
   };
+}
+
+/** Clear all in-memory rate-limit state for a platform (cooldowns, windows, hit counters).
+ *  Called when a custom provider is deleted so stale entries don't accumulate. */
+export function clearPlatformCaches(platform: string): void {
+  const prefix = `${platform}:`;
+  for (const key of cooldowns.keys()) {
+    if (key.startsWith(prefix)) cooldowns.delete(key);
+  }
+  for (const key of cooldownHits.keys()) {
+    if (key.startsWith(prefix)) cooldownHits.delete(key);
+  }
+  for (const key of windows.keys()) {
+    if (key.startsWith(prefix)) windows.delete(key);
+  }
 }

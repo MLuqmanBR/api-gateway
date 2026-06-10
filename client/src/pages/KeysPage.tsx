@@ -701,15 +701,6 @@ export default function KeysPage() {
       setEditingLabel('')
     },
   })
-  const removeProvider = useMutation({
-    mutationFn: (slug: string) => apiFetch(`/api/custom-providers/${slug}`, { method: 'DELETE' }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['models'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-    },
-  })
   function startEditing(key: ApiKey) {
     setEditingKeyId(key.id)
     setEditingLabel(key.label)

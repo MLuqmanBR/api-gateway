@@ -63,10 +63,9 @@ async function listenWithScan(
 function tryListen(app: ReturnType<typeof createApp>, host: string, port: number): Promise<Server | null> {
   return new Promise((resolve) => {
     const server = app.listen(port, host);
-    server.once('listening', () => resolve(server));
     server.once('error', (err: NodeJS.ErrnoException) => {
       if (err.code === 'EADDRINUSE') resolve(null);
-      else resolve(null);
+      else throw err;
     });
   });
 }

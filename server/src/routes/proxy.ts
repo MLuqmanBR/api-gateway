@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
-import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS } from '../services/ratelimit.js';
+import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { pruneRequestAnalytics } from '../services/request-retention.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
@@ -1077,14 +1077,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         route.platform,
         route.modelId,
         route.keyId,
-        isPaymentRequiredError(lastError)
-          ? PAYMENT_REQUIRED_COOLDOWN_MS
-          : isModelAccessForbiddenError(lastError)
-          ? MODEL_FORBIDDEN_COOLDOWN_MS
-          : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
-              rpd: route.rpdLimit,
-              tpd: route.tpdLimit,
-            }, lastError?.retryAfterMs),
+        computeRetryCooldownMs(
+          isPaymentRequiredError(lastError),
+          route.platform, route.modelId, route.keyId,
+          { rpd: route.rpdLimit, tpd: route.tpdLimit },
+          lastError?.retryAfterMs,
+        ),
       );
     }
     recordRateLimitHit(route.modelDbId);

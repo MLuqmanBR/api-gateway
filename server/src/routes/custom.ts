@@ -2,13 +2,15 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { clearRateLimitPenalty } from '../services/router.js';
+import { clearPlatformCaches } from '../services/ratelimit.js';
 
 export const customRouter = Router();
 
 // Built-in platform slugs are off-limits as custom slugs — the catalog
 // already binds those names. Reject early to avoid silent shadowing.
 const BUILTIN_SLUGS = new Set([
-  'google', 'groq', 'cerebras', 'sambanova', 'nvidia', 'mistral',
+  'google', 'groq', 'cerebras', 'nvidia', 'mistral',
   'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
   'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode',
 ]);
@@ -338,6 +340,7 @@ customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response)
   });
   tx();
 
+  clearPlatformCaches(slug);
   res.json({ success: true });
 });
 
@@ -558,5 +561,6 @@ customRouter.delete('/api/custom-models/:id', (req: Request, res: Response) => {
   });
   tx();
 
+  clearRateLimitPenalty(id);
   res.json({ success: true, id });
 });
