@@ -8,6 +8,7 @@
 // relative imports in sync with the repo-root default in main.ts.
 import '../../server/src/env.js';
 import crypto from 'node:crypto';
+import type { Express } from 'express';
 import type { Server } from 'node:http';
 import { createApp } from '../../server/src/app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../server/src/db/index.js';
@@ -48,7 +49,7 @@ export function ensureSessionToken(): string {
 }
 
 async function listenWithScan(
-  app: ReturnType<typeof createApp>,
+  app: Express,
   host: string,
   start: number,
   attempts = 50,
@@ -60,12 +61,12 @@ async function listenWithScan(
   throw new Error(`No free port found in ${start}–${start + attempts - 1}`);
 }
 
-function tryListen(app: ReturnType<typeof createApp>, host: string, port: number): Promise<Server | null> {
-  return new Promise((resolve) => {
-    const server = app.listen(port, host);
-    server.once('error', (err: NodeJS.ErrnoException) => {
-      if (err.code === 'EADDRINUSE') resolve(null);
-      else throw err;
-    });
+function tryListen(app: Express, host: string, port: number): Promise<Server | null> {
+  const { promise, resolve } = Promise.withResolvers<Server | null>();
+  const server = app.listen(port, host);
+  server.once('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') resolve(null);
+    else throw err;
   });
+  return promise;
 }

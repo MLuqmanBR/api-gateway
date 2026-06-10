@@ -8,6 +8,7 @@ contextBridge.exposeInMainWorld('freeapi', {
   copyBaseUrl: () => ipcRenderer.invoke('freeapi:copy-base-url'),
   copyApiKey: () => ipcRenderer.invoke('freeapi:copy-api-key'),
   setLoginItem: (open: boolean) => ipcRenderer.invoke('freeapi:set-login-item', open),
+  serverState: () => ipcRenderer.invoke('freeapi:server-state'),
   quit: () => ipcRenderer.invoke('freeapi:quit'),
   onRefresh: (cb: () => void) => ipcRenderer.on('freeapi:refresh', cb),
 });

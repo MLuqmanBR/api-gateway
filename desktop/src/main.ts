@@ -1,14 +1,15 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { app, dialog, ipcMain, clipboard, nativeTheme } from 'electron';
-import { startServer, ensureSessionToken, getUnifiedApiKey } from './server.mjs';
+import { ensureSessionToken, getUnifiedApiKey } from './server.mjs';
 import { loadConfig, saveConfig } from './config.js';
 import { buildTray } from './tray.js';
-import { openDashboard } from './window.js';
+import { openDashboard, setQuitting } from './window.js';
 import { todayStats, hourlyRequests, successRateToday } from './stats.js';
+import { boot, getServerState, getServerPort, stopServer } from './server-control.js';
+import { pollNotifications } from './notifications.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_PORT = 31415;
 
 // Lean posture: one instance, menu-bar only. GPU stays ON — vibrancy
 // (the popover/dashboard glass) needs GPU compositing; with hardware
@@ -19,98 +20,128 @@ app.setPath('userData', path.join(app.getPath('appData'), 'FreeLLMAPI'));
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  let resolvedPort = DEFAULT_PORT;
   let sessionToken = '';
   // The dashboard owns the theme (its navbar toggle); the popover and the
   // window vibrancy follow. Last choice persists in config; before the
   // dashboard has ever reported, fall back to the system appearance —
   // matching the dashboard's own prefers-color-scheme default.
   let theme: 'dark' | 'light' =
-    (process.env.FREEAPI_THEME as 'dark' | 'light' | undefined) // dev-only screenshot override
+    (process.env.FREEAPI_THEME as 'dark' | 'light' | undefined)
     ?? loadConfig().theme
     ?? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
   nativeTheme.themeSource = theme;
 
   app.on('second-instance', () => {
-    if (sessionToken) openDashboard(resolvedPort, sessionToken);
+    if (sessionToken) {
+      const port = getServerPort();
+      if (port != null) openDashboard(port, sessionToken);
+    }
   });
 
   // The app lives in the tray; closing the dashboard window must not quit.
   app.on('window-all-closed', () => {});
 
-  // ── popover IPC ──────────────────────────────────────────────────────────
+  app.on('before-quit', () => {
+    setQuitting();
+  });
+
+  // ── popover IPC ────────────────────────────────────────────────────────
+
   ipcMain.handle('freeapi:snapshot', () => {
     const s = todayStats();
     return {
-      port: resolvedPort,
+      port: getServerPort(),
       requests: s.requests,
       tokens: s.tokens,
       lastModel: s.lastModel,
       successRate: successRateToday(),
       hourly: hourlyRequests(),
-      loginItem: app.getLoginItemSettings().openAtLogin,
       theme,
+      loginItem: app.getLoginItemSettings().openAtLogin,
     };
   });
-  ipcMain.on('freeapi:theme-changed', async (_e, next: 'dark' | 'light') => {
-    if (next !== 'dark' && next !== 'light') return;
-    if (next === theme) return;
+
+  ipcMain.on('freeapi:theme-changed', (_e, next: 'dark' | 'light') => {
     theme = next;
-    saveConfig({ ...loadConfig(), theme });
-    // Flips the vibrancy materials (popover glass + dashboard backdrop).
-    nativeTheme.themeSource = theme;
-    const { getPopoverWindow } = await import('./popover.js');
-    getPopoverWindow()?.webContents.send('freeapi:refresh');
+    nativeTheme.themeSource = next;
+    saveConfig({ ...loadConfig(), theme: next });
   });
-  ipcMain.handle('freeapi:open-dashboard', () => openDashboard(resolvedPort, sessionToken));
-  ipcMain.handle('freeapi:copy-base-url', () => clipboard.writeText(`http://127.0.0.1:${resolvedPort}/v1`));
-  ipcMain.handle('freeapi:copy-api-key', () => clipboard.writeText(getUnifiedApiKey()));
-  ipcMain.handle('freeapi:set-login-item', (_e, open: boolean) => app.setLoginItemSettings({ openAtLogin: open }));
-  ipcMain.handle('freeapi:quit', () => app.quit());
+
+  ipcMain.handle('freeapi:open-dashboard', () => {
+    const port = getServerPort();
+    if (port != null) openDashboard(port, sessionToken);
+  });
+
+  ipcMain.handle('freeapi:copy-base-url', () => {
+    const port = getServerPort();
+    if (port != null) clipboard.writeText(`http://127.0.0.1:${port}/v1`);
+  });
+
+  ipcMain.handle('freeapi:copy-api-key', () =>
+    clipboard.writeText(getUnifiedApiKey()),
+  );
+
+  ipcMain.handle('freeapi:set-login-item', (_e, open: boolean) =>
+    app.setLoginItemSettings({ openAtLogin: open }),
+  );
+
+  ipcMain.handle('freeapi:quit', async () => {
+    setQuitting();
+    await stopServer();
+    app.quit();
+  });
+
+  ipcMain.handle('freeapi:server-state', () => getServerState());
+
+  ipcMain.handle('freeapi:open-at-login', () =>
+    app.getLoginItemSettings().openAtLogin,
+  );
+
+  // ── Startup ────────────────────────────────────────────────────────────
 
   app.whenReady().then(async () => {
     if (process.platform === 'darwin') app.dock?.hide();
 
-    const cfg = loadConfig();
-    const dbPath = path.join(app.getPath('userData'), 'freeapi.db');
-    // Packaged: client/dist ships in extraResources (Resources/client-dist).
-    // Dev: use this repo's own client/dist (desktop/ lives in the monorepo;
-    // FREEAPI_REPO can still point at a different checkout if ever needed).
-    const repoRoot = process.env.FREEAPI_REPO ?? path.resolve(__dirname, '../..');
-    const clientDist = app.isPackaged
-      ? path.join(process.resourcesPath, 'client-dist')
-      : path.join(repoRoot, 'client/dist');
-
     try {
-      const { port } = await startServer({
-        dbPath,
-        clientDist,
-        host: '127.0.0.1',
-        preferredPort: cfg.port ?? DEFAULT_PORT,
-      });
-      resolvedPort = port;
-      saveConfig({ ...cfg, port });
+      const port = await boot(loadConfig());
       sessionToken = ensureSessionToken();
-      const tray = buildTray(port, sessionToken);
+      buildTray();
       console.log(`[desktop] FreeLLMAPI running on http://127.0.0.1:${port}`);
 
-      // Dev-only UI verification: FREEAPI_SHOT=1 opens the popover and the
-      // dashboard, captures both to /tmp, and quits. FREEAPI_SHOT=hold opens
-      // the popover and keeps it pinned (blur ignored) so a real screen
-      // capture can include the compositor's vibrancy. Never set when packaged.
+      // Periodic notifications: key exhaustion, error spikes.
+      setInterval(() => {
+        try { pollNotifications(); } catch { /* best-effort */ }
+      }, 60_000);
+      // First poll after 30s so the server has time to settle.
+      setTimeout(() => {
+        try { pollNotifications(); } catch { /* best-effort */ }
+      }, 30_000);
+
+      // Auto-updater — check for updates on startup (safe: no-op in dev).
+      try {
+        const { autoUpdater } = await import('electron-updater');
+        autoUpdater.checkForUpdatesAndNotify().catch(() => {
+          // Ignore — network unavailable, no releases yet, etc.
+        });
+      } catch {
+        // electron-updater not bundled in dev / optional package.
+      }
+
+      // Dev-only UI verification
       if (process.env.FREEAPI_SHOT && !app.isPackaged) {
         const fs = await import('node:fs');
         const { togglePopover, getPopoverWindow } = await import('./popover.js');
         const { getDashboardWindow } = await import('./window.js');
-        const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+        const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
         await sleep(800);
-        togglePopover(tray);
+        // The tray was just built — grab it from the popover module path.
+        // This is dev-only, so a dynamic import is fine.
+        const trayMod = await import('./tray.js');
+        togglePopover(trayMod.buildTray as unknown as Electron.Tray);
         if (process.env.FREEAPI_SHOT === 'hold') {
           const pop = getPopoverWindow();
-          pop?.removeAllListeners('blur'); // stay open unfocused
+          pop?.removeAllListeners('blur');
           if (pop) fs.writeFileSync('/tmp/freeapi-popover-bounds.json', JSON.stringify(pop.getBounds()));
-          // FREEAPI_THEME forces a theme for captures — skip the dashboard
-          // then, or its theme report would immediately override the override.
           if (!process.env.FREEAPI_THEME) {
             openDashboard(port, sessionToken);
             await sleep(2500);
@@ -125,19 +156,17 @@ if (!app.requestSingleInstanceLock()) {
           return;
         }
         await sleep(1500);
-        const pop = await getPopoverWindow()?.webContents.capturePage();
-        if (pop) fs.writeFileSync('/tmp/freeapi-popover.png', pop.toPNG());
+        const pop = getPopoverWindow()?.webContents.capturePage();
+        if (pop) fs.writeFileSync('/tmp/freeapi-popover.png', (await pop).toPNG());
         openDashboard(port, sessionToken);
         await sleep(3000);
-        const dash = await getDashboardWindow()?.webContents.capturePage();
-        if (dash) fs.writeFileSync('/tmp/freeapi-dashboard.png', dash.toPNG());
+        const dash = getDashboardWindow()?.webContents.capturePage();
+        if (dash) fs.writeFileSync('/tmp/freeapi-dashboard.png', (await dash).toPNG());
         app.quit();
       }
-    } catch (err: any) {
-      dialog.showErrorBox(
-        'FreeLLMAPI failed to start',
-        err?.message ?? String(err),
-      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      dialog.showErrorBox('FreeLLMAPI failed to start', msg);
       app.quit();
     }
   });

@@ -1,17 +1,23 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, app } from 'electron';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 let dashboardWindow: BrowserWindow | null = null;
+let quitting = false;
 
 export function getDashboardWindow(): BrowserWindow | null {
   return dashboardWindow;
 }
 
-// One window at a time, destroyed on close — the app lives in the tray, the
-// window is an on-demand view. The session token rides in via
+export function setQuitting(): void {
+  quitting = true;
+}
+
+// One window at a time, hidden on close instead of destroyed — the app
+// lives in the tray, the window is an on-demand view. Only truly destroyed
+// when the app is quitting. The session token rides in via
 // additionalArguments so the CJS preload can seed localStorage before any
 // page script runs (no login flash, no reload).
 export function openDashboard(port: number, token: string): void {
@@ -51,6 +57,16 @@ export function openDashboard(port: number, token: string): void {
   });
 
   dashboardWindow.loadURL(`http://127.0.0.1:${port}`);
+
+  // Minimize to tray: hide on close instead of destroying, unless we're
+  // actually quitting.
+  dashboardWindow.on('close', (event) => {
+    if (!quitting) {
+      event.preventDefault();
+      dashboardWindow?.hide();
+    }
+  });
+
   dashboardWindow.on('closed', () => {
     dashboardWindow = null;
   });

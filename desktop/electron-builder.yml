@@ -1,5 +1,9 @@
 appId: com.freellmapi.desktop
 productName: FreeLLMAPI
+publish:
+  provider: github
+  owner: MLuqmanBR
+  repo: freellmapi
 directories:
   output: dist-electron
 files:
