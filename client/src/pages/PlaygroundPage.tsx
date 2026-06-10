@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
@@ -25,6 +25,7 @@ interface ChatMessage {
     model?: string
     latency?: number
     fallbackAttempts?: number
+    streaming?: boolean
   }
 }
 
@@ -35,6 +36,7 @@ export default function PlaygroundPage() {
   const [selectedModel, setSelectedModel] = useState<string>('auto')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   const { data: keyData } = useQuery<{ apiKey: string }>({
     queryKey: ['unified-key'],
@@ -52,78 +54,215 @@ export default function PlaygroundPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const handleSend = async () => {
+  // ── Error formatting (Fix 5) ──────────────────────────────────────────────
+  const formatError = (status: number, body: any): string => {
+    const errType: string = body?.error?.type ?? ''
+    const errMsg: string = body?.error?.message ?? `HTTP ${status}`
+    if (status === 401 || errType === 'authentication_error')
+      return `🔑 Invalid API key. Regenerate it in Settings.`
+    if (status === 429 || errType === 'rate_limit_error')
+      return `⏳ All models are rate-limited. Wait a moment and try again.`
+    if (status === 400 || errType === 'invalid_request_error')
+      return `⚠️ ${errMsg}`
+    if (status >= 500)
+      return `🔌 Upstream provider error — the model returned an error.`
+    return `❌ ${errMsg}`
+  }
+
+  // ── Streaming send (Fixes 3, 4, 6) ────────────────────────────────────────
+  const handleSend = useCallback(async () => {
     const text = input.trim()
     if (!text || loading) return
 
     const userMsg: ChatMessage = { role: 'user', content: text }
-    const newMessages = [...messages, userMsg]
-    setMessages(newMessages)
+    const assistantMsg: ChatMessage = { role: 'assistant', content: '' }
+    setMessages(prev => [...prev, userMsg, assistantMsg])
     setInput('')
     setLoading(true)
     inputRef.current?.focus()
+
+    const controller = new AbortController()
+    abortRef.current = controller
+
+    let content = ''
+    let routedPlatform = ''
+    let routedModel = ''
+    let fallbackCount = 0
+    let latency = 0
+    const start = Date.now()
+
+    // Throttled UI flush — updates the streaming message at ~30fps
+    let pending = false
+    const flush = () => {
+      if (pending) return
+      pending = true
+      requestAnimationFrame(() => {
+        pending = false
+        setMessages(prev => {
+          const copy = [...prev]
+          const last = copy[copy.length - 1]
+          if (last?.role === 'assistant') {
+            copy[copy.length - 1] = {
+              ...last,
+              content,
+              meta: {
+                platform: routedPlatform || undefined,
+                model: routedModel || undefined,
+                latency: undefined, // shown only when complete
+                fallbackAttempts: fallbackCount > 0 ? fallbackCount : undefined,
+                streaming: true,
+              },
+            }
+          }
+          return copy
+        })
+      })
+    }
 
     try {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
 
       const body: any = {
-        messages: newMessages.map(m => ({ role: m.role, content: m.content })),
+        messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
+        stream: true,
       }
       if (selectedModel !== 'auto') body.model = selectedModel
 
       const base = import.meta.env.BASE_URL.replace(/\/$/, '')
-      const start = Date.now()
       const res = await fetch(`${base}/v1/chat/completions`, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal: controller.signal,
       })
 
-      const latency = Date.now() - start
+      // Read routing info from response headers (Fix 4)
       const routedVia = res.headers.get('X-Routed-Via')
-      const fallbackAttempts = res.headers.get('X-Fallback-Attempts')
+      if (routedVia) {
+        const slash = routedVia.indexOf('/')
+        routedPlatform = slash === -1 ? routedVia : routedVia.slice(0, slash)
+        routedModel = slash === -1 ? '' : routedVia.slice(slash + 1)
+      }
+      fallbackCount = parseInt(res.headers.get('X-Fallback-Attempts') ?? '0', 10)
+      flush()
 
       if (!res.ok) {
-        const err = await res.json().catch(() => ({ error: { message: `HTTP ${res.status}` } }))
-        setMessages([...newMessages, {
-          role: 'assistant',
-          content: `Error: ${err.error?.message ?? 'Unknown error'}`,
-        }])
+        const errBody = await res.json().catch(() => ({}))
+        content = formatError(res.status, errBody)
+        latency = Date.now() - start
+        setMessages(prev => {
+          const copy = [...prev]
+          const last = copy[copy.length - 1]
+          if (last?.role === 'assistant') {
+            copy[copy.length - 1] = {
+              ...last,
+              content,
+              meta: {
+                platform: routedPlatform || undefined,
+                model: routedModel || undefined,
+                latency,
+                fallbackAttempts: fallbackCount > 0 ? fallbackCount : undefined,
+              },
+            }
+          }
+          return copy
+        })
         return
       }
 
-      const data = await res.json()
-      const content = data.choices?.[0]?.message?.content ?? JSON.stringify(data, null, 2)
-      const via = data._routed_via ?? (routedVia ? {
-        platform: routedVia.split('/')[0],
-        model: routedVia.split('/').slice(1).join('/'),
-      } : undefined)
+      // Stream the response (Fix 3)
+      const reader = res.body?.getReader()
+      if (!reader) {
+        content = '❌ No response body — the server closed the connection.'
+        latency = Date.now() - start
+        return
+      }
 
-      setMessages([...newMessages, {
-        role: 'assistant',
-        content,
-        meta: {
-          platform: via?.platform,
-          model: via?.model,
-          latency,
-          fallbackAttempts: fallbackAttempts ? parseInt(fallbackAttempts) : undefined,
-        },
-      }])
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          const payload = line.slice(6)
+
+          if (payload === '[DONE]') {
+            reader.cancel()
+            break
+          }
+
+          try {
+            const chunk = JSON.parse(payload)
+            // In-band error frame (e.g. mid-stream provider error)
+            if (chunk.error) {
+              content += content ? '\n\n' : ''
+              content += `⚠️ ${chunk.error.message ?? 'Stream error'}`
+              reader.cancel()
+              latency = Date.now() - start
+              break
+            }
+            const delta = chunk.choices?.[0]?.delta?.content ?? ''
+            if (delta) {
+              content += delta
+              flush()
+            }
+          } catch {
+            // ignore unparseable chunks
+          }
+        }
+      }
+
+      latency = Date.now() - start
     } catch (err: any) {
-      setMessages([...newMessages, {
-        role: 'assistant',
-        content: `Error: ${err.message}`,
-      }])
+      latency = Date.now() - start
+      if (err.name === 'AbortError') {
+        if (!content) content = '(cancelled)'
+      } else if (err.message === 'Failed to fetch') {
+        content = '🔌 Connection failed — is the server running?'
+      } else {
+        content = `❌ ${err.message}`
+      }
     } finally {
+      abortRef.current = null
       setLoading(false)
+      // Final update with complete metadata
+      setMessages(prev => {
+        const copy = [...prev]
+        const last = copy[copy.length - 1]
+        if (last?.role === 'assistant') {
+          copy[copy.length - 1] = {
+            ...last,
+            content: content || '(empty response)',
+            meta: {
+              platform: routedPlatform || undefined,
+              model: routedModel || undefined,
+              latency: latency > 0 ? latency : undefined,
+              fallbackAttempts: fallbackCount > 0 ? fallbackCount : undefined,
+            },
+          }
+        }
+        return copy
+      })
       setTimeout(() => inputRef.current?.focus(), 0)
     }
+  }, [input, loading, messages, keyData, selectedModel])
+
+  const handleCancel = () => {
+    abortRef.current?.abort()
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
+      if (loading) return
       handleSend()
     }
   }
@@ -192,11 +331,16 @@ export default function PlaygroundPage() {
                     }`}
                   >
                     {msg.role === 'assistant' ? (
-                      <Markdown>{msg.content}</Markdown>
+                      <span>
+                        <Markdown>{msg.content}</Markdown>
+                        {msg.meta?.streaming && (
+                          <span className="inline-block w-1.5 h-4 bg-foreground/60 ml-0.5 align-text-bottom animate-pulse rounded-sm" />
+                        )}
+                      </span>
                     ) : (
                       <div className="whitespace-pre-wrap">{msg.content}</div>
                     )}
-                    {msg.meta && (
+                    {msg.meta && !msg.meta.streaming && (
                       <div className="flex items-center gap-2 mt-2 flex-wrap text-[11px] opacity-70 tabular-nums">
                         {msg.meta.platform && <span>{msg.meta.platform}</span>}
                         {msg.meta.model && <span className="font-mono">· {msg.meta.model}</span>}
@@ -209,7 +353,7 @@ export default function PlaygroundPage() {
                   </div>
                 </div>
               ))}
-              {loading && (
+              {loading && messages[messages.length - 1]?.role !== 'assistant' && (
                 <div className="flex justify-start">
                   <div className="bg-muted rounded-2xl px-4 py-3">
                     <div className="flex gap-1">
@@ -242,9 +386,15 @@ export default function PlaygroundPage() {
                 el.style.height = Math.min(el.scrollHeight, 160) + 'px'
               }}
             />
-            <Button onClick={handleSend} disabled={loading || !input.trim()} size="default">
-              {loading ? 'Sending…' : 'Send'}
-            </Button>
+            {loading ? (
+              <Button onClick={handleCancel} variant="outline" size="default">
+                Cancel
+              </Button>
+            ) : (
+              <Button onClick={handleSend} disabled={!input.trim()} size="default">
+                Send
+              </Button>
+            )}
           </div>
         </div>
       </div>
