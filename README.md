@@ -6,7 +6,7 @@
 
 Aggregate free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, Z.ai (Zhipu), Ollama, Kilo, Pollinations, LLM7, OVH AI Endpoints, and OpenCode Zen — plus **any OpenAI-compatible endpoint you bring** (llama.cpp, LM Studio, vLLM, local Ollama, or any remote service with an API key) — behind a single `/v1/chat/completions` endpoint. Every provider is a first-class citizen: the same fallback chain, the same intelligent routing, the same dashboard. Keys are stored encrypted. A Thompson-sampling bandit picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every cap. If you can reach it over HTTP and it speaks OpenAI, API-Gateway routes to it.
 
-> **This is a fork** of [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/freellmapi). We add first-class custom provider support with CRUD, per-provider rate limiting & parallel gating, one-click model auto-discovery, full model editing (including built-ins), per-key exhaustion recovery, and a self-healing catalog — all detailed in [What this fork adds](#what-this-fork-adds). We track upstream weekly and merge cleanly.
+> **This is a fork** of [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/freellmapi). We add first-class custom provider support with CRUD, per-provider rate limiting & parallel gating, one-click model auto-discovery, full model editing (including built-ins), and per-key exhaustion recovery — all detailed in [What this fork adds](#what-this-fork-adds). We track upstream weekly and merge cleanly.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
@@ -44,11 +44,9 @@ This fork tracks [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/fre
 |---|---|
 | **Custom providers as first-class citizens** | You're not stuck with the built-in list. Add any OpenAI-compatible endpoint — a cloud service with a free tier, a local Ollama instance on your LAN, a vLLM server on your homelab — give it a name, a base URL, and optional rate limits. It routes through the same fallback chain, scores against the same Thompson-sampling bandit, and appears alongside Google and Groq in every dashboard view. No second-class treatment. |
 | **Per-provider rate limits & parallel gating** | Set RPM, RPD, TPM, and TPD caps *per provider*, plus a `maxParallelRequests` ceiling. A slow local model on a Raspberry Pi won't starve your Groq connection of request slots. A free-tier cloud endpoint with a 4-RPM cap won't get hammered and rate-limited into uselessness. You define the guardrails; the router enforces them. |
-| **One-click model auto-discovery** | Register a custom provider, click "Sync models," and API-Gateway pulls the provider's `/v1/models` endpoint, seeds every model into your catalog with sensible defaults (intelligence rank, speed, context window), and slots them into your fallback chain. No manual JSON editing, no copy-pasting model IDs one by one. What took 20 minutes now takes one click. |
-| **Edit any model — built-in or custom** | Intelligence rank, speed rank, size label, context window, max output tokens, tools/vision flags, per-model rate limits — all editable from the dashboard. The built-in catalog is a starting point, not a straitjacket. If you know your local Mixtral 8x7B runs smarter than the upstream score suggests, bump its rank. If a provider silently cuts a context window, correct it yourself. Changes take effect immediately — no restart, no migration. |
+| **One-click model auto-discovery** | Register a custom provider and API-Gateway automatically pulls its `/v1/models` endpoint, seeds every model into your catalog with sensible defaults (intelligence, speed, context window), and slots them into your fallback chain. No manual JSON editing, no copy-pasting model IDs one by one. Re-run discovery anytime via the API. |
 | **`/v1/models` only shows what you can actually use** | The `/v1/models` endpoint returns only models that are in your fallback chain *and* have at least one active, healthy key. Your IDE's model picker won't list things it can't call. No more "model not found" errors in Cline because the dropdown showed a model you disabled three weeks ago. |
 | **Per-key exhaustion recovery that doesn't give up** | Most proxies retry once and bail. API-Gateway gives each key three immediate retries on transient failures, then cycles through your remaining keys for that model. When every key is exhausted — say, your 5 Gemini keys all hit their daily quotas — it doesn't throw an error. It drops to 1-RPM recovery mode, patiently probing each key once per minute until one comes back. The moment a key starts working, normal operation resumes. Your IDE keeps running; you might not even notice the hiccup. |
-| **Self-healing catalog** | Free-tier offerings change constantly — OpenRouter adds models, Ollama paywalls previously-free ones, Zhipu rotates endpoints. API-Gateway ships Ed25519-signed catalog updates that keep your model list current without manual intervention. Free installs get monthly snapshots; premium license holders get live updates every 2-3 days. The catalog fixes itself while you sleep. |
 
 We chose this path because we use API-Gateway as a daily driver — not as a weekend project. These features make it faster to set up, harder to break, and more resilient when providers inevitably flake. If you're evaluating API-Gateway for actual daily use, you want this fork.
 
@@ -114,7 +112,7 @@ And when the built-in list isn't enough? You add your own. Any OpenAI-compatible
 - **Unified API key** — Clients authenticate to your proxy with a single `api-gateway-…` bearer token. You never expose upstream provider keys to your apps.
 - **LAN auto-trust** — API-Gateway is a single-user tool, so the admin UI and `/api/*` routes skip the login form whenever the request comes from the local machine (loopback, RFC1918, link-local, IPv6 ULA / link-local). Remote callers still need an email + password account (scrypt-hashed, session-token auth), set on first run. The `/v1` proxy keeps its own unified-key auth for apps.
 - **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
-- **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, edit any model's properties, register custom providers, sync models with one click, inspect analytics, and run prompts in a playground. Dark mode included.
+- **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, edit any model's properties, register custom providers (models are auto-discovered on creation), inspect analytics, and run prompts in a playground. Dark mode included.
 - **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns over 24h / 7d / 30d windows.
 - **Context handoff on model switch** — Optional. When a session falls over to a different model, injects one compact system message so the new model knows it is continuing an existing task. Disabled by default; enable with `API_GATEWAY_CONTEXT_HANDOFF=on_model_switch`. See [Context Handoff](#context-handoff).
 - **Runs anywhere Node 20+ runs** — Windows, macOS, Linux servers, or a small ARM SBC (Raspberry Pi included). ~40 MB RSS at idle behind PM2 / systemd / whatever supervisor you prefer.
@@ -343,7 +341,7 @@ The built-in provider list is a starting point, not a boundary. From the Keys pa
 - **Rate limits** (optional) — RPM, RPD, TPM, TPD caps enforced per-provider. A local Ollama that can handle 200 RPM gets different treatment than a free-tier cloud endpoint limited to 4.
 - **Max parallel requests** (optional) — concurrency ceiling so this provider never hogs all connection slots.
 
-Once a platform exists, click **Sync models** to auto-discover every model the endpoint exposes at `/v1/models`. Or use the **Add a model** form to register models manually:
+Once a platform exists, its models are auto-discovered from the endpoint's `/v1/models` during creation. You can also re-run discovery at any time via `POST /api/custom-providers/:slug/sync-models`. Or use the **Add a model** form to register models manually:
 
 - **Model ID** and **Display name** — required.
 - **Context window**, **Supports tools**, **Supports vision** — basic flags.
@@ -408,7 +406,6 @@ Request volume, success rate, tokens in and out, average latency, and per-provid
 - **Key exhaustion** (`server/src/services/key-exhaustion.ts`) — per-key 3-retry → key cycling → 1-RPM recovery mode.
 - **Provider adapters** (`server/src/providers/*.ts`) — one file per provider, implementing the `Provider` base class: `chatCompletion()` and `streamChatCompletion()`. Custom providers are resolved from the `custom_providers` table at request time.
 - **Health service** (`server/src/services/health.ts`) — periodic probe keeps key status fresh.
-- **Catalog sync** (`server/src/services/catalog-sync.ts`) — Ed25519-signed catalog updates keep models current.
 - **Dashboard** (`client/`) — React + Vite + shadcn/ui admin surface.
 - **Storage** — SQLite (`better-sqlite3`) with AES-256-GCM envelope encryption for keys.
 
