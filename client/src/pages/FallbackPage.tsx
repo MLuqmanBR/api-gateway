@@ -452,14 +452,9 @@ function EditModelModal({
               <Input type="number" min={0} value={tpdLimit ?? ''} onChange={e => setTpdLimit(e.target.value ? parseInt(e.target.value, 10) : null)} className="font-mono text-xs" />
             </div>
           </div>
-          {save.isError && (
-            <p className="text-destructive text-xs">{(save.error as Error).message}</p>
-          )}
           <div className="flex justify-end gap-2 pt-1">
             <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
-            <Button type="submit" size="sm" disabled={save.isPending}>
-              {save.isPending ? 'Saving…' : 'Save'}
-            </Button>
+            <Button type="submit" size="sm">Queue edit</Button>
           </div>
         </form>
       </div>
