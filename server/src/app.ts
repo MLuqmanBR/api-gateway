@@ -36,6 +36,13 @@ function getAllowedCorsOrigins() {
 
 export function createApp() {
   const app = express();
+  // Honor `X-Forwarded-For` only when the operator opts in. Without this, the
+  // LAN auto-grant in requireAuth falls back to the TCP peer IP, which is the
+  // only safe default when the server is bound directly. `TRUST_PROXY=1` is
+  // a single-hop trust — the upstream must be a reverse proxy you control.
+  if (process.env.TRUST_PROXY === '1' || process.env.TRUST_PROXY === 'true') {
+    app.set('trust proxy', 1);
+  }
   const allowedCorsOrigins = getAllowedCorsOrigins();
 
   // CSP intentionally disabled — the SPA bundles inline styles and the OG
