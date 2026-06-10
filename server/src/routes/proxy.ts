@@ -137,10 +137,12 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
       FROM models m
       WHERE m.enabled = 1
         AND EXISTS (
+          SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id AND fc.enabled = 1
+        )
+        AND EXISTS (
           SELECT 1 FROM api_keys k
           WHERE k.platform = m.platform
             AND k.enabled = 1
-            AND (m.key_id IS NULL OR k.id = m.key_id)
         )
     )
     WHERE rn = 1
@@ -1028,6 +1030,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         },
       });
       return;
+    } finally {
+      route.release();
     }
   }
 

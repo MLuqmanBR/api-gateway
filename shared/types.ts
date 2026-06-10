@@ -39,20 +39,31 @@ export interface CustomProvider {
   displayName: string;
   baseUrl: string;
   createdAt: string;
+  rpmLimit: number | null;
+  rpdLimit: number | null;
+  tpmLimit: number | null;
+  tpdLimit: number | null;
+  maxParallelRequests: number | null;
 }
-
-// Slug must match this pattern: lowercase letters, digits, dashes, 2-32 chars.
-// Cannot start or end with a dash. The server rejects slugs that collide with
-// built-in platform names.
 export interface CustomProviderCreate {
   slug: string;
   displayName: string;
   baseUrl: string;
+  rpmLimit?: number | null;
+  rpdLimit?: number | null;
+  tpmLimit?: number | null;
+  tpdLimit?: number | null;
+  maxParallelRequests?: number | null;
 }
 
 export interface CustomProviderUpdate {
   displayName?: string;
   baseUrl?: string;
+  rpmLimit?: number | null;
+  rpdLimit?: number | null;
+  tpmLimit?: number | null;
+  tpdLimit?: number | null;
+  maxParallelRequests?: number | null;
 }
 
 export interface CustomModelCreate {

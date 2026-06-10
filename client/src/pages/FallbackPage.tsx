@@ -17,9 +17,11 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { ChevronDown, SlidersHorizontal } from 'lucide-react'
+import { ChevronDown, SlidersHorizontal, Pencil } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
@@ -42,7 +44,10 @@ interface FallbackEntry {
   sizeLabel: string
   rpmLimit: number | null
   rpdLimit: number | null
+  tpmLimit: number | null
+  tpdLimit: number | null
   monthlyTokenBudget: string
+  contextWindow: number | null
   supportsVision: boolean
   supportsTools: boolean
   keyCount: number
@@ -325,18 +330,160 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
 }
 
 // ── One row of the unified table ────────────────────────────────────────────
+function EditModelModal({
+  model,
+  onClose,
+  onSaved,
+}: {
+  model: Row
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const queryClient = useQueryClient()
+  const [displayName, setDisplayName] = useState(model.displayName)
+  const [contextWindow, setContextWindow] = useState(model.contextWindow ?? 128000)
+  const [intelligenceRank, setIntelligenceRank] = useState(model.intelligenceRank)
+  const [speedRank, setSpeedRank] = useState(model.speedRank)
+  const [sizeLabel, setSizeLabel] = useState(model.sizeLabel)
+  const [supportsTools, setSupportsTools] = useState(model.supportsTools)
+  const [supportsVision, setSupportsVision] = useState(model.supportsVision)
+  const [monthlyTokenBudget, setMonthlyTokenBudget] = useState(model.monthlyTokenBudget)
+  const [rpmLimit, setRpmLimit] = useState(model.rpmLimit ?? null)
+  const [rpdLimit, setRpdLimit] = useState(model.rpdLimit ?? null)
+  const [tpmLimit, setTpmLimit] = useState(model.tpmLimit ?? null)
+  const [tpdLimit, setTpdLimit] = useState(model.tpdLimit ?? null)
+
+  const save = useMutation({
+    mutationFn: (body: Record<string, unknown>) =>
+      apiFetch(`/api/custom-models/${model.modelDbId}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      onSaved()
+    },
+  })
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const body: Record<string, unknown> = {
+      displayName: displayName.trim(),
+      contextWindow: contextWindow || null,
+      intelligenceRank,
+      speedRank,
+      sizeLabel,
+      supportsTools,
+      supportsVision,
+      monthlyTokenBudget,
+      rpmLimit,
+      rpdLimit,
+      tpmLimit,
+      tpdLimit,
+    }
+    save.mutate(body)
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-background/60 backdrop-blur-sm flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg rounded-3xl border bg-card p-5 shadow-lg max-h-[90vh] overflow-y-auto"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <h3 className="text-sm font-medium">Edit model</h3>
+            <p className="text-xs text-muted-foreground font-mono mt-0.5">{model.platform}/{model.modelId}</p>
+          </div>
+          <Button variant="ghost" size="xs" onClick={onClose}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </Button>
+        </div>
+        <form onSubmit={submit} className="space-y-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Display name</Label>
+            <Input value={displayName} onChange={e => setDisplayName(e.target.value)} />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Context window</Label>
+              <Input type="number" min={0} value={contextWindow} onChange={e => setContextWindow(parseInt(e.target.value, 10) || 0)} className="font-mono text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Intelligence rank</Label>
+              <Input type="number" min={1} max={100} value={intelligenceRank} onChange={e => setIntelligenceRank(parseInt(e.target.value, 10) || 50)} className="font-mono text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Speed rank</Label>
+              <Input type="number" min={1} max={100} value={speedRank} onChange={e => setSpeedRank(parseInt(e.target.value, 10) || 50)} className="font-mono text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Size label</Label>
+              <Input value={sizeLabel} onChange={e => setSizeLabel(e.target.value)} className="font-mono text-xs" />
+            </div>
+          </div>
+          <div className="flex items-center gap-6 text-xs">
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <Switch checked={supportsTools} onCheckedChange={setSupportsTools} />
+              Supports tools
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <Switch checked={supportsVision} onCheckedChange={setSupportsVision} />
+              Supports vision
+            </label>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Monthly token budget</Label>
+            <Input value={monthlyTokenBudget} onChange={e => setMonthlyTokenBudget(e.target.value)} className="font-mono text-xs" />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label className="text-xs">RPM limit</Label>
+              <Input type="number" min={0} value={rpmLimit ?? ''} onChange={e => setRpmLimit(e.target.value ? parseInt(e.target.value, 10) : null)} className="font-mono text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">RPD limit</Label>
+              <Input type="number" min={0} value={rpdLimit ?? ''} onChange={e => setRpdLimit(e.target.value ? parseInt(e.target.value, 10) : null)} className="font-mono text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">TPM limit</Label>
+              <Input type="number" min={0} value={tpmLimit ?? ''} onChange={e => setTpmLimit(e.target.value ? parseInt(e.target.value, 10) : null)} className="font-mono text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">TPD limit</Label>
+              <Input type="number" min={0} value={tpdLimit ?? ''} onChange={e => setTpdLimit(e.target.value ? parseInt(e.target.value, 10) : null)} className="font-mono text-xs" />
+            </div>
+          </div>
+          {save.isError && (
+            <p className="text-destructive text-xs">{(save.error as Error).message}</p>
+          )}
+          <div className="flex justify-end gap-2 pt-1">
+            <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
+            <Button type="submit" size="sm" disabled={save.isPending}>
+              {save.isPending ? 'Saving…' : 'Save'}
+            </Button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 function RowContent({
   row,
   rank,
   draggable,
   dragHandle,
   onToggle,
+  onEdit,
 }: {
   row: Row
   rank: number
   draggable: boolean
   dragHandle?: ReactNode
   onToggle: (modelDbId: number, enabled: boolean) => void
+  onEdit: (row: Row) => void
 }) {
   const guard = (row.headroom ?? 1) * (row.rateLimit ?? 1)
   return (
@@ -388,13 +535,23 @@ function RowContent({
         {row.score !== undefined ? row.score.toFixed(3) : '–'}
       </td>
       <td className="py-2 pr-3 align-middle text-right">
-        <Switch checked={row.enabled} onCheckedChange={(c) => onToggle(row.modelDbId, c)} />
+        <div className="flex items-center gap-1 justify-end">
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onEdit(row); }}
+            className="p-1 rounded hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+            title="Edit model"
+          >
+            <Pencil className="size-3.5" />
+          </button>
+          <Switch checked={row.enabled} onCheckedChange={(c) => onToggle(row.modelDbId, c)} />
+        </div>
       </td>
     </>
   )
 }
 
-function SortableRow({ row, rank, onToggle }: { row: Row; rank: number; onToggle: (id: number, e: boolean) => void }) {
+function SortableRow({ row, rank, onToggle, onEdit }: { row: Row; rank: number; onToggle: (id: number, e: boolean) => void; onEdit: (row: Row) => void }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: row.modelDbId })
   const handle = (
     <button
@@ -416,7 +573,7 @@ function SortableRow({ row, rank, onToggle }: { row: Row; rank: number; onToggle
       style={{ transform: CSS.Transform.toString(transform), transition }}
       className={`border-b last:border-0 bg-card ${isDragging ? 'opacity-50' : ''} ${row.enabled ? '' : 'opacity-50'}`}
     >
-      <RowContent row={row} rank={rank} draggable dragHandle={handle} onToggle={onToggle} />
+      <RowContent row={row} rank={rank} draggable dragHandle={handle} onToggle={onToggle} onEdit={onEdit} />
     </tr>
   )
 }
@@ -424,6 +581,7 @@ function SortableRow({ row, rank, onToggle }: { row: Row; rank: number; onToggle
 export default function FallbackPage() {
   const queryClient = useQueryClient()
   const [localEntries, setLocalEntries] = useState<FallbackEntry[] | null>(null)
+  const [editingModel, setEditingModel] = useState<Row | null>(null)
 
   const { data: entries = [], isLoading } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback'],
@@ -611,7 +769,7 @@ export default function FallbackPage() {
                     <SortableContext items={ordered.map(e => e.modelDbId)} strategy={verticalListSortingStrategy}>
                       <tbody>
                         {ordered.map((row, i) => (
-                          <SortableRow key={row.modelDbId} row={row} rank={i + 1} onToggle={handleToggle} />
+                          <SortableRow key={row.modelDbId} row={row} rank={i + 1} onToggle={handleToggle} onEdit={setEditingModel} />
                         ))}
                       </tbody>
                     </SortableContext>
@@ -625,7 +783,7 @@ export default function FallbackPage() {
                   <tbody>
                     {ordered.map((row, i) => (
                       <tr key={row.modelDbId} className={`border-b last:border-0 ${row.enabled ? '' : 'opacity-50'}`}>
-                        <RowContent row={row} rank={i + 1} draggable={false} onToggle={handleToggle} />
+                        <RowContent row={row} rank={i + 1} draggable={false} onToggle={handleToggle} onEdit={setEditingModel} />
                       </tr>
                     ))}
                   </tbody>
@@ -647,6 +805,13 @@ export default function FallbackPage() {
               <p className="text-xs text-muted-foreground">Hidden (no keys): {unconfiguredPlatforms.join(', ')}</p>
             )}
           </>
+        )}
+        {editingModel && (
+          <EditModelModal
+            model={editingModel}
+            onClose={() => setEditingModel(null)}
+            onSaved={() => { setEditingModel(null); queryClient.invalidateQueries({ queryKey: ['fallback'] }); }}
+          />
         )}
       </div>
     </div>

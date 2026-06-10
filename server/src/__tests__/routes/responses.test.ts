@@ -13,7 +13,7 @@ import { createApp } from '../../app.js';
 import { initDb, getUnifiedApiKey } from '../../db/index.js';
 
 function fakeRoute(provider: any) {
-  return { provider, modelId: 'fake-model', modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model' };
+  return { provider, modelId: 'fake-model', modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model', release: () => {} };
 }
 
 async function post(app: Express, path: string, body: any, key?: string) {

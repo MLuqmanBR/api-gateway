@@ -673,6 +673,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
       res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type: 'provider_error' } });
       return;
+    } finally {
+      route.release();
     }
   }
 

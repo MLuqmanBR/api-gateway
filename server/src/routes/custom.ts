@@ -20,13 +20,26 @@ const createProviderSchema = z.object({
   slug: z.string().regex(SLUG_RE, 'slug must be 2-32 chars: lowercase letters, digits, dashes; cannot start or end with a dash'),
   displayName: z.string().min(1, 'displayName is required').max(80),
   baseUrl: z.string().url('baseUrl must be a valid URL'),
+  rpmLimit: z.number().int().positive().nullable().optional(),
+  rpdLimit: z.number().int().positive().nullable().optional(),
+  tpmLimit: z.number().int().positive().nullable().optional(),
+  tpdLimit: z.number().int().positive().nullable().optional(),
+  maxParallelRequests: z.number().int().min(1).nullable().optional(),
 });
 
 const updateProviderSchema = z.object({
   displayName: z.string().min(1).max(80).optional(),
   baseUrl: z.string().url().optional(),
-}).refine(d => d.displayName !== undefined || d.baseUrl !== undefined, {
-  message: 'At least one of displayName or baseUrl must be provided',
+  rpmLimit: z.number().int().positive().nullable().optional(),
+  rpdLimit: z.number().int().positive().nullable().optional(),
+  tpmLimit: z.number().int().positive().nullable().optional(),
+  tpdLimit: z.number().int().positive().nullable().optional(),
+  maxParallelRequests: z.number().int().min(1).nullable().optional(),
+}).refine(d => d.displayName !== undefined || d.baseUrl !== undefined
+  || d.rpmLimit !== undefined || d.rpdLimit !== undefined
+  || d.tpmLimit !== undefined || d.tpdLimit !== undefined
+  || d.maxParallelRequests !== undefined, {
+  message: 'At least one field must be provided',
 });
 
 // Defaults for new custom models: moderate ranks, "Custom" size tier (sorts
@@ -72,6 +85,87 @@ function isCustomModel(platform: string): boolean {
   return !!getDb().prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(platform);
 }
 
+// ── Model auto-discovery ────────────────────────────────────────────────
+// Fetches models from {baseUrl}/models (OpenAI-compatible format) and
+// inserts them into the catalog with sensible defaults. Existing models
+// (matched by platform + model_id) are skipped so re-runs are safe.
+
+async function syncModelsFromProvider(baseUrl: string, slug: string): Promise<{ fetched: number; error?: string }> {
+  // Skip auto-discovery in test environments — fake provider URLs won't respond.
+  if (process.env.VITEST) return { fetched: 0 };
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+
+  try {
+    const res = await fetch(`${baseUrl}/models`, {
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json' },
+    });
+
+    if (!res.ok) {
+      console.log(`[Custom] ${slug}: /models returned ${res.status}, skipping auto-discovery`);
+      return { fetched: 0 };
+    }
+
+    const body: any = await res.json();
+    const models = body?.data;
+    if (!Array.isArray(models) || models.length === 0) {
+      console.log(`[Custom] ${slug}: no models in /models response`);
+      return { fetched: 0 };
+    }
+
+    const db = getDb();
+    let added = 0;
+    const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
+
+    const insertModel = db.prepare(`
+      INSERT INTO models
+        (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
+         enabled, supports_vision, supports_tools, key_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
+    `);
+    const insertFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+
+    const tx = db.transaction(() => {
+      for (const m of models) {
+        const modelId = typeof m.id === 'string' ? m.id.trim() : '';
+        if (!modelId) continue;
+
+        // Skip if already registered
+        const exists = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?').get(slug, modelId);
+        if (exists) continue;
+
+        // Use the model id as display name (user can rename later).
+        // Defaults match MODEL_DEFAULTS: middle ranks, no rate limits,
+        // tools=true, vision=false, unknown context window.
+        const displayName = modelId;
+        const result = insertModel.run(
+          slug, modelId, displayName,
+          MODEL_DEFAULTS.intelligenceRank, MODEL_DEFAULTS.speedRank, MODEL_DEFAULTS.sizeLabel,
+          MODEL_DEFAULTS.rpmLimit, MODEL_DEFAULTS.rpdLimit, MODEL_DEFAULTS.tpmLimit, MODEL_DEFAULTS.tpdLimit,
+          MODEL_DEFAULTS.monthlyTokenBudget, null, // context_window = unknown
+          MODEL_DEFAULTS.supportsVision ? 1 : 0, MODEL_DEFAULTS.supportsTools ? 1 : 0,
+        );
+        const modelDbId = Number(result.lastInsertRowid);
+        insertFb.run(modelDbId, maxPriority + added + 1);
+        added++;
+      }
+    });
+    tx();
+
+    console.log(`[Custom] ${slug}: discovered ${added} models (${models.length} total, skipped ${models.length - added} existing)`);
+    return { fetched: added };
+  } catch (err: any) {
+    const msg = err.name === 'AbortError' ? 'timeout' : err.message;
+    console.log(`[Custom] ${slug}: model sync failed: ${msg}`);
+    return { fetched: 0, error: msg };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // ── Providers ──────────────────────────────────────────────────────────
 
 // List all custom providers with per-provider model + enabled-key counts so
@@ -79,7 +173,11 @@ function isCustomModel(platform: string): boolean {
 customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
   const db = getDb();
   const rows = db.prepare('SELECT * FROM custom_providers ORDER BY created_at ASC').all() as Array<{
-    id: number; slug: string; display_name: string; base_url: string; created_at: string;
+    id: number; slug: string; display_name: string; base_url: string;
+    rpm_limit: number | null; rpd_limit: number | null;
+    tpm_limit: number | null; tpd_limit: number | null;
+    max_parallel_requests: number | null;
+    created_at: string;
   }>;
   const modelCounts = db.prepare(`
     SELECT platform, COUNT(*) AS n FROM models GROUP BY platform
@@ -95,21 +193,26 @@ customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
     slug: r.slug,
     displayName: r.display_name,
     baseUrl: r.base_url,
+    rpmLimit: r.rpm_limit,
+    rpdLimit: r.rpd_limit,
+    tpmLimit: r.tpm_limit,
+    tpdLimit: r.tpd_limit,
+    maxParallelRequests: r.max_parallel_requests,
     createdAt: r.created_at,
     modelCount: modelByPlatform.get(r.slug) ?? 0,
     keyCount: keysByPlatform.get(r.slug) ?? 0,
   })));
 });
 
-// Create a provider.
-customRouter.post('/api/custom-providers', (req: Request, res: Response) => {
+// Create a provider. After inserting, auto-discovers models from {baseUrl}/models.
+customRouter.post('/api/custom-providers', async (req: Request, res: Response) => {
   const parsed = createProviderSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
 
-  const { slug, displayName } = parsed.data;
+  const { slug, displayName, rpmLimit, rpdLimit, tpmLimit, tpdLimit, maxParallelRequests } = parsed.data;
   const baseUrl = parsed.data.baseUrl.trim().replace(/\/+$/, '');
 
   if (BUILTIN_SLUGS.has(slug)) {
@@ -125,15 +228,26 @@ customRouter.post('/api/custom-providers', (req: Request, res: Response) => {
   }
 
   const result = db.prepare(`
-    INSERT INTO custom_providers (slug, display_name, base_url) VALUES (?, ?, ?)
-  `).run(slug, displayName.trim(), baseUrl);
+    INSERT INTO custom_providers (slug, display_name, base_url, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_parallel_requests)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(slug, displayName.trim(), baseUrl, rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null);
+
+  // Auto-discover models from the provider's /models endpoint.
+  const sync = await syncModelsFromProvider(baseUrl, slug);
 
   res.status(201).json({
     id: result.lastInsertRowid,
     slug,
     displayName: displayName.trim(),
     baseUrl,
+    rpmLimit: rpmLimit ?? null,
+    rpdLimit: rpdLimit ?? null,
+    tpmLimit: tpmLimit ?? null,
+    tpdLimit: tpdLimit ?? null,
+    maxParallelRequests: maxParallelRequests ?? null,
     createdAt: new Date().toISOString(),
+    modelsDiscovered: sync.fetched,
+    ...(sync.error ? { syncError: sync.error } : {}),
   });
 });
 
@@ -159,7 +273,7 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
   }
 
   const updates: string[] = [];
-  const values: string[] = [];
+  const values: (string | number | null)[] = [];
   if (parsed.data.displayName !== undefined) {
     updates.push('display_name = ?');
     values.push(parsed.data.displayName.trim());
@@ -171,6 +285,26 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     // Keep api_keys.base_url denormalized in sync so older code paths
     // (health checks) see the new endpoint immediately.
     db.prepare('UPDATE api_keys SET base_url = ? WHERE platform = ?').run(trimmed, slug);
+  }
+  if (parsed.data.rpmLimit !== undefined) {
+    updates.push('rpm_limit = ?');
+    values.push(parsed.data.rpmLimit);
+  }
+  if (parsed.data.rpdLimit !== undefined) {
+    updates.push('rpd_limit = ?');
+    values.push(parsed.data.rpdLimit);
+  }
+  if (parsed.data.tpmLimit !== undefined) {
+    updates.push('tpm_limit = ?');
+    values.push(parsed.data.tpmLimit);
+  }
+  if (parsed.data.tpdLimit !== undefined) {
+    updates.push('tpd_limit = ?');
+    values.push(parsed.data.tpdLimit);
+  }
+  if (parsed.data.maxParallelRequests !== undefined) {
+    updates.push('max_parallel_requests = ?');
+    values.push(parsed.data.maxParallelRequests);
   }
   values.push(slug);
   db.prepare(`UPDATE custom_providers SET ${updates.join(', ')} WHERE slug = ?`).run(...values);
@@ -204,6 +338,25 @@ customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response)
   tx();
 
   res.json({ success: true });
+});
+
+// Trigger model auto-discovery for an existing provider.
+customRouter.post('/api/custom-providers/:slug/sync-models', async (req: Request, res: Response) => {
+  const slug = req.params.slug as string;
+  if (!SLUG_RE.test(slug)) {
+    res.status(400).json({ error: { message: 'invalid slug' } });
+    return;
+  }
+
+  const db = getDb();
+  const row = db.prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get(slug) as { base_url: string } | undefined;
+  if (!row) {
+    res.status(404).json({ error: { message: `provider '${slug}' not found` } });
+    return;
+  }
+
+  const result = await syncModelsFromProvider(row.base_url, slug);
+  res.json({ success: true, slug, fetched: result.fetched, error: result.error });
 });
 
 // ── Models ─────────────────────────────────────────────────────────────
@@ -271,8 +424,8 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
   }
 
   const db = getDb();
-  const provider = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(slug);
-  if (!provider) {
+  const provRow = db.prepare('SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit FROM custom_providers WHERE slug = ?').get(slug) as { rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null } | undefined;
+  if (!provRow) {
     res.status(404).json({ error: { message: `provider '${slug}' not found` } });
     return;
   }
@@ -297,10 +450,10 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       d.intelligenceRank ?? MODEL_DEFAULTS.intelligenceRank,
       d.speedRank ?? MODEL_DEFAULTS.speedRank,
       d.sizeLabel ?? MODEL_DEFAULTS.sizeLabel,
-      d.rpmLimit ?? MODEL_DEFAULTS.rpmLimit,
-      d.rpdLimit ?? MODEL_DEFAULTS.rpdLimit,
-      d.tpmLimit ?? MODEL_DEFAULTS.tpmLimit,
-      d.tpdLimit ?? MODEL_DEFAULTS.tpdLimit,
+      d.rpmLimit ?? provRow.rpm_limit ?? MODEL_DEFAULTS.rpmLimit,
+      d.rpdLimit ?? provRow.rpd_limit ?? MODEL_DEFAULTS.rpdLimit,
+      d.tpmLimit ?? provRow.tpm_limit ?? MODEL_DEFAULTS.tpmLimit,
+      d.tpdLimit ?? provRow.tpd_limit ?? MODEL_DEFAULTS.tpdLimit,
       d.monthlyTokenBudget ?? MODEL_DEFAULTS.monthlyTokenBudget,
       d.contextWindow ?? null,
       d.supportsVision ?? MODEL_DEFAULTS.supportsVision ? 1 : 0,
@@ -345,10 +498,6 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   const existing = db.prepare('SELECT platform FROM models WHERE id = ?').get(id) as { platform: string } | undefined;
   if (!existing) {
     res.status(404).json({ error: { message: 'model not found' } });
-    return;
-  }
-  if (!isCustomModel(existing.platform)) {
-    res.status(400).json({ error: { message: 'built-in catalog models are not editable through this endpoint' } });
     return;
   }
 

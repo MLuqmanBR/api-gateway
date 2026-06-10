@@ -57,10 +57,39 @@ export interface RouteResult {
   // exhaustion (escalate the cooldown) from a transient per-minute spike.
   rpdLimit: number | null;
   tpdLimit: number | null;
+  // Decrements the in-flight slot for the associated provider.
+  // Callers MUST invoke this in a finally block after the request completes.
+  release: () => void;
 }
 
 // Round-robin index per platform
 const roundRobinIndex = new Map<string, number>();
+
+// ── Parallel request gating ──
+// Per-provider (platform slug) in-flight counter. The limit is provider-level
+// so that the total concurrency across all models of one custom provider never
+// exceeds maxParallelRequests. Built-in providers are implicitly unlimited.
+const providerInFlight = new Map<string, { count: number; limit: number | null }>();
+
+/** Try to reserve one in-flight slot for the given platform slug.
+ *  Returns true if the slot was reserved, false if the provider is at capacity. */
+function tryReserveSlot(platform: string, maxParallel: number | null): boolean {
+  if (maxParallel === null || maxParallel === undefined || maxParallel <= 0) return true;
+  let entry = providerInFlight.get(platform);
+  if (!entry) {
+    entry = { count: 0, limit: maxParallel };
+    providerInFlight.set(platform, entry);
+  }
+  if (entry.count >= maxParallel) return false;
+  entry.count++;
+  return true;
+}
+
+/** Release one in-flight slot for the given platform slug. */
+function releaseSlot(platform: string): void {
+  const entry = providerInFlight.get(platform);
+  if (entry && entry.count > 0) entry.count--;
+}
 
 // ── Dynamic priority: track 429s per model and demote accordingly ──
 // Key: model_db_id → { count, lastHit, penalty }
@@ -508,6 +537,18 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
       // We found a working key for this model!
       roundRobinIndex.set(rrKey, idx);
+
+      // ── Parallel request gating (provider-level) ──
+      // Check if this provider has a concurrency cap and try to reserve a slot.
+      const cp = db.prepare(
+        'SELECT max_parallel_requests FROM custom_providers WHERE slug = ?'
+      ).get(entry.platform) as { max_parallel_requests: number | null } | undefined;
+      const maxPar = cp?.max_parallel_requests ?? null;
+      if (!tryReserveSlot(entry.platform, maxPar)) continue; // at capacity, try next model
+
+      // Build the release function so callers can decrement the slot.
+      const release = () => releaseSlot(entry.platform);
+
       return {
         provider: provider,
         modelId: entry.model_id,
@@ -518,6 +559,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         displayName: entry.display_name,
         rpdLimit: limits.rpd,
         tpdLimit: limits.tpd,
+        release,
       };
     }
 

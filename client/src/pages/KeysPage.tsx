@@ -181,8 +181,15 @@ function AddPlatformModal({
   const [slug, setSlug] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [rpmLimit, setRpmLimit] = useState<string>('')
+  const [rpdLimit, setRpdLimit] = useState<string>('')
+  const [tpmLimit, setTpmLimit] = useState<string>('')
+  const [tpdLimit, setTpdLimit] = useState<string>('')
+  const [parallelEnabled, setParallelEnabled] = useState(false)
+  const [maxParallelRequests, setMaxParallelRequests] = useState(4)
 
-  const create = useMutation<{ slug: string }, Error, { slug: string; displayName: string; baseUrl: string }>({
+  const create = useMutation<{ slug: string }, Error, Record<string, unknown>>({
     mutationFn: (body) => apiFetch('/api/custom-providers', { method: 'POST', body: JSON.stringify(body) }) as Promise<{ slug: string }>,
     onSuccess: (data: { slug: string }) => {
       queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
@@ -191,6 +198,13 @@ function AddPlatformModal({
       setSlug('')
       setDisplayName('')
       setBaseUrl('')
+      setShowAdvanced(false)
+      setRpmLimit('')
+      setRpdLimit('')
+      setTpmLimit('')
+      setTpdLimit('')
+      setParallelEnabled(false)
+      setMaxParallelRequests(4)
     },
   })
 
@@ -220,7 +234,15 @@ function AddPlatformModal({
           onSubmit={e => {
             e.preventDefault()
             if (!slug || !displayName || !baseUrl) return
-            create.mutate({ slug: slug.trim(), displayName: displayName.trim(), baseUrl: baseUrl.trim() })
+            const body: Record<string, unknown> = { slug: slug.trim(), displayName: displayName.trim(), baseUrl: baseUrl.trim() }
+            if (showAdvanced) {
+              if (rpmLimit) body.rpmLimit = parseInt(rpmLimit, 10)
+              if (rpdLimit) body.rpdLimit = parseInt(rpdLimit, 10)
+              if (tpmLimit) body.tpmLimit = parseInt(tpmLimit, 10)
+              if (tpdLimit) body.tpdLimit = parseInt(tpdLimit, 10)
+              body.maxParallelRequests = parallelEnabled ? maxParallelRequests : null
+            }
+            create.mutate(body)
           }}
           className="space-y-3"
         >
@@ -253,7 +275,58 @@ function AddPlatformModal({
               placeholder="http://192.168.1.10:11434/v1"
               className="font-mono text-xs"
             />
-          </div>
+</div>
+          <button
+            type="button"
+            onClick={() => setShowAdvanced(s => !s)}
+            className="text-xs text-muted-foreground hover:text-foreground"
+          >
+            {showAdvanced ? '▾' : '▸'} Advanced
+          </button>
+          {showAdvanced && (
+            <>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">RPM limit (blank = none)</Label>
+                <Input type="number" min={0} value={rpmLimit} onChange={e => setRpmLimit(e.target.value)} className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">RPD limit</Label>
+                <Input type="number" min={0} value={rpdLimit} onChange={e => setRpdLimit(e.target.value)} className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">TPM limit</Label>
+                <Input type="number" min={0} value={tpmLimit} onChange={e => setTpmLimit(e.target.value)} className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">TPD limit</Label>
+                <Input type="number" min={0} value={tpdLimit} onChange={e => setTpdLimit(e.target.value)} className="font-mono text-xs" />
+              </div>
+            </div>
+            <div className="border-t pt-3 mt-1">
+              <Label className="text-xs">Parallel requests</Label>
+              <div className="flex items-center gap-3 mt-1">
+                <label className="flex items-center gap-1.5 cursor-pointer text-xs">
+                  <Switch checked={parallelEnabled} onCheckedChange={setParallelEnabled} />
+                  Limit
+                </label>
+                {parallelEnabled && (
+                  <Input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={maxParallelRequests}
+                    onChange={e => setMaxParallelRequests(parseInt(e.target.value, 10) || 1)}
+                    className="font-mono text-xs w-20"
+                  />
+                )}
+              </div>
+              <p className="text-[10px] text-muted-foreground mt-1">
+                Caps in-flight requests across all models on this provider. When at the limit, every model is skipped until a slot frees.
+              </p>
+            </div>
+            </>
+          )}
           {create.isError && (
             <p className="text-destructive text-xs">{(create.error as Error).message}</p>
           )}
@@ -339,13 +412,11 @@ function PlatformTile({
 function PlatformsSection({
   customProviders,
   keys,
-  onAddProvider,
   onEditProvider,
   onRemoveProvider,
 }: {
   customProviders: CustomProvider[]
   keys: ApiKey[]
-  onAddProvider: () => void
   onEditProvider: (slug: string) => void
   onRemoveProvider: (slug: string) => void
 }) {
@@ -386,13 +457,6 @@ function PlatformsSection({
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
         {builtinTiles}
         {customTiles}
-        <button
-          onClick={onAddProvider}
-          className="rounded-2xl border border-dashed p-3 flex items-center justify-center gap-2 text-sm text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors min-h-[88px]"
-        >
-          <Plus className="size-4" />
-          Add New Platform
-        </button>
       </div>
     </section>
   )
@@ -505,10 +569,6 @@ function CustomModelsSection() {
   const [intelligenceRank, setIntelligenceRank] = useState(50)
   const [speedRank, setSpeedRank] = useState(50)
   const [sizeLabel, setSizeLabel] = useState('Custom')
-  const [rpmLimit, setRpmLimit] = useState<string>('')
-  const [rpdLimit, setRpdLimit] = useState<string>('')
-  const [tpmLimit, setTpmLimit] = useState<string>('')
-  const [tpdLimit, setTpdLimit] = useState<string>('')
   const addModel = useMutation({
     mutationFn: (body: any) =>
       apiFetch(`/api/custom-providers/${body.providerSlug}/models`, {
@@ -536,10 +596,6 @@ function CustomModelsSection() {
       fields.intelligenceRank = intelligenceRank
       fields.speedRank = speedRank
       fields.sizeLabel = sizeLabel
-      if (rpmLimit) fields.rpmLimit = parseInt(rpmLimit, 10)
-      if (rpdLimit) fields.rpdLimit = parseInt(rpdLimit, 10)
-      if (tpmLimit) fields.tpmLimit = parseInt(tpmLimit, 10)
-      if (tpdLimit) fields.tpdLimit = parseInt(tpdLimit, 10)
     }
     addModel.mutate({ providerSlug: provider ?? '', fields })
   }
@@ -652,28 +708,6 @@ function CustomModelsSection() {
               <div className="space-y-1.5">
                 <Label className="text-xs">Size label</Label>
                 <Input value={sizeLabel} onChange={e => setSizeLabel(e.target.value)} className="font-mono text-xs" />
-              </div>
-            </div>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              <div className="space-y-1.5">
-                <Label className="text-xs">RPM limit (blank = none)</Label>
-                <Input type="number" min={0} value={rpmLimit} onChange={e => setRpmLimit(e.target.value)}
-                  className="font-mono text-xs" />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs">RPD limit</Label>
-                <Input type="number" min={0} value={rpdLimit} onChange={e => setRpdLimit(e.target.value)}
-                  className="font-mono text-xs" />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs">TPM limit</Label>
-                <Input type="number" min={0} value={tpmLimit} onChange={e => setTpmLimit(e.target.value)}
-                  className="font-mono text-xs" />
-              </div>
-              <div className="space-y-1.5">
-                <Label className="text-xs">TPD limit</Label>
-                <Input type="number" min={0} value={tpdLimit} onChange={e => setTpdLimit(e.target.value)}
-                  className="font-mono text-xs" />
               </div>
             </div>
           </div>
@@ -849,7 +883,6 @@ export default function KeysPage() {
         <PlatformsSection
           customProviders={customProviders}
           keys={keys}
-          onAddProvider={() => setAddOpen(true)}
           onEditProvider={slug => setEditingProviderSlug(slug)}
           onRemoveProvider={slug => {
             if (confirm(`Remove provider "${slug}"? This deletes all its keys, models, and fallback entries.`)) {
@@ -862,7 +895,10 @@ export default function KeysPage() {
           <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 rounded-3xl border p-4 bg-card">
             <div className="space-y-1.5">
               <Label className="text-xs">Platform</Label>
-              <Select value={platform} onValueChange={setPlatform}>
+              <Select value={platform} onValueChange={val => {
+                if (val === '__add_new_platform__') { setAddOpen(true); return }
+                setPlatform(val)
+              }}>
                 <SelectTrigger className="w-[220px]">
                   <SelectValue placeholder="Select provider" />
                 </SelectTrigger>
@@ -878,6 +914,9 @@ export default function KeysPage() {
                       ))}
                     </>
                   )}
+                  <SelectItem value="__add_new_platform__" className="border-t font-semibold text-muted-foreground italic">
+                    <Plus className="size-4 inline mr-1" />Add New Platform
+                  </SelectItem>
                 </SelectContent>
               </Select>
               {selectedPlatform?.url && (
