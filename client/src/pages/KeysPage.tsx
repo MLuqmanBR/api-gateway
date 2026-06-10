@@ -516,9 +516,7 @@ function CustomModelsSection() {
               </SelectTrigger>
               <SelectContent>
                 {platformOptions.map(p => (
-                  <SelectItem key={p.value} value={p.value}>
-                    {p.label} <span className="text-muted-foreground ml-1 text-[10px]">{p.sublabel}</span>
-                  </SelectItem>
+                  <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
                 ))}
               </SelectContent>
             </Select>

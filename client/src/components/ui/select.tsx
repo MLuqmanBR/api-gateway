@@ -78,6 +78,7 @@ function SelectContent({
         align={align}
         alignOffset={alignOffset}
         alignItemWithTrigger={alignItemWithTrigger}
+        positionMethod="fixed"
         className="isolate z-50"
       >
         <SelectPrimitive.Popup
