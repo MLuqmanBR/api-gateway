@@ -1930,10 +1930,23 @@ function migrateCustomProvidersV27UserProviders(db: Database.Database) {
 
   const tx = db.transaction(() => {
     // Register providers (idempotent via slug UNIQUE + INSERT OR IGNORE)
+    // Also set RPM and parallel limits from pi provider-manager config.
     const insProv = db.prepare(
-      'INSERT OR IGNORE INTO custom_providers (slug, display_name, base_url) VALUES (?, ?, ?)'
+      "INSERT OR IGNORE INTO custom_providers (slug, display_name, base_url, rpm_limit, max_parallel_requests) VALUES (?, ?, ?, ?, ?)"
     );
-    for (const p of providers) insProv.run(p.slug, p.name, p.url);
+    const limits: Record<string, [number, number]> = {
+      glmaggregatora: [15, 5],
+      glmaggregatorb: [60, 5],
+      deepseek: [500, 500],
+    };
+    const updProv = db.prepare(
+      'UPDATE custom_providers SET rpm_limit = ?, max_parallel_requests = ? WHERE slug = ?'
+    );
+    for (const p of providers) {
+      const [rpm, par] = limits[p.slug] ?? [null, null];
+      insProv.run(p.slug, p.name, p.url, rpm, par);
+      updProv.run(rpm, par, p.slug);
+    }
 
     // Register models
     const insModel = db.prepare(`
