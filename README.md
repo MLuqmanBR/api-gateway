@@ -29,6 +29,7 @@ Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRoute
 - [Using the API](#using-the-api)
 - [Screenshots](#screenshots)
 - [How it works](#how-it-works)
+- [Context Handoff](#context-handoff)
 - [Limitations](#limitations)
 - [Contributing](#contributing)
 - [Terms of Service review](#terms-of-service-review)
@@ -93,6 +94,7 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 - **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
 - **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, and run prompts in a playground. Dark mode included.
 - **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns.
+- **Context handoff on model switch** — Optional. When a session falls over to a different model, injects one compact system message so the new model knows it is continuing an existing task. Disabled by default; enable with `FREELLMAPI_CONTEXT_HANDOFF=on_model_switch`. See [Context Handoff](#context-handoff).
 - **Runs anywhere Node 20+ runs** — Windows, macOS, Linux servers, or a small ARM SBC (Raspberry Pi included). ~40 MB RSS at idle behind PM2 / systemd / whatever supervisor you prefer.
 
 ## Not yet supported
@@ -416,6 +418,38 @@ Request volume, success rate, tokens in and out, average latency, and per-provid
 - **Health service** (`server/src/services/health.ts`) — periodic probe keeps key status fresh.
 - **Dashboard** (`client/`) — React + Vite + shadcn/ui admin surface.
 - **Storage** — SQLite (`better-sqlite3`) with AES-256-GCM envelope encryption for keys.
+
+## Context Handoff
+
+When FreeLLMAPI falls over to a different model mid-conversation (quota, rate limit, cooldown), the new model has no idea it is picking up someone else's task. **Context handoff** adds a single compact `system` message to the outbound request that tells the new model exactly that:
+
+```
+FreeLLMAPI context handoff:
+You are taking over an ongoing coding-agent conversation from another model (groq:llama-3 → google:gemini-flash).
+Continue the user's task using the conversation context already provided in this request.
+Do not restart the task, re-ask already answered setup questions, or discard prior tool results.
+Respect the user's latest message as the highest-priority instruction.
+
+Recent session summary:
+User: …
+Assistant: …
+```
+
+**Enable it in `.env`:**
+
+```env
+FREELLMAPI_CONTEXT_HANDOFF=on_model_switch
+```
+
+**How it works:**
+
+- Messages per session are stored in memory (TTL: 3 hours).
+- Only injected when the selected model changes for a given session key.
+- Not injected on the first request, on same-model continuations, or if a handoff message is already present.
+- Session key: `X-Session-Id` header if present, otherwise SHA-1 of the first user message (same as sticky sessions).
+- Storage is in-memory only. Nothing is written to disk or logged.
+
+> **Important:** Context Handoff improves continuity for conversations routed through FreeLLMAPI. It cannot recover provider-internal hidden state or messages that were never sent to the proxy.
 
 ## Limitations
 
