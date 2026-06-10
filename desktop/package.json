@@ -13,7 +13,8 @@
     "rebuild:native": "electron-rebuild -f -w better-sqlite3",
     "dev": "npm run build:all && electron .",
     "dist": "npm run build:all && electron-builder --mac --arm64",
-    "dist:win": "npm run build:all && electron-builder --win --x64"
+    "dist:win": "npm run build:all && electron-builder --win --x64",
+    "dist:linux": "npm run build:all && electron-builder --linux --x64"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0"
