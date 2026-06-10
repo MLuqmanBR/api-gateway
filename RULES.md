@@ -256,6 +256,15 @@ single rebase session. Follow them in order.
    like `reasoning_content` to `ChatMessage`, your rebased `types.ts` must
    keep it. Overwriting with an old version silently removes upstream features.
 
+8. **Push after every completed task.** Commits left local-only are lost on
+   disk failure, session switch, or machine change. After any significant
+   work that passes tests: `git push origin main` (or the current branch).
+
+9. **Never set git credentials globally.** Use `git config user.email` (without
+   `--global`) so credentials stay scoped to this project directory. This fork
+   uses a noreply GitHub address. Personal credentials should never leak into
+   commit metadata outside their own repos.
+
 ### 4.1 Conflict Hotspots (files you modify that upstream also touches)
 
 | File | Your Features Touching It | Risk Level |
@@ -544,11 +553,13 @@ git checkout test/combined
 git merge feat/new-feature
 npm test
 git push origin test/combined
-```
+# Set git credentials (project-only, never --global)
+git config user.name "MLuqmanBR"
+git config user.email "57311290+MLuqmanBR@users.noreply.github.com"
 
----
-
-## 8. Anti-Patterns (Don't Do These)
+# Push after completing work
+git push origin main
+``` (Don't Do These)
 
 | Anti-Pattern | Why It's Bad | What Actually Happened |
 |---|---|---|
