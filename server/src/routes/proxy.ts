@@ -12,7 +12,7 @@ import { contentToString, messageHasImage, normalizeOutboundContent } from '../l
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
-import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
+import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 
 export const proxyRouter = Router();
 
@@ -633,6 +633,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (handoffMode !== 'off' && sessionKey) {
     recordIncomingMessages(sessionKey, messages);
   }
+  // A handoff can only fire when a prior model is on record for this session.
+  // Check after recordIncomingMessages, which clears the prior model on a
+  // fresh conversation. Stable across the retry loop (the prior model only
+  // changes on a success, which returns), so compute it once here.
+  const handoffPossible = handoffMode !== 'off' && !!sessionKey && hasPriorModel(sessionKey);
 
   // Explicit `model` field pins routing. If the catalog has no enabled row
   // matching the requested id, return 400 — silently auto-routing to a
@@ -676,13 +681,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      // When handoff injection is active, pad the token estimate so the router's
+      // When a handoff could fire this turn, pad the token estimate so the router's
       // context-window and TPM checks account for the extra system message overhead.
-      // This padding is conservative and fires on every auto-routed request (not just
-      // on turns where injection will actually occur), because we don't know the
-      // selected model key until after routeRequest() returns. The trade-off is a
-      // ~1600-token headroom tax that prevents under-counting on turns that do inject.
-      const routingEstimate = (handoffMode !== 'off' && sessionKey) ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
+      // We don't know the selected model key until after routeRequest() returns, so
+      // the padding is conservative on turns where injection is *possible* (a prior
+      // model is on record). Turns where injection can't happen — every turn 1, and
+      // sessions that never switched — pay no headroom tax.
+      const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
       route = routeRequest(routingEstimate, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools, skipModels.size > 0 ? skipModels : undefined);
     } catch (err: any) {
       // No more models available
@@ -704,10 +709,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
     const modelKey = `${route.platform}:${route.modelId}`;
     let outboundMessages = messages;
+    // Extra input tokens the injected handoff adds on this turn (0 when not
+    // injected). Folded into the streaming success accounting, where token
+    // counts are estimated; the non-stream path uses the provider's usage,
+    // which already counts the injected message.
+    let injectedHandoffTokens = 0;
     if (handoffMode !== 'off' && sessionKey) {
       const handoff = maybeInjectContextHandoff({ mode: handoffMode, sessionKey, messages, selectedModelKey: modelKey });
       if (handoff.injected) console.log(`[Proxy] Context handoff injected (session ${sessionKey.slice(0, 8)}…, model switch detected)`);
       outboundMessages = handoff.messages;
+      injectedHandoffTokens = handoff.injectedTokens;
     }
 
     try {
@@ -909,11 +920,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.end();
 
           recordRequest(route.platform, route.modelId, route.keyId);
-          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
+          recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + injectedHandoffTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
           setStickyModel(messages, route.modelDbId, sessionIdHeader);
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           return;
         } catch (streamErr: any) {
           if (headerSent) {

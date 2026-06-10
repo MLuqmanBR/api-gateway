@@ -4,6 +4,7 @@ import {
   recordIncomingMessages,
   maybeInjectContextHandoff,
   recordSuccessfulModel,
+  hasPriorModel,
   HANDOFF_MAX_TOKENS,
   _clearStoreForTesting,
 } from '../../services/context-handoff.js';
@@ -308,5 +309,62 @@ describe('HANDOFF_MAX_TOKENS', () => {
   it('is a positive number exported for proxy routing estimate', () => {
     expect(HANDOFF_MAX_TOKENS).toBeGreaterThan(0);
     expect(typeof HANDOFF_MAX_TOKENS).toBe('number');
+  });
+});
+
+describe('hasPriorModel', () => {
+  it('is false for an unknown session', () => {
+    expect(hasPriorModel('nope')).toBe(false);
+  });
+
+  it('is false for an empty session key', () => {
+    expect(hasPriorModel('')).toBe(false);
+  });
+
+  it('is false after recordIncomingMessages alone (no model yet)', () => {
+    recordIncomingMessages('sess1', messages);
+    expect(hasPriorModel('sess1')).toBe(false);
+  });
+
+  it('is true once a model has succeeded for the session', () => {
+    recordIncomingMessages('sess1', messages);
+    recordSuccessfulModel({ sessionKey: 'sess1', modelKey: 'groq:llama-3' });
+    expect(hasPriorModel('sess1')).toBe(true);
+  });
+
+  it('flips back to false when a fresh conversation clears the prior model', () => {
+    recordIncomingMessages('sess1', messages);
+    recordSuccessfulModel({ sessionKey: 'sess1', modelKey: 'groq:llama-3' });
+    // Reused session ID, brand-new conversation (no assistant turns) → cleared.
+    recordIncomingMessages('sess1', [msg('user', 'brand new')]);
+    expect(hasPriorModel('sess1')).toBe(false);
+  });
+});
+
+describe('injectedTokens', () => {
+  it('is 0 when no handoff is injected', () => {
+    const result = maybeInjectContextHandoff({
+      mode: 'on_model_switch',
+      sessionKey: 'sess1',
+      messages,
+      selectedModelKey: 'groq:llama-3',
+    });
+    expect(result.injected).toBe(false);
+    expect(result.injectedTokens).toBe(0);
+  });
+
+  it('is a positive estimate when a handoff is injected', () => {
+    recordIncomingMessages('sess1', messages);
+    recordSuccessfulModel({ sessionKey: 'sess1', modelKey: 'groq:llama-3' });
+    const result = maybeInjectContextHandoff({
+      mode: 'on_model_switch',
+      sessionKey: 'sess1',
+      messages,
+      selectedModelKey: 'google:gemini-flash',
+    });
+    expect(result.injected).toBe(true);
+    expect(result.injectedTokens).toBeGreaterThan(0);
+    // Never exceeds the conservative routing-pad upper bound.
+    expect(result.injectedTokens).toBeLessThanOrEqual(HANDOFF_MAX_TOKENS);
   });
 });

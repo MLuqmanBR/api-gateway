@@ -29,9 +29,20 @@ export function getContextHandoffMode(): ContextHandoffMode {
   return raw === 'on_model_switch' ? 'on_model_switch' : 'off';
 }
 
+// Slice without cutting through a surrogate pair. A bare String.slice can
+// leave a lone high surrogate when it lands mid astral-plane char (emoji etc.),
+// and some providers 400 on a lone surrogate. Trim that trailing half-char off.
+// (Lib-agnostic — String.prototype.toWellFormed needs the es2024 lib target.)
+function safeSlice(text: string, max: number): string {
+  if (text.length <= max) return text;
+  const lastCode = text.charCodeAt(max - 1);
+  const end = lastCode >= 0xd800 && lastCode <= 0xdbff ? max - 1 : max;
+  return text.slice(0, end);
+}
+
 function trimContent(content: ChatMessage['content']): string {
   const text = contentToString(content);
-  return text.length > MAX_CONTENT_PER_MSG ? text.slice(0, MAX_CONTENT_PER_MSG) + '…' : text;
+  return text.length > MAX_CONTENT_PER_MSG ? safeSlice(text, MAX_CONTENT_PER_MSG) + '…' : text;
 }
 
 function pruneExpired(): void {
@@ -84,8 +95,17 @@ function buildSummary(messages: TrimmedMessage[]): string {
   const lines = messages.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`);
   const joined = lines.join('\n');
   return joined.length > MAX_HANDOFF_CHARS
-    ? joined.slice(0, MAX_HANDOFF_CHARS) + '\n…[truncated]'
+    ? safeSlice(joined, MAX_HANDOFF_CHARS) + '\n…[truncated]'
     : joined;
+}
+
+// True when a prior successful model is on record for this session, i.e. the
+// next request *could* trigger a handoff. proxy.ts uses this to skip padding
+// the routing token estimate on turns where injection is impossible (every
+// turn 1, and sessions that never switched), avoiding a needless headroom tax.
+export function hasPriorModel(sessionKey: string): boolean {
+  if (!sessionKey) return false;
+  return !!store.get(sessionKey)?.lastModelKey;
 }
 
 export function maybeInjectContextHandoff(params: {
@@ -93,13 +113,13 @@ export function maybeInjectContextHandoff(params: {
   sessionKey: string;
   messages: ChatMessage[];
   selectedModelKey: string;
-}): { messages: ChatMessage[]; injected: boolean } {
+}): { messages: ChatMessage[]; injected: boolean; injectedTokens: number } {
   const { mode, sessionKey, messages, selectedModelKey } = params;
-  if (mode === 'off' || !sessionKey) return { messages, injected: false };
+  if (mode === 'off' || !sessionKey) return { messages, injected: false, injectedTokens: 0 };
 
   const ctx = store.get(sessionKey);
   if (!ctx?.lastModelKey || ctx.lastModelKey === selectedModelKey) {
-    return { messages, injected: false };
+    return { messages, injected: false, injectedTokens: 0 };
   }
 
   // Skip if a handoff message is already present — handles both plain strings
@@ -109,12 +129,12 @@ export function maybeInjectContextHandoff(params: {
     const text = typeof m.content === 'string' ? m.content : contentToString(m.content);
     return text.startsWith('FreeLLMAPI context handoff:');
   });
-  if (alreadyPresent) return { messages, injected: false };
+  if (alreadyPresent) return { messages, injected: false, injectedTokens: 0 };
 
   const summary = buildSummary(ctx.recentMessages);
   const handoffContent = [
     'FreeLLMAPI context handoff:',
-    `You are taking over an ongoing coding-agent conversation from another model (${ctx.lastModelKey} → ${selectedModelKey}).`,
+    `You are taking over an ongoing conversation from another model (${ctx.lastModelKey} → ${selectedModelKey}).`,
     'Continue the user\'s task using the conversation context already provided in this request.',
     'Do not restart the task, re-ask already answered setup questions, or discard prior tool results.',
     'Respect the user\'s latest message as the highest-priority instruction.',
@@ -132,6 +152,7 @@ export function maybeInjectContextHandoff(params: {
   return {
     messages: [...messages.slice(0, pos), handoffMsg, ...messages.slice(pos)],
     injected: true,
+    injectedTokens: Math.ceil(handoffContent.length / 4),
   };
 }
 

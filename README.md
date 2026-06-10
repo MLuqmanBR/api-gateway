@@ -425,7 +425,7 @@ When FreeLLMAPI falls over to a different model mid-conversation (quota, rate li
 
 ```
 FreeLLMAPI context handoff:
-You are taking over an ongoing coding-agent conversation from another model (groq:llama-3 → google:gemini-flash).
+You are taking over an ongoing conversation from another model (groq:llama-3 → google:gemini-flash).
 Continue the user's task using the conversation context already provided in this request.
 Do not restart the task, re-ask already answered setup questions, or discard prior tool results.
 Respect the user's latest message as the highest-priority instruction.
@@ -521,6 +521,7 @@ PRs should include a test, keep the existing test suite green, and match the `.e
 <a href="https://github.com/hmm183"><img src="https://images.weserv.nl/?url=github.com/hmm183.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@hmm183" /></a>
 <a href="https://github.com/duemilionidieuro-bot"><img src="https://images.weserv.nl/?url=github.com/duemilionidieuro-bot.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@duemilionidieuro-bot" /></a>
 <a href="https://github.com/hjhhoni"><img src="https://images.weserv.nl/?url=github.com/hjhhoni.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@hjhhoni" /></a>
+<a href="https://github.com/immanuelsavio"><img src="https://images.weserv.nl/?url=github.com/immanuelsavio.png&w=60&h=60&fit=cover&mask=circle" width="60" alt="@immanuelsavio" /></a>
 
 ## Terms of Service review
 
