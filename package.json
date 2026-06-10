@@ -1,5 +1,8 @@
 {
   "name": "api-gateway",
+  "bin": {
+    "api": "./scripts/cli.mjs"
+  },
   "private": true,
   "workspaces": [
     "shared",
