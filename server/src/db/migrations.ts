@@ -36,6 +36,7 @@ export function migrateDbSchema(db: Database.Database) {
   // (drives the realistic "Est. savings" analytics stat).
   applyModelPricing(db);
   migrateEmbeddingsV1(db);
+  migrateCustomProvidersV24(db);
   ensureUnifiedKey(db);
 }
 
@@ -140,6 +141,19 @@ function createTables(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_lookup ON rate_limit_usage(platform, model_id, key_id, kind, created_at_ms);
     CREATE INDEX IF NOT EXISTS idx_rate_limit_cooldowns_expires ON rate_limit_cooldowns(expires_at_ms);
     CREATE INDEX IF NOT EXISTS idx_api_keys_platform ON api_keys(platform);
+
+    CREATE TABLE IF NOT EXISTS custom_providers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      slug TEXT NOT NULL UNIQUE,
+      display_name TEXT NOT NULL,
+      base_url TEXT NOT NULL,
+      rpm_limit INTEGER,
+      rpd_limit INTEGER,
+      tpm_limit INTEGER,
+      tpd_limit INTEGER,
+      max_parallel_requests INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   ensureRequestKeyIdColumn(db);
@@ -147,6 +161,7 @@ function createTables(db: Database.Database) {
   ensureModelsKeyIdColumn(db);
   ensureRequestTtfbColumn(db);
   ensureRequestRequestedModelColumn(db);
+  ensureCustomProvidersMaxParallelColumn(db);
 }
 
 // `requested_model` is the model id the CLIENT pinned in the request body.
@@ -201,6 +216,13 @@ function ensureModelsKeyIdColumn(db: Database.Database) {
          SET key_id = (SELECT id FROM api_keys WHERE platform = 'custom' ORDER BY id LIMIT 1)
        WHERE platform = 'custom' AND key_id IS NULL
     `).run();
+  }
+}
+
+function ensureCustomProvidersMaxParallelColumn(db: Database.Database) {
+  const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
+  if (!cols.some(c => c.name === 'max_parallel_requests')) {
+    db.prepare('ALTER TABLE custom_providers ADD COLUMN max_parallel_requests INTEGER').run();
   }
 }
 
@@ -1921,6 +1943,41 @@ function migrateEmbeddingsV1(db: Database.Database) {
   if (!def) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('embeddings_default_family', 'gemini-embedding-001')").run();
   }
+}
+
+// Custom providers V24: promote the special-cased 'custom' platform to a real
+// custom_providers row. Pre-existing api_keys (with their base_url) and models
+// rows (with their key_id binding) get re-pointed to the new slug 'legacy-custom',
+// preserving every URL and credential without any user action. After this runs,
+// 'custom' is no longer a magic value — the runtime looks up the base URL from
+// custom_providers for ANY platform string, and built-ins just happen to have
+// hardcoded base URLs in providers/index.ts.
+//
+// Idempotent: a re-run sees no 'custom' rows and exits quietly.
+function migrateCustomProvidersV24(db: Database.Database) {
+  const legacy = db.prepare(
+    "SELECT id, base_url FROM api_keys WHERE platform = 'custom' ORDER BY id LIMIT 1"
+  ).get() as { id: number; base_url: string | null } | undefined;
+
+  if (!legacy) return;
+
+  const baseUrl = legacy.base_url ?? '';
+  if (!baseUrl) {
+    db.prepare("UPDATE api_keys SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+    db.prepare("UPDATE models SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+    return;
+  }
+
+  const tx = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO custom_providers (slug, display_name, base_url)
+      VALUES ('legacy-custom', 'Imported custom provider', ?)
+    `).run(baseUrl);
+
+    db.prepare("UPDATE api_keys SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+    db.prepare("UPDATE models SET platform = 'legacy-custom' WHERE platform = 'custom'").run();
+  });
+  tx();
 }
 
 /** Append any models not yet in the fallback chain, lowest priority, ordered by

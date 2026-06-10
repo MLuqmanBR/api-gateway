@@ -1,9 +1,10 @@
 import type { Platform } from '@freellmapi/shared/types.js';
-import type { BaseProvider } from './base.js';
-import { GoogleProvider } from './google.js';
+import { getDb } from '../db/index.js';
 import { OpenAICompatProvider } from './openai-compat.js';
-import { CohereProvider } from './cohere.js';
+import { BaseProvider } from './base.js';
 import { CloudflareProvider } from './cloudflare.js';
+import { CohereProvider } from './cohere.js';
+import { GoogleProvider } from './google.js';
 
 const providers = new Map<Platform, BaseProvider>();
 
@@ -164,18 +165,6 @@ register(new OpenAICompatProvider({
 
 // Chutes was evaluated for V11 and dropped: probe with a free-tier key
 // returned 402 on every model — "Quota exceeded and account balance is
-// $0.0, please pay with fiat or send tao". The "free" tier requires a
-// non-zero balance, which conflicts with the project's no-card criterion.
-
-// Placeholder so getProvider('custom')/hasProvider('custom')/getAllProviders()
-// behave — but the real instance is built per-key by resolveProvider(), since
-// a custom provider's base URL is user-supplied and lives on the api_keys row.
-register(new OpenAICompatProvider({
-  platform: 'custom',
-  name: 'Custom (OpenAI-compatible)',
-  baseUrl: '',
-}));
-
 // Locally-hosted inference (llama.cpp / vLLM / Ollama on CPU) can be slow, so
 // custom providers get the same extended timeout as Ollama Cloud.
 const CUSTOM_PROVIDER_TIMEOUT_MS = 120000;
@@ -185,23 +174,30 @@ export function getProvider(platform: Platform): BaseProvider | undefined {
 }
 
 /**
- * Resolve the provider for a route. Built-in platforms return their registered
- * singleton; the 'custom' platform builds a fresh OpenAICompatProvider bound to
- * the caller-supplied base URL (stored per api_keys row). Returns undefined for
- * a custom provider with no base URL configured.
+ * Build the provider that should serve requests for `platformSlug`.
+ * - Built-in platforms: returns the registered singleton.
+ * - Custom provider slugs (anything not in the built-in map): looks up the
+ *   base URL from custom_providers and returns a fresh OpenAICompatProvider.
+ *
+ * Returns undefined if the slug is unknown or the custom provider has no
+ * base URL configured (e.g. the row was deleted but a model still references
+ * it).
  */
-export function resolveProvider(platform: Platform, baseUrl?: string | null): BaseProvider | undefined {
-  if (platform === 'custom') {
-    const trimmed = baseUrl?.trim();
-    if (!trimmed) return undefined;
-    return new OpenAICompatProvider({
-      platform: 'custom',
-      name: 'Custom (OpenAI-compatible)',
-      baseUrl: trimmed,
-      timeoutMs: CUSTOM_PROVIDER_TIMEOUT_MS,
-    });
-  }
-  return providers.get(platform);
+export function buildProviderFor(platformSlug: string): BaseProvider | undefined {
+  const builtin = getProvider(platformSlug as Platform);
+  if (builtin) return builtin;
+  // Custom slug: look up its base URL. We don't memoize across requests —
+  // OpenAICompatProvider holds no per-instance state worth reusing, and the
+  // DB hit is one indexed lookup.
+  const db = getDb();
+  const row = db.prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get(platformSlug) as { base_url: string } | undefined;
+  if (!row?.base_url) return undefined;
+  return new OpenAICompatProvider({
+    platform: platformSlug as Platform,
+    name: platformSlug,
+    baseUrl: row.base_url,
+    timeoutMs: CUSTOM_PROVIDER_TIMEOUT_MS,
+  });
 }
 
 export function getAllProviders(): BaseProvider[] {

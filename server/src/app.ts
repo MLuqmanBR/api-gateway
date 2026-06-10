@@ -13,11 +13,10 @@ import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
 import { authRouter } from './routes/auth.js';
+import { customRouter } from './routes/custom.js';
 import { requireAuth } from './middleware/requireAuth.js';
 import { createProxyRateLimiter } from './middleware/rateLimit.js';
 import { errorHandler } from './middleware/errorHandler.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const DEFAULT_DASHBOARD_ORIGINS = [
   'http://localhost:5173',
@@ -75,20 +74,22 @@ export function createApp() {
   app.use('/api/analytics', requireAuth, analyticsRouter);
   app.use('/api/health', requireAuth, healthRouter);
   app.use('/api/settings', requireAuth, settingsRouter);
-
-  // OpenAI-compatible proxy. Per-IP rate limiting (#35 item #6) runs first so
-  // it throttles unauthenticated brute-force / flood attempts before any
-  // routing work. Tune via PROXY_RATE_LIMIT_RPM; 0 disables it.
+  // Custom providers + their models. The router declares its own
+  // `/api/custom-providers` paths. We mount the router at root, but
+  // requireAuth only runs for matching paths via a conditional. This
+  // keeps `/api/ping` and `/api/auth/*` (intentionally public) free.
+  app.use((req, res, next) => {
+    if (!/^\/api\/(custom-providers|custom-models)(\/|$)/.test(req.url)) return next();
+    requireAuth(req, res, next);
+  }, customRouter);
   app.use('/v1', createProxyRateLimiter());
   app.use('/v1', proxyRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
-
   // Health check
   app.get('/api/ping', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
-
   // Error handler (for API routes)
   app.use(errorHandler);
 

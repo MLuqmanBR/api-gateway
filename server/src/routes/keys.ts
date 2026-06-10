@@ -2,25 +2,30 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { resolveProvider } from '../providers/index.js';
+import { getProvider, buildProviderFor } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 
 export const keysRouter = Router();
 
-// Active providers — must match providers/index.ts registrations + shared/types.ts Platform.
+// Active built-in providers — must match providers/index.ts registrations +
+// shared/types.ts Platform. Custom providers are NOT in this list: they are
+// created via POST /api/custom-providers and have their own base URL, and their
+// keys (if any) are added by hitting POST /api/keys with the custom slug.
 // Moonshot and MiniMax direct integrations were dropped in V4. HuggingFace
 // was dropped in V4 and re-added in V13 via the router.huggingface.co route.
 // SambaNova was dropped in V23 (free tier permanently retired).
 const PLATFORMS = [
   'google', 'groq', 'cerebras', 'nvidia', 'mistral',
   'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
-  'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode', 'custom',
+  'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode',
 ] as const;
 
 // `key` is optional so keyless providers (Kilo's anonymous gateway) can be added
 // without one; the handler enforces a non-empty key for everyone else.
+// Platform accepts any built-in (PLATFORMS) OR a custom provider slug; the
+// handler resolves it to confirm it exists.
 const addKeySchema = z.object({
-  platform: z.enum(PLATFORMS),
+  platform: z.string().min(1, 'platform is required'),
   key: z.string().optional(),
   label: z.string().optional(),
 });
@@ -70,7 +75,18 @@ keysRouter.post('/', (req: Request, res: Response) => {
   }
 
   const { platform, label } = parsed.data;
-  const isKeyless = resolveProvider(platform)?.keyless === true;
+
+  // Resolve platform → provider. Built-ins come from the registry; custom
+  // slugs come from custom_providers (and their base URL gets stamped on the
+  // key row so the denormalized schema stays consistent with the new
+  // canonical source of truth).
+  const db = getDb();
+  const provider = getProvider(platform as any) ?? buildProviderFor(platform);
+  if (!provider) {
+    res.status(400).json({ error: { message: `Unknown platform '${platform}'` } });
+    return;
+  }
+  const isKeyless = provider.keyless === true;
   const rawKey = parsed.data.key?.trim() ?? '';
 
   if (!isKeyless && !rawKey) {
@@ -82,7 +98,10 @@ keysRouter.post('/', (req: Request, res: Response) => {
   // as configured; the provider omits the auth header on outgoing calls.
   const keyToStore = isKeyless ? (rawKey || 'no-key') : rawKey;
 
-  const db = getDb();
+  // For custom slugs, look up the base URL so the key row carries it
+  // (denormalized — custom_providers is the source of truth, but having
+  // base_url on api_keys keeps older queries from breaking).
+  const baseUrl = (provider as { baseUrl?: string }).baseUrl ?? null;
 
   // A keyless provider needs only one sentinel row — re-enable an existing one
   // instead of piling up duplicates each time the user clicks "Add".
@@ -104,9 +123,9 @@ keysRouter.post('/', (req: Request, res: Response) => {
 
   const { encrypted, iv, authTag } = encrypt(keyToStore);
   const result = db.prepare(`
-    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-    VALUES (?, ?, ?, ?, ?, 'unknown', 1)
-  `).run(platform, label ?? '', encrypted, iv, authTag);
+    INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
+    VALUES (?, ?, ?, ?, ?, 'unknown', 1, ?)
+  `).run(platform, label ?? '', encrypted, iv, authTag, baseUrl);
 
   res.status(201).json({
     id: result.lastInsertRowid,
@@ -118,94 +137,6 @@ keysRouter.post('/', (req: Request, res: Response) => {
   });
 });
 
-// ── Custom OpenAI-compatible providers (#117, #212) ───────────────────────
-// User-configured endpoints (llama.cpp / LM Studio / vLLM / Ollama / any
-// OpenAI-compatible base_url). Each DISTINCT base_url gets its own 'custom'
-// api_keys row, and every registered model binds to its endpoint's key via
-// models.key_id — so several custom providers coexist without overwriting
-// each other (#212). Re-submitting an existing base_url updates its key/label;
-// re-registering an existing model id re-binds it to the submitted endpoint.
-const customProviderSchema = z.object({
-  baseUrl: z.string().url('baseUrl must be a valid URL'),
-  model: z.string().min(1, 'model is required'),
-  displayName: z.string().optional(),
-  apiKey: z.string().optional(),
-  label: z.string().optional(),
-});
-
-keysRouter.post('/custom', (req: Request, res: Response) => {
-  const parsed = customProviderSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-
-  const baseUrl = parsed.data.baseUrl.trim().replace(/\/+$/, '');
-  const modelId = parsed.data.model.trim();
-  const displayName = (parsed.data.displayName ?? modelId).trim();
-  // Local servers often need no key; keep a sentinel so there's always a bearer.
-  const rawKey = parsed.data.apiKey?.trim() || 'no-key';
-  const label = parsed.data.label ?? 'Custom';
-
-  const db = getDb();
-  const upsert = db.transaction(() => {
-    // One 'custom' key row PER ENDPOINT (matched on base_url). Re-submitting
-    // the same endpoint updates its key/label; a new base_url gets its own
-    // row instead of clobbering the previous provider. (#212)
-    const existing = db.prepare("SELECT id FROM api_keys WHERE platform = 'custom' AND base_url = ? LIMIT 1")
-      .get(baseUrl) as { id: number } | undefined;
-    let keyId: number;
-    if (existing) {
-      const { encrypted, iv, authTag } = encrypt(rawKey);
-      db.prepare("UPDATE api_keys SET label = ?, encrypted_key = ?, iv = ?, auth_tag = ?, status = 'unknown', enabled = 1 WHERE id = ?")
-        .run(label, encrypted, iv, authTag, existing.id);
-      keyId = existing.id;
-    } else {
-      const { encrypted, iv, authTag } = encrypt(rawKey);
-      const r = db.prepare(`
-        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
-        VALUES ('custom', ?, ?, ?, ?, 'unknown', 1, ?)
-      `).run(label, encrypted, iv, authTag, baseUrl);
-      keyId = Number(r.lastInsertRowid);
-    }
-
-    // Register the model bound to THIS endpoint's key. Custom models carry no
-    // rate limits and sort last in the intelligence preset (size_label tier).
-    // Re-registering an existing model id re-binds it (model ids are unique
-    // per platform, so one id can't live on two endpoints at once).
-    db.prepare(`
-      INSERT INTO models
-        (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
-         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id)
-      VALUES ('custom', ?, ?, 50, 50, 'Custom', NULL, NULL, NULL, NULL, '', NULL, 1, ?)
-      ON CONFLICT(platform, model_id)
-      DO UPDATE SET display_name = excluded.display_name, key_id = excluded.key_id, enabled = 1
-    `).run(modelId, displayName, keyId);
-
-    const modelRow = db.prepare("SELECT id FROM models WHERE platform = 'custom' AND model_id = ?").get(modelId) as { id: number };
-
-    // Append to the fallback chain if not already present.
-    const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelRow.id);
-    if (!inChain) {
-      const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
-      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelRow.id, max.m + 1);
-    }
-
-    return { keyId, modelDbId: modelRow.id };
-  });
-
-  const { keyId, modelDbId } = upsert();
-  res.status(201).json({
-    success: true,
-    keyId,
-    modelDbId,
-    platform: 'custom',
-    baseUrl,
-    model: modelId,
-    displayName,
-    maskedKey: maskKey(rawKey),
-  });
-});
 
 // Delete a key
 keysRouter.delete('/:id', (req: Request, res: Response) => {
@@ -222,34 +153,28 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
     return;
   }
 
+  // Custom models are owned by their custom_providers row, not by a key — so
+  // deleting a key never orphans its models. (The migration V23 moved the
+  // cascade from here to DELETE /api/custom-providers/:slug.)
   const remove = db.transaction(() => {
     db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
-    // Custom models exist only because POST /custom registered them alongside
-    // their endpoint key (#117) — they can't route without it. Cascade away
-    // the models bound to THIS endpoint (#212); other custom providers keep
-    // theirs. Legacy rows (key_id NULL) are swept once no custom keys remain,
-    // so they never linger in the fallback chain forever (#189).
-    if (row.platform === 'custom') {
-      db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(id);
-      db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(id);
-      const remaining = db.prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'custom'").get() as { n: number };
-      if (remaining.n === 0) {
-        db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
-        db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
-      }
-    }
   });
   remove();
 
   res.json({ success: true });
 });
 
-// Toggle all keys for a platform
+// Toggle all keys for a platform. Accepts built-in platforms OR a custom
+// provider slug — for the latter, the slug is verified against custom_providers.
 keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
   const platform = req.params.platform as string;
   if (!(PLATFORMS as readonly string[]).includes(platform)) {
-    res.status(400).json({ error: { message: `Invalid platform '${platform}'` } });
-    return;
+    const db = getDb();
+    const exists = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(platform);
+    if (!exists) {
+      res.status(400).json({ error: { message: `Invalid platform '${platform}'` } });
+      return;
+    }
   }
 
   const { enabled } = req.body;

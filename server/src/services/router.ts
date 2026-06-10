@@ -1,5 +1,5 @@
 import { getDb, getSetting, setSetting } from '../db/index.js';
-import { getProvider, resolveProvider } from '../providers/index.js';
+import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider } from './ratelimit.js';
 import {
@@ -450,10 +450,12 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // estimatedTokens already includes reserved output, mirroring the check above.
     if (entry.tpm_limit != null && estimatedTokens > entry.tpm_limit) continue;
 
-    // Check if we have a provider for this platform
-    const provider = getProvider(entry.platform as any);
+    // Resolve the provider for this platform. Built-in platforms return their
+    // registered singleton; custom slugs look up their base URL from
+    // custom_providers. If neither resolves (e.g. the custom provider row
+    // was deleted), skip the model.
+    const provider = buildProviderFor(entry.platform);
     if (!provider) continue;
-
     // Get enabled keys that have not already failed validation or decryption.
     const keys = db.prepare(
       "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
@@ -477,13 +479,8 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       const key = keys[idx % keys.length];
       idx++;
 
-      // A custom model belongs to exactly one endpoint: skip every custom key
-      // except the one it was registered with. Without this, multiple custom
-      // providers would round-robin each other's models onto the wrong
-      // endpoint. (#212) Legacy rows (key_id NULL) keep the old any-key match.
-      if (entry.platform === 'custom' && entry.key_id != null && key.id !== entry.key_id) continue;
-
       const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
+
       if (skipKeys?.has(skipId)) continue;
 
       // Check cooldown (from previous 429s)
@@ -506,18 +503,13 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         continue;
       }
 
-      // For the 'custom' platform the real provider is built from this key's
-      // base_url (the registered instance is just a placeholder). A custom key
-      // with no base_url can't be routed — skip it.
-      const resolvedProvider = entry.platform === 'custom'
-        ? resolveProvider('custom', key.base_url)
-        : provider;
-      if (!resolvedProvider) continue;
+      // provider was already resolved above; if it came back undefined (e.g.
+      // a custom provider row was deleted), we already continued.
 
       // We found a working key for this model!
       roundRobinIndex.set(rrKey, idx);
       return {
-        provider: resolvedProvider,
+        provider: provider,
         modelId: entry.model_id,
         modelDbId: entry.model_db_id,
         apiKey: decryptedKey,

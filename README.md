@@ -69,7 +69,21 @@ The problem is that stacking them by hand is painful: sixteen different SDKs, si
 </tr>
 </table>
 
-Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, a local Ollama, or a remote gateway) from the Keys page.
+Plus **your own custom platforms and models** — add any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, a local Ollama, or a remote gateway) as a first-class provider from the Keys page, then add individual models under it. They route through the same fallback chain, score against the same bandit, and show up alongside built-in platforms everywhere.
+
+### Custom platforms and models
+
+From the Keys page, the **Platforms** grid is the unified catalog view. Every built-in platform you've added a key for shows up alongside every custom platform you've registered. The grid ends with an **Add New Platform** tile that opens a modal for:
+
+- **Slug** — a short identifier like `my-ollama` (lowercase letters, digits, dashes; 2-32 chars; cannot collide with a built-in).
+- **Display name** — shown in the dashboard.
+- **Base URL** — the OpenAI-compatible endpoint, e.g. `http://192.168.1.10:11434/v1`.
+
+Once a platform exists, the **Add a model** form below it lets you register any number of individual models on that platform. Only the essentials are required (model id, display name, context window, supports-tools, supports-vision); an **Advanced** toggle exposes intelligence rank, speed rank, size label, and the four rate-limit counters for users who care. The model joins the fallback chain at the lowest priority and shows up everywhere built-in models do — `/v1/models`, the Fallback page, the Analytics page.
+
+Adding an API key for a custom platform works the same as for a built-in: pick the custom slug in the **Add a provider key** form, paste the bearer (or leave blank for local servers that don't need one), and the key routes to your endpoint.
+
+Removing a custom platform cascades — it drops every model on that platform, every key, and every fallback entry. There's no "leaving a model orphaned" state.
 
 ## Features
 
@@ -83,7 +97,7 @@ Plus a **custom** provider — point at any OpenAI-compatible endpoint (llama.cp
 - **Sticky sessions** — Multi-turn conversations keep talking to the same model for 30 minutes to avoid the hallucination spike that comes from mid-conversation model switches.
 - **Encrypted key storage** — API keys are encrypted with AES-256-GCM before hitting SQLite; decryption happens in-memory just before a request.
 - **Unified API key** — Clients authenticate to your proxy with a single `freellmapi-…` bearer token. You never expose upstream provider keys to your apps.
-- **Dashboard login** — The admin UI and all `/api/*` routes are gated behind an email + password account (scrypt-hashed, session-token auth), set on first run. The `/v1` proxy keeps its own unified-key auth for apps.
+- **LAN auto-trust** — FreeLLMAPI is a single-user tool, so the admin UI and `/api/*` routes skip the login form whenever the request comes from the local machine (loopback, RFC1918, link-local, IPv6 ULA / link-local). Remote callers still need an email + password account (scrypt-hashed, session-token auth), set on first run. The `/v1` proxy keeps its own unified-key auth for apps.
 - **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
 - **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, and run prompts in a playground. Dark mode included.
 - **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns.

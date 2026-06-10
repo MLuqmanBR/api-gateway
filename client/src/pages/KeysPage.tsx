@@ -7,8 +7,8 @@ import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
-import type { ApiKey, Platform } from '../../../shared/types'
-import { Pencil, ExternalLink } from 'lucide-react'
+import type { ApiKey, Platform, CustomProvider, Model } from '../../../shared/types'
+import { Pencil, ExternalLink, Plus, X } from 'lucide-react'
 import { formatSqliteUtcToLocalTime } from '@/lib/utils'
 
 // Small "Get API key" external link shown next to a provider (#137).
@@ -38,7 +38,7 @@ const PLATFORMS: { value: Platform; label: string; url: string; keyless?: boolea
   { value: 'groq', label: 'Groq', url: 'https://console.groq.com/keys' },
   { value: 'cerebras', label: 'Cerebras', url: 'https://cloud.cerebras.ai' },
   { value: 'nvidia', label: 'NVIDIA NIM', url: 'https://build.nvidia.com/settings/api-keys' },
-  { value: 'mistral', label: 'Mistral', url: 'https://console.mistral.ai/api-keys/' },
+  { value: 'mistral', label: 'Mistral', url: 'https://console.mistral.com/api-keys/' },
   { value: 'openrouter', label: 'OpenRouter', url: 'https://openrouter.ai/keys' },
   { value: 'github', label: 'GitHub Models', url: 'https://github.com/settings/tokens' },
   { value: 'cohere', label: 'Cohere', url: 'https://dashboard.cohere.com/api-keys' },
@@ -51,14 +51,6 @@ const PLATFORMS: { value: Platform; label: string; url: string; keyless?: boolea
   { value: 'huggingface', label: 'HuggingFace Router', url: 'https://huggingface.co/settings/tokens' },
   { value: 'opencode', label: 'OpenCode Zen (free key)', url: 'https://opencode.ai/auth' },
 ]
-
-// 'custom' is configured through its own form (base URL + model), not the
-// generic key dropdown — but it still appears in the grouped provider list.
-const CUSTOM_GROUP: { value: Platform; label: string; url: string } = {
-  value: 'custom',
-  label: 'Custom (OpenAI-compatible)',
-  url: '',
-}
 
 const statusDot: Record<string, string> = {
   healthy: 'bg-emerald-500',
@@ -171,110 +163,561 @@ function UnifiedKeySection() {
   )
 }
 
-function CustomProviderSection() {
-  const queryClient = useQueryClient()
-  const [baseUrl, setBaseUrl] = useState('')
-  const [model, setModel] = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [apiKey, setApiKey] = useState('')
+// ── Add-platform modal ────────────────────────────────────────────────────
+// Modal shown by the "Add New Platform" tile in the Platforms section. Adds
+// the user's first custom OpenAI-compatible endpoint to the catalog. After
+// the row is created the same form lets them add models immediately.
 
-  const addCustom = useMutation({
-    mutationFn: (body: { baseUrl: string; model: string; displayName?: string; apiKey?: string }) =>
-      apiFetch('/api/keys/custom', { method: 'POST', body: JSON.stringify(body) }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+function AddPlatformModal({
+  open,
+  onClose,
+  onCreated,
+}: {
+  open: boolean
+  onClose: () => void
+  onCreated: (slug: string) => void
+}) {
+  const queryClient = useQueryClient()
+  const [slug, setSlug] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [baseUrl, setBaseUrl] = useState('')
+
+  const create = useMutation<{ slug: string }, Error, { slug: string; displayName: string; baseUrl: string }>({
+    mutationFn: (body) => apiFetch('/api/custom-providers', { method: 'POST', body: JSON.stringify(body) }) as Promise<{ slug: string }>,
+    onSuccess: (data: { slug: string }) => {
+      queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
       queryClient.invalidateQueries({ queryKey: ['models'] })
-      setModel('')
+      onCreated(data.slug)
+      setSlug('')
       setDisplayName('')
+      setBaseUrl('')
     },
   })
 
-  const submit = (e: React.FormEvent) => {
-    e.preventDefault()
-    if (!baseUrl || !model) return
-    addCustom.mutate({ baseUrl, model, displayName: displayName || undefined, apiKey: apiKey || undefined })
-  }
+  if (!open) return null
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-background/60 backdrop-blur-sm flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-3xl border bg-card p-5 shadow-lg"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <h3 className="text-sm font-medium">Add a custom platform</h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Point at any OpenAI-compatible endpoint: Ollama, LM Studio, llama.cpp, vLLM, a remote gateway.
+              Models are added separately once the provider exists.
+            </p>
+          </div>
+          <Button variant="ghost" size="xs" onClick={onClose}>
+            <X className="size-4" />
+          </Button>
+        </div>
+        <form
+          onSubmit={e => {
+            e.preventDefault()
+            if (!slug || !displayName || !baseUrl) return
+            create.mutate({ slug: slug.trim(), displayName: displayName.trim(), baseUrl: baseUrl.trim() })
+          }}
+          className="space-y-3"
+        >
+          <div className="space-y-1.5">
+            <Label className="text-xs">Slug (the platform id)</Label>
+            <Input
+              value={slug}
+              onChange={e => setSlug(e.target.value)}
+              placeholder="my-ollama"
+              className="font-mono text-xs"
+              autoFocus
+            />
+            <p className="text-[11px] text-muted-foreground">
+              Lowercase letters, digits, dashes; 2-32 chars. Cannot collide with built-in platforms.
+            </p>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Display name</Label>
+            <Input
+              value={displayName}
+              onChange={e => setDisplayName(e.target.value)}
+              placeholder="My Ollama box"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Base URL</Label>
+            <Input
+              value={baseUrl}
+              onChange={e => setBaseUrl(e.target.value)}
+              placeholder="http://192.168.1.10:11434/v1"
+              className="font-mono text-xs"
+            />
+          </div>
+          {create.isError && (
+            <p className="text-destructive text-xs">{(create.error as Error).message}</p>
+          )}
+          <div className="flex justify-end gap-2 pt-1">
+            <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
+            <Button type="submit" size="sm" disabled={!slug || !displayName || !baseUrl || create.isPending}>
+              {create.isPending ? 'Adding…' : 'Add platform'}
+            </Button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// ── Platforms grid ────────────────────────────────────────────────────────
+// Lists built-in platforms and user-added custom providers as a uniform grid
+// of tiles. The very last tile is always the "Add New Platform" entry —
+// clicking it opens a modal that creates a new row in custom_providers.
+// Custom providers expose Edit/Remove; built-ins don't (they're seeded by
+// server migrations).
+
+function PlatformTile({
+  label,
+  url,
+  keys,
+  isCustom,
+  onEdit,
+  onRemove,
+}: {
+  label: string
+  url: string
+  keys: ApiKey[]
+  isCustom: boolean
+  onEdit?: () => void
+  onRemove?: () => void
+}) {
+  const enabledSome = keys.some(k => k.enabled)
+  return (
+    <div className="rounded-2xl border bg-card p-3 flex flex-col gap-2">
+      <div className="flex items-center justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5 text-sm font-medium truncate">
+            {label}
+            {isCustom && (
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground">
+                custom
+              </span>
+            )}
+          </div>
+          {url && <div className="truncate"><GetKeyLink url={url} /></div>}
+        </div>
+        <span className="text-[11px] text-muted-foreground tabular-nums">
+          {keys.length} key{keys.length === 1 ? '' : 's'}
+        </span>
+      </div>
+      {isCustom && (
+        <div className="flex items-center gap-2 text-xs">
+          {onEdit && (
+            <Button variant="ghost" size="xs" onClick={onEdit}>
+              <Pencil className="size-3" />
+            </Button>
+          )}
+          {onRemove && (
+            <Button
+              variant="ghost"
+              size="xs"
+              className="text-muted-foreground hover:text-destructive"
+              onClick={onRemove}
+            >
+              Remove
+            </Button>
+          )}
+          {keys.length === 0 && !enabledSome && (
+            <span className="text-[11px] text-muted-foreground ml-auto">no keys yet</span>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PlatformsSection({
+  customProviders,
+  keys,
+  onAddProvider,
+  onEditProvider,
+  onRemoveProvider,
+}: {
+  customProviders: CustomProvider[]
+  keys: ApiKey[]
+  onAddProvider: () => void
+  onEditProvider: (slug: string) => void
+  onRemoveProvider: (slug: string) => void
+}) {
+  // Build a tiles list: built-ins (only if they have at least one key) +
+  // every custom provider (always shown, even with no keys) + the always-last
+  // "Add New Platform" tile.
+  const builtinTiles = PLATFORMS
+    .map(p => ({
+      ...p,
+      keys: keys.filter(k => k.platform === p.value),
+    }))
+    .filter(p => p.keys.length > 0)
+    .map(p => (
+      <PlatformTile
+        key={p.value}
+        label={p.label}
+        url={p.url}
+        keys={p.keys}
+        isCustom={false}
+      />
+    ))
+
+  const customTiles = customProviders.map(cp => (
+    <PlatformTile
+      key={cp.slug}
+      label={cp.displayName}
+      url=""
+      keys={keys.filter(k => k.platform === cp.slug)}
+      isCustom
+      onEdit={() => onEditProvider(cp.slug)}
+      onRemove={() => onRemoveProvider(cp.slug)}
+    />
+  ))
 
   return (
     <section>
-      <h2 className="text-sm font-medium mb-1">Add a custom OpenAI-compatible model</h2>
-      <p className="text-xs text-muted-foreground mb-3">
-        Point at any OpenAI-compatible endpoint: llama.cpp, LM Studio, vLLM, a local Ollama, or a remote
-        gateway. Add each model you want routed; they all share the one endpoint. The API key is optional
-        (most local servers don't need one).
-      </p>
-      <form onSubmit={submit} className="flex flex-wrap items-end gap-3 rounded-3xl border p-4 bg-card">
-        <div className="space-y-1.5 flex-1 min-w-[240px]">
-          <Label className="text-xs">Base URL</Label>
-          <Input
-            value={baseUrl}
-            onChange={e => setBaseUrl(e.target.value)}
-            placeholder="http://127.0.0.1:11434/v1"
-            className="font-mono text-xs"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label className="text-xs">Model</Label>
-          <Input
-            value={model}
-            onChange={e => setModel(e.target.value)}
-            placeholder="qwen3:4b"
-            className="w-[180px] font-mono text-xs"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label className="text-xs">Display name</Label>
-          <Input
-            value={displayName}
-            onChange={e => setDisplayName(e.target.value)}
-            placeholder="optional"
-            className="w-[150px]"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label className="text-xs">API key</Label>
-          <Input
-            type="password"
-            value={apiKey}
-            onChange={e => setApiKey(e.target.value)}
-            placeholder="optional"
-            className="w-[150px] font-mono text-xs"
-          />
-        </div>
-        <Button type="submit" size="sm" disabled={!baseUrl || !model || addCustom.isPending}>
-          {addCustom.isPending ? 'Adding…' : 'Add model'}
-        </Button>
-      </form>
-      {addCustom.isError && (
-        <p className="text-destructive text-xs mt-2">{(addCustom.error as Error).message}</p>
-      )}
+      <h2 className="text-sm font-medium mb-3">Platforms</h2>
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {builtinTiles}
+        {customTiles}
+        <button
+          onClick={onAddProvider}
+          className="rounded-2xl border border-dashed p-3 flex items-center justify-center gap-2 text-sm text-muted-foreground hover:text-foreground hover:border-foreground/30 transition-colors min-h-[88px]"
+        >
+          <Plus className="size-4" />
+          Add New Platform
+        </button>
+      </div>
     </section>
   )
 }
 
+// ── Edit-platform modal ───────────────────────────────────────────────────
+// Reused for the PATCH /api/custom-providers/:slug flow. Lets the user
+// correct a typo in the baseUrl or the display name without re-registering
+// the slug (which is the platform id and would orphan existing models).
+
+function EditPlatformModal({
+  slug,
+  initial,
+  onClose,
+  onSaved,
+}: {
+  slug: string
+  initial: { displayName: string; baseUrl: string }
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const queryClient = useQueryClient()
+  const [displayName, setDisplayName] = useState(initial.displayName)
+  const [baseUrl, setBaseUrl] = useState(initial.baseUrl)
+
+  const save = useMutation({
+    mutationFn: (body: { displayName?: string; baseUrl?: string }) =>
+      apiFetch(`/api/custom-providers/${slug}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
+      queryClient.invalidateQueries({ queryKey: ['keys'] })
+      queryClient.invalidateQueries({ queryKey: ['health'] })
+      onSaved()
+    },
+  })
+
+  return (
+    <div
+      className="fixed inset-0 z-50 bg-background/60 backdrop-blur-sm flex items-center justify-center p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-md rounded-3xl border bg-card p-5 shadow-lg"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between mb-3">
+          <div>
+            <h3 className="text-sm font-medium">Edit platform</h3>
+            <p className="text-xs text-muted-foreground mt-0.5 font-mono">{slug}</p>
+          </div>
+          <Button variant="ghost" size="xs" onClick={onClose}><X className="size-4" /></Button>
+        </div>
+        <form
+          onSubmit={e => {
+            e.preventDefault()
+            save.mutate({ displayName: displayName.trim(), baseUrl: baseUrl.trim() })
+          }}
+          className="space-y-3"
+        >
+          <div className="space-y-1.5">
+            <Label className="text-xs">Display name</Label>
+            <Input value={displayName} onChange={e => setDisplayName(e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Base URL</Label>
+            <Input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} className="font-mono text-xs" />
+          </div>
+          {save.isError && (
+            <p className="text-destructive text-xs">{(save.error as Error).message}</p>
+          )}
+          <div className="flex justify-end gap-2 pt-1">
+            <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
+            <Button type="submit" size="sm" disabled={save.isPending}>
+              {save.isPending ? 'Saving…' : 'Save'}
+            </Button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+// Custom model registration form: adds a single model to any provider —
+// built-in or custom. Defaults are chosen so the user can submit with just
+// the model id and display name; the rest of the form's "advanced" fields
+// take sensible defaults and can be edited later from the Fallback page.
+//   contextWindow = 128_000  (matches the modern LLM ceiling)
+//   supportsTools = true     (most OpenAI-compat endpoints do)
+//   supportsVision = false   (text-only is the safe default)
+//   ranks = 50 / 50          (middle of the bandit scoring range)
+//   sizeLabel = 'Custom'     (sorts below named tiers)
+
+function CustomModelsSection() {
+  const queryClient = useQueryClient()
+  const { data: customProviders = [] } = useQuery<CustomProvider[]>({
+    queryKey: ['custom-providers'],
+    queryFn: () => apiFetch('/api/custom-providers'),
+  })
+  const { data: models = [] } = useQuery<Model[]>({
+    queryKey: ['models'],
+    queryFn: () => apiFetch('/api/models'),
+  })
+  const [provider, setProvider] = useState<string | null>(null)
+  const [modelId, setModelId] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [contextWindow, setContextWindow] = useState(128000)
+  const [supportsTools, setSupportsTools] = useState(true)
+  const [supportsVision, setSupportsVision] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [intelligenceRank, setIntelligenceRank] = useState(50)
+  const [speedRank, setSpeedRank] = useState(50)
+  const [sizeLabel, setSizeLabel] = useState('Custom')
+  const [rpmLimit, setRpmLimit] = useState<string>('')
+  const [rpdLimit, setRpdLimit] = useState<string>('')
+  const [tpmLimit, setTpmLimit] = useState<string>('')
+  const [tpdLimit, setTpdLimit] = useState<string>('')
+  const addModel = useMutation({
+    mutationFn: (body: any) =>
+      apiFetch(`/api/custom-providers/${body.providerSlug}/models`, {
+        method: 'POST',
+        body: JSON.stringify(body.fields),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      setModelId('')
+      setDisplayName('')
+    },
+  })
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!provider || !modelId || !displayName) return
+    const fields: Record<string, unknown> = {
+      modelId: modelId.trim(),
+      displayName: displayName.trim(),
+      contextWindow: contextWindow || null,
+      supportsTools,
+      supportsVision,
+    }
+    if (showAdvanced) {
+      fields.intelligenceRank = intelligenceRank
+      fields.speedRank = speedRank
+      fields.sizeLabel = sizeLabel
+      if (rpmLimit) fields.rpmLimit = parseInt(rpmLimit, 10)
+      if (rpdLimit) fields.rpdLimit = parseInt(rpdLimit, 10)
+      if (tpmLimit) fields.tpmLimit = parseInt(tpmLimit, 10)
+      if (tpdLimit) fields.tpdLimit = parseInt(tpdLimit, 10)
+    }
+    addModel.mutate({ providerSlug: provider ?? '', fields })
+  }
+  // Count of registered models per platform — used to label the dropdown
+  // entries so the user can see which providers already have models.
+  const modelCountByPlatform = new Map<string, number>()
+  for (const m of models) {
+    modelCountByPlatform.set(m.platform, (modelCountByPlatform.get(m.platform) ?? 0) + 1)
+  }
+  const platformOptions: { value: string; label: string; sublabel: string }[] = [
+    ...PLATFORMS.map(p => ({
+      value: p.value as string,
+      label: p.label,
+      sublabel: `${modelCountByPlatform.get(p.value) ?? 0} models`,
+    })),
+    ...customProviders.map(cp => ({
+      value: cp.slug,
+      label: `${cp.displayName} (custom)`,
+      sublabel: `${modelCountByPlatform.get(cp.slug) ?? 0} models`,
+    })),
+  ]
+  return (
+    <section>
+      <h2 className="text-sm font-medium mb-1">Add a model</h2>
+      <p className="text-xs text-muted-foreground mb-3">
+        Register a model on a built-in provider (e.g. an unlisted Cerebras model) or on one of your
+        custom platforms. The new model joins the fallback chain at the lowest priority — reorder in
+        the Fallback tab.
+      </p>
+      <form onSubmit={submit} className="space-y-3 rounded-3xl border p-4 bg-card">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Provider</Label>
+            <Select value={provider} onValueChange={setProvider}>
+              <SelectTrigger>
+                <SelectValue placeholder="Select provider" />
+              </SelectTrigger>
+              <SelectContent>
+                {platformOptions.map(p => (
+                  <SelectItem key={p.value} value={p.value}>
+                    {p.label} <span className="text-muted-foreground ml-1 text-[10px]">{p.sublabel}</span>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Model id</Label>
+            <Input
+              value={modelId}
+              onChange={e => setModelId(e.target.value)}
+              placeholder={provider ? `the model id your endpoint expects` : 'pick a provider first'}
+              className="font-mono text-xs"
+              disabled={!provider}
+            />
+          </div>
+        </div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Display name</Label>
+            <Input
+              value={displayName}
+              onChange={e => setDisplayName(e.target.value)}
+              placeholder="human-readable label"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Context window (tokens)</Label>
+            <Input
+              type="number"
+              min={0}
+              value={contextWindow}
+              onChange={e => setContextWindow(parseInt(e.target.value, 10) || 0)}
+              className="font-mono text-xs"
+            />
+          </div>
+        </div>
+        <div className="flex items-center gap-6 text-xs">
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <Switch checked={supportsTools} onCheckedChange={setSupportsTools} />
+            Supports tools
+          </label>
+          <label className="flex items-center gap-1.5 cursor-pointer">
+            <Switch checked={supportsVision} onCheckedChange={setSupportsVision} />
+            Supports vision
+          </label>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowAdvanced(s => !s)}
+          className="text-xs text-muted-foreground hover:text-foreground"
+        >
+          {showAdvanced ? '▾' : '▸'} Advanced
+        </button>
+        {showAdvanced && (
+          <div className="space-y-3 pt-1 border-t">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">Intelligence rank (1-100)</Label>
+                <Input type="number" min={1} max={100} value={intelligenceRank}
+                  onChange={e => setIntelligenceRank(parseInt(e.target.value, 10) || 50)}
+                  className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Speed rank (1-100)</Label>
+                <Input type="number" min={1} max={100} value={speedRank}
+                  onChange={e => setSpeedRank(parseInt(e.target.value, 10) || 50)}
+                  className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Size label</Label>
+                <Input value={sizeLabel} onChange={e => setSizeLabel(e.target.value)} className="font-mono text-xs" />
+              </div>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+              <div className="space-y-1.5">
+                <Label className="text-xs">RPM limit (blank = none)</Label>
+                <Input type="number" min={0} value={rpmLimit} onChange={e => setRpmLimit(e.target.value)}
+                  className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">RPD limit</Label>
+                <Input type="number" min={0} value={rpdLimit} onChange={e => setRpdLimit(e.target.value)}
+                  className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">TPM limit</Label>
+                <Input type="number" min={0} value={tpmLimit} onChange={e => setTpmLimit(e.target.value)}
+                  className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">TPD limit</Label>
+                <Input type="number" min={0} value={tpdLimit} onChange={e => setTpdLimit(e.target.value)}
+                  className="font-mono text-xs" />
+              </div>
+            </div>
+          </div>
+        )}
+        <div className="flex justify-end pt-1">
+          <Button type="submit" size="sm" disabled={!provider || !modelId || !displayName || addModel.isPending}>
+            {addModel.isPending ? 'Adding…' : 'Add model'}
+          </Button>
+        </div>
+        {addModel.isError && (
+          <p className="text-destructive text-xs">{(addModel.error as Error).message}</p>
+        )}
+      </form>
+    </section>
+  )
+}
+
+// Main Keys page. Renders the unified key section, the platform grid, the
+// add-key form (which now lists custom slugs too), the per-platform key
+// list, and the add-model form.
 export default function KeysPage() {
   const queryClient = useQueryClient()
-  const [platform, setPlatform] = useState<Platform | ''>('')
+  const [platform, setPlatform] = useState<string | null>(null)
   const [apiKey, setApiKey] = useState('')
   const [accountId, setAccountId] = useState('')
   const [label, setLabel] = useState('')
   const [editingKeyId, setEditingKeyId] = useState<number | null>(null)
   const [editingLabel, setEditingLabel] = useState('')
   const editInputRef = useRef<HTMLInputElement>(null)
-
+  const [addOpen, setAddOpen] = useState(false)
+  const [editingProviderSlug, setEditingProviderSlug] = useState<string | null>(null)
   const { data: keys = [], isLoading } = useQuery<ApiKey[]>({
     queryKey: ['keys'],
     queryFn: () => apiFetch('/api/keys'),
   })
-
   const { data: healthData } = useQuery<HealthData>({
     queryKey: ['health'],
     queryFn: () => apiFetch('/api/health'),
     refetchInterval: 30000,
   })
-
+  const { data: customProviders = [] } = useQuery<CustomProvider[]>({
+    queryKey: ['custom-providers'],
+    queryFn: () => apiFetch('/api/custom-providers'),
+  })
   const addKey = useMutation({
     mutationFn: (body: { platform: string; key: string; label?: string }) =>
       apiFetch('/api/keys', { method: 'POST', body: JSON.stringify(body) }),
@@ -288,7 +731,6 @@ export default function KeysPage() {
       setLabel('')
     },
   })
-
   const deleteKey = useMutation({
     mutationFn: (id: number) => apiFetch(`/api/keys/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
@@ -296,7 +738,6 @@ export default function KeysPage() {
       queryClient.invalidateQueries({ queryKey: ['health'] })
     },
   })
-
   const checkAll = useMutation({
     mutationFn: () => apiFetch('/api/health/check-all', { method: 'POST' }),
     onSuccess: () => {
@@ -304,7 +745,6 @@ export default function KeysPage() {
       queryClient.invalidateQueries({ queryKey: ['keys'] })
     },
   })
-
   const checkKey = useMutation({
     mutationFn: (keyId: number) => apiFetch(`/api/health/check/${keyId}`, { method: 'POST' }),
     onSuccess: () => {
@@ -312,7 +752,6 @@ export default function KeysPage() {
       queryClient.invalidateQueries({ queryKey: ['keys'] })
     },
   })
-
   const togglePlatform = useMutation({
     mutationFn: ({ platform, enabled }: { platform: string; enabled: boolean }) =>
       apiFetch(`/api/keys/platform/${platform}`, {
@@ -325,7 +764,6 @@ export default function KeysPage() {
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
     },
   })
-
   const updateKey = useMutation({
     mutationFn: ({ id, label }: { id: number; label: string }) =>
       apiFetch(`/api/keys/${id}`, {
@@ -338,50 +776,61 @@ export default function KeysPage() {
       setEditingLabel('')
     },
   })
-
+  const removeProvider = useMutation({
+    mutationFn: (slug: string) => apiFetch(`/api/custom-providers/${slug}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
+      queryClient.invalidateQueries({ queryKey: ['keys'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+    },
+  })
   function startEditing(key: ApiKey) {
     setEditingKeyId(key.id)
     setEditingLabel(key.label)
   }
-
   function cancelEditing() {
     setEditingKeyId(null)
     setEditingLabel('')
   }
-
   function saveEditing(id: number) {
     if (editingLabel !== undefined) {
       updateKey.mutate({ id, label: editingLabel })
     }
   }
-
   useEffect(() => {
     if (editingKeyId !== null && editInputRef.current) {
       editInputRef.current.focus()
     }
   }, [editingKeyId])
-
+  // Build a unified platform list for the add-key form. Built-ins come
+  // first; user-added custom providers appear at the end of the dropdown.
+  const allPlatforms: { value: string; label: string; url: string; keyless?: boolean }[] = [
+    ...PLATFORMS,
+    ...customProviders.map(cp => ({ value: cp.slug, label: `${cp.displayName} (custom)`, url: '' })),
+  ]
+  const selectedPlatform = allPlatforms.find(p => p.value === platform)
   const needsAccountId = platform === 'cloudflare'
-  const isKeyless = PLATFORMS.find(p => p.value === platform)?.keyless ?? false
-
+  const isKeyless = selectedPlatform?.keyless === true
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!platform) return
     if (!isKeyless && !apiKey) return
     if (needsAccountId && !accountId) return
-    // Keyless providers submit an empty key; the backend stores a sentinel.
     const key = isKeyless ? '' : (needsAccountId ? `${accountId}:${apiKey}` : apiKey)
     addKey.mutate({ platform, key, label: label || undefined })
   }
-
   const healthKeyMap = new Map<number, { status: string; lastCheckedAt: string | null }>()
   for (const k of healthData?.keys ?? []) healthKeyMap.set(k.id, k)
-
-  const grouped = [...PLATFORMS, CUSTOM_GROUP].map(p => ({
-    ...p,
-    keys: keys.filter(k => k.platform === p.value),
-  })).filter(p => p.keys.length > 0)
-
+  // The "Configured providers" list groups by platform string. PLATFORMS
+  // only seeds the header label; any platform string on a key (built-in
+  // or custom) gets its own group.
+  const grouped = allPlatforms
+    .map(p => ({ ...p, keys: keys.filter(k => k.platform === p.value) }))
+    .filter(p => p.keys.length > 0)
+  const editingProvider = editingProviderSlug
+    ? customProviders.find(p => p.slug === editingProviderSlug) ?? null
+    : null
   return (
     <div>
       <PageHeader
@@ -395,16 +844,25 @@ export default function KeysPage() {
           )
         }
       />
-
       <div className="space-y-8">
         <UnifiedKeySection />
-
+        <PlatformsSection
+          customProviders={customProviders}
+          keys={keys}
+          onAddProvider={() => setAddOpen(true)}
+          onEditProvider={slug => setEditingProviderSlug(slug)}
+          onRemoveProvider={slug => {
+            if (confirm(`Remove provider "${slug}"? This deletes all its keys, models, and fallback entries.`)) {
+              removeProvider.mutate(slug)
+            }
+          }}
+        />
         <section>
           <h2 className="text-sm font-medium mb-3">Add a provider key</h2>
           <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 rounded-3xl border p-4 bg-card">
             <div className="space-y-1.5">
               <Label className="text-xs">Platform</Label>
-              <Select value={platform} onValueChange={(v) => setPlatform(v as Platform)}>
+              <Select value={platform} onValueChange={setPlatform}>
                 <SelectTrigger className="w-[220px]">
                   <SelectValue placeholder="Select provider" />
                 </SelectTrigger>
@@ -412,12 +870,19 @@ export default function KeysPage() {
                   {PLATFORMS.map(p => (
                     <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
                   ))}
+                  {customProviders.length > 0 && (
+                    <>
+                      <SelectItem value="__divider" disabled className="text-muted-foreground">— custom —</SelectItem>
+                      {customProviders.map(cp => (
+                        <SelectItem key={cp.slug} value={cp.slug}>{cp.displayName} (custom)</SelectItem>
+                      ))}
+                    </>
+                  )}
                 </SelectContent>
               </Select>
-              {(() => {
-                const sel = PLATFORMS.find(p => p.value === platform)
-                return sel?.url ? <div className="pt-0.5"><GetKeyLink url={sel.url} /></div> : null
-              })()}
+              {selectedPlatform?.url && (
+                <div className="pt-0.5"><GetKeyLink url={selectedPlatform.url} /></div>
+              )}
             </div>
             {needsAccountId && (
               <div className="space-y-1.5">
@@ -465,14 +930,12 @@ export default function KeysPage() {
             <p className="text-destructive text-xs mt-2">{(addKey.error as Error).message}</p>
           )}
         </section>
-
-        <CustomProviderSection />
-
+        <CustomModelsSection />
         <section>
-          <h2 className="text-sm font-medium mb-3">Configured providers</h2>
+          <h2 className="text-sm font-medium mb-3">Configured keys</h2>
           {isLoading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
-          ) : keys.length === 0 ? (
+          ) : grouped.length === 0 ? (
             <div className="rounded-3xl border border-dashed p-8 text-center">
               <p className="text-sm text-muted-foreground">
                 No provider keys yet. Add one above to start routing.
@@ -522,9 +985,7 @@ export default function KeysPage() {
                               disabled={updateKey.isPending}
                             />
                           ) : (
-                            <>
-                              {k.label && <span className="text-xs text-muted-foreground">{k.label}</span>}
-                            </>
+                            <>{k.label && <span className="text-xs text-muted-foreground">{k.label}</span>}</>
                           )}
                           <span className="text-xs text-muted-foreground">{statusLabel[status] ?? status}</span>
                           <div className="flex-1" />
@@ -554,6 +1015,19 @@ export default function KeysPage() {
           )}
         </section>
       </div>
+      <AddPlatformModal
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        onCreated={() => setAddOpen(false)}
+      />
+      {editingProvider && (
+        <EditPlatformModal
+          slug={editingProvider.slug}
+          initial={{ displayName: editingProvider.displayName, baseUrl: editingProvider.baseUrl }}
+          onClose={() => setEditingProviderSlug(null)}
+          onSaved={() => setEditingProviderSlug(null)}
+        />
+      )}
     </div>
   )
 }

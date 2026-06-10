@@ -25,14 +25,75 @@ export type Platform =
   | 'huggingface'
   // OpenCode Zen — OpenAI-compatible gateway. Free promotional models require a
   // free (no-card) account key from opencode.ai/auth; see migrateModelsV18.
-  | 'opencode'
-  // User-configured OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM,
-  // Ollama, any base_url). The endpoint URL lives on the api_keys row; see #117.
-  | 'custom';
+  | 'opencode';
+// NOTE: the literal string 'custom' is no longer a special platform. Users add
+// their own OpenAI-compatible providers (ollama, llama.cpp, LM Studio, vLLM,
+// any base_url) via POST /api/custom-providers, and the resulting slug becomes
+// the value in models.platform / api_keys.platform. The router, analytics, and
+// health checks key off the platform string and treat it identically to a
+// built-in — the only difference is the base URL lives in custom_providers.
+
+export interface CustomProvider {
+  id: number;
+  slug: string;
+  displayName: string;
+  baseUrl: string;
+  createdAt: string;
+}
+
+// Slug must match this pattern: lowercase letters, digits, dashes, 2-32 chars.
+// Cannot start or end with a dash. The server rejects slugs that collide with
+// built-in platform names.
+export interface CustomProviderCreate {
+  slug: string;
+  displayName: string;
+  baseUrl: string;
+}
+
+export interface CustomProviderUpdate {
+  displayName?: string;
+  baseUrl?: string;
+}
+
+export interface CustomModelCreate {
+  providerSlug: string;
+  modelId: string;
+  displayName: string;
+  contextWindow?: number | null;
+  intelligenceRank?: number;
+  speedRank?: number;
+  sizeLabel?: string;
+  supportsTools?: boolean;
+  supportsVision?: boolean;
+  monthlyTokenBudget?: string;
+  rpmLimit?: number | null;
+  rpdLimit?: number | null;
+  tpmLimit?: number | null;
+  tpdLimit?: number | null;
+}
+
+export interface CustomModelUpdate {
+  displayName?: string;
+  contextWindow?: number | null;
+  intelligenceRank?: number;
+  speedRank?: number;
+  sizeLabel?: string;
+  supportsTools?: boolean;
+  supportsVision?: boolean;
+  monthlyTokenBudget?: string;
+  rpmLimit?: number | null;
+  rpdLimit?: number | null;
+  tpmLimit?: number | null;
+  tpdLimit?: number | null;
+  enabled?: boolean;
+}
 
 export interface Model {
   id: number;
-  platform: Platform;
+  // Built-in platforms (Platform union) plus user-defined slugs from
+  // custom_providers. The DB stores arbitrary strings; only the add-key form
+  // narrows to the built-in union.
+  platform: string;
   modelId: string;
   displayName: string;
   intelligenceRank: number;
@@ -60,7 +121,7 @@ export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unkn
 
 export interface ApiKey {
   id: number;
-  platform: Platform;
+  platform: string;
   label: string;
   maskedKey: string;
   status: KeyStatus;
