@@ -39,6 +39,7 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     tpdLimit: m.tpd_limit,
     monthlyTokenBudget: m.monthly_token_budget,
     contextWindow: m.context_window,
+    maxOutputTokens: m.max_output_tokens,
     enabled: m.enabled === 1,
     supportsVision: m.supports_vision === 1,
     supportsTools: m.supports_tools === 1,

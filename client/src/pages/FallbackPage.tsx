@@ -48,6 +48,7 @@ interface FallbackEntry {
   tpdLimit: number | null
   monthlyTokenBudget: string
   contextWindow: number | null
+  maxOutputTokens: number | null
   supportsVision: boolean
   supportsTools: boolean
   keyCount: number
@@ -333,15 +334,15 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
 function EditModelModal({
   model,
   onClose,
-  onSaved,
+  onQueueEdit,
 }: {
   model: Row
   onClose: () => void
-  onSaved: () => void
+  onQueueEdit: (modelDbId: number, body: Record<string, unknown>) => void
 }) {
-  const queryClient = useQueryClient()
   const [displayName, setDisplayName] = useState(model.displayName)
   const [contextWindow, setContextWindow] = useState(model.contextWindow ?? 128000)
+  const [maxOutputTokens, setMaxOutputTokens] = useState(model.maxOutputTokens ?? null as number | null)
   const [intelligenceRank, setIntelligenceRank] = useState(model.intelligenceRank)
   const [speedRank, setSpeedRank] = useState(model.speedRank)
   const [sizeLabel, setSizeLabel] = useState(model.sizeLabel)
@@ -353,21 +354,12 @@ function EditModelModal({
   const [tpmLimit, setTpmLimit] = useState(model.tpmLimit ?? null)
   const [tpdLimit, setTpdLimit] = useState(model.tpdLimit ?? null)
 
-  const save = useMutation({
-    mutationFn: (body: Record<string, unknown>) =>
-      apiFetch(`/api/custom-models/${model.modelDbId}`, { method: 'PATCH', body: JSON.stringify(body) }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['models'] })
-      onSaved()
-    },
-  })
-
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     const body: Record<string, unknown> = {
       displayName: displayName.trim(),
       contextWindow: contextWindow || null,
+      maxOutputTokens: maxOutputTokens,
       intelligenceRank,
       speedRank,
       sizeLabel,
@@ -379,7 +371,8 @@ function EditModelModal({
       tpmLimit,
       tpdLimit,
     }
-    save.mutate(body)
+    onQueueEdit(model.modelDbId, body)
+    onClose()
   }
 
   return (
@@ -409,6 +402,10 @@ function EditModelModal({
             <div className="space-y-1.5">
               <Label className="text-xs">Context window</Label>
               <Input type="number" min={0} value={contextWindow} onChange={e => setContextWindow(parseInt(e.target.value, 10) || 0)} className="font-mono text-xs" />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Max output tokens</Label>
+              <Input type="number" min={0} value={maxOutputTokens ?? ''} onChange={e => { const v = parseInt(e.target.value, 10); setMaxOutputTokens(v > 0 ? v : null) }} placeholder="no limit" className="font-mono text-xs" />
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Intelligence rank</Label>
@@ -582,6 +579,8 @@ export default function FallbackPage() {
   const queryClient = useQueryClient()
   const [localEntries, setLocalEntries] = useState<FallbackEntry[] | null>(null)
   const [editingModel, setEditingModel] = useState<Row | null>(null)
+  const [pendingRetryLimit, setPendingRetryLimit] = useState<number | null>(null)
+  const [pendingModelEdits, setPendingModelEdits] = useState<Map<number, Record<string, unknown>>>(new Map())
 
   const { data: entries = [], isLoading } = useQuery<FallbackEntry[]>({
     queryKey: ['fallback'],
@@ -671,7 +670,46 @@ export default function FallbackPage() {
     saveMutation.mutate(allEntries.map(e => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled })))
   }
 
-  const hasChanges = localEntries !== null
+  const activeRetryLimit = pendingRetryLimit ?? globalRetryLimit
+  const hasChanges = localEntries !== null || pendingModelEdits.size > 0 || pendingRetryLimit !== null
+
+  async function handleSaveAll() {
+    const saved: string[] = []
+    // Save retry limit
+    if (pendingRetryLimit !== null) {
+      await apiFetch('/api/fallback/retry-limit', { method: 'PUT', body: JSON.stringify({ limit: pendingRetryLimit }) })
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'retry-limit'] })
+      setPendingRetryLimit(null)
+      saved.push('retry limit')
+    }
+    // Save model edits
+    if (pendingModelEdits.size > 0) {
+      for (const [id, body] of pendingModelEdits) {
+        await apiFetch(`/api/custom-models/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
+      }
+      setPendingModelEdits(new Map())
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      saved.push(`${pendingModelEdits.size} model edit(s)`)
+    }
+    // Save sort order
+    if (localEntries !== null) {
+      await saveMutation.mutateAsync(allEntries.map(e => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled })))
+      setLocalEntries(null)
+      saved.push('sort order')
+    }
+    
+    queryClient.invalidateQueries({ queryKey: ['fallback'] })
+    return saved
+  }
+
+  function handleDiscardAll() {
+    setLocalEntries(null)
+    setPendingModelEdits(new Map())
+    setPendingRetryLimit(null)
+  }
+
+  const [savingAll, setSavingAll] = useState(false)
 
   const tableHead = (
     <thead>
@@ -778,23 +816,18 @@ export default function FallbackPage() {
               type="range"
               min={0}
               max={100}
-              value={globalRetryLimit}
-              disabled={retryLimitMutation.isPending}
-              onChange={e => {
-                const v = parseInt(e.target.value, 10)
-                retryLimitMutation.mutate(v)
-              }}
+              value={activeRetryLimit}
+              onChange={e => setPendingRetryLimit(parseInt(e.target.value, 10))}
               className="flex-1 h-1.5 rounded-full appearance-none bg-muted cursor-pointer accent-foreground"
             />
             <Input
               type="number"
               min={0}
               max={100}
-              value={globalRetryLimit}
-              disabled={retryLimitMutation.isPending}
+              value={activeRetryLimit}
               onChange={e => {
                 const v = parseInt(e.target.value, 10)
-                if (Number.isFinite(v) && v >= 0 && v <= 100) retryLimitMutation.mutate(v)
+                if (Number.isFinite(v) && v >= 0 && v <= 100) setPendingRetryLimit(v)
               }}
               className="w-20 text-center text-sm"
             />
@@ -848,9 +881,9 @@ export default function FallbackPage() {
                 sliding up when there are unsaved changes and back down on save/discard. */}
             <FloatingBar show={hasChanges}>
               <span className="text-xs text-muted-foreground">Unsaved changes</span>
-              <Button variant="outline" size="sm" onClick={() => setLocalEntries(null)}>Discard</Button>
-              <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending}>
-                {saveMutation.isPending ? 'Saving…' : 'Save changes'}
+              <Button variant="outline" size="sm" onClick={handleDiscardAll}>Discard</Button>
+              <Button size="sm" onClick={() => { setSavingAll(true); handleSaveAll().finally(() => setSavingAll(false)) }} disabled={savingAll}>
+                {savingAll ? 'Saving…' : 'Save changes'}
               </Button>
             </FloatingBar>
 
@@ -863,7 +896,7 @@ export default function FallbackPage() {
           <EditModelModal
             model={editingModel}
             onClose={() => setEditingModel(null)}
-            onSaved={() => { setEditingModel(null); queryClient.invalidateQueries({ queryKey: ['fallback'] }); }}
+            onQueueEdit={(id, body) => setPendingModelEdits(prev => { const next = new Map(prev); next.set(id, body); return next })}
           />
         )}
       </div>

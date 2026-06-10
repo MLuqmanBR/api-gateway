@@ -32,6 +32,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateModelsV23FreeTierAudit(db);
   migrateModelsV24ZenRefresh(db);
   migrateModelsV25ZenDeadPromos(db);
+  migrateModelsV26MaxOutputTokens(db);
   // After all model migrations: add/refresh paid-equivalent pricing
   // (drives the realistic "Est. savings" analytics stat).
   applyModelPricing(db);
@@ -1883,6 +1884,15 @@ function migrateModelsV25ZenDeadPromos(db: Database.Database) {
     for (const [p, m] of disables) disable.run(p, m);
   });
   apply();
+}
+
+// V26: max_output_tokens for models so users can set the default max_tokens
+// the proxy sends upstream for each model. NULL means no default cap.
+function migrateModelsV26MaxOutputTokens(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'max_output_tokens')) {
+    db.prepare('ALTER TABLE models ADD COLUMN max_output_tokens INTEGER').run();
+  }
 }
 
 // Embeddings V1 (2026-06): per-family embedding catalog. A "family" is one

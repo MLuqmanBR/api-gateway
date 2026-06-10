@@ -342,126 +342,6 @@ function AddPlatformModal({
   )
 }
 
-// ── Platforms grid ────────────────────────────────────────────────────────
-// Lists built-in platforms and user-added custom providers as a uniform grid
-// of tiles. The very last tile is always the "Add New Platform" entry —
-// clicking it opens a modal that creates a new row in custom_providers.
-// Custom providers expose Edit/Remove; built-ins don't (they're seeded by
-// server migrations).
-
-function PlatformTile({
-  label,
-  url,
-  keys,
-  isCustom,
-  onEdit,
-  onRemove,
-}: {
-  label: string
-  url: string
-  keys: ApiKey[]
-  isCustom: boolean
-  onEdit?: () => void
-  onRemove?: () => void
-}) {
-  const enabledSome = keys.some(k => k.enabled)
-  return (
-    <div className="rounded-2xl border bg-card p-3 flex flex-col gap-2">
-      <div className="flex items-center justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-1.5 text-sm font-medium truncate">
-            {label}
-            {isCustom && (
-              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground">
-                custom
-              </span>
-            )}
-          </div>
-          {url && <div className="truncate"><GetKeyLink url={url} /></div>}
-        </div>
-        <span className="text-[11px] text-muted-foreground tabular-nums">
-          {keys.length} key{keys.length === 1 ? '' : 's'}
-        </span>
-      </div>
-      {isCustom && (
-        <div className="flex items-center gap-2 text-xs">
-          {onEdit && (
-            <Button variant="ghost" size="xs" onClick={onEdit}>
-              <Pencil className="size-3" />
-            </Button>
-          )}
-          {onRemove && (
-            <Button
-              variant="ghost"
-              size="xs"
-              className="text-muted-foreground hover:text-destructive"
-              onClick={onRemove}
-            >
-              Remove
-            </Button>
-          )}
-          {keys.length === 0 && !enabledSome && (
-            <span className="text-[11px] text-muted-foreground ml-auto">no keys yet</span>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-function PlatformsSection({
-  customProviders,
-  keys,
-  onEditProvider,
-  onRemoveProvider,
-}: {
-  customProviders: CustomProvider[]
-  keys: ApiKey[]
-  onEditProvider: (slug: string) => void
-  onRemoveProvider: (slug: string) => void
-}) {
-  // Build a tiles list: built-ins (only if they have at least one key) +
-  // every custom provider (always shown, even with no keys) + the always-last
-  // "Add New Platform" tile.
-  const builtinTiles = PLATFORMS
-    .map(p => ({
-      ...p,
-      keys: keys.filter(k => k.platform === p.value),
-    }))
-    .filter(p => p.keys.length > 0)
-    .map(p => (
-      <PlatformTile
-        key={p.value}
-        label={p.label}
-        url={p.url}
-        keys={p.keys}
-        isCustom={false}
-      />
-    ))
-
-  const customTiles = customProviders.map(cp => (
-    <PlatformTile
-      key={cp.slug}
-      label={cp.displayName}
-      url=""
-      keys={keys.filter(k => k.platform === cp.slug)}
-      isCustom
-      onEdit={() => onEditProvider(cp.slug)}
-      onRemove={() => onRemoveProvider(cp.slug)}
-    />
-  ))
-
-  return (
-    <section>
-      <h2 className="text-sm font-medium mb-3">Platforms</h2>
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-        {builtinTiles}
-        {customTiles}
-      </div>
-    </section>
-  )
-}
-
 // ── Edit-platform modal ───────────────────────────────────────────────────
 // Reused for the PATCH /api/custom-providers/:slug flow. Lets the user
 // correct a typo in the baseUrl or the display name without re-registering
@@ -563,6 +443,7 @@ function CustomModelsSection() {
   const [modelId, setModelId] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [contextWindow, setContextWindow] = useState(128000)
+  const [maxOutputTokens, setMaxOutputTokens] = useState(null as number | null)
   const [supportsTools, setSupportsTools] = useState(true)
   const [supportsVision, setSupportsVision] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -589,6 +470,7 @@ function CustomModelsSection() {
       modelId: modelId.trim(),
       displayName: displayName.trim(),
       contextWindow: contextWindow || null,
+      maxOutputTokens: maxOutputTokens,
       supportsTools,
       supportsVision,
     }
@@ -669,6 +551,17 @@ function CustomModelsSection() {
               min={0}
               value={contextWindow}
               onChange={e => setContextWindow(parseInt(e.target.value, 10) || 0)}
+              className="font-mono text-xs"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Max output tokens</Label>
+            <Input
+              type="number"
+              min={0}
+              value={maxOutputTokens ?? ''}
+              onChange={e => { const v = parseInt(e.target.value, 10); setMaxOutputTokens(v > 0 ? v : null) }}
+              placeholder="no limit"
               className="font-mono text-xs"
             />
           </div>
@@ -880,16 +773,6 @@ export default function KeysPage() {
       />
       <div className="space-y-8">
         <UnifiedKeySection />
-        <PlatformsSection
-          customProviders={customProviders}
-          keys={keys}
-          onEditProvider={slug => setEditingProviderSlug(slug)}
-          onRemoveProvider={slug => {
-            if (confirm(`Remove provider "${slug}"? This deletes all its keys, models, and fallback entries.`)) {
-              removeProvider.mutate(slug)
-            }
-          }}
-        />
         <section>
           <h2 className="text-sm font-medium mb-3">Add a provider key</h2>
           <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 rounded-3xl border p-4 bg-card">

@@ -72,6 +72,7 @@ const createModelSchema = z.object({
   rpdLimit: z.number().int().positive().nullable().optional(),
   tpmLimit: z.number().int().positive().nullable().optional(),
   tpdLimit: z.number().int().positive().nullable().optional(),
+  maxOutputTokens: z.number().int().positive().nullable().optional(),
 });
 
 const updateModelSchema = createModelSchema.partial().extend({
@@ -123,8 +124,8 @@ async function syncModelsFromProvider(baseUrl: string, slug: string): Promise<{ 
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools, key_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
+         enabled, supports_vision, supports_tools, max_output_tokens, key_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
     `);
     const insertFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
 
@@ -399,6 +400,7 @@ customRouter.get('/api/custom-providers/:slug/models', (req: Request, res: Respo
     tpdLimit: m.tpd_limit,
     monthlyTokenBudget: m.monthly_token_budget,
     contextWindow: m.context_window,
+    maxOutputTokens: m.max_output_tokens,
     enabled: m.enabled === 1,
     supportsVision: m.supports_vision === 1,
     supportsTools: m.supports_tools === 1,
@@ -443,8 +445,8 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools, key_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL)
+         enabled, supports_vision, supports_tools, max_output_tokens, key_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
     `).run(
       slug, modelId, displayName,
       d.intelligenceRank ?? MODEL_DEFAULTS.intelligenceRank,
@@ -516,6 +518,7 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   if (d.rpdLimit !== undefined) { updates.push('rpd_limit = ?'); values.push(d.rpdLimit); }
   if (d.tpmLimit !== undefined) { updates.push('tpm_limit = ?'); values.push(d.tpmLimit); }
   if (d.tpdLimit !== undefined) { updates.push('tpd_limit = ?'); values.push(d.tpdLimit); }
+  if (d.maxOutputTokens !== undefined) { updates.push('max_output_tokens = ?'); values.push(d.maxOutputTokens); }
   if (d.enabled !== undefined) { updates.push('enabled = ?'); values.push(d.enabled ? 1 : 0); }
 
   if (updates.length === 0) {
