@@ -511,7 +511,7 @@ function CustomModelsSection() {
         <div className="space-y-1.5">
           <Label className="text-xs">Provider</Label>
             <Select value={provider} onValueChange={setProvider}>
-              <SelectTrigger>
+              <SelectTrigger className="w-[220px]">
                 <SelectValue placeholder="Select provider" />
               </SelectTrigger>
               <SelectContent>
