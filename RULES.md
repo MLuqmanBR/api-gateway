@@ -13,7 +13,7 @@
 | Role | URL |
 |---|---|
 | **Your fork** (origin) | `https://github.com/MLuqmanBR/api-gateway.git` |
-| **Upstream** (original) | `https://github.com/tashfeenahmed/api-gateway.git` |
+| **Upstream** (original) | `https://github.com/tashfeenahmed/freellmapi.git` |
 
 ```
 upstream/main  ←  the canonical upstream. Never commit here directly.
@@ -46,28 +46,24 @@ custom-stuff                     ← bad (no prefix)
 feature/new-thing                ← bad (wrong prefix)
 ```
 
-### 1.3 Current Feature Branches
 
-```
-feat/lan-auto-grant              cf20159   auth: LAN auto-grant
-feat/custom-providers-redesign   4754e3e   providers: custom providers as first-class objects
-```
+### 1.4 Features currently on main
 
-### 1.4 Features on main (deployable)
+All custom features have been merged to `main`. The `feat/*` branches are kept as
+historical snapshots. New features should follow the branch architecture in §1.1.
 
-Beyond the two structural branches above, these capabilities are live on `main`:
+Key features deployed on main:
 
-| Feature | Implementation |
-|---|---|
-| LAN auto-grant | `ip-trust.ts`, `requireAuth.ts`, `auth.ts` |
-| Custom providers (CRUD) | `custom.ts`, `providers/index.ts` |
-| Provider-level parallel request gating | `router.ts`, `types.ts`, `custom.ts`, `KeysPage.tsx` |
-| Model auto-discovery from provider /models | `custom.ts` (syncModelsFromProvider) |
-| Model editing (including built-in models) | `custom.ts`, `FallbackPage.tsx` (EditModelModal) |
-| /v1/models filtering (fallback-config + active keys) | `proxy.ts` |
-| Provider rate limits (rpm/rpd/tpm/tpd) | `types.ts`, `custom.ts`, `db/migrations.ts` |
+- Custom providers (CRUD, auto-discovery, rate limits, parallel gating)
+- Model editing for all models (built-in and custom)
+- /v1/models filtering (only models with active keys)
+- Per-key exhaustion recovery (3-retry + 1-RPM recovery mode)
+- LAN auto-trust (loopback/RFC1918 callers skip login)
+- CLI management tool (`api start`, `api stop`, etc.)
+- Encrypted key storage and unified API key auth
 
 ### 1.5 What Lives Where
+
 
 | Code | Where |
 |---|---|
@@ -278,14 +274,14 @@ single rebase session. Follow them in order.
 12. **When adding custom providers, verify every property after migration.** Check
     RPM limits, parallel gating, model size labels, intelligence ranks, context
     windows, and max output tokens against the source config. A single typo or
-    omission (e.g., `parallelEnabled: false` in pi but `max_parallel_requests = 5`
-    in the migration) breaks behavior silently.
+    omission (e.g., a source config has parallel disabled but the migration sets
+    a concurrency limit) breaks behavior silently.
 
-13. **Share providers that look similar may be completely different.** Cloudflare
-    AI Gateway ≠ Cloudflare Workers AI. Always read the actual provider config
-    (base URL, credential format, auth method) before assuming. Pi's credential
-    "sets" (multi-field keys) map to API-Gateway's colon-separated combined key
-    format — the UI already handles this with `needsAccountId`.
+13. **Providers with similar names may be completely different services.** Always
+    verify the actual provider configuration (base URL, credential format, auth
+    method) before assuming. Multi-field credentials (e.g., account ID + API key)
+    map to a combined key format with colon separation — the UI already handles
+    such cases through platform-specific input fields.
 
 ### 4.1 Conflict Hotspots (files you modify that upstream also touches)
 
@@ -600,11 +596,69 @@ git push origin main
 | **Replacing shared type files wholesale** | `shared/types.ts` has fields added by upstream (e.g., `reasoning_content`). Overwriting removes them silently. | `reasoning_content` test failed after overwrite. |
 | **Not testing between consecutive rebase resolutions** | If you resolve conflict 1, continue, hit conflict 2, and only test at the end — you won't know WHICH resolution broke things. | — |
 | **Committing API keys to git (even in migrations)** | Keys in source code leak to GitHub on push. Even if you delete the file later, it's in git history forever. | — |
-| **INSERT OR IGNORE without companion UPDATE** | First run inserts correct data. Second run skips silently, leaving stale values from the first run. Broken RPM limits and wrong model sizes persist until you notice. | GLM 5.1 models showed `Frontier` instead of `Large`. GlmAggregatorB had `max_parallel=5` instead of `null`. |
-| **Not verifying provider config against source** | Pi provider-manager.json had `parallelEnabled: false` for GlmAggregatorB. Migration set `max_parallel_requests = 5`. Silent mismatch until manually caught. | GlmAggregatorB parallel gating was wrong until the user caught it. |
-| **Changing EditModelModal to queued edits but leaving stale mutation refs** | The modal's JSX still referenced `save.isError` and `save.isPending` after removing the `save` mutation. React crashes with "save is not defined" and the entire modal goes black. | EditModelModal broke completely until the stale refs were removed. |
-| **Adding models but forgetting to update hasProvider** | `hasProvider()` only checked the built-in provider map. Custom providers added via `custom_providers` table weren't found, breaking the idempotency test and the /api/models response. | Tests failed: "expected [glmaggregatora, deepseek, glmaggregatorb] to equal []". |
+| **INSERT OR IGNORE without companion UPDATE** | First run inserts correct data. Second run skips silently, leaving stale values from the first run. Broken RPM limits and wrong model sizes persist until you notice. | A model showed wrong size label after migration re-ran. A provider had mismatched parallel gating config. |
+| **Not verifying provider config against source** | Source config had different settings than migration assumptions. Silent mismatch until manually caught. | Provider parallel gating was wrong until caught during review. |
+| **Changing UI to batch-save pattern but leaving stale mutation refs** | JSX still referenced removed mutation hooks. React crashes with "is not defined" and the component goes black. | Component broke completely until stale refs were removed. |
+| **Adding models but forgetting to update provider lookup** | `hasProvider()` only checked the built-in provider map. Custom providers added programmatically weren't found, breaking tests and API responses. | Tests failed because custom providers were invisible to the lookup function. |
 
+
+---
+
+## 8. Tooling & Workflow
+
+### 8.1 CLI Management Tool
+
+The project ships a CLI tool (`scripts/cli.mjs`) installed via `npm link`.
+Commands:
+
+```
+api start [--port <N>]    Start server (builds only if needed)
+api stop [--port <N>]     Stop a specific instance
+api stop --all            Stop all instances
+api restart               Stop then start (uses .env PORT)
+api status                Show running instances
+api list                  List all instances across ports
+api build                 Force rebuild
+api logs                  Tail server.log
+api help                  Show help
+```
+
+The CLI tracks instances via `.api-gateway.instances` (gitignored). Multiple
+instances on different ports are supported. The `api` command is registered
+via the `bin` field in `package.json` — run `npm link` after cloning to
+activate it globally.
+
+### 8.2 Build & Dev Loop
+
+```bash
+npm run dev           # server :3001, dashboard :5173 (HMR)
+npm run build         # production build
+npm test              # full test suite
+npm run build -w server  # server only
+```
+
+### 8.3 Environment Configuration
+
+`.env` (gitignored) controls runtime behavior. Key variables:
+
+| Variable | Purpose |
+|---|---|
+| `ENCRYPTION_KEY` | 64-char hex key for API key encryption (required) |
+| `PORT` | Server port (default 3001) |
+| `API_GATEWAY_CONTEXT_HANDOFF` | Enable context handoff (`on_model_switch`) |
+| `REQUEST_ANALYTICS_RETENTION_DAYS` | Analytics retention (default 90) |
+| `REQUEST_ANALYTICS_MAX_ROWS` | Max analytics rows (default 100000) |
+
+See `.env.example` for the full commented template.
+
+### 8.4 Adding CLI Commands
+
+New CLI commands follow the pattern in `scripts/cli.mjs`:
+1. Add a handler function (e.g., `function doThing() { ... }`)
+2. Add a branch in `main()` that matches the subcommand
+3. Use `parseFlags()` for any `--option` flags
+
+Keep the CLI self-contained — no external dependencies beyond Node.js built-ins.
 ---
 
 ## 9. Project-Specific Notes
@@ -902,19 +956,27 @@ git push origin main
 7. **Preserve upstream additions** — especially in shared types files.
 
 
-## 12. API Key Import from pi Provider Manager
+## 12. Credential Import
 
-When migrating credentials from a pi coding agent setup, follow this exact
-procedure to avoid leaking secrets into git history.
+When migrating credentials from another tool or config file, follow the
+one-time import pattern to avoid leaking secrets into git history.
 
 ### 12.1 Never Commit Secrets
 
 API keys, tokens, and account IDs must NEVER appear in committed files. The
 `server/data/` directory (which contains the SQLite DB with encrypted keys)
-is gitignored. All other secret-containing files must be deleted immediately
+is gitignored. Any secret-containing scripts must be deleted immediately
 after use.
 
 ### 12.2 One-Time Import Script Pattern
+
+Write a throwaway script that reads credentials from your source, encrypts
+them, and inserts them into the database. The pattern:
+
+1. Import `initDb` and `encrypt` from the server modules
+2. Define your credentials as a plain array (never commit this)
+3. Insert each credential with `INSERT OR IGNORE` to avoid duplicates
+4. Run the script once, then delete it immediately
 
 ```ts
 // scripts/import-keys.ts — RUN ONCE, DELETE IMMEDIATELY
@@ -938,23 +1000,17 @@ for (const { platform, label, value } of KEYS) {
 }
 ```
 
-Run with: `npx tsx scripts/import-keys.ts`
-Delete with: `rm scripts/import-keys.ts`
+Run with `npx tsx scripts/import-keys.ts`, then `rm scripts/import-keys.ts`.
 
-### 12.3 Credential Mapping: pi → API-Gateway
+### 12.3 Multi-Field Credentials
 
-Pi stores credentials in three formats:
+Some providers require more than one credential field (e.g., account ID +
+API key, or project ID + token). API-Gateway handles these with a colon-
+separated combined format. The "Add a provider key" form in the dashboard
+automatically shows multiple input fields for platforms that need them.
 
-| pi Format | API-Gateway Equivalent |
-|---|---|
-| `keys["openrouter"][{name, value: "sk-..."}]` | `api_keys(platform='openrouter', label=name, encrypted_key=encrypt(value))` |
-| `sets["cloudflare-ai"][{name, fields: {accountId, apiKey}}]` | `api_keys(platform='cloudflare', label=name, encrypted_key=encrypt(accountId + ':' + apiKey))` |
-| `tokens["google-antigravity"][{name, access, refresh, extra}]` | Not directly supported. Google uses OAuth in pi, Cloudflare uses API keys in API-Gateway. |
-
-Cloudflare Workers AI credential "sets" (two fields: accountId + apiKey) map to
-API-Gateway's colon-separated format (`account_id:api_token`). The UI already shows
-two separate input fields when Cloudflare is selected in the "Add a provider key"
-form (`needsAccountId = platform === 'cloudflare'`).
+When importing programmatically, join the fields with a colon before
+encrypting: `encrypt(accountId + ':' + apiKey)`.
 
 ### 12.4 Post-Import Verification
 
@@ -963,8 +1019,7 @@ sqlite3 server/data/api-gateway.db \
   "SELECT platform, COUNT(*) FROM api_keys WHERE enabled=1 GROUP BY platform ORDER BY COUNT(*) DESC"
 ```
 
-Compare counts against the source pi config. Every provider should match exactly.
-
+Compare counts against the source config to verify every credential was imported.
 ---
 
 ## 13. Select Component Positioning (Base UI)
@@ -994,5 +1049,5 @@ In `client/src/components/ui/select.tsx`, add to the `Positioner`:
 
 ---
 
-*Last updated: 2026-06-10 after adding custom providers (GlmAggregatorA/GlmAggregatorB/DeepSeek), per-key 3-retry with 1-RPM exhaustion recovery, max_output_tokens field, queued edits pattern, and 79 API key imports from pi.*
-*Features tracked: feat/lan-auto-grant, feat/custom-providers-redesign, parallel gating, auto-discovery, model editing, /v1/models filter, exhaustion retry, max_output_tokens, GlmAggregatorA/GlmAggregatorB/DeepSeek providers*
+*Last updated: 2026-06-10 — CLI management tool, desktop removal, catalog-sync removal, credential import generalized, all custom features merged to main.*
+*Features tracked: custom provider CRUD, auto-discovery, model editing, /v1/models filtering, exhaustion recovery, LAN auto-trust, parallel gating, CLI tool, queued edits*
