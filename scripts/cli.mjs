@@ -62,6 +62,20 @@ function setPort(port) {
   console.log(`Port set to ${port}.`);
 }
 
+function needsBuild() {
+  if (!existsSync(join(ROOT, 'server', 'dist', 'index.js'))) return true;
+  if (!existsSync(join(ROOT, 'client', 'dist', 'index.html'))) return true;
+  return false;
+}
+
+async function ensureBuilt() {
+  if (needsBuild()) {
+    await build();
+  } else {
+    console.log('Already built. Use api --build to rebuild.');
+  }
+}
+
 function build() {
   return new Promise((resolve, reject) => {
     console.log('Building API-Gateway…');
@@ -236,14 +250,14 @@ async function main() {
     stopServer();
     await new Promise(r => setTimeout(r, 1500));
     const port = readPort();
-    try { await build(); } catch (e) { console.error(e.message); process.exit(1); }
+    await ensureBuilt();
     await startServer(port);
     return;
   }
 
   if (cmd === '--start' || cmd === '-s') {
     const port = readPort();
-    try { await build(); } catch (e) { console.error(e.message); process.exit(1); }
+    await ensureBuilt();
     await startServer(port);
     return;
   }
