@@ -1934,9 +1934,9 @@ function migrateCustomProvidersV27UserProviders(db: Database.Database) {
     const insProv = db.prepare(
       "INSERT OR IGNORE INTO custom_providers (slug, display_name, base_url, rpm_limit, max_parallel_requests) VALUES (?, ?, ?, ?, ?)"
     );
-    const limits: Record<string, [number, number]> = {
+    const limits: Record<string, [number | null, number | null]> = {
       glmaggregatora: [15, 5],
-      glmaggregatorb: [60, 5],
+      glmaggregatorb: [60, null],
       deepseek: [500, 500],
     };
     const updProv = db.prepare(
@@ -1957,6 +1957,18 @@ function migrateCustomProvidersV27UserProviders(db: Database.Database) {
     `);
     for (const m of models) {
       insModel.run(m.provider, m.id, m.name, m.intel, m.speed, m.size, m.context, m.maxOut);
+    }
+
+    // Ensure model properties are correct even on re-run (INSERT OR IGNORE
+    // skips existing rows, so UPDATE catches any corrections).
+    const updModel = db.prepare(`
+      UPDATE models SET
+        display_name = ?, intelligence_rank = ?, speed_rank = ?, size_label = ?,
+        context_window = ?, max_output_tokens = ?
+      WHERE platform = ? AND model_id = ?
+    `);
+    for (const m of models) {
+      updModel.run(m.name, m.intel, m.speed, m.size, m.context, m.maxOut, m.provider, m.id);
     }
 
     // Add to fallback chain at lowest priority (idempotent via LEFT JOIN filter)
