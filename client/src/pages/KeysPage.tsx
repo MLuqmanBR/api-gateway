@@ -508,9 +508,8 @@ function CustomModelsSection() {
         the Fallback tab.
       </p>
       <form onSubmit={submit} className="space-y-3 rounded-3xl border p-4 bg-card">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div className="space-y-1.5">
-            <Label className="text-xs">Provider</Label>
+        <div className="space-y-1.5">
+          <Label className="text-xs">Provider</Label>
             <Select value={provider} onValueChange={setProvider}>
               <SelectTrigger>
                 <SelectValue placeholder="Select provider" />
@@ -524,6 +523,7 @@ function CustomModelsSection() {
               </SelectContent>
             </Select>
           </div>
+        <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1.5">
             <Label className="text-xs">Model id</Label>
             <Input
@@ -534,8 +534,6 @@ function CustomModelsSection() {
               disabled={!provider}
             />
           </div>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <div className="space-y-1.5">
             <Label className="text-xs">Display name</Label>
             <Input
@@ -544,6 +542,8 @@ function CustomModelsSection() {
               placeholder="human-readable label"
             />
           </div>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1.5">
             <Label className="text-xs">Context window (tokens)</Label>
             <Input
