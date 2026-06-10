@@ -4,9 +4,9 @@
 
 **One endpoint. Any provider. Every free tier. ~1.7B tokens per month.**
 
-Aggregate free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, Z.ai (Zhipu), Ollama, Kilo, Pollinations, LLM7, OVH AI Endpoints, and OpenCode Zen — plus **any OpenAI-compatible endpoint you bring** (llama.cpp, LM Studio, vLLM, local Ollama, or any remote service with an API key) — behind a single `/v1/chat/completions` endpoint. Every provider is a first-class citizen: the same fallback chain, the same intelligent routing, the same dashboard. Keys are stored encrypted. A Thompson-sampling bandit picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every cap. If you can reach it over HTTP and it speaks OpenAI, API-Gateway routes to it.
+Aggregate free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, Z.ai (Zhipu), Ollama, Kilo, Pollinations, LLM7, OVH AI Endpoints, and OpenCode Zen — plus **any OpenAI-compatible endpoint you bring** (llama.cpp, LM Studio, vLLM, local Ollama, or any remote service with an API key) — behind a single `/v1/chat/completions` endpoint. Every provider gets the same fallback chain, the same intelligent routing, the same dashboard. Keys are stored encrypted. A Thompson-sampling bandit picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every cap. If you can reach it over HTTP and it speaks OpenAI, API-Gateway routes to it.
 
-> **This is a fork** of [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/freellmapi). We add first-class custom provider support with CRUD, per-provider rate limiting & parallel gating, one-click model auto-discovery, full model editing (including built-ins), and per-key exhaustion recovery — all detailed in [What this fork adds](#what-this-fork-adds). We track upstream weekly and merge cleanly.
+> **This is a fork** of [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/freellmapi). We add custom provider CRUD, per-provider rate limiting & parallel gating, model auto-discovery, editing of all models (including built-ins), and per-key exhaustion recovery — all detailed in [What this fork adds](#what-this-fork-adds). We track upstream weekly and merge cleanly.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
@@ -42,9 +42,10 @@ This fork tracks [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/fre
 
 | Feature | Why it matters |
 |---|---|
-| **Custom providers as first-class citizens** | You're not stuck with the built-in list. Add any OpenAI-compatible endpoint — a cloud service with a free tier, a local Ollama instance on your LAN, a vLLM server on your homelab — give it a name, a base URL, and optional rate limits. It routes through the same fallback chain, scores against the same Thompson-sampling bandit, and appears alongside Google and Groq in every dashboard view. No second-class treatment. |
+| **Custom providers on equal footing** | You're not stuck with the built-in list. Add any OpenAI-compatible endpoint — a cloud service with a free tier, a local Ollama instance on your LAN, a vLLM server on your homelab — give it a name, a base URL, and optional rate limits. It routes through the same fallback chain, scores against the same Thompson-sampling bandit, and appears alongside Google and Groq in every dashboard view. No second-class treatment. |
 | **Per-provider rate limits & parallel gating** | Set RPM, RPD, TPM, and TPD caps *per provider*, plus a `maxParallelRequests` ceiling. A slow local model on a Raspberry Pi won't starve your Groq connection of request slots. A free-tier cloud endpoint with a 4-RPM cap won't get hammered and rate-limited into uselessness. You define the guardrails; the router enforces them. |
-| **One-click model auto-discovery** | Register a custom provider and API-Gateway automatically pulls its `/v1/models` endpoint, seeds every model into your catalog with sensible defaults (intelligence, speed, context window), and slots them into your fallback chain. No manual JSON editing, no copy-pasting model IDs one by one. Re-run discovery anytime via the API. |
+| **Model auto-discovery** | Register a custom provider and API-Gateway automatically pulls its `/v1/models` endpoint, seeds every model into your catalog with sensible defaults (intelligence, speed, context window), and slots them into your fallback chain. No manual JSON editing, no copy-pasting model IDs one by one. Re-run discovery anytime via the API. |
+| **Edit any model — built-in or custom** | Intelligence rank, speed rank, size label, context window, max output tokens, tools/vision flags, per-model rate limits — all editable from the dashboard. The built-in catalog is a starting point, not a straitjacket. If you know your local Mixtral 8x7B runs smarter than the upstream score suggests, bump its rank. If a provider silently cuts a context window, correct it yourself. Changes take effect immediately — no restart, no migration. |
 | **`/v1/models` only shows what you can actually use** | The `/v1/models` endpoint returns only models that are in your fallback chain *and* have at least one active, healthy key. Your IDE's model picker won't list things it can't call. No more "model not found" errors in Cline because the dropdown showed a model you disabled three weeks ago. |
 | **Per-key exhaustion recovery that doesn't give up** | Most proxies retry once and bail. API-Gateway gives each key three immediate retries on transient failures, then cycles through your remaining keys for that model. When every key is exhausted — say, your 5 Gemini keys all hit their daily quotas — it doesn't throw an error. It drops to 1-RPM recovery mode, patiently probing each key once per minute until one comes back. The moment a key starts working, normal operation resumes. Your IDE keeps running; you might not even notice the hiccup. |
 
@@ -56,7 +57,7 @@ Every serious AI lab now offers a free tier — millions of tokens a month, thou
 
 The problem is that stacking them by hand is painful: a dozen different SDKs, a dozen different rate limits, a dozen places a request can fail. API-Gateway collapses all of that — every free tier, every custom endpoint, every local model — into one OpenAI-compatible endpoint. Point any OpenAI client library at your local server, and it routes transparently across whichever providers you've added keys for.
 
-And when the built-in list isn't enough? You add your own. Any OpenAI-compatible HTTP endpoint becomes a first-class provider in under a minute.
+And when the built-in list isn't enough? You add your own. Any OpenAI-compatible HTTP endpoint becomes a provider in under a minute.
 
 ## Supported providers
 
@@ -93,7 +94,7 @@ And when the built-in list isn't enough? You add your own. Any OpenAI-compatible
 </tr>
 </table>
 
-<p align="center"><strong>Don't see yours? Add it.</strong> Any OpenAI-compatible endpoint — cloud service, local server, homelab GPU — becomes a first-class provider in under a minute. It gets the same fallback chain, the same intelligent routing, the same rate-limit protection as every built-in. <a href="#custom-platforms-and-models">See how →</a></p>
+<p align="center"><strong>Don't see yours? Add it.</strong> Any OpenAI-compatible endpoint — cloud service, local server, homelab GPU — becomes a provider in under a minute. It gets the same fallback chain, the same intelligent routing, the same rate-limit protection as every built-in. <a href="#custom-platforms-and-models">See how →</a></p>
 
 ## Features
 
