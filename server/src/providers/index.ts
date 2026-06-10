@@ -205,5 +205,7 @@ export function getAllProviders(): BaseProvider[] {
 }
 
 export function hasProvider(platform: Platform): boolean {
-  return providers.has(platform);
+  if (providers.has(platform)) return true;
+  const db = getDb();
+  return !!db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(platform);
 }

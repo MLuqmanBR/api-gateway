@@ -33,6 +33,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateModelsV24ZenRefresh(db);
   migrateModelsV25ZenDeadPromos(db);
   migrateModelsV26MaxOutputTokens(db);
+  migrateCustomProvidersV27UserProviders(db);
   // After all model migrations: add/refresh paid-equivalent pricing
   // (drives the realistic "Est. savings" analytics stat).
   applyModelPricing(db);
@@ -1893,6 +1894,80 @@ function migrateModelsV26MaxOutputTokens(db: Database.Database) {
   if (!columns.some(col => col.name === 'max_output_tokens')) {
     db.prepare('ALTER TABLE models ADD COLUMN max_output_tokens INTEGER').run();
   }
+}
+
+// V27: user-requested custom providers and their models (GlmAggregatorA,
+// GlmAggregatorB, DeepSeek). Each is an OpenAI-compatible endpoint with
+// free-tier API keys. Models are registered and added to the fallback
+// chain at lowest priority so they don't displace existing models.
+function migrateCustomProvidersV27UserProviders(db: Database.Database) {
+  type ProviderDef = { slug: string; name: string; url: string };
+  type ModelDef = {
+    provider: string; id: string; name: string;
+    context: number; maxOut: number;
+    intel: number; speed: number; size: string;
+  };
+
+  const providers: ProviderDef[] = [
+    { slug: 'glmaggregatora', name: 'GlmAggregatorA', url: 'https://api.glmaggregatora.example/v1' },
+    { slug: 'glmaggregatorb', name: 'GlmAggregatorB', url: 'https://api.glmaggregatorb.example/v1' },
+    { slug: 'deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com' },
+  ];
+
+  const models: ModelDef[] = [
+    // GlmAggregatorA
+    { provider: 'glmaggregatora', id: 'accounts/fireworks/models/deepseek-v4-pro', name: 'DeepSeek v4 Pro', context: 1048576, maxOut: 131072, intel: 95, speed: 40, size: 'Frontier' },
+    { provider: 'glmaggregatora', id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', context: 262144, maxOut: 65536, intel: 90, speed: 45, size: 'Frontier' },
+    { provider: 'glmaggregatora', id: 'qwen3.6-max-preview', name: 'Qwen 3.6 Max Preview', context: 262144, maxOut: 65536, intel: 88, speed: 50, size: 'Frontier' },
+    { provider: 'glmaggregatora', id: 'z-ai/glm-5.1', name: 'GLM 5.1', context: 200000, maxOut: 65536, intel: 85, speed: 55, size: 'Large' },
+    { provider: 'glmaggregatora', id: 'DeepSeek-V4-Flash', name: 'DeepSeek v4 Flash', context: 1048576, maxOut: 131072, intel: 85, speed: 70, size: 'Frontier' },
+    // GlmAggregatorB
+    { provider: 'glmaggregatorb', id: 'zai-org/GLM-5.1-FP8', name: 'GLM 5.1', context: 202752, maxOut: 32768, intel: 85, speed: 60, size: 'Large' },
+    // DeepSeek
+    { provider: 'deepseek', id: 'deepseek-v4-pro', name: 'DeepSeek v4 Pro', context: 1048576, maxOut: 262144, intel: 95, speed: 40, size: 'Frontier' },
+    { provider: 'deepseek', id: 'deepseek-v4-flash', name: 'DeepSeek v4 Flash', context: 1048576, maxOut: 262144, intel: 85, speed: 70, size: 'Frontier' },
+  ];
+
+  const tx = db.transaction(() => {
+    // Register providers (idempotent via slug UNIQUE + INSERT OR IGNORE)
+    const insProv = db.prepare(
+      'INSERT OR IGNORE INTO custom_providers (slug, display_name, base_url) VALUES (?, ?, ?)'
+    );
+    for (const p of providers) insProv.run(p.slug, p.name, p.url);
+
+    // Register models
+    const insModel = db.prepare(`
+      INSERT OR IGNORE INTO models
+        (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+         context_window, max_output_tokens, enabled, supports_vision, supports_tools)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
+    `);
+    for (const m of models) {
+      insModel.run(m.provider, m.id, m.name, m.intel, m.speed, m.size, m.context, m.maxOut);
+    }
+
+    // Add to fallback chain at lowest priority (idempotent via LEFT JOIN filter)
+    const missing = db.prepare(`
+      SELECT m.id FROM models m
+      LEFT JOIN fallback_config f ON m.id = f.model_db_id
+      WHERE m.platform IN (${providers.map(() => '?').join(',')})
+        AND f.id IS NULL
+      ORDER BY m.intelligence_rank ASC
+    `).all(...providers.map(p => p.slug)) as { id: number }[];
+
+    if (missing.length > 0) {
+      const maxPriority = (db.prepare(
+        'SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config'
+      ).get() as { m: number }).m;
+      const insFb = db.prepare(
+        'INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)'
+      );
+      for (let i = 0; i < missing.length; i++) {
+        insFb.run(missing[i].id, maxPriority + i + 1);
+      }
+    }
+  });
+  tx();
 }
 
 // Embeddings V1 (2026-06): per-family embedding catalog. A "family" is one
