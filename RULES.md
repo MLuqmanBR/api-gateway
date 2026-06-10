@@ -280,229 +280,140 @@ server/src/__tests__/routes/custom-providers.test.ts
 server/src/__tests__/routes/requireAuth.test.ts
 ```
 
-### 4.3 Resolution Strategy Per Feature
+### 4.3 Decision Framework: How to Resolve ANY Conflict
 
-#### feat/custom-providers-redesign — THE HARD ONE
+When you see `<<<<<<< HEAD ... >>>>>>>` markers, don't guess. Apply this framework.
 
-This feature hits the most conflict-prone files. Below is the actual battle plan
-from the 2026-06-08 rebase.
+#### Step 1: Classify the conflict
 
-##### Conflict 1: `server/src/db/index.ts`
+| Category | What it looks like | Decision |
+|---|---|---|
+| **Upstream MOVED code** (same logic, different file) | Your change is in `foo.ts` but upstream deleted that section and recreated it in `bar.ts` | Accept upstream's file deletion. Port your change to `bar.ts`. |
+| **Upstream ADDED code near yours** (adjacent, non-overlapping) | Your change at line 50, upstream added something at line 48 | Keep both. The auto-merge usually handles this. |
+| **Upstream ADDED code OVER your code** (same lines) | Both you and upstream modified the same function signature | Merge manually: keep upstream's new parameter AND your new parameter. |
+| **Upstream REMOVED what you modified** | Upstream deleted a function you patched | Your feature's hook point no longer exists. Rethink: can you attach elsewhere? |
+| **Your ADDITION to shared types** | You added a field to an interface, upstream added a different field | Keep BOTH fields. Never drop upstream additions. |
 
-**What happened:** Upstream (commit `6f5f765`) extracted ALL migration functions
-from `db/index.ts` into a new `db/migrations.ts`. `initDb()` now calls a single
-`migrateDbSchema(db)` instead of a chain of inline `migrateXxx(db)` calls. Meanwhile,
-your feature branch added `custom_providers` CREATE TABLE and `migrateCustomProvidersV24`
-inline in `db/index.ts`.
+#### Step 2: Choose a strategy
 
-**The wrong way (don't do this):**
-```bash
-git checkout --theirs db/index.ts   # ❌ Grabs YOUR version, losing upstream refactor
-git checkout --ours db/index.ts     # ❌ Grabs upstream only, losing custom_providers
+```
+┌──────────────────────────────────────────────────────────┐
+│                    Conflict Strategy                      │
+├─────────────┬────────────────────┬───────────────────────┤
+│  Upstream   │   Your change is   │      Decision         │
+│  change     │   in the same spot │                       │
+├─────────────┼────────────────────┼───────────────────────┤
+│ Moved file  │       Yes          │  Follow the move      │
+│ New param   │   No (diff lines)  │  Merge both           │
+│ New param   │       Yes          │  Merge manually       │
+│ Deleted fn  │       Yes          │  Find new hook point  │
+│ New field   │   No (diff field)  │  Keep both            │
+└─────────────┴────────────────────┴───────────────────────┘
 ```
 
-**The right way:**
+#### Step 3: Apply the resolution
 
-1. Accept upstream's version completely:
-   ```bash
-   git show main:server/src/db/index.ts > server/src/db/index.ts
-   git add server/src/db/index.ts
-   ```
+- **Targeted edits ONLY.** Never `git checkout --ours/--theirs` blindly. Never copy
+  old file versions wholesale. Use the edit tool to change only conflicting lines.
+- **Test after EVERY resolution.** Not at the end. After each `git rebase --continue`,
+  run `npm test -w server`. If 468 → 459, you know EXACTLY which resolution broke it.
 
-2. In `server/src/db/migrations.ts` (upstream's new home for migrations):
-   - **Add `custom_providers` CREATE TABLE** inside `createTables()` after the
-     last index:
-     ```sql
-     CREATE TABLE IF NOT EXISTS custom_providers (
-       id INTEGER PRIMARY KEY AUTOINCREMENT,
-       slug TEXT NOT NULL UNIQUE,
-       display_name TEXT NOT NULL,
-       base_url TEXT NOT NULL,
-       rpm_limit INTEGER,
-       rpd_limit INTEGER,
-       tpm_limit INTEGER,
-       tpd_limit INTEGER,
-       max_parallel_requests INTEGER,
-       created_at TEXT NOT NULL DEFAULT (datetime('now'))
-     );
-     ```
-   - **Add `ensureCustomProvidersMaxParallelColumn(db)`** call after the other
-     `ensure*` calls in `createTables()`. This is needed for existing DBs that
-     were created before `max_parallel_requests` was added.
-   - **Add `migrateCustomProvidersV24(db)` call** inside `migrateDbSchema()`,
-     after `migrateEmbeddingsV1(db)` and before `ensureUnifiedKey(db)`.
-   - **Add the `migrateCustomProvidersV24` function** — it promotes the legacy
-     `'custom'` platform slug to a custom_providers row. Copy it verbatim from
-     your old `db/index.ts`.
+#### Step 4: Common sub-patterns
 
-3. **Verify:** `grep custom_providers server/src/db/migrations.ts` should show
-   the CREATE TABLE, the migration call, and the function definition.
+**Pattern A: Upstream extracted code to a new file**
 
-##### Conflict 2: `server/src/services/router.ts`
+Your feature modified code that upstream moved from `file-a.ts` → `file-b.ts`.
 
-**What happened:** Your feature replaced `getProvider(entry.platform)` with
-`buildProviderFor(entry.platform)`. Upstream added a TPM budget guard and
-`skipModels` parameter. Both changes are in the same `routeRequest()` function
-but on different lines.
+1. Accept upstream's version of `file-a.ts` (deletion of your code)
+2. Port your change to `file-b.ts` at the equivalent location
+3. If `file-b.ts` didn't exist before (your feature never touched it), add your
+   change as a new edit to that file
 
-**Resolution:**
-- Keep upstream's TPM guard (lines before the provider resolution)
-- Keep YOUR `buildProviderFor` call instead of `getProvider`
-- Merge the comments: upstream's comment about TPM + your comment about
-  custom_providers lookup
-- The `buildProviderFor` import from `../providers/index.js` should already
-  be present from the auto-merge.
+> *Example from 2026-06-08: Upstream moved all migrations from `db/index.ts` →
+> `db/migrations.ts`. Our custom_providers migration was ported from the old file
+> to the new one as a CREATE TABLE + function + call in migrateDbSchema().*
 
-**Resulting merged code:**
-```typescript
-// TPM guard (from upstream)
-if (entry.tpm_limit != null && estimatedTokens > entry.tpm_limit) continue;
+**Pattern B: Both you and upstream modified the same function**
 
-// Provider resolution (from your feature)
-const provider = buildProviderFor(entry.platform);
-if (!provider) continue;
-```
+1. Read the conflict block. Identify which lines are upstream's and which are yours.
+2. Keep upstream's new logic AND your new logic.
+3. If the edits touch the same expression (e.g., different function calls in the
+   same assignment), evaluate: can both coexist? If yes, merge. If no, your feature
+   may need to adapt to upstream's new API.
 
-##### Conflict 3: `server/src/routes/proxy.ts` — /v1/models SQL query
+> *Example from 2026-06-08: Upstream added a TPM budget guard before provider
+> resolution. Our feature replaced `getProvider()` with `buildProviderFor()`.
+> Both changes were on adjacent lines — kept both.*
 
-**What happened:** Your feature adds a `JOIN fallback_config` to filter models
-by fallback enabled status AND removes the legacy `key_id` binding check.
+**Pattern C: SQL query with JOIN introduces column ambiguity**
 
-**Critical SQL lesson:** When you add a JOIN and the joined table has an `id`
-column, `id` becomes AMBIGUOUS in ORDER BY, ROW_NUMBER() OVER, and other clauses.
-The error is `ambiguous column name: id` or `no such column: m.id`.
+Adding a JOIN to an existing SQL query is risky because:
+1. Both tables may have an `id` column → ambiguous in ORDER BY
+2. Table-qualified columns (`m.id`) don't survive into outer scopes of subqueries
 
-**The fix:** Use `EXISTS` subquery instead of JOIN:
+Use `EXISTS` subqueries instead of JOINs for filtering:
 ```sql
--- ✅ CORRECT — no column ambiguity
+-- ✅ SAFE: no column ambiguity
 FROM models m
 WHERE m.enabled = 1
-  AND EXISTS (
-    SELECT 1 FROM fallback_config fc
-    WHERE fc.model_db_id = m.id AND fc.enabled = 1
-  )
-
--- ❌ WRONG — id is ambiguous (both m.id and fc.id exist)
-FROM models m
-JOIN fallback_config fc ON fc.model_db_id = m.id
-WHERE m.enabled = 1 AND fc.enabled = 1
+  AND EXISTS (SELECT 1 FROM other_table o WHERE o.ref_id = m.id AND o.active = 1)
 ```
 
-Also: NEVER use table-qualified columns (`m.id`) in the outer ORDER BY of a
-subquery — the alias doesn't carry through. Use unqualified `id`.
+**Pattern D: Shared types file gained upstream fields**
 
-```sql
--- ❌ WRONG — m.id doesn't exist in outer scope
-) WHERE rn = 1 ORDER BY intelligence_rank ASC, m.id ASC
+Upstream added a field to an interface you also modified. If you overwrite the file,
+you silently drop the upstream field. Tests for that field will fail.
 
--- ✅ CORRECT
-) WHERE rn = 1 ORDER BY intelligence_rank ASC, id ASC
-```
+Always: `git diff upstream/main -- shared/types.ts` before committing to verify
+no upstream fields were removed.
 
-##### Conflict 4: `shared/types.ts` — Preserving upstream additions
-
-**What happened:** Your feature added `rpmLimit`, `rpdLimit`, `tpmLimit`,
-`tpdLimit`, `maxParallelRequests` to `CustomProvider` interfaces. Upstream added
-`reasoning_content?: string` to `ChatMessage` (for DeepSeek thinking traces, #255).
-
-**The danger:** If you overwrite `types.ts` with an old version (e.g., from
-`git show e83e0f8:shared/types.ts`), the `reasoning_content` field is silently
-removed. Tests will fail because proxy-tools tests expect it to round-trip.
-
-**The right way:** Apply your additions with targeted edits to the CURRENT
-version of the file. Never replace the whole file.
+### 4.4 Full Rebase Workflow
 
 ```bash
-# ❌ WRONG — loses upstream reasoning_content
-git show e83e0f8:shared/types.ts > shared/types.ts
-
-# ✅ CORRECT — apply only your changes with edit tool
-git diff main...feat/custom-providers-redesign -- shared/types.ts
-# Then manually add those specific lines to the current file
-```
-
-#### feat/lan-auto-grant — THE EASY ONE
-
-**Problem:** Almost none. This feature adds 1 new file (`ip-trust.ts`) and makes
-targeted changes to `requireAuth.ts`, `auth.ts`, `app.ts`, and client files.
-
-**Resolution:** Usually clean rebase. If `app.ts` conflicts, your `TRUST_PROXY`
-block and the `customRouter` mount (from the other feature) need to coexist.
-Accept both blocks.
-
-### 4.4 Full Rebase Walkthrough (Step-by-Step)
-
-This is the exact sequence used for the 2026-06-08 rebase. Follow this pattern
-for every upstream sync.
-
-#### Phase 1: Update main
-
-```bash
+# === PHASE 1: Update main ===
 git checkout main
 git fetch upstream
-git merge upstream/main           # fast-forward only
+git merge upstream/main
 git push origin main
-```
 
-#### Phase 2: Rebase each feature branch (do NOT parallelize)
-
-```bash
-# ─── feat/lan-auto-grant (easy, do first for a quick win) ───
-git checkout feat/lan-auto-grant
+# === PHASE 2: Rebase each feature (ONE AT A TIME) ===
+# Start with the simplest feature (least conflicts) as a warm-up.
+git checkout feat/<simple-one>
 git rebase main
-# Usually clean. If conflict:
-#   git diff --name-only --diff-filter=U  → see conflicted files
-#   resolve → git add → git rebase --continue
-npm run test -w server              # MUST PASS
-git push --force-with-lease origin feat/lan-auto-grant
+# Resolve conflicts if any, test, push:
+npm run test -w server
+git push --force-with-lease origin feat/<simple-one>
 
-# ─── feat/custom-providers-redesign (hard, takes multiple rounds) ───
-git checkout feat/custom-providers-redesign
+# Then do the complex one:
+git checkout feat/<complex-one>
 git rebase main
-# Conflicts expected in:
-#   server/src/db/index.ts         → resolve per §4.3 Conflict 1
-#   server/src/services/router.ts  → resolve per §4.3 Conflict 2
-# Resolve ONE at a time:
-#   edit file → git add → git rebase --continue
-# After both resolved:
-npm run test -w server              # MUST PASS
-git push --force-with-lease origin feat/custom-providers-redesign
-```
+# Expect conflicts. For each:
+#   1. Classify per §4.3 Step 1
+#   2. Choose strategy per §4.3 Step 2
+#   3. Resolve with targeted edits per §4.3 Step 3
+#   4. git add → git rebase --continue → npm test
+git push --force-with-lease origin feat/<complex-one>
 
-#### Phase 3: Rebuild test/combined
+# Repeat for all feat/* branches.
 
-```bash
+# === PHASE 3: Rebuild integration branch ===
 git checkout test/combined
 git reset --hard main
-git merge feat/lan-auto-grant
-git merge feat/custom-providers-redesign
-npm run test -w server              # MUST PASS
+git merge feat/<simple-one>
+npm run test -w server
+git merge feat/<complex-one>
+npm run test -w server
 git push --force-with-lease origin test/combined
-```
 
-#### Phase 4: Apply session features (NEW work, not yet in any feat/ branch)
+# === PHASE 4: Apply uncommitted session work ===
+# If you have new features on test/combined that aren't in any feat/* branch:
+# Apply them as targeted edits (NEVER file overwrites).
+# Commit in logical groups, testing after each commit.
+npm run test -w server
 
-```bash
-# Stay on test/combined
-git checkout test/combined
-
-# Apply each new feature as targeted edits (NEVER overwrite entire files):
-# - Parallel request gating → edit router.ts, proxy.ts, responses.ts, types.ts, custom.ts
-# - Model auto-discovery → edit custom.ts
-# - Model editing → edit custom.ts, FallbackPage.tsx
-# - /v1/models filter → edit proxy.ts
-
-npm run test -w server              # MUST PASS after EACH feature
-
-# Commit in logical groups:
-git add <files> && git commit -m "feat: <description>"
-```
-
-#### Phase 5: Merge to main (deploy)
-
-```bash
+# === PHASE 5: Deploy to main ===
 git checkout main
-git merge test/combined            # fast-forward
+git merge test/combined
 git push origin main
 ```
 
@@ -514,16 +425,12 @@ When rebase pauses for conflict:
 □ git status                        — see conflicted files
 □ git diff --name-only --diff-filter=U  — just the filenames
 □ For each conflicted file:
-  □ Open file, find <<<<<<< markers
-  □ Understand what your change does vs upstream's
-  □ Check: did upstream MOVE code to a different file?
-    → If yes: follow the move (see §4.3 Conflict 1)
-  □ Check: did upstream ADD new code in the same area?
-    → If yes: merge both (see §4.3 Conflict 2)
-  □ Choose correct resolution (your version / upstream / manual merge)
+  □ Classify per §4.3 Step 1 (moved? adjacent? deleted? shared type?)
+  □ Choose strategy per §4.3 Step 2
+  □ Apply resolution with TARGETED edits (not file overwrites)
   □ Remove conflict markers
-  □ For SQL changes: check for ambiguous column names (§4.3 Conflict 3)
-  □ For type changes: verify no upstream fields were dropped (§4.3 Conflict 4)
+  □ For SQL changes: use EXISTS not JOIN to avoid column ambiguity
+  □ For type changes: verify no upstream fields were dropped
 □ git add <resolved files>
 □ git diff --cached                  — review what you're about to commit
 □ git rebase --continue
@@ -531,7 +438,7 @@ When rebase pauses for conflict:
 □ If tests fail:
   □ Read the error carefully (the test output tells you what's wrong)
   □ Common post-rebase errors:
-    - "ambiguous column name" → SQL JOIN added ambiguous id (§4.3 Conflict 3)
+    - "ambiguous column name" → SQL JOIN added ambiguity; switch to EXISTS
     - "no such column: m.id" → table alias in outer ORDER BY
     - "expected 500 to be 200" → likely SQL syntax error (check stderr)
     - "property X missing" → upstream addition dropped from shared types
@@ -666,57 +573,64 @@ git push origin test/combined
 
 ### 9.1 Known Integration Points
 
-- **`server/src/app.ts`** — Both features mount middleware/routers. The `customRouter` is mounted with a path-aware `requireAuth` guard. The `TRUST_PROXY` setting goes before all middleware. If upstream adds new routes here, merge manually.
+These are the files where custom features intersect with upstream code. When upstream
+modifies these files, expect conflicts.
 
-- **`server/src/providers/index.ts`** — Your `buildProviderFor()` replaces the old `resolveProvider()`. If upstream adds new providers or changes the registration pattern, verify that `buildProviderFor` still works for built-in platforms.
+| File | Why it conflicts |
+|---|---|
+| `server/src/app.ts` | Multiple features mount middleware/routers. New upstream routes will overlap. |
+| `server/src/db/migrations.ts` | Custom tables and migrations live alongside upstream ones. Upstream refactors affect placement. |
+| `server/src/providers/index.ts` | Custom provider resolution (`buildProviderFor`) replaces upstream's lookup. |
+| `server/src/services/router.ts` | Request routing modified for custom providers and parallel gating. |
+| `shared/types.ts` | Custom interfaces add fields; upstream adds fields too. Both must survive. |
+| `server/src/routes/proxy.ts` | /v1/models query customized; proxy error handling adds release() call. |
 
-- **`server/src/db/migrations.ts`** — ALL migrations live here now (upstream refactored them out of `db/index.ts`). Your custom migrations (`migrateCustomProvidersV24`, custom_providers table, `ensureCustomProvidersMaxParallelColumn`) are injected here. When upstream adds new migrations, add your custom code to the same file in the correct order.
+**General principle:** When upstream adds code near your hooks, merge both. When upstream
+moves where code lives, follow the move.
 
-- **`shared/types.ts`** — You widened `Platform` from a union type to `string` for `Model.platform` and `ApiKey.platform`. If upstream adds new platform literals, confirm your widened types still compile. The `ChatMessage` interface gains fields over time (e.g., `reasoning_content` in V25). Never drop these.
+### 9.2 Custom Migration Naming
 
-- **`server/src/services/router.ts`** — Your parallel request gating uses `tryReserveSlot`/`releaseSlot` keyed by platform slug. The `RouteResult` interface has a `release` function. When upstream changes `routeRequest()` signature, ensure your changes to the return value include `release`.
+Name your migrations to not collide with upstream numbering. If upstream has
+`migrateModelsV24`, `migrateModelsV25`, yours could be `migrateCustomProvidersV24`.
+The function names don't need to match upstream's sequence — they just need to be
+called from `migrateDbSchema()` in the right order.
 
-- **`server/src/routes/proxy.ts`** — The `/v1/models` query is customized with fallback_config and api_keys filtering. Use EXISTS subqueries, not JOINs, to avoid column ambiguity.
+If upstream creates a function with the same name as yours, rename your function.
+The name doesn't affect behavior — only the call site in `migrateDbSchema()` matters.
 
-### 9.2 Migration Numbering
+### 9.3 Custom Database Tables
 
-Your `migrateCustomProvidersV24` uses the V24 number. When upstream adds V25, V26, etc., your migration function name is fine as-is — these are just function names, not version identifiers that conflict. But if upstream creates a `migrateModelsV24` with a different purpose, rename yours to avoid confusion.
+Any tables you add (e.g., `custom_providers`) are **only in your fork**. Upstream will
+never create or migrate them. When upstream refactors the migration system (extracting
+functions to new files, renaming init patterns), your custom tables and migrations must
+follow the same pattern.
 
-### 9.3 Database Schema
+**General rule for custom migrations:**
+1. CREATE TABLE goes in the same function that creates upstream tables (currently
+   `createTables()` in `db/migrations.ts`).
+2. Column additions use `ensure*` pattern so existing DBs get new columns on restart.
+3. Data migrations (backfills, renames) go as a function called from the migration
+   orchestrator (`migrateDbSchema()`).
 
-Your `custom_providers` table:
-```sql
-CREATE TABLE IF NOT EXISTS custom_providers (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  slug TEXT NOT NULL UNIQUE,
-  display_name TEXT NOT NULL,
-  base_url TEXT NOT NULL,
-  rpm_limit INTEGER,
-  rpd_limit INTEGER,
-  tpm_limit INTEGER,
-  tpd_limit INTEGER,
-  max_parallel_requests INTEGER,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-```
+If upstream moves where migrations live, move yours too. The file location and function
+name may change; the pattern stays the same.
 
-This table is **only in your fork**. Upstream will never create it. Your migration handles it idempotently.
+### 9.4 General Architecture Principles
 
-Column additions use `ensure*` pattern (e.g., `ensureCustomProvidersMaxParallelColumn`) so
-existing DBs get new columns on restart.
+**Resource pooling:** Gating (rate limits, concurrency) should be at the appropriate
+level. Currently parallel requests are provider-level, not model-level, because all
+models under one provider share the same upstream endpoint capacity.
 
-### 9.4 Parallel Request Gating Architecture
+**Cleanup contracts:** Any resource acquired during routing (slots, locks, connections)
+must have a paired release in a `finally` block. Both proxy and responses routes follow
+this pattern.
 
-- **Per-provider, not per-model.** The in-flight counter in `router.ts` is keyed by
-  platform slug (string), not model ID. All models under one custom provider share
-  a single concurrency cap.
-- **Built-in providers are unlimited.** `tryReserveSlot` returns `true` immediately
-  when `maxParallel` is null/undefined/≤0.
-- **release() must be called in finally blocks.** Both `proxy.ts` and `responses.ts`
-  call `route.release()` in `finally` after the retry loop. If you add a new proxy
-  route, add the release call.
-- **The limit is read from `custom_providers.max_parallel_requests`** at routing time.
-  It's NOT cached — changes take effect on the next request.
+**Dynamic config:** Operational limits (max parallel, rpm/tpm) are read from the database
+at request time, not cached. This means dashboard changes take effect immediately.
+
+**Testability:** Custom provider auto-discovery skips in test environments (`VITEST` env
+var) to avoid timeouts from unreachable fake URLs. Follow the same pattern for any new
+network-dependent feature.
 
 ---
 
