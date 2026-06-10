@@ -71,8 +71,6 @@ function needsBuild() {
 async function ensureBuilt() {
   if (needsBuild()) {
     await build();
-  } else {
-    console.log('Already built. Use api --build to rebuild.');
   }
 }
 
