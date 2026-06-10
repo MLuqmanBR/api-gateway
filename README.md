@@ -2,14 +2,14 @@
 
 # API-Gateway
 
-**One OpenAI-compatible endpoint. Sixteen free LLM providers. ~1.7B tokens per month.**
+**One OpenAI-compatible endpoint. Seventeen free LLM providers. ~1.7B tokens per month.**
 
-Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, Z.ai (Zhipu), Ollama, Kilo, Pollinations, LLM7, OVH AI Endpoints, and OpenCode Zen — plus any custom OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, local Ollama) — behind a single `/v1/chat/completions` endpoint. Keys are stored encrypted. A router picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
+Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, GitHub Models, Cohere, Cloudflare, HuggingFace, Z.ai (Zhipu), Ollama, Kilo, Pollinations, LLM7, OVH AI Endpoints, and OpenCode Zen — plus any custom OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, local Ollama, or any remote gateway) — behind a single `/v1/chat/completions` endpoint. Keys are stored encrypted. A router picks the best available model for each request, falls over to the next provider when one is rate-limited, and tracks per-key usage so you stay under every free-tier cap.
 
-[![CI](https://github.com/tashfeenahmed/api-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/tashfeenahmed/api-gateway/actions/workflows/ci.yml)
+> **This is a fork** of [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/freellmapi). We add first-class custom provider support with CRUD, per-provider rate limits & parallelism gating, model auto-discovery, editing of all models (including built-in), per-key exhaustion recovery, and more — all detailed in [What this fork adds](#what-this-fork-adds). We track upstream weekly and merge cleanly.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
-[![Docker image](https://img.shields.io/badge/ghcr.io-api-gateway-2496ED?logo=docker&logoColor=white)](https://github.com/tashfeenahmed/api-gateway/pkgs/container/api-gateway)
 
 ![Fallback chain with per-provider token budget](repo-assets/fallback-chain.png)
 
@@ -19,6 +19,7 @@ Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRoute
 
 ## Contents
 
+- [What this fork adds](#what-this-fork-adds)
 - [Why this exists](#why-this-exists)
 - [Supported providers](#supported-providers)
 - [Features](#features)
@@ -27,6 +28,7 @@ Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRoute
 - [Docker](#docker)
 - [Desktop app](#desktop-app)
 - [Using the API](#using-the-api)
+- [Custom platforms and models](#custom-platforms-and-models)
 - [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [Context Handoff](#context-handoff)
@@ -34,6 +36,22 @@ Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRoute
 - [Contributing](#contributing)
 - [Terms of Service review](#terms-of-service-review)
 - [Disclaimer](#disclaimer)
+
+## What this fork adds
+
+This fork tracks [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/freellmapi) (upstream) and merges every release. On top of that, we ship features that make API-Gateway more useful as a daily driver:
+
+| Feature | Why it matters |
+|---|---|
+| **Custom providers as first-class citizens** | Add any OpenAI-compatible endpoint with a slug, base URL, and optional rate limits. They route through the same fallback chain, score against the same bandit, and appear alongside built-in platforms everywhere. |
+| **Provider-level rate limits & parallel gating** | Set RPM/RPD/TPM/TPD caps *per custom provider*, plus a `maxParallelRequests` ceiling — so a slow local Ollama never starves your fast cloud providers of request slots. |
+| **Model auto-discovery** | Register a custom provider and click "Sync models" — it pulls `/v1/models` from the endpoint and seeds every model into your catalog with sensible defaults. No manual data entry. |
+| **Edit any model** | Intelligence rank, speed rank, size label, context window, max output tokens, tools/vision flags, and per-model rate limits — all editable from the dashboard for both custom *and* built-in models. |
+| **`/v1/models` filtering** | The proxy only returns models that are in your fallback chain *and* have at least one active, healthy key. No more showing clients models they can't actually use. |
+| **Per-key exhaustion recovery** | Three retries per key on transient errors, then cycle through remaining keys. When all keys are exhausted, drop to 1-RPM recovery mode until one succeeds — then resume normal operation. |
+| **Catalog sync service** | Self-healing model catalog with Ed25519-signed updates. Free installs get monthly snapshots; premium license holders get live catalogs refreshed every 2-3 days. |
+
+We chose this path over upstream because we use API-Gateway as a daily driver — not just as a weekend project. These features make it faster to set up, easier to maintain, and more resilient when providers flake. If you're evaluating API-Gateway for actual daily use, you almost certainly want this fork.
 
 ## Why this exists
 
@@ -76,39 +94,29 @@ The problem is that stacking them by hand is painful: seventeen different SDKs, 
 </tr>
 </table>
 
-Plus **your own custom platforms and models** — add any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, a local Ollama, or a remote gateway) as a first-class provider from the Keys page, then add individual models under it. They route through the same fallback chain, score against the same bandit, and show up alongside built-in platforms everywhere.
-
-### Custom platforms and models
-
-From the Keys page, the **Platforms** grid is the unified catalog view. Every built-in platform you've added a key for shows up alongside every custom platform you've registered. The grid ends with an **Add New Platform** tile that opens a modal for:
-
-- **Slug** — a short identifier like `my-ollama` (lowercase letters, digits, dashes; 2-32 chars; cannot collide with a built-in).
-- **Display name** — shown in the dashboard.
-- **Base URL** — the OpenAI-compatible endpoint, e.g. `http://192.168.1.10:11434/v1`.
-
-Once a platform exists, the **Add a model** form below it lets you register any number of individual models on that platform. Only the essentials are required (model id, display name, context window, supports-tools, supports-vision); an **Advanced** toggle exposes intelligence rank, speed rank, size label, and the four rate-limit counters for users who care. The model joins the fallback chain at the lowest priority and shows up everywhere built-in models do — `/v1/models`, the Fallback page, the Analytics page.
-
-Adding an API key for a custom platform works the same as for a built-in: pick the custom slug in the **Add a provider key** form, paste the bearer (or leave blank for local servers that don't need one), and the key routes to your endpoint.
-
-Removing a custom platform cascades — it drops every model on that platform, every key, and every fallback entry. There's no "leaving a model orphaned" state.
+Plus **your own custom platforms and models** — add any OpenAI-compatible endpoint as a first-class provider, auto-discover its models, and route through the same fallback chain.
 
 ## Features
 
-- **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Hermes, etc.). Just change `base_url`.
+- **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Cline, Codex, Claude Code via CC Switch, etc.). Just change `base_url`.
 - **Responses API** — `POST /v1/responses` (the wire format current Codex CLI versions require) is implemented as a translating shim over the same router, with full streaming events and tool calls.
 - **Streaming and non-streaming** — Server-Sent Events for `stream: true`, JSON response otherwise. Every provider adapter implements both.
 - **Tool calling** — OpenAI-style `tools` / `tool_choice` requests are passed through, and assistant `tool_calls` + `tool` role follow-up messages round-trip across providers.
 - **Embeddings** — `/v1/embeddings` with family-based routing: failover only ever happens between providers serving the *same* model (vectors from different models are incompatible), never across models. See [Embeddings](#embeddings).
-- **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain (up to 20 attempts).
+- **Automatic fallover** — If the chosen provider returns a 429, 5xx, or times out, the router skips it, puts the key on a short cooldown, and retries on the next model in your fallback chain.
 - **Per-key rate tracking** — RPM, RPD, TPM, and TPD counters per `(platform, model, key)` so the router always picks a key that's under its caps.
+- **Per-key exhaustion recovery** — Each key gets up to 3 immediate retries on transient errors. Once all keys for a model are exhausted, the router drops to 1-RPM recovery mode, cycling through exhausted keys until one succeeds — then normal operation resumes.
+- **Provider-level parallel request gating** — Cap concurrent requests per provider so a slow endpoint never starves faster ones of connection slots.
 - **Sticky sessions** — Multi-turn conversations keep talking to the same model for 30 minutes to avoid the hallucination spike that comes from mid-conversation model switches.
 - **Encrypted key storage** — API keys are encrypted with AES-256-GCM before hitting SQLite; decryption happens in-memory just before a request.
 - **Unified API key** — Clients authenticate to your proxy with a single `api-gateway-…` bearer token. You never expose upstream provider keys to your apps.
 - **LAN auto-trust** — API-Gateway is a single-user tool, so the admin UI and `/api/*` routes skip the login form whenever the request comes from the local machine (loopback, RFC1918, link-local, IPv6 ULA / link-local). Remote callers still need an email + password account (scrypt-hashed, session-token auth), set on first run. The `/v1` proxy keeps its own unified-key auth for apps.
 - **Health checks** — Periodic probes mark keys as `healthy`, `rate_limited`, `invalid`, or `error` so the router skips dead ones automatically.
-- **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, inspect analytics, and run prompts in a playground. Dark mode included.
+- **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, edit models, configure custom providers, inspect analytics, and run prompts in a playground. Dark mode included.
 - **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns.
 - **Context handoff on model switch** — Optional. When a session falls over to a different model, injects one compact system message so the new model knows it is continuing an existing task. Disabled by default; enable with `API_GATEWAY_CONTEXT_HANDOFF=on_model_switch`. See [Context Handoff](#context-handoff).
+- **Bandit routing** — Thompson-sampling-based router (balanced / smartest / fastest / reliable presets) learns which providers actually work and routes accordingly. Fall back to classic priority ordering anytime.
+- **Catalog self-healing** — Ed25519-signed catalog updates keep your model list current even as providers change free tiers. Free installs get monthly snapshots; premium license holders get live updates.
 - **Runs anywhere Node 20+ runs** — Windows, macOS, Linux servers, or a small ARM SBC (Raspberry Pi included). ~40 MB RSS at idle behind PM2 / systemd / whatever supervisor you prefer.
 
 ## Not yet supported
@@ -126,60 +134,20 @@ PRs that add any of these are very welcome. See [Contributing](#contributing).
 
 ## Quick start
 
-**One-liner** (Docker required — sets up `~/api-gateway`, generates an encryption key, pulls the image, and starts the container):
+**Prerequisites:** Node.js 20+, npm. (Docker also works — see [Docker](#docker).)
 
 ```bash
-curl -fsSL https://tashfeenahmed.github.io/api-gateway/install.sh | bash
-```
-
-Prefer to read before you pipe to bash? [The script is here](docs/install.sh). Re-running it is safe: your `.env` (and encryption key) is preserved and the container updates to `:latest`. Override the defaults with `API_GATEWAY_DIR`, `PORT`, or `HOST_BIND` env vars.
-
-**Or manually with Docker Compose.** It runs the API and dashboard together on port 3001 and persists SQLite in a named volume.
-
-**Prerequisites:** Docker, Docker Compose, OpenSSL.
-
-```bash
-git clone https://github.com/tashfeenahmed/api-gateway.git
-cd api-gateway
-
-# Generate an encryption key for at-rest key storage
-ENCRYPTION_KEY="$(openssl rand -hex 32)"
-printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
-
-docker compose up -d
-```
-
-Open http://localhost:3001, add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
-
-> **Reaching it from another machine?** By default the container is published only on `127.0.0.1`, so `http://<server-ip>:3001` won't load from another device (the page just hangs). To expose it on your LAN — e.g. a Raspberry Pi at `http://192.168.1.x:3001` — start it with `HOST_BIND=0.0.0.0`:
->
-> ```bash
-> HOST_BIND=0.0.0.0 docker compose up -d
-> ```
->
-> Only do this on a trusted network: the proxy is single-user and guarded only by the unified API key.
-
-### Local development
-
-**Prerequisites:** Node.js 20+, npm.
-
-```bash
-git clone https://github.com/tashfeenahmed/api-gateway.git
+git clone https://github.com/MLuqmanBR/api-gateway.git
 cd api-gateway
 npm install
 cp .env.example .env
+
+# Generate an encryption key for at-rest key storage
 ENCRYPTION_KEY="$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
 printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
+
 npm run dev
 ```
-
-`ENCRYPTION_KEY` is required for startup. The server only falls back to a
-database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not
-`production`; do not use that fallback with real provider keys.
-
-Request analytics are retained for 90 days or 100000 request rows by default,
-whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or
-`REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
 
 Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
 
@@ -192,34 +160,40 @@ npm run build
 node server/dist/index.js     # server + dashboard both served on :3001
 ```
 
+`ENCRYPTION_KEY` is required for startup. The server only falls back to a database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not `production`; do not use that fallback with real provider keys.
+
+Request analytics are retained for 90 days or 100000 request rows by default, whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or `REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
+
 ## Docker
 
-API-Gateway publishes a single production image that contains the Express server and the built React dashboard:
+This fork does not publish its own Docker image. If you want to run with Docker, **build from source** — this ensures you get all the fork-specific features:
 
 ```bash
-docker pull ghcr.io/tashfeenahmed/api-gateway:latest   # or pin a release, e.g. :v1.2.3
+git clone https://github.com/MLuqmanBR/api-gateway.git
+cd api-gateway
+
+# Generate an encryption key
+ENCRYPTION_KEY="$(openssl rand -hex 32)"
+printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
+
+docker compose up -d --build
 ```
 
-The image is multi-arch (`linux/amd64` + `linux/arm64`, so it runs on a Raspberry Pi). Published tags: `latest` (default branch), `v*.*.*` (git release tags), and `sha-<commit>`.
+Open http://localhost:3001. SQLite data is stored in the `api-gateway-data` volume at `/app/server/data`. Keep the same `.env` `ENCRYPTION_KEY` and volume when upgrading.
 
-The included `docker-compose.yml` is the recommended install path:
-
-```bash
-docker compose up -d
-docker compose logs -f api-gateway
-```
-
-By default the container's port is bound to `127.0.0.1` (localhost only). To reach the dashboard/API from another machine on your network, publish it on all interfaces with `HOST_BIND=0.0.0.0 docker compose up -d` — only on a trusted LAN, since the proxy is single-user.
-
-SQLite data is stored in the `api-gateway-data` volume at `/app/server/data`. Keep the same `.env` `ENCRYPTION_KEY` and volume when upgrading, because provider keys are encrypted at rest.
+> **Reaching it from another machine?** By default the container is published only on `127.0.0.1`. To expose it on your LAN — e.g. a Raspberry Pi at `http://192.168.1.x:3001` — start it with `HOST_BIND=0.0.0.0`:
+>
+> ```bash
+> HOST_BIND=0.0.0.0 docker compose up -d --build
+> ```
+>
+> Only do this on a trusted network: the proxy is single-user and guarded only by the unified API key.
 
 More Docker operations and examples live in [docker/README.md](./docker/README.md).
 
 ## Desktop app
 
-A native menu-bar app lives in [`desktop/`](./desktop): the entire router +
-dashboard running locally from your tray, with a glass popover showing live
-request stats.
+A native menu-bar app lives in [`desktop/`](./desktop): the entire router + dashboard running locally from your tray, with a glass popover showing live request stats.
 
 ![API-Gateway desktop app](repo-assets/desktop.png)
 
@@ -231,11 +205,9 @@ npm run desktop:dist        # macOS: desktop/dist-electron/API-Gateway-…-arm64
 npm run desktop:dist:win    # Windows installer
 ```
 
-> **Windows:** the build config is in place but not tested yet — if you try it,
-> a quick report (working or not) in an issue would be much appreciated.
+> **Windows:** the build config is in place but not tested yet — if you try it, a quick report (working or not) in an issue would be much appreciated.
 
-Locally built apps launch without Gatekeeper/SmartScreen warnings — no code
-signing involved. Full instructions in [desktop/README.md](./desktop/README.md).
+Locally built apps launch without Gatekeeper/SmartScreen warnings — no code signing involved. Full instructions in [desktop/README.md](./desktop/README.md).
 
 ## Using the API
 
@@ -325,7 +297,7 @@ print(final.choices[0].message.content)
 
 **Vision / image input**
 
-Send images with the standard OpenAI `image_url` content blocks (base64 `data:` URLs or `http(s)` URLs). When a request contains an image, the router restricts itself to **vision-capable models** and ignores text-only ones. Vision models are tagged with a **Vision** badge on the Fallback Chain page; the current set includes Gemini (2.5 / 3.x), Llama 4 Scout/Maverick (Groq, NVIDIA), GLM-4.6V Flash (Z.ai), Nemotron Nano 12B VL (OpenRouter), and GitHub's GPT-4o / GPT-4.1.
+Send images with the standard OpenAI `image_url` content blocks (base64 `data:` URLs or `http(s)` URLs). When a request contains an image, the router restricts itself to **vision-capable models** and ignores text-only ones. Vision models are tagged with a **Vision** badge on the Fallback Chain page.
 
 ```python
 resp = client.chat.completions.create(
@@ -341,9 +313,7 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-If no vision-capable model is enabled in your Fallback Chain, an image request returns a clear `422` (`code: "no_vision_model"`) rather than silently dropping the image. (Image input on `/v1/responses` isn't supported yet — use `/v1/chat/completions`.)
-
-Works with `stream=True` as well — you'll get `delta.tool_calls` chunks followed by a `finish_reason: "tool_calls"` close. Under the hood, OpenAI-compatible providers (Groq, Cerebras, Mistral, OpenRouter, GitHub Models, HuggingFace, Cloudflare, Cohere compat) get the request passed through; Gemini requests get translated into Google's `functionDeclarations` / `functionResponse` shape and the response is translated back.
+If no vision-capable model is enabled in your Fallback Chain, an image request returns a clear `422` (`code: "no_vision_model"`) rather than silently dropping the image.
 
 Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. If a request fell over between providers, you'll also see `X-Fallback-Attempts: N`.
 
@@ -381,13 +351,35 @@ curl http://localhost:3001/v1/embeddings \
 | `llama-nemotron-embed-vl-1b-v2` | 2048 | NVIDIA → OpenRouter |
 | `embeddinggemma-300m` | 768 | Cloudflare |
 
-The default family, per-provider toggles, and priorities live on the dashboard's **Models → Embeddings** page. Pick your family once and stick with it for a given vector store — that's the whole point of the family model.
+The default family, per-provider toggles, and priorities live on the dashboard's **Models → Embeddings** page.
+
+## Custom platforms and models
+
+From the Keys page, the **Platforms** grid is the unified catalog view. Every built-in platform you've added a key for shows up alongside every custom platform you've registered. The grid ends with an **Add New Platform** tile that opens a modal for:
+
+- **Slug** — a short identifier like `my-ollama` (lowercase letters, digits, dashes; 2-32 chars; cannot collide with a built-in).
+- **Display name** — shown in the dashboard.
+- **Base URL** — the OpenAI-compatible endpoint, e.g. `http://192.168.1.10:11434/v1`.
+- **Rate limits** (optional) — RPM, RPD, TPM, TPD caps enforced per-provider.
+- **Max parallel requests** (optional) — concurrency ceiling so this provider never hogs all connection slots.
+
+Once a platform exists, click **Sync models** to auto-discover every model the endpoint exposes at `/v1/models`. Or use the **Add a model** form to register models manually:
+
+- **Model ID** and **Display name** — required.
+- **Context window**, **Supports tools**, **Supports vision** — basic flags.
+- **Advanced** toggle exposes intelligence rank, speed rank, size label, per-model rate limits, and max output tokens.
+
+The model joins the fallback chain at the lowest priority and shows up everywhere built-in models do — `/v1/models`, the Fallback page, the Analytics page. You can edit any model (built-in or custom) later: adjust ranks, toggle tools/vision, cap output tokens, change rate limits — all from the dashboard.
+
+Adding an API key for a custom platform works the same as for a built-in: pick the custom slug in the **Add a provider key** form, paste the bearer (or leave blank for local servers that don't need one), and the key routes to your endpoint.
+
+Removing a custom platform cascades — it drops every model on that platform, every key, and every fallback entry. There's no "leaving a model orphaned" state.
 
 ## Screenshots
 
 ### Keys
 
-Manage provider credentials and grab the unified API key your apps connect with. Each key shows a status dot and when it was last health-checked.
+Manage provider credentials and grab the unified API key your apps connect with. Each key shows a status dot and when it was last health-checked. Custom platforms appear alongside built-in ones in the unified grid.
 
 ![Keys page](repo-assets/keys.png)
 
@@ -419,17 +411,23 @@ Request volume, success rate, tokens in and out, average latency, and per-provid
                              │      (b) is under all its rate limits.         │
                              │   2. Decrypt key, call provider SDK.           │
                              │   3. On 429/5xx → cooldown + retry next model. │
+                             │   4. On key exhaustion → cycle keys, 1-RPM.    │
                              └────────────────────────────────────────────────┘
                                           │
    ┌──────────────┬────────────┬──────────┴─────────┬─────────────┬──────────┐
    ▼              ▼            ▼                    ▼             ▼          ▼
- Google         Groq        Cerebras           OpenRouter        HF       …10 more
-```
+ Google         Groq        Cerebras           OpenRouter        HF       …12 more
+                                +
+                        Custom Providers
+                    (any OpenAI-compatible endpoint)
 
-- **Router** (`server/src/services/router.ts`) — picks a model per request.
+- **Router** (`server/src/services/router.ts`) — picks a model per request using bandit scoring or priority chain.
+- **Scoring** (`server/src/services/scoring.ts`) — Thompson-sampling bandit: reliability × speed × intelligence, with headroom and rate-limit guardrails.
 - **Rate-limit ledger** (`server/src/services/ratelimit.ts`) — in-memory RPM/RPD/TPM/TPD counters backed by SQLite, with cooldowns on 429s.
-- **Provider adapters** (`server/src/providers/*.ts`) — one file per provider, implementing the `Provider` base class: `chatCompletion()` and `streamChatCompletion()`.
+- **Key exhaustion** (`server/src/services/key-exhaustion.ts`) — per-key 3-retry → key cycling → 1-RPM recovery mode.
+- **Provider adapters** (`server/src/providers/*.ts`) — one file per provider, implementing the `Provider` base class: `chatCompletion()` and `streamChatCompletion()`. Custom providers are resolved from `custom_providers` table at request time.
 - **Health service** (`server/src/services/health.ts`) — periodic probe keeps key status fresh.
+- **Catalog sync** (`server/src/services/catalog-sync.ts`) — Ed25519-signed catalog updates keep models current.
 - **Dashboard** (`client/`) — React + Vite + shadcn/ui admin surface.
 - **Storage** — SQLite (`better-sqlite3`) with AES-256-GCM envelope encryption for keys.
 
@@ -480,7 +478,7 @@ Stacking free tiers has real trade-offs. Be honest with yourself about them:
 
 Contributors very welcome! Good first PRs:
 
-- **Add a provider** — copy `server/src/providers/openai-compat.ts` as a template, wire it into `server/src/providers/index.ts`, seed its models in `server/src/db/index.ts`, add a test in `server/src/__tests__/providers/`.
+- **Add a provider** — copy `server/src/providers/openai-compat.ts` as a template, wire it into `server/src/providers/index.ts`, seed its models in `server/src/db/migrations.ts`, add a test in `server/src/__tests__/providers/`.
 - **Add an endpoint** — images, moderations, audio. The provider base class can grow new methods; adapters declare which they support.
 - **Improve the router** — cost-aware routing (cheapest-healthy-fastest tradeoffs), better latency-weighted priority, regional pinning.
 - **Dashboard polish** — charts on the Analytics page, key rotation UX, batch import of keys from `.env`.
@@ -553,21 +551,19 @@ A self-hosted, single-user, personal-use setup was re-reviewed against each prov
 | GitHub Models | ⚠️ Caution | Free tier explicitly scoped to *"experimentation"* and *"prototyping."* |
 | Cohere | ❌ Avoid | Terms §14 still forbids *"personal, family or household purposes."* |
 | Zhipu (open.bigmodel.cn) | ✅ Likely OK | Personal/non-commercial research carve-out still in the platform docs. |
-| Z.ai (api.z.ai) | ⚠️ Caution | New row — Singapore entity (distinct from Zhipu CN). §III.3(l) anti-traffic-redirect clause could plausibly be read against a proxy; no explicit personal-use carve-out. |
-| Ollama Cloud | ✅ Likely OK | New row — Free plan permits cloud-model access (1 concurrent, 5-hour session caps). No anti-proxy / anti-resale clauses found. *(Integration tracked in #14.)* |
-| OVH AI Endpoints | ✅ Likely OK | New row (June 2026) — anonymous access is officially documented (2 req/min per IP per model). OVH reserves the right to introduce token/consumption caps. |
+| Z.ai (api.z.ai) | ⚠️ Caution | Singapore entity (distinct from Zhipu CN). §III.3(l) anti-traffic-redirect clause could plausibly be read against a proxy; no explicit personal-use carve-out. |
+| Ollama Cloud | ✅ Likely OK | Free plan permits cloud-model access (1 concurrent, 5-hour session caps). No anti-proxy / anti-resale clauses found. |
+| OVH AI Endpoints | ✅ Likely OK | Anonymous access is officially documented (2 req/min per IP per model). OVH reserves the right to introduce token/consumption caps. |
 
 Rules of thumb that keep most providers happy: **one account per provider**, **no reselling**, **no sharing your endpoint with other humans**, **don't hammer a free tier as a paid production backend**. This is informational, not legal advice — read each provider's ToS and make your own call.
-
-Removed since the April 2026 review: Hugging Face, Moonshot, and MiniMax direct integrations were dropped from the catalog (HF — tool-call format issues; Moonshot — moved to paid only; MiniMax — superseded by the OpenRouter `minimax/minimax-m2.5:free` route).
 
 ## Disclaimer
 
 **This project is for personal experimentation and learning, not production.** Free tiers exist so developers can prototype against them; they aren't a stable, supported inference substrate and shouldn't be treated as one. If you build something real on top of API-Gateway, swap in a paid API before you ship. Your relationship with each upstream provider is governed by the terms you accepted when you created your account — those terms still apply when the traffic is proxied through this project, and you're responsible for complying with them.
 
-## Star History
+***
 
-[![Star History Chart](https://api.star-history.com/chart?repos=tashfeenahmed/api-gateway&type=date&legend=top-left)](https://www.star-history.com/?repos=tashfeenahmed%2Fapi-gateway&type=date&legend=top-left)
+Built on [tashfeenahmed/freellmapi](https://github.com/tashfeenahmed/freellmapi). Fork maintained by [MLuqmanBR](https://github.com/MLuqmanBR).
 
 ## License
 
