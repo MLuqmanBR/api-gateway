@@ -48,6 +48,7 @@ export interface CustomProvider {
   tpdLimit: number | null;
   maxParallelRequests: number | null;
   keyless: boolean;
+  archived: boolean;
 }
 export interface CustomProviderCreate {
   slug: string;

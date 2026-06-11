@@ -624,12 +624,10 @@ function CustomModelsSection() {
         {addModel.isError && (
           <p className="text-destructive text-xs">{(addModel.error as Error).message}</p>
         )}
-      </form>
-      {/* List existing custom models with archive buttons */}
-      {models.filter(m => customProviders.some(cp => cp.slug === m.platform)).length > 0 && (
+      {models.filter(m => activeCustom.some(cp => cp.slug === m.platform)).length > 0 && (
         <div className="mt-3 rounded-2xl border divide-y bg-card overflow-hidden">
           {models
-            .filter(m => customProviders.some(cp => cp.slug === m.platform))
+            .filter(m => activeCustom.some(cp => cp.slug === m.platform))
             .map(m => (
               <div key={m.id} className="flex items-center gap-2 px-4 py-2 hover:bg-muted/40 transition-colors">
                 <code className="text-xs font-mono">{m.platform}/{m.modelId}</code>
@@ -706,6 +704,18 @@ export default function KeysPage() {
       queryClient.invalidateQueries({ queryKey: ['health'] })
     },
   })
+  const restoreProvider = useMutation({
+    mutationFn: (slug: string) => {
+      const cp = archivedCustom.find(c => c.slug === slug)
+      return apiFetch('/api/custom-providers', { method: 'POST', body: JSON.stringify({ slug, baseUrl: cp?.baseUrl || '' }) })
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
+      queryClient.invalidateQueries({ queryKey: ['keys'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      queryClient.invalidateQueries({ queryKey: ['health'] })
+    },
+  })
   const checkAll = useMutation({
     mutationFn: () => apiFetch('/api/health/check-all', { method: 'POST' }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['health'] }),
@@ -759,13 +769,16 @@ export default function KeysPage() {
       editInputRef.current.focus()
     }
   }, [editingKeyId])
+  // Split custom providers so archived ones don't clutter the main list.
+  const activeCustom = customProviders.filter(cp => !cp.archived)
+  const archivedCustom = customProviders.filter(cp => cp.archived)
+
   // Build a unified platform list for the add-key form. Built-ins come
-  // first; user-added custom providers appear at the end of the dropdown.
+  // first; active user-added custom providers appear at the end.
   const allPlatforms: { value: string; label: string; url: string; keyless?: boolean }[] = [
     ...PLATFORMS,
-    ...customProviders.map(cp => ({ value: cp.slug, label: `${cp.displayName} (custom)`, url: '', keyless: cp.keyless })),
+    ...activeCustom.map(cp => ({ value: cp.slug, label: `${cp.displayName} (custom)`, url: '', keyless: cp.keyless })),
   ]
-  const selectedPlatform = allPlatforms.find(p => p.value === platform)
   const needsAccountId = platform === 'cloudflare'
   const isKeyless = selectedPlatform?.keyless === true
   const handleSubmit = (e: React.FormEvent) => {
@@ -974,13 +987,35 @@ export default function KeysPage() {
             </div>
           )}
         </section>
+        {archivedCustom.length > 0 && (
+          <section>
+            <h2 className="text-sm font-medium mb-2 text-muted-foreground">Archived providers</h2>
+            <div className="rounded-2xl border divide-y bg-card overflow-hidden">
+              {archivedCustom.map(cp => (
+                <div key={cp.slug} className="flex items-center gap-3 px-4 py-3">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-muted-foreground">{cp.displayName}</p>
+                    <p className="text-[11px] text-muted-foreground font-mono">{cp.slug}</p>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    onClick={() => restoreProvider.mutate(cp.slug)}
+                    disabled={restoreProvider.isPending}
+                  >
+                    {restoreProvider.isPending ? 'Restoring…' : 'Restore'}
+                  </Button>
+                </div>
+              ))}
+            </div>
+          </section>
+        )}
       </div>
       <AddPlatformModal
         open={addOpen}
         onClose={() => setAddOpen(false)}
         onCreated={() => setAddOpen(false)}
       />
-      {editingProvider && (
         <EditPlatformModal
           slug={editingProvider.slug}
           initial={{ displayName: editingProvider.displayName, baseUrl: editingProvider.baseUrl }}

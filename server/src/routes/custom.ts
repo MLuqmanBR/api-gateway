@@ -184,6 +184,7 @@ customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
     max_parallel_requests: number | null;
     created_at: string;
     keyless: number;
+    archived: number;
   }>;
   const modelCounts = db.prepare(`
     SELECT platform, COUNT(*) AS n FROM models GROUP BY platform
@@ -193,7 +194,6 @@ customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
   `).all() as Array<{ platform: string; n: number }>;
   const modelByPlatform = new Map(modelCounts.map(r => [r.platform, r.n]));
   const keysByPlatform = new Map(keyCounts.map(r => [r.platform, r.n]));
-
   res.json(rows.map(r => ({
     id: r.id,
     slug: r.slug,
@@ -205,6 +205,7 @@ customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
     tpdLimit: r.tpd_limit,
     maxParallelRequests: r.max_parallel_requests,
     keyless: r.keyless === 1,
+    archived: r.archived === 1,
     createdAt: r.created_at,
     modelCount: modelByPlatform.get(r.slug) ?? 0,
     keyCount: keysByPlatform.get(r.slug) ?? 0,
