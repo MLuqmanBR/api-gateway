@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -65,6 +65,15 @@ export default function AnalyticsPage() {
     queryKey: ['analytics', 'timeline', range],
     queryFn: () => apiFetch<any[]>(`/api/analytics/timeline?range=${range}`),
   })
+
+  // Format timeline timestamps in local time before they reach Recharts.
+  const formattedTimeline = useMemo(() =>
+    timeline.map((d: any) => ({
+      ...d,
+      timestamp: formatIsoUtcToLocalChart(d.timestamp, range === '24h' ? 'hour' : 'day'),
+    })),
+    [timeline, range],
+  );
 
   const { data: byModel = [] } = useQuery({
     queryKey: ['analytics', 'by-model', range],
@@ -193,13 +202,13 @@ export default function AnalyticsPage() {
 
           <div className="lg:col-span-2">
             <Panel title="Requests over time">
-              {timeline.length === 0 ? (
+              {formattedTimeline.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
               ) : (
                 <ResponsiveContainer width="100%" height={240}>
-                  <LineChart data={timeline} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
+                  <LineChart data={formattedTimeline} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                    <XAxis dataKey="timestamp" tickFormatter={(v: string) => formatIsoUtcToLocalChart(v, range === '24h' ? 'hour' : 'day')} tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                    <XAxis dataKey="timestamp" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                     <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                     <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
                     <Legend wrapperStyle={{ fontSize: 12 }} iconType="line" />

@@ -92,12 +92,14 @@ export function LiveEvents() {
   }, [addLine]);
 
 
-  // Auto-scroll terminal to latest lines when enabled.
   // Auto-scroll only the terminal container — never the page.
+  // rAF ensures scrollHeight reflects the newly-painted line before we read it.
   useEffect(() => {
-    if (autoScroll && logContainerRef.current) {
-      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
-    }
+    if (!autoScroll || !logContainerRef.current) return;
+    const el = logContainerRef.current;
+    requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
   }, [lines.length, autoScroll]);
 
   const clearLogs = () => setLines([]);
