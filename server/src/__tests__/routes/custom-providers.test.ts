@@ -145,15 +145,20 @@ describe('Custom providers (#230)', () => {
       VALUES ('doomed', 'k', ?, ?, ?, 'unknown', 1, 'http://d.example.com/v1')
     `).run(encrypted, iv, authTag);
 
-    const { status } = await request(app, 'DELETE', '/api/custom-providers/doomed');
+    const { status, body } = await request(app, 'DELETE', '/api/custom-providers/doomed');
 
     expect(status).toBe(200);
+    expect(body.archived).toBe(true);
 
     const db = getDb();
-    expect(db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get('doomed')).toBeUndefined();
-    expect((db.prepare('SELECT COUNT(*) AS n FROM models WHERE platform = ?').get('doomed') as any).n).toBe(0);
-    expect((db.prepare('SELECT COUNT(*) AS n FROM api_keys WHERE platform = ?').get('doomed') as any).n).toBe(0);
-    // Fallback row pointing at the model should be gone too.
+    // Provider is archived, not deleted.
+    const prov = db.prepare('SELECT archived FROM custom_providers WHERE slug = ?').get('doomed') as { archived: number };
+    expect(prov.archived).toBe(1);
+    // Models are disabled, not deleted.
+    expect((db.prepare('SELECT COUNT(*) AS n FROM models WHERE platform = ? AND enabled = 1').get('doomed') as any).n).toBe(0);
+    // Keys are disabled, not deleted.
+    expect((db.prepare('SELECT COUNT(*) AS n FROM api_keys WHERE platform = ? AND enabled = 1').get('doomed') as any).n).toBe(0);
+    // Fallback rows are cleaned up.
     expect((db.prepare('SELECT COUNT(*) AS n FROM fallback_config WHERE model_db_id = ?').get(created.id) as any).n).toBe(0);
   });
 
@@ -236,7 +241,7 @@ describe('Custom providers (#230)', () => {
     expect(model.supports_tools).toBe(0);
   });
 
-  it('DELETE /api/custom-models/:id removes the model and its fallback entry', async () => {
+  it('DELETE /api/custom-models/:id archives the model and removes its fallback entry', async () => {
     await request(app, 'POST', '/api/custom-providers', {
       slug: 'removable', displayName: 'R', baseUrl: 'http://r.example.com/v1',
     });
@@ -245,7 +250,9 @@ describe('Custom providers (#230)', () => {
     });
     const { status } = await request(app, 'DELETE', `/api/custom-models/${created.id}`);
     expect(status).toBe(200);
-    expect(getDb().prepare('SELECT 1 FROM models WHERE id = ?').get(created.id)).toBeUndefined();
+    // Model is archived, not deleted.
+    const model = getDb().prepare('SELECT enabled FROM models WHERE id = ?').get(created.id) as { enabled: number };
+    expect(model.enabled).toBe(0);
     expect((getDb().prepare('SELECT COUNT(*) AS n FROM fallback_config WHERE model_db_id = ?').get(created.id) as any).n).toBe(0);
   });
 
@@ -276,14 +283,16 @@ describe('Custom providers (#230)', () => {
     expect(cfModel).toBeDefined();
   });
 
-  it('DELETE /api/custom-models/:id works for models on built-in providers', async () => {
+  it('DELETE /api/custom-models/:id archives models on built-in providers', async () => {
     // Find the custom model we added to cloudflare
     const db = getDb();
     const model = db.prepare("SELECT id FROM models WHERE platform = 'cloudflare' AND model_id = 'custom-cloudflare-model'").get() as any;
     expect(model).toBeDefined();
     const { status } = await request(app, 'DELETE', `/api/custom-models/${model.id}`);
     expect(status).toBe(200);
-    expect(db.prepare('SELECT 1 FROM models WHERE id = ?').get(model.id)).toBeUndefined();
+    // Archived, not deleted.
+    const archived = db.prepare('SELECT enabled FROM models WHERE id = ?').get(model.id) as { enabled: number };
+    expect(archived.enabled).toBe(0);
   });
 
   // ── Wiring: buildProviderFor + the proxy see a custom provider ───

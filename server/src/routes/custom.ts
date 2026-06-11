@@ -225,9 +225,41 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
   }
 
   const db = getDb();
-  const existing = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(slug);
+  const existing = db.prepare('SELECT id, base_url, archived, display_name, rpm_limit, rpd_limit, tpm_limit, tpd_limit FROM custom_providers WHERE slug = ?').get(slug) as {
+    id: number; base_url: string; archived: number; display_name: string;
+    rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null;
+  } | undefined;
+
   if (existing) {
-    res.status(409).json({ error: { message: `provider with slug '${slug}' already exists` } });
+    if (existing.archived !== 1) {
+      res.status(409).json({ error: { message: `provider with slug '${slug}' already exists` } });
+      return;
+    }
+    // Revive from archive only when the base URL matches — different URL
+    // means a genuinely different provider using the same slug.
+    if (existing.base_url !== baseUrl) {
+      res.status(409).json({ error: { message: `slug '${slug}' is archived with a different base_url — delete it first or choose a new slug` } });
+      return;
+    }
+    // Restore: un-archive, re-enable keys and models, update limits.
+    const tx = db.transaction(() => {
+      db.prepare('UPDATE custom_providers SET archived = 0, display_name = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?, max_parallel_requests = ? WHERE slug = ?')
+        .run(displayName.trim(), rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, slug);
+      db.prepare('UPDATE api_keys SET enabled = 1 WHERE platform = ?').run(slug);
+      db.prepare('UPDATE models SET enabled = 1 WHERE platform = ?').run(slug);
+    });
+    tx();
+
+    clearPlatformCaches(slug);
+    // Re-sync models in case the provider added new ones while archived.
+    const sync = await syncModelsFromProvider(baseUrl, slug);
+    res.json({
+      id: existing.id, slug, displayName: displayName.trim(), baseUrl,
+      rpmLimit: rpmLimit ?? null, rpdLimit: rpdLimit ?? null,
+      tpmLimit: tpmLimit ?? null, tpdLimit: tpdLimit ?? null,
+      maxParallelRequests: maxParallelRequests ?? null,
+      modelCount: sync.fetched, revived: true,
+    });
     return;
   }
 
@@ -249,9 +281,7 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
     tpmLimit: tpmLimit ?? null,
     tpdLimit: tpdLimit ?? null,
     maxParallelRequests: maxParallelRequests ?? null,
-    createdAt: new Date().toISOString(),
-    modelsDiscovered: sync.fetched,
-    ...(sync.error ? { syncError: sync.error } : {}),
+    modelCount: sync.fetched,
   });
 });
 
@@ -310,15 +340,21 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     updates.push('max_parallel_requests = ?');
     values.push(parsed.data.maxParallelRequests);
   }
+
+  if (updates.length === 0) {
+    res.json({ success: true, slug });
+    return;
+  }
+
   values.push(slug);
   db.prepare(`UPDATE custom_providers SET ${updates.join(', ')} WHERE slug = ?`).run(...values);
 
   res.json({ success: true, slug });
 });
 
-// Delete a provider. Cascades: drops every model on the provider and every
-// fallback_config row pointing at those models, plus every api_key on the
-// platform. Built-in catalog rows on other platforms are untouched.
+// Archive a provider. Disables models and keys, removes from fallback chain.
+// Analytics retains historical request data. Re-adding the same slug+bare_url
+// revives the provider from the archive.
 customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response) => {
   const slug = req.params.slug as string;
   if (!SLUG_RE.test(slug)) {
@@ -327,23 +363,30 @@ customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response)
   }
 
   const db = getDb();
-  const existing = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(slug);
+  const existing = db.prepare('SELECT archived FROM custom_providers WHERE slug = ?').get(slug) as { archived: number } | undefined;
   if (!existing) {
     res.status(404).json({ error: { message: `provider '${slug}' not found` } });
     return;
   }
+  if (existing.archived === 1) {
+    res.status(400).json({ error: { message: `provider '${slug}' is already archived` } });
+    return;
+  }
 
+  // Soft-delete: remove from fallback chain, disable keys and models,
+  // archive the provider row. Analytics retains historical request data.
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = ?)').run(slug);
-    db.prepare('DELETE FROM models WHERE platform = ?').run(slug);
-    db.prepare('DELETE FROM api_keys WHERE platform = ?').run(slug);
-    db.prepare('DELETE FROM custom_providers WHERE slug = ?').run(slug);
+    db.prepare('UPDATE custom_providers SET archived = 1 WHERE slug = ?').run(slug);
+    db.prepare('UPDATE api_keys SET enabled = 0 WHERE platform = ?').run(slug);
+    db.prepare('UPDATE models SET enabled = 0 WHERE platform = ?').run(slug);
   });
   tx();
 
   clearPlatformCaches(slug);
-  res.json({ success: true });
+  res.json({ success: true, archived: true });
 });
+
 
 // Trigger model auto-discovery for an existing provider.
 customRouter.post('/api/custom-providers/:slug/sync-models', async (req: Request, res: Response) => {
@@ -448,10 +491,27 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
   const d = parsed.data;
   const modelId = d.modelId.trim();
   const displayName = d.displayName.trim();
-  // UNIQUE(platform, model_id) protects against re-registering the same id.
-  const dup = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(slug, modelId);
+  // If the model exists but is disabled (e.g. from an archived provider),
+  // revive it instead of returning 409.
+  const dup = db.prepare('SELECT id, enabled FROM models WHERE platform = ? AND model_id = ?').get(slug, modelId) as { id: number; enabled: number } | undefined;
   if (dup) {
-    res.status(409).json({ error: { message: `model '${modelId}' already exists on provider '${slug}'` } });
+    if (dup.enabled === 1) {
+      res.status(409).json({ error: { message: `model '${modelId}' already exists on provider '${slug}'` } });
+      return;
+    }
+    // Revive: re-enable and update metadata.
+    db.prepare(`
+      UPDATE models SET enabled = 1, display_name = ? WHERE id = ?
+    `).run(displayName, dup.id);
+    // Ensure in fallback chain.
+    const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(dup.id);
+    if (!inChain) {
+      const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
+      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(dup.id, max.m + 1);
+    }
+    res.status(200).json({
+      success: true, id: dup.id, platform: slug, modelId, displayName, revived: true,
+    });
     return;
   }
   const tx = db.transaction(() => {
@@ -545,9 +605,9 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   res.json({ success: true, id });
 });
 
-// Remove a single custom model from the catalog and the fallback chain.
-// The provider row stays — only the model is deleted. Use the provider
-// DELETE to drop the whole provider.
+// Archive a single custom model — disables it and removes from the fallback
+// chain. The row stays for analytics. Use the provider DELETE to archive all
+// models at once. Re-adding the model revives it.
 customRouter.delete('/api/custom-models/:id', (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
@@ -556,21 +616,22 @@ customRouter.delete('/api/custom-models/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const existing = db.prepare('SELECT platform FROM models WHERE id = ?').get(id) as { platform: string } | undefined;
+  const existing = db.prepare('SELECT id, platform, enabled FROM models WHERE id = ?').get(id) as { id: number; platform: string; enabled: number } | undefined;
   if (!existing) {
     res.status(404).json({ error: { message: 'model not found' } });
     return;
   }
-  // Models on any known provider can be deleted here. Built-in catalog rows
-  // (seeded by migrations) will simply be re-created on next server start
-  // if they're still in the migration chain, so deletion is safe.
+  if (existing.enabled === 0) {
+    res.status(400).json({ error: { message: 'model is already archived' } });
+    return;
+  }
 
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);
-    db.prepare('DELETE FROM models WHERE id = ?').run(id);
+    db.prepare('UPDATE models SET enabled = 0 WHERE id = ?').run(id);
   });
   tx();
 
   clearRateLimitPenalty(id);
-  res.json({ success: true, id });
+  res.json({ success: true, id, archived: true });
 });
