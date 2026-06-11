@@ -452,6 +452,11 @@ function CustomModelsSection() {
   const [contextWindow, setContextWindow] = useState(128000)
   const [maxOutputTokens, setMaxOutputTokens] = useState(null as number | null)
   const [supportsTools, setSupportsTools] = useState(true)
+  const [supportsVision, setSupportsVision] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [intelligenceRank, setIntelligenceRank] = useState(50)
+  const [speedRank, setSpeedRank] = useState(50)
+  const [sizeLabel, setSizeLabel] = useState('Custom')
   const deleteModel = useMutation({
     mutationFn: (id: number) => apiFetch(`/api/custom-models/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
@@ -621,6 +626,7 @@ function CustomModelsSection() {
           <p className="text-destructive text-xs">{(addModel.error as Error).message}</p>
         )}
       </form>
+      {/* List existing custom models with archive buttons */}
       {models.filter(m => activeCustom.some(cp => cp.slug === m.platform)).length > 0 && (
         <div className="mt-3 rounded-2xl border divide-y bg-card overflow-hidden">
           {models
@@ -790,6 +796,8 @@ export default function KeysPage() {
     const key = isKeyless ? '' : (needsAccountId ? `${accountId}:${apiKey}` : apiKey)
     addKey.mutate({ platform, key, label: label || undefined })
   }
+  const healthKeyMap = new Map<number, { status: string; lastCheckedAt: string | null }>()
+  for (const k of healthData?.keys ?? []) healthKeyMap.set(k.id, k)
   // The "Configured providers" list groups by platform string. PLATFORMS
   // only seeds the header label; any platform string on a key (built-in
   // or custom) gets its own group.
