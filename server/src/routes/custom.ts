@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { clearRateLimitPenalty } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
+import { hasProvider, buildProviderFor } from '../providers/index.js';
 
 export const customRouter = Router();
 
@@ -80,12 +81,12 @@ const createModelSchema = z.object({
 const updateModelSchema = createModelSchema.partial().extend({
   enabled: z.boolean().optional(),
 });
-
-// Returns true if the model is owned by a custom provider (i.e. its
-// platform slug is present in custom_providers). Built-in catalog rows
-// return false and are not editable through /api/custom-* endpoints.
-function isCustomModel(platform: string): boolean {
-  return !!getDb().prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(platform);
+// Returns true if the slug belongs to a known provider — either a built-in
+// (registered in providers/index.ts) or a custom provider (present in
+// custom_providers). Models on either kind of platform are user-editable
+// through /api/custom-* endpoints as long as they're in the models table.
+function isKnownProvider(slug: string): boolean {
+  return hasProvider(slug as any) || !!getDb().prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(slug);
 }
 
 // ── Model auto-discovery ────────────────────────────────────────────────
@@ -352,14 +353,23 @@ customRouter.post('/api/custom-providers/:slug/sync-models', async (req: Request
     return;
   }
 
-  const db = getDb();
-  const row = db.prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get(slug) as { base_url: string } | undefined;
-  if (!row) {
-    res.status(404).json({ error: { message: `provider '${slug}' not found` } });
+  // Resolve base URL: custom providers have it in the DB; built-in providers
+  // expose it via BaseProvider.baseUrl.
+  const customRow = getDb().prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get(slug) as { base_url: string } | undefined;
+  let baseUrl: string | undefined;
+  if (customRow) {
+    baseUrl = customRow.base_url;
+  } else if (hasProvider(slug as any)) {
+    const provider = buildProviderFor(slug);
+    baseUrl = provider?.baseUrl;
+  }
+  if (!baseUrl) {
+    res.status(404).json({ error: { message: `provider '${slug}' not found or does not support model discovery` } });
     return;
   }
 
-  const result = await syncModelsFromProvider(row.base_url, slug);
+  const result = await syncModelsFromProvider(baseUrl, slug);
+
   res.json({ success: true, slug, fetched: result.fetched, error: result.error });
 });
 
@@ -375,8 +385,7 @@ customRouter.get('/api/custom-providers/:slug/models', (req: Request, res: Respo
   }
 
   const db = getDb();
-  const provider = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(slug);
-  if (!provider) {
+  if (!isKnownProvider(slug)) {
     res.status(404).json({ error: { message: `provider '${slug}' not found` } });
     return;
   }
@@ -429,11 +438,13 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
   }
 
   const db = getDb();
-  const provRow = db.prepare('SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit FROM custom_providers WHERE slug = ?').get(slug) as { rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null } | undefined;
-  if (!provRow) {
+  if (!isKnownProvider(slug)) {
     res.status(404).json({ error: { message: `provider '${slug}' not found` } });
     return;
   }
+
+  const provRow = db.prepare('SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit FROM custom_providers WHERE slug = ?').get(slug) as { rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null } | undefined;
+  // Built-in providers return null provRow — use MODEL_DEFAULTS for limits.
   const d = parsed.data;
   const modelId = d.modelId.trim();
   const displayName = d.displayName.trim();
@@ -455,10 +466,10 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       d.intelligenceRank ?? MODEL_DEFAULTS.intelligenceRank,
       d.speedRank ?? MODEL_DEFAULTS.speedRank,
       d.sizeLabel ?? MODEL_DEFAULTS.sizeLabel,
-      d.rpmLimit ?? provRow.rpm_limit ?? MODEL_DEFAULTS.rpmLimit,
-      d.rpdLimit ?? provRow.rpd_limit ?? MODEL_DEFAULTS.rpdLimit,
-      d.tpmLimit ?? provRow.tpm_limit ?? MODEL_DEFAULTS.tpmLimit,
-      d.tpdLimit ?? provRow.tpd_limit ?? MODEL_DEFAULTS.tpdLimit,
+      d.rpmLimit ?? provRow?.rpm_limit ?? MODEL_DEFAULTS.rpmLimit,
+      d.rpdLimit ?? provRow?.rpd_limit ?? MODEL_DEFAULTS.rpdLimit,
+      d.tpmLimit ?? provRow?.tpm_limit ?? MODEL_DEFAULTS.tpmLimit,
+      d.tpdLimit ?? provRow?.tpd_limit ?? MODEL_DEFAULTS.tpdLimit,
       d.monthlyTokenBudget ?? MODEL_DEFAULTS.monthlyTokenBudget,
       d.contextWindow ?? null,
       d.supportsVision ?? MODEL_DEFAULTS.supportsVision ? 1 : 0,
@@ -550,10 +561,9 @@ customRouter.delete('/api/custom-models/:id', (req: Request, res: Response) => {
     res.status(404).json({ error: { message: 'model not found' } });
     return;
   }
-  if (!isCustomModel(existing.platform)) {
-    res.status(400).json({ error: { message: 'built-in catalog models cannot be deleted through this endpoint' } });
-    return;
-  }
+  // Models on any known provider can be deleted here. Built-in catalog rows
+  // (seeded by migrations) will simply be re-created on next server start
+  // if they're still in the migration chain, so deletion is safe.
 
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM fallback_config WHERE model_db_id = ?').run(id);

@@ -59,6 +59,11 @@ export abstract class BaseProvider {
    * the platform "configured", and the provider omits the Authorization header
    * on outgoing requests. Defaults to false; set by subclasses. */
   keyless = false;
+  /** Providers whose models endpoint follows the OpenAI /v1/models convention
+   * can expose their base URL so the custom-model auto-discovery route knows
+   * where to probe. Providers that construct the URL from key contents (e.g.
+   * Cloudflare Workers AI — account_id embedded in the key) leave this empty. */
+  baseUrl?: string;
 
   abstract chatCompletion(
     apiKey: string,

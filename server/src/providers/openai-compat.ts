@@ -14,7 +14,7 @@ import { BaseProvider, providerHttpError, type CompletionOptions } from './base.
 export class OpenAICompatProvider extends BaseProvider {
   readonly platform: Platform;
   readonly name: string;
-  private readonly baseUrl: string;
+  // baseUrl is inherited from BaseProvider (set in constructor below)
   private readonly extraHeaders: Record<string, string>;
   private readonly validateUrl?: string;
   /** Per-provider HTTP timeout override. Cloud APIs finish in ~15s; locally-hosted

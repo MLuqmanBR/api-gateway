@@ -11,6 +11,7 @@ const API_BASE = 'https://api.cohere.ai/compatibility/v1';
 export class CohereProvider extends BaseProvider {
   readonly platform = 'cohere' as const;
   readonly name = 'Cohere';
+  baseUrl = API_BASE;
 
   async chatCompletion(
     apiKey: string,

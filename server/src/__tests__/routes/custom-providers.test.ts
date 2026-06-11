@@ -249,6 +249,43 @@ describe('Custom providers (#230)', () => {
     expect((getDb().prepare('SELECT COUNT(*) AS n FROM fallback_config WHERE model_db_id = ?').get(created.id) as any).n).toBe(0);
   });
 
+  // ── Built-in provider model operations ──────────────────────────────
+
+  it('POST /api/custom-providers/:slug/models accepts a built-in provider slug', async () => {
+    // cloudflare is a built-in provider — adding a model to it should succeed
+    const { status, body } = await request(app, 'POST', '/api/custom-providers/cloudflare/models', {
+      modelId: 'custom-cloudflare-model',
+      displayName: 'Custom CF Model',
+    });
+    expect(status).toBe(201);
+    expect(body.platform).toBe('cloudflare');
+    expect(body.modelId).toBe('custom-cloudflare-model');
+
+    const db = getDb();
+    const model = db.prepare("SELECT * FROM models WHERE platform = 'cloudflare' AND model_id = 'custom-cloudflare-model'").get() as any;
+    expect(model).toBeDefined();
+    expect(model.supports_tools).toBe(1);
+  });
+
+  it('GET /api/custom-providers/:slug/models works for built-in providers', async () => {
+    // cloudflare already has a model from the test above, plus built-in catalog rows
+    const { status, body } = await request(app, 'GET', '/api/custom-providers/cloudflare/models');
+    expect(status).toBe(200);
+    expect(Array.isArray(body)).toBe(true);
+    const cfModel = body.find((m: any) => m.modelId === 'custom-cloudflare-model');
+    expect(cfModel).toBeDefined();
+  });
+
+  it('DELETE /api/custom-models/:id works for models on built-in providers', async () => {
+    // Find the custom model we added to cloudflare
+    const db = getDb();
+    const model = db.prepare("SELECT id FROM models WHERE platform = 'cloudflare' AND model_id = 'custom-cloudflare-model'").get() as any;
+    expect(model).toBeDefined();
+    const { status } = await request(app, 'DELETE', `/api/custom-models/${model.id}`);
+    expect(status).toBe(200);
+    expect(db.prepare('SELECT 1 FROM models WHERE id = ?').get(model.id)).toBeUndefined();
+  });
+
   // ── Wiring: buildProviderFor + the proxy see a custom provider ───
 
   it('buildProviderFor returns an OpenAI-compat provider for a custom slug after the row exists', async () => {
