@@ -641,6 +641,7 @@ function CustomModelsSection() {
             ))}
         </div>
       )}
+    </section>
   )
 }
 
