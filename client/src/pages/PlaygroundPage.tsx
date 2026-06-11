@@ -37,6 +37,7 @@ export default function PlaygroundPage() {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const mountedRef = useRef(true)
 
   const { data: keyData } = useQuery<{ apiKey: string }>({
     queryKey: ['unified-key'],
@@ -53,6 +54,13 @@ export default function PlaygroundPage() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      abortRef.current?.abort()
+    }
+  }, [])
 
   // ── Error formatting (Fix 5) ──────────────────────────────────────────────
   const formatError = (status: number, body: any): string => {
@@ -83,6 +91,7 @@ export default function PlaygroundPage() {
 
     const controller = new AbortController()
     abortRef.current = controller
+    const timeoutId = setTimeout(() => controller.abort(), 120_000)
 
     let content = ''
     let routedPlatform = ''
@@ -97,6 +106,7 @@ export default function PlaygroundPage() {
       if (pending) return
       pending = true
       requestAnimationFrame(() => {
+        if (!mountedRef.current) return
         pending = false
         setMessages(prev => {
           const copy = [...prev]
@@ -151,6 +161,9 @@ export default function PlaygroundPage() {
         const errBody = await res.json().catch(() => ({}))
         content = formatError(res.status, errBody)
         latency = Date.now() - start
+        if (!mountedRef.current) {
+          return
+        }
         setMessages(prev => {
           const copy = [...prev]
           const last = copy[copy.length - 1]
@@ -231,7 +244,9 @@ export default function PlaygroundPage() {
         content = `❌ ${err.message}`
       }
     } finally {
+      clearTimeout(timeoutId)
       abortRef.current = null
+      if (!mountedRef.current) return
       setLoading(false)
       // Final update with complete metadata
       setMessages(prev => {

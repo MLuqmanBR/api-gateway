@@ -6,7 +6,6 @@ import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
-import { pruneRequestAnalytics } from '../services/request-retention.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
@@ -699,7 +698,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let lastRequestTime = 0;
   const globalRetryMax = getGlobalRetryLimit();
 
-  for (let totalAttempt = 0; ; totalAttempt++) {
+  outerLoop: for (let totalAttempt = 0; ; totalAttempt++) {
     // ---- Exit: global retries exhausted (1 RPM mode only) ----
     if (inOneRPMMode && globalRetryMax > 0 && oneRPMCycles >= globalRetryMax) {
       const msg = `All models rate-limited after ${oneRPMCycles} recovery cycle(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
@@ -994,7 +993,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: estimatedInputTokens + injectedHandoffTokens, out: totalOutputTokens }, at: Date.now() });
-          clearExhausted(route.keyId);
+          clearExhausted(route.keyId, route.modelId);
           if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
           return;
         } catch (streamErr: any) {
@@ -1006,6 +1005,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), null, pinnedModelId);
+            recordRateLimitHit(route.modelDbId);
             return;
           }
           // Headers never sent — bubble to the outer retry handler, which
@@ -1087,7 +1087,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           Date.now() - start, null, null, pinnedModelId,
         );
         publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: result.usage?.prompt_tokens ?? 0, out: result.usage?.completion_tokens ?? 0 }, at: Date.now() });
-        clearExhausted(route.keyId);
+        clearExhausted(route.keyId, route.modelId);
         if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
         return;
       }
@@ -1096,14 +1096,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
 
+      // Model-level 404/403: not a key issue — every key on this platform
+      // would hit the same dead route. Skip only the model and continue the
+      // outer loop without exhausting the key or burning retries.
+      if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) {
+        skipModels.add(route.modelDbId);
+        continue outerLoop;
+      }
+
       if (isRetryableError(err)) {
-        // Model-level 404/403: rule the whole model out immediately.
-        if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) {
-          skipModels.add(route.modelDbId);
-        }
         // Dead-turn errors (in-band error, empty completion, stream stall,
-        // unparseable dialect): skip key immediately — retrying the same key
-        // won't help. Per-key 3-retry is for transient limits (429, etc.).
+        // unparseable dialect): in-band error means the key WORKS but this
+        // specific model can't handle the request. Skip the model, not the
+        // key — retrying a different model on the same key is valid.
         const msg = (err.message ?? '').toLowerCase();
         const skipImmediately = msg.includes('in-band provider error')
           || msg.includes('empty completion')
@@ -1111,14 +1116,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           || msg.includes('stream stalled')
           || msg.includes('unparseable inline tool-call dialect');
 
-        if (!skipImmediately && keyAttempt < PER_KEY_RETRIES - 1) {
+        if (skipImmediately) {
+          skipModels.add(route.modelDbId);
+          continue outerLoop;
+        }
+
+        if (keyAttempt < PER_KEY_RETRIES - 1) {
           // Transient limit: retry same key immediately.
           lastError = err;
           publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
           console.log(`[Proxy] ${safeError.slice(0, 60)} from ${route.displayName}, retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
           continue keyRetry;
         }
-        // Skip immediately or last attempt → fall through to key exhaustion.
+        // Last retry attempt exhausted → fall through to key exhaustion.
         lastError = err;
         break keyRetry;
       } else {
@@ -1190,7 +1200,6 @@ export function logRequest(
       INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel);
-    pruneRequestAnalytics({ db });
   } catch (e) {
     console.error('Failed to log request:', e);
   }

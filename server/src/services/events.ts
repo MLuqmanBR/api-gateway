@@ -23,6 +23,7 @@ const MAX_SUBSCRIBERS = 8;
 
 // Each subscriber gets its own ring buffer so a slow reader never blocks others.
 const subscribers = new Set<(evt: LiveEvent) => void>();
+const heartbeats = new Map<(evt: LiveEvent) => void, NodeJS.Timeout>();
 
 export function publish(evt: LiveEvent): void {
   for (const fn of subscribers) {
@@ -32,11 +33,13 @@ export function publish(evt: LiveEvent): void {
 
 /** Register an SSE response as a subscriber. Returns an unsubscribe function. */
 export function subscribeSse(res: Response): () => void {
-  if (subscribers.size >= MAX_SUBSCRIBERS) {
-    // Drop the oldest subscriber to make room.
     const first = subscribers.values().next().value;
-    if (first) subscribers.delete(first);
-  }
+    if (first) {
+      const t = heartbeats.get(first);
+      if (t) clearInterval(t);
+      heartbeats.delete(first);
+      subscribers.delete(first);
+    }
 
   const fn = (evt: LiveEvent) => {
     if (res.destroyed) { subscribers.delete(fn); return; }
@@ -58,14 +61,17 @@ export function subscribeSse(res: Response): () => void {
     }
     try { res.write(`: heartbeat\n\n`); } catch { /* socket gone */ }
   }, 30000);
+  heartbeats.set(fn, heartbeat);
 
   res.on('close', () => {
     clearInterval(heartbeat);
+    heartbeats.delete(fn);
     subscribers.delete(fn);
   });
 
   return () => {
     clearInterval(heartbeat);
+    heartbeats.delete(fn);
     subscribers.delete(fn);
   };
 }

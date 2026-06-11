@@ -75,6 +75,7 @@ export default function EmbeddingsPage() {
   const hasChanges = localFamilies !== null || localDefault !== null
 
   function updateProvider(familyName: string, id: number, patch: Partial<ProviderEntry>) {
+    if (isLoading) return
     setLocalFamilies(families.map(f =>
       f.family === familyName
         ? { ...f, providers: f.providers.map(p => (p.id === id ? { ...p, ...patch } : p)) }
@@ -83,6 +84,7 @@ export default function EmbeddingsPage() {
   }
 
   function moveProvider(familyName: string, index: number, dir: -1 | 1) {
+    if (isLoading) return
     setLocalFamilies(families.map(f => {
       if (f.family !== familyName) return f
       const list = [...f.providers]
@@ -94,6 +96,7 @@ export default function EmbeddingsPage() {
   }
 
   function handleSave() {
+    if (isLoading) return
     saveMutation.mutate({
       ...(localDefault !== null ? { defaultFamily: localDefault } : {}),
       ...(localFamilies !== null

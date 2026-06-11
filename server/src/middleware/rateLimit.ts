@@ -55,6 +55,19 @@ export function createProxyRateLimiter() {
       for (const [key, value] of windows) {
         if (now >= value.resetAt) windows.delete(key);
       }
+      // If all entries are still active (not expired), evict the oldest window
+      // to guarantee the map never exceeds MAX_TRACKED_IPS.
+      if (windows.size > MAX_TRACKED_IPS) {
+        let oldestKey = '';
+        let oldestReset = Infinity;
+        for (const [k, v] of windows) {
+          if (v.resetAt < oldestReset) {
+            oldestReset = v.resetAt;
+            oldestKey = k;
+          }
+        }
+        windows.delete(oldestKey);
+      }
     }
 
     res.setHeader('X-RateLimit-Limit', String(limit));

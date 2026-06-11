@@ -44,6 +44,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateCustomProvidersV24(db);
   migrateQuirksV1(db);
   ensureUnifiedKey(db);
+  migrateSchemaV28IndexesAndFK(db);
 }
 
 function createTables(db: Database.Database) {
@@ -168,6 +169,7 @@ function createTables(db: Database.Database) {
   ensureRequestTtfbColumn(db);
   ensureRequestRequestedModelColumn(db);
   ensureCustomProvidersMaxParallelColumn(db);
+  ensureSessionsLastUsedColumn(db);
 }
 
 // `requested_model` is the model id the CLIENT pinned in the request body.
@@ -178,6 +180,16 @@ function ensureRequestRequestedModelColumn(db: Database.Database) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'requested_model')) {
     db.prepare('ALTER TABLE requests ADD COLUMN requested_model TEXT').run();
+  }
+}
+
+// `last_used` tracks the most recent session validation timestamp so stale
+// sessions can be pruned on a rolling basis rather than only at expiry.
+// NULL for sessions created before this migration — treated as active.
+function ensureSessionsLastUsedColumn(db: Database.Database) {
+  const columns = db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'last_used')) {
+    db.prepare('ALTER TABLE sessions ADD COLUMN last_used INTEGER').run();
   }
 }
 
@@ -2262,4 +2274,25 @@ function ensureUnifiedKey(db: Database.Database) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
     console.log(`\n  Your unified API key: ${key}\n`);
   }
+}
+
+// ── V28: schema hardening (2026-06) ──
+// Three idempotent schema fixes that cannot go into createTables because the
+// tables already exist on installed instances:
+//   1. Composite index requests(platform, model_id) — fuels GROUP BY analytics.
+//   2. Index fallback_config(priority) — fuels ORDER BY in routeRequest.
+//   3. FK trigger: models.key_id → api_keys(id) ON DELETE SET NULL. SQLite
+//      won't ALTER TABLE to add a foreign key, so a trigger keeps the ref
+//      clean when an api_key row is deleted.
+function migrateSchemaV28IndexesAndFK(db: Database.Database) {
+  db.prepare(`CREATE INDEX IF NOT EXISTS idx_requests_platform_model ON requests(platform, model_id)`).run();
+  db.prepare(`CREATE INDEX IF NOT EXISTS idx_fallback_config_priority ON fallback_config(priority)`).run();
+  db.prepare(`
+    CREATE TRIGGER IF NOT EXISTS trg_models_key_id_fk_on_delete
+    AFTER DELETE ON api_keys
+    FOR EACH ROW
+    BEGIN
+      UPDATE models SET key_id = NULL WHERE key_id = OLD.id;
+    END
+  `).run();
 }

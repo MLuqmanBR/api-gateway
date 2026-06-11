@@ -78,6 +78,7 @@ interface GeminiResponse {
     candidatesTokenCount?: number;
     totalTokenCount?: number;
   };
+  promptFeedback?: { blockReason?: string };
 }
 
 function safeParseObject(raw: string): Record<string, unknown> {
@@ -193,6 +194,23 @@ function extractImageUrl(block: unknown): string | undefined {
 // not fetch external URLs itself. Fetching a user-supplied URL is a minor SSRF
 // surface, acceptable for a single-user self-hosted proxy; we still restrict to
 // http/https and cap the size. Returns null (part skipped) on any failure.
+/** Small wrapper that aborts a fetch if it hasn't completed within the
+ * given timeout (in ms). Falls through to the surrounding catch handler
+ * on timeout. */
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = 30000,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; data: string } | null> {
   const dataMatch = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
   if (dataMatch) {
@@ -211,7 +229,7 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
       // Single-user self-hosted proxy — but the unified API key is portable,
       // so internal-network requests a leaked key could make are worth blocking.
       if (isInternalHost(parsed.hostname)) return null;
-      const res = await fetch(url);
+      const res = await fetchWithTimeout(url);
       if (!res.ok) return null;
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
@@ -413,6 +431,13 @@ export class GoogleProvider extends BaseProvider {
     }
 
     const data = await res.json() as GeminiResponse;
+    // Safety/prompt block: Gemini may refuse the request and return an empty
+    // candidates array with a blockReason. Throw so the proxy relays the error
+    // to the user instead of silently falling over to the next model.
+    if (!data.candidates || data.candidates.length === 0) {
+      const reason = data.promptFeedback?.blockReason ?? 'UNKNOWN';
+      throw new Error(`Gemini blocked the request: ${reason}`);
+    }
     const candidate = data.candidates?.[0];
     const parts = candidate?.content?.parts;
     const toolCalls = extractToolCalls(parts);
@@ -486,20 +511,87 @@ export class GoogleProvider extends BaseProvider {
 
     const seenToolCallKeys = new Set<string>();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    try {
+      while (true) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const result = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error(`Google AI Studio stream stalled: no data for 300000ms (timeout)`)),
+              300000,
+            );
+          }),
+        ]).finally(() => clearTimeout(timer));
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+        const { done, value } = result;
+        if (done) break;
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const raw = trimmed.slice(6);
-        if (raw === '[DONE]') {
-          if (!emittedFinish) {
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const raw = trimmed.slice(6);
+          if (raw === '[DONE]') {
+            if (!emittedFinish) {
+              emittedFinish = true;
+              yield {
+                id,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: modelId,
+                choices: [{
+                  index: 0,
+                  delta: {},
+                  finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
+                }],
+              };
+            }
+            return;
+          }
+
+          // Skip malformed SSE frames instead of aborting the whole stream.
+          // Matches the defensive parse in openai-compat / cohere / cloudflare:
+          // a single corrupt chunk shouldn't take down the rest of the response.
+          let chunk: GeminiResponse;
+          try {
+            chunk = JSON.parse(raw) as GeminiResponse;
+          } catch {
+            continue;
+          }
+          const candidate = chunk.candidates?.[0];
+          const parts = candidate?.content?.parts ?? [];
+
+          const text = extractText(parts);
+          const toolCalls = extractToolCalls(parts).filter(call => {
+            const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
+            if (seenToolCallKeys.has(key)) return false;
+            seenToolCallKeys.add(key);
+            return true;
+          });
+
+          if ((text && text.length > 0) || toolCalls.length > 0) {
+            sawToolCalls = sawToolCalls || toolCalls.length > 0;
+            yield {
+              id,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: modelId,
+              choices: [{
+                index: 0,
+                delta: {
+                  ...(text ? { content: text } : {}),
+                  ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+                },
+                finish_reason: null,
+              }],
+            };
+          }
+
+          if (candidate?.finishReason && !emittedFinish) {
             emittedFinish = true;
             yield {
               id,
@@ -509,81 +601,29 @@ export class GoogleProvider extends BaseProvider {
               choices: [{
                 index: 0,
                 delta: {},
-                finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
+                finish_reason: sawToolCalls ? 'tool_calls' : toGeminiFinishReason(candidate.finishReason),
               }],
             };
+            return;
           }
-          return;
-        }
-
-        // Skip malformed SSE frames instead of aborting the whole stream.
-        // Matches the defensive parse in openai-compat / cohere / cloudflare:
-        // a single corrupt chunk shouldn't take down the rest of the response.
-        let chunk: GeminiResponse;
-        try {
-          chunk = JSON.parse(raw) as GeminiResponse;
-        } catch {
-          continue;
-        }
-        const candidate = chunk.candidates?.[0];
-        const parts = candidate?.content?.parts ?? [];
-
-        const text = extractText(parts);
-        const toolCalls = extractToolCalls(parts).filter(call => {
-          const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
-          if (seenToolCallKeys.has(key)) return false;
-          seenToolCallKeys.add(key);
-          return true;
-        });
-
-        if ((text && text.length > 0) || toolCalls.length > 0) {
-          sawToolCalls = sawToolCalls || toolCalls.length > 0;
-          yield {
-            id,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: modelId,
-            choices: [{
-              index: 0,
-              delta: {
-                ...(text ? { content: text } : {}),
-                ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-              },
-              finish_reason: null,
-            }],
-          };
-        }
-
-        if (candidate?.finishReason && !emittedFinish) {
-          emittedFinish = true;
-          yield {
-            id,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: modelId,
-            choices: [{
-              index: 0,
-              delta: {},
-              finish_reason: sawToolCalls ? 'tool_calls' : toGeminiFinishReason(candidate.finishReason),
-            }],
-          };
-          return;
         }
       }
-    }
 
-    if (!emittedFinish) {
-      yield {
-        id,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: modelId,
-        choices: [{
-          index: 0,
-          delta: {},
-          finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
-        }],
-      };
+      if (!emittedFinish) {
+        yield {
+          id,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: modelId,
+          choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
+          }],
+        };
+      }
+    } finally {
+      reader.cancel().catch(() => { /* upstream already gone */ });
     }
   }
 

@@ -114,35 +114,64 @@ function startServer(port) {
     }
   });
 
+  child.on('error', (err) => {
+    console.error('Failed to start server:', err.message);
+    process.exit(1);
+  });
+
   child.unref();
 
   inst[String(port)] = child.pid;
   writeInstances(inst);
 
   console.log(`Starting server on port ${port} (PID ${child.pid})…`);
-
-  return waitForReady(port).then(() => {
-    if (crashed) return;
+  return waitForReady(port, child).then(() => {
     console.log('Server is ready.\n');
     printInfo(port);
+  }).catch((err) => {
+    if (crashed) return;
+    console.error(err.message);
+    process.exit(1);
   });
 }
 
-function waitForReady(port) {
+function waitForReady(port, child) {
   const start = Date.now();
   const timeout = 30000;
-  return new Promise((resolve) => {
+  let stderrChunks = [];
+  if (child.stderr) {
+    child.stderr.on('data', (chunk) => { stderrChunks.push(chunk); });
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const once = (fn) => (v) => { if (!settled) { settled = true; fn(v); } };
+
+    child.on('exit', (code) => {
+      if (code !== 0 && code !== null) {
+        const stderrMsg = Buffer.concat(stderrChunks).toString().trim();
+        const msg = stderrMsg
+          ? `Server exited with code ${code}: ${stderrMsg}`
+          : `Server exited with code ${code} before becoming ready`;
+        once(reject)(new Error(msg));
+      } else if (code === 0) {
+        once(reject)(new Error('Server exited unexpectedly with code 0 before becoming ready'));
+      }
+    });
+
     const check = () => {
       const req = http.get(`http://localhost:${port}/api/health`, (res) => {
         res.resume();
-        if (res.statusCode === 200) resolve();
+        if (res.statusCode === 200) once(resolve)();
         else retry();
       });
       req.on('error', () => retry());
       req.setTimeout(2000, () => { req.destroy(); retry(); });
       function retry() {
-        if (Date.now() - start > timeout) { console.log('Health check timed out. Server may still be initializing.'); resolve(); }
-        else { setTimeout(check, 500); }
+        if (Date.now() - start > timeout) {
+          once(reject)(new Error('Health check timed out after 30s. Server may have failed to start.'));
+        } else {
+          setTimeout(check, 500);
+        }
       }
     };
     check();

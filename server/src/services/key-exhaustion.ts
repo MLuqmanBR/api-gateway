@@ -31,7 +31,7 @@ export function rebuildExhaustionFromDB(): void {
   for (const row of rows) {
     // Estimate exhaustion time from expiry: a 90s cooldown means exhausted ~90s ago;
     // a 24h cooldown means exhausted ~24h ago. Approximate by assuming default 90s.
-    const estimatedExhaustedAt = row.expires_at_ms - 90_000;
+    const estimatedExhaustedAt = Math.min(row.expires_at_ms - 90_000, now);
     exhaustionMap.set(row.key_id, {
       exhaustedAt: estimatedExhaustedAt > 0 ? estimatedExhaustedAt : now,
       provider: row.platform,
@@ -46,12 +46,12 @@ export function markExhausted(keyId: number, provider: string, modelId: string):
 }
 
 /** Clear exhaustion — called when a key successfully handles a request. */
-export function clearExhausted(keyId: number): void {
+export function clearExhausted(keyId: number, modelId: string): void {
   exhaustionMap.delete(keyId);
   // Also remove any persisted cooldown for this key so a restart
   // doesn't resurrect a stale exhaustion.
   const db = getDb();
-  db.prepare('DELETE FROM rate_limit_cooldowns WHERE key_id = ?').run(keyId);
+  db.prepare('DELETE FROM rate_limit_cooldowns WHERE key_id = ? AND model_id = ?').run(keyId, modelId);
 }
 
 /** Check whether a key is currently marked exhausted. */

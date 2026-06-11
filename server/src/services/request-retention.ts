@@ -3,6 +3,26 @@ import { getDb } from '../db/index.js';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RETENTION_DAYS = 90;
 const DEFAULT_MAX_ROWS = 100_000;
+const PRUNE_TIMER_MS = 10 * 60 * 1000; // 10 minutes
+
+let pruneTimer: ReturnType<typeof setInterval> | null = null;
+
+export function startRequestRetentionPruner(): void {
+  if (pruneTimer) return;
+  console.log('[Retention] Starting request analytics pruner (every 10m)');
+  pruneRequestAnalytics({ force: true });
+  pruneTimer = setInterval(() => {
+    pruneRequestAnalytics({ force: true });
+  }, PRUNE_TIMER_MS);
+}
+
+export function stopRequestRetentionPruner(): void {
+  if (pruneTimer) {
+    clearInterval(pruneTimer);
+    pruneTimer = null;
+  }
+}
+
 const PRUNE_INTERVAL_MS = 60_000;
 
 type RetentionDb = ReturnType<typeof getDb>;

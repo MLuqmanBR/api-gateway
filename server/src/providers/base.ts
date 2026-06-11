@@ -140,7 +140,10 @@ export abstract class BaseProvider {
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode(); // flush remaining buffered bytes
+          break;
+        }
 
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');

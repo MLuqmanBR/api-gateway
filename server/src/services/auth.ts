@@ -73,10 +73,16 @@ export function validateSession(token: string | undefined | null): SessionUser |
     db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
     return null;
   }
+  db.prepare('UPDATE sessions SET last_used = ? WHERE token_hash = ?').run(Date.now(), sha256(token));
   return { userId: row.user_id, email: row.email };
 }
-
 export function deleteSession(token: string | undefined | null): void {
   if (!token) return;
   getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+}
+
+export function pruneSessions(): void {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  getDb().prepare('DELETE FROM sessions WHERE last_used IS NOT NULL AND last_used < ?').run(cutoff);
+  console.log(`[Auth] Pruned sessions not used since ${new Date(cutoff).toISOString()}`);
 }

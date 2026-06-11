@@ -9,6 +9,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.resolve(__dirname, '../../data/api-gateway.db');
 
 let db: Database.Database;
+let _initialized = false;
+
 
 export function getDb(): Database.Database {
   if (!db) {
@@ -18,6 +20,11 @@ export function getDb(): Database.Database {
 }
 
 export function initDb(dbPath?: string): Database.Database {
+  // Guard only the singleton (no-arg) path so accidental double-init in
+  // production never opens a second WAL connection on the same file.
+  // Explicit paths (tests, import scripts) always create a fresh connection.
+  if (_initialized && dbPath === undefined) return db;
+  _initialized = true;
   const resolvedPath = dbPath ?? DB_PATH;
   const isMemory = resolvedPath === ':memory:';
 

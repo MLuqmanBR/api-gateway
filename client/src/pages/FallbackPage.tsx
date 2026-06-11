@@ -660,32 +660,47 @@ export default function FallbackPage() {
   const hasChanges = localEntries !== null || pendingModelEdits.size > 0 || pendingRetryLimit !== null
 
   async function handleSaveAll() {
+    // Snapshot pending state before any API call so we can roll back on failure.
+    const backupRetryLimit = pendingRetryLimit
+    const backupModelEdits = new Map(pendingModelEdits)
+    const backupLocalEntries = localEntries
     const saved: string[] = []
-    // Save retry limit
-    if (pendingRetryLimit !== null) {
-      await apiFetch('/api/fallback/retry-limit', { method: 'PUT', body: JSON.stringify({ limit: pendingRetryLimit }) })
-      queryClient.invalidateQueries({ queryKey: ['fallback', 'retry-limit'] })
-      setPendingRetryLimit(null)
-      saved.push('retry limit')
-    }
-    // Save model edits
-    if (pendingModelEdits.size > 0) {
-      for (const [id, body] of pendingModelEdits) {
-        await apiFetch(`/api/custom-models/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
+
+    try {
+      // Save retry limit
+      if (pendingRetryLimit !== null) {
+        await apiFetch('/api/fallback/retry-limit', { method: 'PUT', body: JSON.stringify({ limit: pendingRetryLimit }) })
+        saved.push('retry limit')
       }
+      // Save model edits
+      if (pendingModelEdits.size > 0) {
+        for (const [id, body] of pendingModelEdits) {
+          await apiFetch(`/api/custom-models/${id}`, { method: 'PATCH', body: JSON.stringify(body) })
+        }
+        saved.push(`${pendingModelEdits.size} model edit(s)`)
+      }
+      // Save sort order
+      if (localEntries !== null) {
+        await saveMutation.mutateAsync(allEntries.map(e => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled })))
+        saved.push('sort order')
+      }
+
+      // All API calls succeeded — clear pending state and invalidate caches.
+      setPendingRetryLimit(null)
       setPendingModelEdits(new Map())
-      queryClient.invalidateQueries({ queryKey: ['fallback'] })
-      queryClient.invalidateQueries({ queryKey: ['models'] })
-      saved.push(`${pendingModelEdits.size} model edit(s)`)
-    }
-    // Save sort order
-    if (localEntries !== null) {
-      await saveMutation.mutateAsync(allEntries.map(e => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled })))
       setLocalEntries(null)
-      saved.push('sort order')
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'retry-limit'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+    } catch (err) {
+      // Partial failure — restore pending state so edits are not silently lost.
+      setPendingRetryLimit(backupRetryLimit)
+      setPendingModelEdits(backupModelEdits)
+      setLocalEntries(backupLocalEntries)
+      throw err
     }
-    
-    queryClient.invalidateQueries({ queryKey: ['fallback'] })
+
     return saved
   }
 

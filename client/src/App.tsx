@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { AuthGate } from '@/components/auth-gate'
+import { ErrorBoundary } from '@/components/error-boundary'
 
 const KeysPage = lazy(() => import('@/pages/KeysPage'))
 const PlaygroundPage = lazy(() => import('@/pages/PlaygroundPage'))
@@ -200,18 +201,20 @@ function App() {
             <Navbar />
             <main className="max-w-6xl mx-auto px-6 py-8">
               <Suspense fallback={<PageLoader />}>
-                <Routes>
-                  <Route path="/" element={<Navigate to="/models/chat" replace />} />
-                  <Route path="/models" element={<Navigate to="/models/chat" replace />} />
-                  <Route path="/models/chat" element={<FallbackPage />} />
-                  <Route path="/models/embeddings" element={<EmbeddingsPage />} />
-                  <Route path="/playground" element={<PlaygroundPage />} />
-                  <Route path="/keys" element={<KeysPage />} />
-                  <Route path="/fallback" element={<Navigate to="/models/chat" replace />} />
-                  <Route path="/analytics" element={<AnalyticsPage />} />
-                  <Route path="/test" element={<Navigate to="/playground" replace />} />
-                  <Route path="/health" element={<Navigate to="/keys" replace />} />
-                </Routes>
+                <ErrorBoundary>
+                  <Routes>
+                    <Route path="/" element={<Navigate to="/models/chat" replace />} />
+                    <Route path="/models" element={<Navigate to="/models/chat" replace />} />
+                    <Route path="/models/chat" element={<FallbackPage />} />
+                    <Route path="/models/embeddings" element={<EmbeddingsPage />} />
+                    <Route path="/playground" element={<PlaygroundPage />} />
+                    <Route path="/keys" element={<KeysPage />} />
+                    <Route path="/fallback" element={<Navigate to="/models/chat" replace />} />
+                    <Route path="/analytics" element={<AnalyticsPage />} />
+                    <Route path="/test" element={<Navigate to="/playground" replace />} />
+                    <Route path="/health" element={<Navigate to="/keys" replace />} />
+                  </Routes>
+                </ErrorBoundary>
               </Suspense>
             </main>
           </div>

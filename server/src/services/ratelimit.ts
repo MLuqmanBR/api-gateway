@@ -33,7 +33,8 @@ const DAY = 24 * 60 * MINUTE;
 function withDb<T>(fn: (db: RateLimitDb) => T): T | undefined {
   try {
     return fn(getDb());
-  } catch {
+  } catch (err) {
+    console.error('[RateLimit] DB write failed:', err);
     return undefined;
   }
 }

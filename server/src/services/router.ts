@@ -528,7 +528,15 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
     ).all(entry.platform) as KeyRow[];
 
-    if (keys.length === 0) continue;
+    if (keys.length === 0) {
+      if (pinMode && preferredModelDbId && entry.model_db_id === preferredModelDbId) {
+        const pinErr = new Error('Pinned model exhausted — all keys for the requested model are rate-limited or on cooldown.') as any;
+        pinErr.code = 'PINNED_MODEL_EXHAUSTED';
+        pinErr.status = 429;
+        throw pinErr;
+      }
+      continue;
+    }
 
     // Get limits once for this model
     const limits = {
@@ -561,6 +569,12 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         }
       }
       exhausted.sort((a, b) => a.exhaustedAt - b.exhaustedAt);
+      // Shuffle unexhausted keys so every recovery cycle doesn't bias toward
+      // the same key via DB insertion order.
+      for (let i = unexhausted.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [unexhausted[i], unexhausted[j]] = [unexhausted[j], unexhausted[i]];
+      }
       keyOrder = [...unexhausted, ...exhausted.map(e => e.row)];
     } else {
       keyOrder = keys;
@@ -593,14 +607,6 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) continue;
       }
 
-      let decryptedKey: string;
-      try {
-        decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
-      } catch {
-        db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
-          .run(key.id);
-        continue;
-      }
 
       // provider was already resolved above; if it came back undefined (e.g.
       // a custom provider row was deleted), we already continued.
@@ -617,6 +623,15 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       ).get(entry.platform) as { max_parallel_requests: number | null } | undefined;
       const maxPar = cp?.max_parallel_requests ?? null;
       if (!tryReserveSlot(entry.platform, maxPar)) continue; // at capacity, try next model
+      let decryptedKey: string;
+      try {
+        decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
+      } catch {
+        db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
+          .run(key.id);
+        releaseSlot(entry.platform);
+        continue;
+      }
 
       // Build the release function so callers can decrement the slot.
       const release = () => releaseSlot(entry.platform);
@@ -638,7 +653,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // If we reach here, this specific model has NO available keys.
     // Update round-robin index even if we failed so we don't get stuck.
     if (!oneRPM) {
-      roundRobinIndex.set(rrKey, idx);
+      roundRobinIndex.set(rrKey, (idx + 1) % keys.length);
     }
 
     // In pin mode, don't fall through to the next model.
