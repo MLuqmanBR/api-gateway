@@ -208,17 +208,18 @@ export function getProvider(platform: Platform): BaseProvider | undefined {
 export function buildProviderFor(platformSlug: string): BaseProvider | undefined {
   const builtin = getProvider(platformSlug as Platform);
   if (builtin) return builtin;
-  // Custom slug: look up its base URL. We don't memoize across requests —
-  // OpenAICompatProvider holds no per-instance state worth reusing, and the
-  // DB hit is one indexed lookup.
+  // Custom slug: look up its base URL and keyless flag. We don't memoize
+  // across requests — OpenAICompatProvider holds no per-instance state worth
+  // reusing, and the DB hit is one indexed lookup.
   const db = getDb();
-  const row = db.prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get(platformSlug) as { base_url: string } | undefined;
+  const row = db.prepare('SELECT base_url, keyless FROM custom_providers WHERE slug = ?').get(platformSlug) as { base_url: string; keyless: number } | undefined;
   if (!row?.base_url) return undefined;
   return new OpenAICompatProvider({
     platform: platformSlug as Platform,
     name: platformSlug,
     baseUrl: row.base_url,
     timeoutMs: CUSTOM_PROVIDER_TIMEOUT_MS,
+    keyless: row.keyless === 1,
   });
 }
 

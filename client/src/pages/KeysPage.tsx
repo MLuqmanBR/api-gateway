@@ -672,12 +672,12 @@ function CustomModelsSection() {
       </form>
       {/* List existing custom models with archive buttons */}
       {models.filter(m => activeCustom.some(cp => cp.slug === m.platform)).length > 0 && (
-        <div className="mt-3 rounded-2xl border divide-y bg-card overflow-hidden">
+        <div className="mt-3 rounded-2xl border divide-y bg-card overflow-hidden max-h-64 overflow-y-auto">
           {models
             .filter(m => activeCustom.some(cp => cp.slug === m.platform))
             .map(m => (
               <div key={m.id} className="flex items-center gap-2 px-4 py-2 hover:bg-muted/40 transition-colors">
-                <code className="text-xs font-mono">{m.platform}/{m.modelId}</code>
+                <code className="text-xs font-mono">{m.modelId}</code>
                 <span className="text-xs text-muted-foreground">{m.displayName}</span>
                 <span className={`ml-auto text-[11px] ${m.enabled ? 'text-emerald-600' : 'text-muted-foreground'}`}>
                   {m.enabled ? 'active' : 'archived'}

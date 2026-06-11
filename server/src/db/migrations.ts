@@ -3,50 +3,62 @@ import Database from 'better-sqlite3';
 import { initEncryptionKey } from '../lib/crypto.js';
 import { applyModelPricing } from './model-pricing.js';
 
+// Bump this when adding a new data migration. Schema-level changes (column
+// additions, indexes, FKs) that use "IF NOT EXISTS" should stay unconditional.
+const CURRENT_DATA_VERSION = 1;
+
 export function migrateDbSchema(db: Database.Database) {
+  // Schema-level changes run every boot — they're idempotent (IF NOT EXISTS).
   createTables(db);
   initEncryptionKey(db);
-  seedModels(db);
-  migrateModels(db);
-  migrateModelsV2(db);
-  migrateModelsV3Ranks(db);
-  migrateModelsV4(db);
-  migrateModelsV5(db);
-  migrateModelsV6(db);
-  migrateModelsV7(db);
-  migrateModelsV8(db);
-  migrateModelsV9(db);
-  migrateModelsV10(db);
-  migrateModelsV11(db);
-  migrateModelsV12(db);
-  migrateModelsV13(db);
-  migrateModelsV14(db);
-  migrateModelsV15(db);
-  migrateModelsV16Vision(db);
-  migrateModelsV17IntelligenceTiers(db);
-  migrateModelsV18OpenCodeZen(db);
-  migrateModelsV19Gemma4(db);
-  migrateModelsV20KiloFree(db);
-  migrateModelsV21PruneDead(db);
-  migrateModelsV22Tools(db);
-  migrateModelsV23FreeTierAudit(db);
-  migrateModelsV24ZenRefresh(db);
-  migrateModelsV25ZenDeadPromos(db);
-  migrateModelsV26MaxOutputTokens(db);
-  migrateCustomProvidersV27UserProviders(db);
-  // V25 is the LAST model-data migration shipped as code. Since June 2026,
-  // model/limit DATA is maintained in the published catalog and reaches
-  // installs via catalog-sync. The call below is schema/code-level only.
-  // After all model migrations: add/refresh paid-equivalent pricing
-  // (drives the realistic "Est. savings" analytics stat).
-  applyModelPricing(db);
-  migrateEmbeddingsV1(db);
-  migrateCustomProvidersV24(db);
-  migrateQuirksV1(db);
   ensureUnifiedKey(db);
   migrateSchemaV28IndexesAndFK(db);
   migrateSchemaV29ArchiveProviders(db);
   migrateSchemaV30KeylessProviders(db);
+  migrateEmbeddingsV1(db);
+  migrateCustomProvidersV24(db);
+
+  // Data migrations run exactly once per database, guarded by user_version.
+  const version = db.pragma('user_version', { simple: true }) as number;
+  if (version < CURRENT_DATA_VERSION) {
+    const apply = db.transaction(() => {
+      seedModels(db);
+      migrateModels(db);
+      migrateModelsV2(db);
+      migrateModelsV3Ranks(db);
+      migrateModelsV4(db);
+      migrateModelsV5(db);
+      migrateModelsV6(db);
+      migrateModelsV7(db);
+      migrateModelsV8(db);
+      migrateModelsV9(db);
+      migrateModelsV10(db);
+      migrateModelsV11(db);
+      migrateModelsV12(db);
+      migrateModelsV13(db);
+      migrateModelsV14(db);
+      migrateModelsV15(db);
+      migrateModelsV16Vision(db);
+      migrateModelsV17IntelligenceTiers(db);
+      migrateModelsV18OpenCodeZen(db);
+      migrateModelsV19Gemma4(db);
+      migrateModelsV20KiloFree(db);
+      migrateModelsV21PruneDead(db);
+      migrateModelsV22Tools(db);
+      migrateModelsV23FreeTierAudit(db);
+      migrateModelsV24ZenRefresh(db);
+      migrateModelsV25ZenDeadPromos(db);
+      migrateModelsV26MaxOutputTokens(db);
+      migrateCustomProvidersV27UserProviders(db);
+      db.pragma(`user_version = ${CURRENT_DATA_VERSION}`);
+    });
+    apply();
+  }
+
+  // Non-destructive refreshes that should run every boot (updates, not resets).
+  // Must run AFTER data migrations so the model rows exist on first boot.
+  applyModelPricing(db);
+  migrateQuirksV1(db);
 }
 
 function createTables(db: Database.Database) {

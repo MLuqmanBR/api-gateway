@@ -75,6 +75,7 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.context_window, m.max_output_tokens, m.supports_vision, m.supports_tools
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
+    WHERE m.enabled = 1
     ORDER BY fc.priority ASC
   `).all() as any[];
 
