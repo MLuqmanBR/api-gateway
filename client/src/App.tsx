@@ -38,6 +38,23 @@ function getPreferredDarkMode() {
   return stored === 'dark' || (!stored && window.matchMedia('(prefers-color-scheme: dark)').matches)
 }
 
+function NavItem({ to, children }: { to: string; children: React.ReactNode }) {
+  return (
+    <NavLink
+      to={to}
+      className={({ isActive }) =>
+        `relative text-sm px-1 py-4 transition-colors ${
+          isActive
+            ? 'text-foreground after:absolute after:inset-x-0 after:-bottom-px after:h-px after:bg-foreground'
+            : 'text-muted-foreground hover:text-foreground'
+        }`
+      }
+    >
+      {children}
+    </NavLink>
+  )
+}
+
 function useDarkMode() {
   const [dark, setDark] = useState(getPreferredDarkMode)
 
@@ -56,47 +73,6 @@ function useDarkMode() {
   return { dark, toggle }
 }
 
-// True when the dashboard runs inside the desktop shell (Electron preload
-// sets this). The sidebar then doubles as the window title bar: draggable,
-// padded for the macOS traffic lights, and the page background is glass.
-// Set by the desktop app's preload script (desktop/src/preload.ts).
-interface ApiGatewayWindow { __API_GATEWAY_DESKTOP__?: boolean }
-const isDesktopApp = typeof window !== 'undefined'
-  && (window as ApiGatewayWindow).__API_GATEWAY_DESKTOP__ === true
-
-// The preload's own early classList.add can be lost (it may run before this
-// document exists), so the client claims the class itself at module load —
-// before the first React paint — keeping html.desktop CSS (transparent body,
-// glass backdrop) reliable.
-if (isDesktopApp) {
-  document.documentElement.classList.add('desktop')
-}
-
-function PageLoader() {
-  return (
-    <div className="flex items-center justify-center h-64">
-      <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-    </div>
-  )
-}
-
-function NavItem({ to, children }: { to: string; children: React.ReactNode }) {
-  return (
-    <NavLink
-      to={to}
-      className={({ isActive }) =>
-        `relative text-sm px-1 py-4 transition-colors ${
-          isActive
-            ? 'text-primary after:absolute after:inset-x-0 after:-bottom-px after:h-px after:bg-primary'
-            : 'text-muted-foreground hover:text-foreground'
-        }`
-      }
-    >
-      {children}
-    </NavLink>
-  )
-}
-
 function DarkModeToggle({ dark, onToggle }: { dark: boolean; onToggle: () => void }) {
   return (
     <Button
@@ -113,9 +89,34 @@ function DarkModeToggle({ dark, onToggle }: { dark: boolean; onToggle: () => voi
 function Brand() {
   return (
     <Link to="/" className="flex items-center gap-2 transition-opacity hover:opacity-70">
-      <span className="inline-block size-2 rounded-full bg-primary" />
+      <span className="inline-block size-2 rounded-full bg-foreground" />
       <span className="font-semibold tracking-tight text-sm">API-Gateway</span>
     </Link>
+  )
+}
+
+// True when the dashboard runs inside the desktop shell (Electron preload
+// sets this). The navbar then doubles as the window title bar: draggable,
+// padded for the macOS traffic lights, and the page background is glass.
+// Set by the desktop app's preload script (desktop/src/preload.ts).
+interface ApiGatewayWindow { __API_GATEWAY_DESKTOP__?: boolean }
+const isDesktopApp = typeof window !== 'undefined'
+  && (window as ApiGatewayWindow).__API_GATEWAY_DESKTOP__ === true
+
+// The preload's own early classList.add can be lost (it may run before this
+// document exists), so the client claims the class itself at module load —
+// before the first React paint — keeping html.desktop CSS (transparent body,
+// glass backdrop) reliable.
+if (isDesktopApp) {
+  document.documentElement.classList.add('desktop')
+}
+
+
+function PageLoader() {
+  return (
+    <div className="flex items-center justify-center h-64">
+      <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+    </div>
   )
 }
 
@@ -125,11 +126,13 @@ function Navbar() {
   const navigate = useNavigate()
 
   function isActiveRoute(to: string) {
-    return location.pathname.startsWith(to)
+    return location.pathname === to
   }
 
   return (
     <header
+      // In the desktop shell the body backdrop is already translucent glass;
+      // a lighter wash keeps the title bar from looking more solid than the page.
       className={`sticky top-0 z-40 border-b backdrop-blur ${isDesktopApp ? 'bg-background/45' : 'bg-background/80'}`}
       style={isDesktopApp ? ({ WebkitAppRegion: 'drag' } as React.CSSProperties) : undefined}
     >

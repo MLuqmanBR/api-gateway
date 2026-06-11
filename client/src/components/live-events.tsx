@@ -107,9 +107,9 @@ export function LiveEvents() {
   const clearLogs = () => setLines([]);
 
   return (
-    <div className="rounded-2xl border bg-card mb-6 overflow-hidden">
+    <div className="rounded-3xl border bg-card mb-6">
       {/* Header bar — always visible */}
-      <div className="flex items-center justify-between px-5 py-3">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b">
         <div className="flex items-center gap-3">
           <h3 className="text-sm font-medium">Live Feed</h3>
           {activeCount > 0 && (

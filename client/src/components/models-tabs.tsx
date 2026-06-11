@@ -6,8 +6,8 @@ import { NavLink } from 'react-router-dom'
 // cross-provider fallback) are different machines behind one roof.
 export function ModelsTabs() {
   const tab = (isActive: boolean) =>
-    `px-3.5 py-1.5 text-xs rounded-lg transition-colors ${
-      isActive ? 'bg-primary text-primary-foreground font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-muted'
+    `px-3 py-1.5 text-xs rounded-lg transition-colors ${
+      isActive ? 'bg-foreground text-background font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-muted'
     }`
   return (
     <div className="inline-flex gap-1 rounded-xl border p-1">

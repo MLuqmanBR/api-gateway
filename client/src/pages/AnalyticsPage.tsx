@@ -2,9 +2,10 @@ import { useState, useMemo } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  LineChart, Line,
+  LineChart, Line, Legend,
 } from 'recharts'
 import { apiFetch } from '@/lib/api'
+import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader } from '@/components/page-header'
 import { LiveEvents } from '@/components/live-events';
@@ -22,29 +23,30 @@ function formatTokens(n?: number): string {
 
 function Stat({ label, value, hint, className }: { label: string; value: string | number; hint?: string; className?: string }) {
   const card = (
-    <div className="rounded-2xl border bg-card px-5 py-4">
-      <p className="text-xs text-muted-foreground">{label}</p>
-      <p className={`text-2xl font-semibold tabular-nums mt-1 ${className ?? ''}`}>{value}</p>
+    <div className="rounded-3xl border bg-card px-4 py-3">
+      <p className="text-[11px] text-muted-foreground uppercase tracking-wider">{label}</p>
+      <p className={`text-xl font-semibold tabular-nums mt-1 ${className ?? ''}`}>{value}</p>
     </div>
   )
+  // Same portal tooltip as the routing strategy chips. Opens BELOW the card:
+  // the stats row sits right under the sticky navbar.
   return hint ? <HoverTooltip text={hint} side="bottom" className="block">{card}</HoverTooltip> : card
 }
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="rounded-2xl border bg-card">
-      <div className="px-5 py-3.5">
+    <div className="rounded-3xl border bg-card">
+      <div className="px-4 py-3 border-b">
         <h3 className="text-sm font-medium">{title}</h3>
       </div>
-      <div className="px-5 pb-5">{children}</div>
+      <div className="p-4">{children}</div>
     </div>
   )
 }
 
 const axisStyle = { fontSize: 11, fill: 'var(--muted-foreground)' } as const
 const gridStyle = 'var(--border)'
-const chartAccent = 'var(--chart-1)'
-const chartAccent2 = 'var(--chart-2)'
+const primaryFill = 'var(--foreground)'
 
 export default function AnalyticsPage() {
   const [range, setRange] = useState<TimeRange>('7d')
@@ -133,19 +135,16 @@ export default function AnalyticsPage() {
         title="Analytics"
         description="Request volume, latency, token usage, and failures."
         actions={
-          <div className="inline-flex items-center gap-0.5 rounded-xl border p-0.5">
+          <div className="flex gap-1 rounded-lg border p-0.5">
             {(['24h', '7d', '30d'] as TimeRange[]).map(r => (
-              <button
+              <Button
                 key={r}
+                variant={range === r ? 'secondary' : 'ghost'}
+                size="xs"
                 onClick={() => setRange(r)}
-                className={`px-3.5 py-1.5 text-xs rounded-lg transition-colors ${
-                  range === r
-                    ? 'bg-primary text-primary-foreground font-medium'
-                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
-                }`}
               >
                 {r}
-              </button>
+              </Button>
             ))}
           </div>
         }
@@ -153,10 +152,18 @@ export default function AnalyticsPage() {
       <div className="space-y-6">
         {/* Live routing feed — real-time visibility into proxy decisions */}
         <LiveEvents />
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+
+        {/* Summary stats */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <Stat label="Requests" value={summary?.totalRequests ?? 0} hint={requestsHint} />
           <Stat label="Success rate" value={`${summary?.successRate ?? 0}%`} />
           <Stat label="Input tokens" value={formatTokens(summary?.totalInputTokens)} />
+          <Stat label="Output tokens" value={formatTokens(summary?.totalOutputTokens)} />
+          <Stat label="Avg latency" value={`${summary?.avgLatencyMs ?? 0} ms`} />
+          {/* Priced per request at the served model's paid-API equivalent
+              rate (not a flat frontier-model rate) — see db/model-pricing.ts.
+              The value is a 30-day projection; the hover hint tells the whole
+              story (actual period amount + whether it was extrapolated). */}
           <Stat label="Est. savings" value={`$${savings30d.toFixed(2)}`} hint={savingsHint} />
         </div>
 
@@ -171,7 +178,7 @@ export default function AnalyticsPage() {
                   <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                   <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
-                  <Bar dataKey="requests" fill={chartAccent} radius={[3, 3, 0, 0]} />
+                  <Bar dataKey="requests" fill={primaryFill} radius={[3, 3, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             )}
@@ -186,7 +193,8 @@ export default function AnalyticsPage() {
                   <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
                   <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                   <YAxis unit="ms" tick={axisStyle} tickLine={false} axisLine={false} />
-                  <Bar dataKey="avgLatencyMs" name="Latency (ms)" fill={chartAccent2} radius={[3, 3, 0, 0]} />
+                  <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
+                  <Bar dataKey="avgLatencyMs" name="Latency (ms)" fill="var(--muted-foreground)" radius={[3, 3, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>
             )}
@@ -203,7 +211,8 @@ export default function AnalyticsPage() {
                     <XAxis dataKey="timestamp" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                     <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                     <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
-                    <Line type="monotone" dataKey="successCount" name="Success" stroke={chartAccent} strokeWidth={1.5} dot={false} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} iconType="line" />
+                    <Line type="monotone" dataKey="successCount" name="Success" stroke={primaryFill} strokeWidth={1.5} dot={false} />
                     <Line type="monotone" dataKey="failureCount" name="Failures" stroke="var(--destructive)" strokeWidth={1.5} dot={false} />
                   </LineChart>
                 </ResponsiveContainer>
@@ -216,7 +225,7 @@ export default function AnalyticsPage() {
               {byModel.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">No data yet</p>
               ) : (
-                <div className="max-h-[360px] overflow-y-auto -mx-5">
+                <div className="max-h-[360px] overflow-y-auto -mx-4">
                   <Table>
                     <TableHeader>
                       <TableRow>
@@ -272,7 +281,7 @@ export default function AnalyticsPage() {
             {errors.length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">No errors</p>
             ) : (
-              <div className="max-h-[240px] overflow-y-auto -mx-5">
+              <div className="max-h-[240px] overflow-y-auto -mx-4">
                 <Table>
                   <TableHeader>
                     <TableRow>
