@@ -57,8 +57,7 @@ export function LiveEvents() {
   const [expanded, setExpanded] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [lines, setLines] = useState<LogEntry[]>([]);
-  const [activeCount, setActiveCount] = useState(0);
-  const tailRef = useRef<HTMLDivElement>(null);
+  const logContainerRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef(new Set<string>());
 
   const addLine = useCallback((entry: LogEntry) => {
@@ -94,8 +93,11 @@ export function LiveEvents() {
 
 
   // Auto-scroll terminal to latest lines when enabled.
+  // Auto-scroll only the terminal container — never the page.
   useEffect(() => {
-    if (autoScroll) tailRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (autoScroll && logContainerRef.current) {
+      logContainerRef.current.scrollTop = logContainerRef.current.scrollHeight;
+    }
   }, [lines.length, autoScroll]);
 
   const clearLogs = () => setLines([]);
@@ -143,9 +145,9 @@ export function LiveEvents() {
           </Button>
         </div>
       </div>
-
       {/* Log area */}
       <div
+        ref={logContainerRef}
         className={`overflow-y-auto font-mono text-[11px] leading-relaxed bg-zinc-950 dark:bg-zinc-900 text-zinc-100 rounded-b-3xl transition-all duration-200 ${
           expanded ? 'max-h-[480px]' : 'max-h-[144px]'
         }`}
@@ -170,7 +172,6 @@ export function LiveEvents() {
                 {l.text}
               </div>
             ))}
-            <div ref={tailRef} />
           </div>
         )}
       </div>
