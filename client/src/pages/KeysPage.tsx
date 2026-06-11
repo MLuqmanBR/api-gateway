@@ -624,6 +624,7 @@ function CustomModelsSection() {
         {addModel.isError && (
           <p className="text-destructive text-xs">{(addModel.error as Error).message}</p>
         )}
+      </form>
       {models.filter(m => activeCustom.some(cp => cp.slug === m.platform)).length > 0 && (
         <div className="mt-3 rounded-2xl border divide-y bg-card overflow-hidden">
           {models
@@ -1016,6 +1017,7 @@ export default function KeysPage() {
         onClose={() => setAddOpen(false)}
         onCreated={() => setAddOpen(false)}
       />
+      {editingProvider && (
         <EditPlatformModal
           slug={editingProvider.slug}
           initial={{ displayName: editingProvider.displayName, baseUrl: editingProvider.baseUrl }}
