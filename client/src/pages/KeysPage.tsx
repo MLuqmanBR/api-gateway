@@ -704,7 +704,10 @@ export default function KeysPage() {
   const restoreProvider = useMutation({
     mutationFn: (slug: string) => {
       const cp = archivedCustom.find(c => c.slug === slug)
-      return apiFetch('/api/custom-providers', { method: 'POST', body: JSON.stringify({ slug, baseUrl: cp?.baseUrl || '' }) })
+      return apiFetch('/api/custom-providers', {
+        method: 'POST',
+        body: JSON.stringify({ slug, displayName: cp?.displayName || slug, baseUrl: cp?.baseUrl || '' }),
+      })
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
