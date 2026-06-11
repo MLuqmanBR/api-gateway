@@ -57,9 +57,9 @@ export function LiveEvents() {
   const [expanded, setExpanded] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [lines, setLines] = useState<LogEntry[]>([]);
+  const [activeCount, setActiveCount] = useState(0);
   const logContainerRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef(new Set<string>());
-
   const addLine = useCallback((entry: LogEntry) => {
     setLines(prev => {
       const next = [...prev, entry];
