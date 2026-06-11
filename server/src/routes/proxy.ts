@@ -1114,7 +1114,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           || msg.includes('empty completion')
           || msg.includes('stream ended unexpectedly')
           || msg.includes('stream stalled')
-          || msg.includes('unparseable inline tool-call dialect');
+          || msg.includes('unparseable inline tool-call dialect')
+          || msg.includes('api error 400');
 
         if (skipImmediately) {
           skipModels.add(route.modelDbId);

@@ -93,10 +93,12 @@ export function LiveEvents() {
 
 
   // Auto-scroll only the terminal container — never the page.
-  // rAF ensures scrollHeight reflects the newly-painted line before we read it.
+  // Double-fire: immediate set catches the common case; rAF catches
+  // late layout when content height is still settling after React commit.
   useEffect(() => {
     if (!autoScroll || !logContainerRef.current) return;
     const el = logContainerRef.current;
+    el.scrollTop = el.scrollHeight;
     requestAnimationFrame(() => {
       el.scrollTop = el.scrollHeight;
     });
