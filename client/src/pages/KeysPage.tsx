@@ -451,6 +451,13 @@ function CustomModelsSection() {
   const [intelligenceRank, setIntelligenceRank] = useState(50)
   const [speedRank, setSpeedRank] = useState(50)
   const [sizeLabel, setSizeLabel] = useState('Custom')
+  const deleteModel = useMutation({
+    mutationFn: (id: number) => apiFetch(`/api/custom-models/${id}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+    },
+  })
   const addModel = useMutation({
     mutationFn: (body: any) =>
       apiFetch(`/api/custom-providers/${body.providerSlug}/models`, {
@@ -613,7 +620,27 @@ function CustomModelsSection() {
           <p className="text-destructive text-xs">{(addModel.error as Error).message}</p>
         )}
       </form>
-    </section>
+      {/* List existing custom models with archive buttons */}
+      {models.filter(m => customProviders.some(cp => cp.slug === m.platform)).length > 0 && (
+        <div className="mt-3 rounded-2xl border divide-y bg-card overflow-hidden">
+          {models
+            .filter(m => customProviders.some(cp => cp.slug === m.platform))
+            .map(m => (
+              <div key={m.id} className="flex items-center gap-2 px-4 py-2 hover:bg-muted/40 transition-colors">
+                <code className="text-xs font-mono">{m.platform}/{m.modelId}</code>
+                <span className="text-xs text-muted-foreground">{m.displayName}</span>
+                <span className={`ml-auto text-[11px] ${m.enabled ? 'text-emerald-600' : 'text-muted-foreground'}`}>
+                  {m.enabled ? 'active' : 'archived'}
+                </span>
+                <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
+                  onClick={() => { if (confirm(`Archive model '${m.modelId}'? Re-add it to restore.`)) deleteModel.mutate(m.id) }}
+                  disabled={!m.enabled || deleteModel.isPending}>
+                  Archive
+                </Button>
+              </div>
+            ))}
+        </div>
+      )}
   )
 }
 
@@ -664,12 +691,18 @@ export default function KeysPage() {
       queryClient.invalidateQueries({ queryKey: ['health'] })
     },
   })
+  const deleteProvider = useMutation({
+    mutationFn: (slug: string) => apiFetch(`/api/custom-providers/${slug}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
+      queryClient.invalidateQueries({ queryKey: ['keys'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+      queryClient.invalidateQueries({ queryKey: ['health'] })
+    },
+  })
   const checkAll = useMutation({
     mutationFn: () => apiFetch('/api/health/check-all', { method: 'POST' }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['health'] }),
   })
   const checkKey = useMutation({
     mutationFn: (keyId: number) => apiFetch(`/api/health/check/${keyId}`, { method: 'POST' }),
@@ -869,9 +902,18 @@ export default function KeysPage() {
                       <h3 className="text-sm font-medium">{group.label}</h3>
                       <GetKeyLink url={group.url} />
                     </div>
-                    <span className="text-xs text-muted-foreground tabular-nums">
-                      {group.keys.length} key{group.keys.length === 1 ? '' : 's'}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs text-muted-foreground tabular-nums">
+                        {group.keys.length} key{group.keys.length === 1 ? '' : 's'}
+                      </span>
+                      {customProviders.some(cp => cp.slug === group.value) && (
+                        <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
+                          onClick={() => { if (confirm(`Archive provider '${group.label}' and all its models? This can be undone by re-adding.`)) deleteProvider.mutate(group.value) }}
+                          disabled={deleteProvider.isPending}>
+                          Archive
+                        </Button>
+                      )}
+                    </div>
                   </div>
                   <div className="rounded-2xl border divide-y bg-card overflow-hidden">
                     {group.keys.map(k => {
