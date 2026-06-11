@@ -152,12 +152,12 @@ export function LiveEvents() {
       {/* Log area */}
       <div
         ref={logContainerRef}
-        className={`overflow-y-auto font-mono text-[11px] leading-relaxed bg-zinc-950 dark:bg-zinc-900 text-zinc-100 rounded-b-3xl transition-all duration-200 ${
+        className={`overflow-y-auto font-mono text-[11px] leading-relaxed bg-muted text-muted-foreground rounded-b-3xl transition-all duration-200 ${
           expanded ? 'max-h-[480px]' : 'max-h-[144px]'
         }`}
       >
         {lines.length === 0 ? (
-          <div className="px-4 py-6 text-center text-zinc-500 text-xs">
+          <div className="px-4 py-6 text-center text-muted-foreground/50 text-xs">
             Waiting for requests… Open a new terminal and send a request to see live routing activity.
           </div>
         ) : (
@@ -166,13 +166,13 @@ export function LiveEvents() {
               <div
                 key={`${l.id}-${i}`}
                 className={`px-4 py-0.5 whitespace-pre-wrap break-all ${
-                  l.kind === 'error' ? 'text-rose-400 bg-rose-500/10'
-                  : l.kind === 'done' ? 'text-emerald-400'
-                  : l.kind === 'start' ? 'text-sky-400'
-                  : 'text-zinc-400'
+                  l.kind === 'error' ? 'text-rose-600 dark:text-rose-400 bg-rose-500/10'
+                  : l.kind === 'done' ? 'text-emerald-600 dark:text-emerald-400'
+                  : l.kind === 'start' ? 'text-sky-600 dark:text-sky-400'
+                  : 'text-muted-foreground'
                 }`}
               >
-                <span className="text-zinc-600 mr-2 select-none tabular-nums">{timeLabel(l.ts)}</span>
+                <span className="text-muted-foreground/50 mr-2 select-none tabular-nums">{timeLabel(l.ts)}</span>
                 {l.text}
               </div>
             ))}
