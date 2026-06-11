@@ -8,8 +8,9 @@ import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { PageHeader } from '@/components/page-header'
+import { LiveEvents } from '@/components/live-events';
 import { Tooltip as HoverTooltip } from '@/components/tooltip'
-import { formatSqliteUtcToLocalTime } from '@/lib/utils'
+import { formatSqliteUtcToLocalTime, formatIsoUtcToLocalChart } from '@/lib/utils'
 
 type TimeRange = '24h' | '7d' | '30d'
 
@@ -139,8 +140,10 @@ export default function AnalyticsPage() {
           </div>
         }
       />
-
       <div className="space-y-6">
+        {/* Live routing feed — real-time visibility into proxy decisions */}
+        <LiveEvents />
+
         {/* Summary stats */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <Stat label="Requests" value={summary?.totalRequests ?? 0} hint={requestsHint} />
@@ -196,7 +199,7 @@ export default function AnalyticsPage() {
                 <ResponsiveContainer width="100%" height={240}>
                   <LineChart data={timeline} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                    <XAxis dataKey="timestamp" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                    <XAxis dataKey="timestamp" tickFormatter={(v: string) => formatIsoUtcToLocalChart(v, range === '24h' ? 'hour' : 'day')} tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
                     <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                     <Tooltip contentStyle={{ backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 }} />
                     <Legend wrapperStyle={{ fontSize: 12 }} iconType="line" />

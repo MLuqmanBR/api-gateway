@@ -573,7 +573,10 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
       const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
 
-      if (skipKeys?.has(skipId)) continue;
+      // In recovery mode retry every exhausted key — skipKeys accumulation
+      // only gates normal-mode attempts to avoid re-hammering the same key
+      // within one request sweep.
+      if (!oneRPM && skipKeys?.has(skipId)) continue;
 
       // In 1 RPM mode, skip normal cooldown + rate-limit checks so exhausted
       // keys get a chance to recover.

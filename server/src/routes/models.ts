@@ -28,7 +28,7 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
   const result = models.map(m => ({
     id: m.id,
     platform: m.platform,
-    modelId: m.model_id,
+    modelId: `${m.platform}/${m.model_id}`,
     displayName: m.display_name,
     intelligenceRank: m.intelligence_rank,
     speedRank: m.speed_rank,

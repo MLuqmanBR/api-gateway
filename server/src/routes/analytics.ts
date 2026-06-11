@@ -170,8 +170,12 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
     ORDER BY timestamp ASC
   `).all(since) as any[];
 
+  // strftime emits UTC without zone marker. Append 'Z' so the client
+  // unambiguously parses as UTC and can format in the user's local timezone.
   res.json(rows.map(r => ({
-    timestamp: r.timestamp,
+    timestamp: interval === 'hour'
+      ? r.timestamp + 'Z'
+      : r.timestamp + 'T00:00:00Z',
     requests: r.requests,
     successCount: r.success_count,
     failureCount: r.failure_count,

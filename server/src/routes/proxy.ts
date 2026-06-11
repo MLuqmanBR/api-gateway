@@ -14,6 +14,7 @@ import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
+import { publish } from '../services/events.js';
 
 export const proxyRouter = Router();
 
@@ -129,25 +130,17 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
 
   const db = getDb();
   const models = db.prepare(`
-    SELECT platform, model_id, display_name, context_window
-    FROM (
-      SELECT platform, model_id, display_name, context_window, intelligence_rank, id,
-             ROW_NUMBER() OVER (
-               PARTITION BY model_id
-               ORDER BY intelligence_rank ASC, id ASC
-             ) AS rn
-      FROM models m
-      WHERE m.enabled = 1
-        AND EXISTS (
-          SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id AND fc.enabled = 1
-        )
-        AND EXISTS (
-          SELECT 1 FROM api_keys k
-          WHERE k.platform = m.platform
-            AND k.enabled = 1
-        )
-    )
-    WHERE rn = 1
+    SELECT platform, model_id, display_name, context_window, intelligence_rank, id
+    FROM models m
+    WHERE m.enabled = 1
+      AND EXISTS (
+        SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id AND fc.enabled = 1
+      )
+      AND EXISTS (
+        SELECT 1 FROM api_keys k
+        WHERE k.platform = m.platform
+          AND k.enabled = 1
+      )
     ORDER BY intelligence_rank ASC, id ASC
   `).all() as ModelListRow[];
 
@@ -163,7 +156,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         context_window: null,
       },
       ...models.map(m => ({
-        id: m.model_id,
+        id: `${m.platform}/${m.model_id}`,
         object: 'model',
         created: 0,
         owned_by: m.platform,
@@ -652,7 +645,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(messages, sessionIdHeader);
   } else if (requestedModel) {
     const db = getDb();
-    const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    // Parse platform/model_id format: the first '/' separates the platform
+    // from the provider-qualified model_id (e.g. nvidia/moonshotai/kimi-k2.6).
+    // Falls back to bare model_id lookup for backward compatibility.
+    const slashIdx = requestedModel.indexOf('/');
+    let enabled: { id: number } | undefined;
+    if (slashIdx > 0) {
+      const platform = requestedModel.slice(0, slashIdx);
+      const modelId = requestedModel.slice(slashIdx + 1);
+      enabled = db.prepare(
+        'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1'
+      ).get(platform, modelId) as { id: number } | undefined;
+    }
+    // Fallback: look up by model_id alone (backward compat for old clients).
+    if (!enabled) {
+      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+    }
     if (enabled) {
       preferredModel = enabled.id;
     } else {
@@ -674,8 +682,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // For analytics: the model id the client pinned, null when auto-routed
   // ('auto' or omitted). Logged with every request row so pinned vs auto
   // traffic and failover overrides are visible.
-  const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
-
+  const pinnedModelId: string | undefined = requestedModel && !isAutoModel(requestedModel) ? requestedModel : undefined;
+  const requestId = crypto.randomUUID();
+  publish({ type: 'request.start', id: requestId, model: pinnedModelId, stream: !!stream, at: Date.now() });
   // Retry loop: per-key 3-retry followed by model/key cycling.
   // In 1 RPM mode (after all keys/models are exhausted), retries are
   // throttled to 1 request/minute for the globally-configured number of
@@ -683,8 +692,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
   let lastError: any = null;
-
   const isPinned = !!(requestedModel && !isAutoModel(requestedModel));
+  let prevModelKey: string | undefined;
   let inOneRPMMode = false;
   let oneRPMCycles = 0;
   let lastRequestTime = 0;
@@ -693,9 +702,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   for (let totalAttempt = 0; ; totalAttempt++) {
     // ---- Exit: global retries exhausted (1 RPM mode only) ----
     if (inOneRPMMode && globalRetryMax > 0 && oneRPMCycles >= globalRetryMax) {
+      const msg = `All models rate-limited after ${oneRPMCycles} recovery cycle(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
+      publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
+      res.setHeader('X-Routed-Via', 'none');
+      res.setHeader('X-Recovery-Cycles', String(oneRPMCycles));
       res.status(429).json({
         error: {
-          message: `All models rate-limited after ${oneRPMCycles} recovery cycle(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`,
+          message: msg,
           type: 'rate_limit_error',
         },
       });
@@ -728,21 +741,38 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     } catch (err: any) {
       // Pinned model has no more keys — enter 1 RPM mode.
       if (err.code === 'PINNED_MODEL_EXHAUSTED') {
+        const firstEntry = !inOneRPMMode;
         inOneRPMMode = true;
         oneRPMCycles++;
-        lastRequestTime = 0; // allow immediate first attempt
+        // Clear skipKeys so exhausted keys become eligible for retry.
+        // In normal mode we accumulate skipKeys to avoid re-hammering the
+        // same key; in 1 RPM recovery every key gets a chance each cycle.
+        skipKeys.clear();
+        // First entry: try immediately. Subsequent: tiny pause so we don't
+        // burn CPU when routeRequest still throws (e.g. no keys configured).
+        if (!firstEntry) await new Promise(r => setTimeout(r, 1000));
+        lastRequestTime = 0;
+        publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: `Pinned model ${requestedModel} exhausted`, at: Date.now() });
         console.log(`[Proxy] Pinned model ${requestedModel} exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? `/${globalRetryMax}` : '/∞'})`);
         continue;
       }
       // All models exhausted — enter 1 RPM mode.
+      const firstEntry = !inOneRPMMode;
       inOneRPMMode = true;
       oneRPMCycles++;
+      skipKeys.clear();
+      if (!firstEntry) await new Promise(r => setTimeout(r, 1000));
       lastRequestTime = 0;
+      publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: 'All models exhausted', at: Date.now() });
       console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? `/${globalRetryMax}` : '/∞'})`);
       continue;
     }
 
     const modelKey = `${route.platform}:${route.modelId}`;
+    if (prevModelKey && prevModelKey !== modelKey && !isPinned) {
+      publish({ type: 'routing.model_switch', id: requestId, from: prevModelKey, to: modelKey, reason: 'auto-routing fallback', at: Date.now() });
+    }
+    prevModelKey = modelKey;
     let outboundMessages = messages;
     // Extra input tokens the injected handoff adds on this turn (0 when not
     // injected). Folded into the streaming success accounting, where token
@@ -963,6 +993,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           setStickyModel(messages, route.modelDbId, sessionIdHeader);
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: estimatedInputTokens + injectedHandoffTokens, out: totalOutputTokens }, at: Date.now() });
           clearExhausted(route.keyId);
           if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
           return;
@@ -1045,6 +1076,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
         }
         // Normalize array-shaped message.content to a string on the way out (#166).
+        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
         res.json(normalizeOutboundContent(result));
 
         logRequest(
@@ -1053,6 +1086,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           result.usage?.completion_tokens ?? 0,
           Date.now() - start, null, null, pinnedModelId,
         );
+        publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: result.usage?.prompt_tokens ?? 0, out: result.usage?.completion_tokens ?? 0 }, at: Date.now() });
         clearExhausted(route.keyId);
         if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
         return;
@@ -1080,6 +1114,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         if (!skipImmediately && keyAttempt < PER_KEY_RETRIES - 1) {
           // Transient limit: retry same key immediately.
           lastError = err;
+          publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
           console.log(`[Proxy] ${safeError.slice(0, 60)} from ${route.displayName}, retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
           continue keyRetry;
         }
@@ -1088,9 +1123,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         break keyRetry;
       } else {
         // Non-retryable error (auth, 4xx, etc.): don't retry.
+        const errorMsg = `Provider error (${route.displayName}): ${safeError}`;
+        publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
+        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
         res.status(502).json({
           error: {
-            message: `Provider error (${route.displayName}): ${safeError}`,
+            message: errorMsg,
             type: 'provider_error',
           },
         });
@@ -1122,6 +1161,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     }
     recordRateLimitHit(route.modelDbId);
     lastRequestTime = Date.now();
+    publish({ type: 'routing.key_exhausted', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, reason: sanitizeProviderErrorMessage(lastError?.message), at: Date.now() });
     console.log(`[Proxy] Key ${route.keyId} exhausted after ${PER_KEY_RETRIES} failures from ${route.displayName}`);
     // Continue outer loop → routeRequest picks next key.
   }

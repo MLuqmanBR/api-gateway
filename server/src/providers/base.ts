@@ -84,7 +84,7 @@ export abstract class BaseProvider {
   protected async fetchWithTimeout(
     url: string,
     init: RequestInit,
-    timeoutMs = 15000,
+    timeoutMs = 60000,
   ): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -117,7 +117,7 @@ export abstract class BaseProvider {
    */
   protected async *readSseStream(
     res: Response,
-    inactivityTimeoutMs = 90000,
+    inactivityTimeoutMs = 300000,
   ): AsyncGenerator<ChatCompletionChunk> {
     const reader = res.body?.getReader();
     if (!reader) throw new Error('No response body');
