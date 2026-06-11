@@ -33,6 +33,7 @@ const createProviderSchema = z.object({
 
 const updateProviderSchema = z.object({
   displayName: z.string().min(1).max(80).optional(),
+  slug: z.string().min(2).max(40).regex(SLUG_RE).optional(),
   baseUrl: z.string().url().optional(),
   rpmLimit: z.number().int().positive().nullable().optional(),
   rpdLimit: z.number().int().positive().nullable().optional(),
@@ -41,13 +42,10 @@ const updateProviderSchema = z.object({
   maxParallelRequests: z.number().int().min(1).nullable().optional(),
   keyless: z.boolean().optional(),
 }).refine(d => d.displayName !== undefined || d.baseUrl !== undefined
-  || d.tpmLimit !== undefined || d.tpdLimit !== undefined
-  || d.maxParallelRequests !== undefined, {
-  message: 'At least one field must be provided',
-});
-
-// Defaults for new custom models: moderate ranks, "Custom" size tier (sorts
-// below named tiers in the intelligence preset), no rate limits, supports
+  || d.slug !== undefined || d.tpmLimit !== undefined || d.tpdLimit !== undefined
+  || d.maxParallelRequests !== undefined || d.keyless !== undefined, {
+    message: `At least one of displayName, slug, baseUrl, or limit must be provided`,
+  });
 // tools by default (the most common case for OpenAI-compatible endpoints).
 const MODEL_DEFAULTS = {
   intelligenceRank: 50,
@@ -238,30 +236,44 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
       res.status(409).json({ error: { message: `provider with slug '${slug}' already exists` } });
       return;
     }
-    // Revive from archive — preserve keyless flag.
     if (existing.base_url !== baseUrl) {
-      res.status(409).json({ error: { message: `slug '${slug}' is archived with a different base_url — delete it first or choose a new slug` } });
+      // Same slug, different base_url — rename the archived provider to free
+      // up the slug, then create the new one as a fresh provider. The archived
+      // one keeps its data for analytics and can be restored later (with its
+      // renamed slug) or deleted through the Archived section.
+      const newSlug = `${slug}-archived-${Date.now()}`;
+      const tx = db.transaction(() => {
+        db.prepare('UPDATE custom_providers SET slug = ? WHERE slug = ?').run(newSlug, slug);
+        // Cascade the slug rename to api_keys and models so analytics stay
+        // connected to the archived provider.
+        db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, slug);
+        db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, slug);
+        db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, slug);
+      });
+      tx();
+      // Fall through to create new provider below.
+    } else {
+      // Same slug, same base_url — revive from archive.
+      const tx = db.transaction(() => {
+        db.prepare('UPDATE custom_providers SET archived = 0, display_name = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?, max_parallel_requests = ?, keyless = ? WHERE slug = ?')
+          .run(displayName.trim(), rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, slug);
+        db.prepare('UPDATE api_keys SET enabled = 1 WHERE platform = ?').run(slug);
+        db.prepare('UPDATE models SET enabled = 1 WHERE platform = ?').run(slug);
+      });
+      tx();
+
+      clearPlatformCaches(slug);
+      const sync = await syncModelsFromProvider(baseUrl, slug);
+      res.json({
+        id: existing.id, slug, displayName: displayName.trim(), baseUrl,
+        rpmLimit: rpmLimit ?? null, rpdLimit: rpdLimit ?? null,
+        tpmLimit: tpmLimit ?? null, tpdLimit: tpdLimit ?? null,
+        maxParallelRequests: maxParallelRequests ?? null,
+        keyless: !!keyless,
+        modelCount: sync.fetched, revived: true,
+      });
       return;
     }
-    const tx = db.transaction(() => {
-      db.prepare('UPDATE custom_providers SET archived = 0, display_name = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?, max_parallel_requests = ?, keyless = ? WHERE slug = ?')
-        .run(displayName.trim(), rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, slug);
-      db.prepare('UPDATE api_keys SET enabled = 1 WHERE platform = ?').run(slug);
-      db.prepare('UPDATE models SET enabled = 1 WHERE platform = ?').run(slug);
-    });
-    tx();
-
-    clearPlatformCaches(slug);
-    const sync = await syncModelsFromProvider(baseUrl, slug);
-    res.json({
-      id: existing.id, slug, displayName: displayName.trim(), baseUrl,
-      rpmLimit: rpmLimit ?? null, rpdLimit: rpdLimit ?? null,
-      tpmLimit: tpmLimit ?? null, tpdLimit: tpdLimit ?? null,
-      maxParallelRequests: maxParallelRequests ?? null,
-      keyless: !!keyless,
-      modelCount: sync.fetched, revived: true,
-    });
-    return;
   }
 
   const result = db.prepare(`
@@ -289,7 +301,7 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
 
 // Edit display name or base URL.
 customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) => {
-  const slug = req.params.slug as string;
+  let slug = req.params.slug as string;
   if (!SLUG_RE.test(slug)) {
     res.status(400).json({ error: { message: 'invalid slug' } });
     return;
@@ -347,6 +359,28 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     values.push(parsed.data.keyless ? 1 : 0);
   }
 
+  if (parsed.data.slug !== undefined) {
+    const newSlug = parsed.data.slug;
+    if (newSlug !== slug) {
+      // Check for conflict with an existing non-archived provider.
+      const conflict = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ? AND archived = 0').get(newSlug);
+      if (conflict) {
+        res.status(409).json({ error: { message: `slug '${newSlug}' is already in use by an active provider` } });
+        return;
+      }
+      // Cascade the slug change to all dependent tables.
+      const tx = db.transaction(() => {
+        updates.push('slug = ?');
+        values.push(newSlug);
+        db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, slug);
+        db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, slug);
+        db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, slug);
+      });
+      tx();
+      slug = newSlug;
+    }
+  }
+
   if (updates.length === 0) {
     res.json({ success: true, slug });
     return;
@@ -357,7 +391,6 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
 
   res.json({ success: true, slug });
 });
-// Archive a provider. Disables models and keys, removes from fallback chain.
 // Analytics retains historical request data. Re-adding the same slug+bare_url
 // revives the provider from the archive.
 customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response) => {

@@ -355,21 +355,30 @@ function AddPlatformModal({
 
 function EditPlatformModal({
   slug,
-  initial,
+  provider,
   onClose,
   onSaved,
 }: {
   slug: string
-  initial: { displayName: string; baseUrl: string }
+  provider: CustomProvider
   onClose: () => void
   onSaved: () => void
 }) {
   const queryClient = useQueryClient()
-  const [displayName, setDisplayName] = useState(initial.displayName)
-  const [baseUrl, setBaseUrl] = useState(initial.baseUrl)
+  const [newSlug, setNewSlug] = useState(slug)
+  const [displayName, setDisplayName] = useState(provider.displayName)
+  const [baseUrl, setBaseUrl] = useState(provider.baseUrl)
+  const [rpmLimit, setRpmLimit] = useState(provider.rpmLimit?.toString() ?? '')
+  const [rpdLimit, setRpdLimit] = useState(provider.rpdLimit?.toString() ?? '')
+  const [tpmLimit, setTpmLimit] = useState(provider.tpmLimit?.toString() ?? '')
+  const [tpdLimit, setTpdLimit] = useState(provider.tpdLimit?.toString() ?? '')
+  const [parallelEnabled, setParallelEnabled] = useState(provider.maxParallelRequests != null)
+  const [maxParallelRequests, setMaxParallelRequests] = useState(provider.maxParallelRequests ?? 4)
+  const [keyless, setKeyless] = useState(provider.keyless)
+  const [showAdvanced, setShowAdvanced] = useState(false)
 
   const save = useMutation({
-    mutationFn: (body: { displayName?: string; baseUrl?: string }) =>
+    mutationFn: (body: Record<string, unknown>) =>
       apiFetch(`/api/custom-providers/${slug}`, { method: 'PATCH', body: JSON.stringify(body) }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
@@ -398,10 +407,26 @@ function EditPlatformModal({
         <form
           onSubmit={e => {
             e.preventDefault()
-            save.mutate({ displayName: displayName.trim(), baseUrl: baseUrl.trim() })
+            const body: Record<string, unknown> = {}
+            if (newSlug.trim() !== slug) body.slug = newSlug.trim()
+            if (displayName.trim() !== provider.displayName) body.displayName = displayName.trim()
+            if (baseUrl.trim() !== provider.baseUrl) body.baseUrl = baseUrl.trim()
+            if (rpmLimit !== (provider.rpmLimit?.toString() ?? '')) body.rpmLimit = rpmLimit ? parseInt(rpmLimit, 10) : null
+            if (rpdLimit !== (provider.rpdLimit?.toString() ?? '')) body.rpdLimit = rpdLimit ? parseInt(rpdLimit, 10) : null
+            if (tpmLimit !== (provider.tpmLimit?.toString() ?? '')) body.tpmLimit = tpmLimit ? parseInt(tpmLimit, 10) : null
+            if (tpdLimit !== (provider.tpdLimit?.toString() ?? '')) body.tpdLimit = tpdLimit ? parseInt(tpdLimit, 10) : null
+            const newMax = parallelEnabled ? maxParallelRequests : null
+            if (newMax !== provider.maxParallelRequests) body.maxParallelRequests = newMax
+            if (keyless !== provider.keyless) body.keyless = keyless
+            if (Object.keys(body).length === 0) { onClose(); return }
+            save.mutate(body)
           }}
           className="space-y-3"
         >
+          <div className="space-y-1.5">
+            <Label className="text-xs">Slug</Label>
+            <Input value={newSlug} onChange={e => setNewSlug(e.target.value)} className="font-mono text-xs" />
+          </div>
           <div className="space-y-1.5">
             <Label className="text-xs">Display name</Label>
             <Input value={displayName} onChange={e => setDisplayName(e.target.value)} />
@@ -410,21 +435,40 @@ function EditPlatformModal({
             <Label className="text-xs">Base URL</Label>
             <Input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} className="font-mono text-xs" />
           </div>
-          {save.isError && (
-            <p className="text-destructive text-xs">{(save.error as Error).message}</p>
+          <button type="button" onClick={() => setShowAdvanced(s => !s)} className="text-xs text-muted-foreground hover:text-foreground">
+            {showAdvanced ? '▾' : '▸'} Advanced
+          </button>
+          {showAdvanced && (
+            <>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5"><Label className="text-xs">RPM limit</Label><Input type="number" min={0} value={rpmLimit} onChange={e => setRpmLimit(e.target.value)} className="font-mono text-xs" /></div>
+                <div className="space-y-1.5"><Label className="text-xs">RPD limit</Label><Input type="number" min={0} value={rpdLimit} onChange={e => setRpdLimit(e.target.value)} className="font-mono text-xs" /></div>
+                <div className="space-y-1.5"><Label className="text-xs">TPM limit</Label><Input type="number" min={0} value={tpmLimit} onChange={e => setTpmLimit(e.target.value)} className="font-mono text-xs" /></div>
+                <div className="space-y-1.5"><Label className="text-xs">TPD limit</Label><Input type="number" min={0} value={tpdLimit} onChange={e => setTpdLimit(e.target.value)} className="font-mono text-xs" /></div>
+              </div>
+              <div className="border-t pt-3 mt-1">
+                <Label className="text-xs">Parallel requests</Label>
+                <div className="flex items-center gap-3 mt-1">
+                  <label className="flex items-center gap-1.5 cursor-pointer text-xs"><Switch checked={parallelEnabled} onCheckedChange={setParallelEnabled} />Limit</label>
+                  {parallelEnabled && <Input type="number" min={1} max={100} value={maxParallelRequests} onChange={e => setMaxParallelRequests(parseInt(e.target.value, 10) || 1)} className="font-mono text-xs w-20" />}
+                </div>
+              </div>
+              <div className="flex items-center gap-2 pt-1">
+                <Switch checked={keyless} onCheckedChange={setKeyless} />
+                <span className="text-xs text-muted-foreground">No API key required</span>
+              </div>
+            </>
           )}
+          {save.isError && <p className="text-destructive text-xs">{(save.error as Error).message}</p>}
           <div className="flex justify-end gap-2 pt-1">
             <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
-            <Button type="submit" size="sm" disabled={save.isPending}>
-              {save.isPending ? 'Saving…' : 'Save'}
-            </Button>
+            <Button type="submit" size="sm" disabled={save.isPending}>{save.isPending ? 'Saving…' : 'Save'}</Button>
           </div>
         </form>
       </div>
     </div>
   )
 }
-
 // Custom model registration form: adds a single model to any provider —
 // built-in or custom. Defaults are chosen so the user can submit with just
 // the model id and display name; the rest of the form's "advanced" fields
@@ -507,7 +551,7 @@ function CustomModelsSection() {
       label: p.label,
       sublabel: `${modelCountByPlatform.get(p.value) ?? 0} models`,
     })),
-    ...customProviders.map(cp => ({
+    ...customProviders.filter(cp => !cp.archived).map(cp => ({
       value: cp.slug,
       label: `${cp.displayName} (custom)`,
       sublabel: `${modelCountByPlatform.get(cp.slug) ?? 0} models`,
@@ -888,11 +932,10 @@ export default function KeysPage() {
                 <Input
                   value={label}
                   onChange={e => setLabel(e.target.value)}
-                  placeholder="optional"
-                  className="w-[160px]"
+                  placeholder="e.g. My production key"
                 />
-                <Button type="submit" size="sm" disabled={!platform || (!isKeyless && !apiKey) || (needsAccountId && !accountId) || addKey.isPending}>
-                  {addKey.isPending ? 'Adding…' : isKeyless ? 'Enable' : 'Add key'}
+                <Button type="submit" size="sm" disabled={addKey.isPending || (!isKeyless && (!platform || !apiKey))}>
+                  {isKeyless ? 'Enable' : addKey.isPending ? 'Adding…' : 'Add key'}
                 </Button>
               </div>
             </div>
@@ -933,11 +976,17 @@ export default function KeysPage() {
                         {group.keys.length} key{group.keys.length === 1 ? '' : 's'}
                       </span>
                       {customProviders.some(cp => cp.slug === group.value) && (
-                        <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
-                          onClick={() => { if (confirm(`Archive provider '${group.label}' and all its models? This can be undone by re-adding.`)) deleteProvider.mutate(group.value) }}
-                          disabled={deleteProvider.isPending}>
-                          Archive
-                        </Button>
+                        <>
+                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-foreground"
+                            onClick={() => setEditingProviderSlug(group.value)}>
+                            Edit
+                          </Button>
+                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
+                            onClick={() => { if (confirm(`Archive provider '${group.label}' and all its models? This can be undone by re-adding.`)) deleteProvider.mutate(group.value) }}
+                            disabled={deleteProvider.isPending}>
+                            Archive
+                          </Button>
+                        </>
                       )}
                     </div>
                   </div>
@@ -1025,8 +1074,8 @@ export default function KeysPage() {
       />
       {editingProvider && (
         <EditPlatformModal
-          slug={editingProvider.slug}
-          initial={{ displayName: editingProvider.displayName, baseUrl: editingProvider.baseUrl }}
+          slug={editingProviderSlug!}
+          provider={editingProvider}
           onClose={() => setEditingProviderSlug(null)}
           onSaved={() => setEditingProviderSlug(null)}
         />
