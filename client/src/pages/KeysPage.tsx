@@ -928,11 +928,12 @@ export default function KeysPage() {
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Label</Label>
-              <div className="flex flex-wrap items-center space-x-3">
+              <div className="flex items-center gap-2">
                 <Input
                   value={label}
                   onChange={e => setLabel(e.target.value)}
                   placeholder="e.g. My production key"
+                  className="w-[160px]"
                 />
                 <Button type="submit" size="sm" disabled={addKey.isPending || (!isKeyless && (!platform || !apiKey))}>
                   {isKeyless ? 'Enable' : addKey.isPending ? 'Adding…' : 'Add key'}
