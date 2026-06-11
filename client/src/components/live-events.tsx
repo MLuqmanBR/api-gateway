@@ -55,6 +55,7 @@ function timeLabel(ts: number): string {
 
 export function LiveEvents() {
   const [expanded, setExpanded] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(true);
   const [lines, setLines] = useState<LogEntry[]>([]);
   const [activeCount, setActiveCount] = useState(0);
   const tailRef = useRef<HTMLDivElement>(null);
@@ -92,8 +93,12 @@ export function LiveEvents() {
   }, [addLine]);
 
 
-  const clearLogs = () => setLines([]);
+  // Auto-scroll terminal to latest lines when enabled.
+  useEffect(() => {
+    if (autoScroll) tailRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [lines.length, autoScroll]);
 
+  const clearLogs = () => setLines([]);
 
   return (
     <div className="rounded-3xl border bg-card mb-6">
@@ -117,6 +122,19 @@ export function LiveEvents() {
           )}
         </div>
         <div className="flex items-center gap-1">
+          <Button
+            variant={autoScroll ? 'secondary' : 'ghost'}
+            size="xs"
+            onClick={() => setAutoScroll(v => !v)}
+            title={autoScroll ? 'Auto-scroll ON — click to pause' : 'Auto-scroll OFF — click to resume'}
+            className="gap-1.5"
+          >
+            <span className={`relative flex size-2 ${autoScroll ? '' : 'opacity-40'}`}>
+              <span className={`absolute inline-flex h-full w-full rounded-full ${autoScroll ? 'animate-ping bg-emerald-400 opacity-75' : 'bg-muted-foreground'}`} />
+              <span className={`relative inline-flex size-2 rounded-full ${autoScroll ? 'bg-emerald-500' : 'bg-muted-foreground'}`} />
+            </span>
+            Live
+          </Button>
           <Button variant="ghost" size="xs" onClick={clearLogs} title="Clear log">
             Clear
           </Button>
