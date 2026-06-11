@@ -3,7 +3,6 @@ import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { PageHeader } from '@/components/page-header'
 import { Markdown } from '@/components/markdown'
 
 interface FallbackEntry {
@@ -292,45 +291,47 @@ export default function PlaygroundPage() {
     : availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
 
   return (
-    <div className="flex flex-col h-[calc(100vh-8rem)]">
-      <PageHeader
-        title="Playground"
-        description="Send a chat completion through the router and see which provider serves it."
-        actions={
-          <>
-            <Select value={selectedModel} onValueChange={(v) => setSelectedModel(v ?? 'auto')}>
-              <SelectTrigger className="w-[260px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="auto">Auto (fallback chain)</SelectItem>
-                {availableModels.map(m => (
-                  <SelectItem key={m.modelDbId} value={m.modelId}>
-                    <span className="flex items-center gap-2">
-                      <span>{m.displayName}</span>
-                      <span className="text-xs text-muted-foreground">{m.platform}</span>
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            {messages.length > 0 && (
-              <Button variant="outline" size="sm" onClick={handleClear}>
-                Clear
-              </Button>
-            )}
-          </>
-        }
-      />
+    <div className="flex flex-col h-[calc(100vh-5rem)]">
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Playground</h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Send a chat completion through the router and see which provider serves it.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Select value={selectedModel} onValueChange={(v) => setSelectedModel(v ?? 'auto')}>
+            <SelectTrigger className="w-[240px]">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="auto">Auto (fallback chain)</SelectItem>
+              {availableModels.map(m => (
+                <SelectItem key={m.modelDbId} value={m.modelId}>
+                  <span className="flex items-center gap-2">
+                    <span>{m.displayName}</span>
+                    <span className="text-xs text-muted-foreground">{m.platform}</span>
+                  </span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          {messages.length > 0 && (
+            <Button variant="outline" size="sm" onClick={handleClear}>
+              Clear
+            </Button>
+          )}
+        </div>
+      </div>
 
-      <div className="flex-1 flex flex-col rounded-3xl border bg-card overflow-hidden min-h-0">
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
+      <div className="flex-1 flex flex-col rounded-2xl border bg-card overflow-hidden min-h-0">
+        <div className="flex-1 overflow-y-auto p-5 space-y-4">
           {messages.length === 0 ? (
             <div className="flex items-center justify-center h-full text-center">
               <div className="space-y-2 max-w-sm">
                 <p className="text-base font-medium">Send a message to get started.</p>
                 <p className="text-sm text-muted-foreground">
-                  Using <span className="text-foreground">{activeModelLabel}</span>. Switch models in the selector above.
+                  Using <span className="text-foreground font-medium">{activeModelLabel}</span>. Switch models in the selector above.
                 </p>
               </div>
             </div>
@@ -357,11 +358,11 @@ export default function PlaygroundPage() {
                     )}
                     {msg.meta && !msg.meta.streaming && (
                       <div className="flex items-center gap-2 mt-2 flex-wrap text-[11px] opacity-70 tabular-nums">
-                        {msg.meta.platform && <span>{msg.meta.platform}</span>}
-                        {msg.meta.model && <span className="font-mono">· {msg.meta.model}</span>}
-                        {msg.meta.latency != null && <span>· {msg.meta.latency} ms</span>}
+                        {msg.meta.platform && <span className="rounded-md bg-foreground/10 px-1.5 py-0.5">{msg.meta.platform}</span>}
+                        {msg.meta.model && <span className="font-mono">{msg.meta.model}</span>}
+                        {msg.meta.latency != null && <span>{msg.meta.latency} ms</span>}
                         {msg.meta.fallbackAttempts != null && msg.meta.fallbackAttempts > 0 && (
-                          <span>· {msg.meta.fallbackAttempts} fallback{msg.meta.fallbackAttempts > 1 ? 's' : ''}</span>
+                          <span>{msg.meta.fallbackAttempts} fallback{msg.meta.fallbackAttempts > 1 ? 's' : ''}</span>
                         )}
                       </div>
                     )}
@@ -372,9 +373,9 @@ export default function PlaygroundPage() {
                 <div className="flex justify-start">
                   <div className="bg-muted rounded-2xl px-4 py-3">
                     <div className="flex gap-1">
-                      <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '0ms' }} />
-                      <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '150ms' }} />
-                      <span className="size-1.5 rounded-full bg-muted-foreground/50 animate-bounce" style={{ animationDelay: '300ms' }} />
+                      <span className="size-1.5 rounded-full bg-primary/40 animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <span className="size-1.5 rounded-full bg-primary/40 animate-bounce" style={{ animationDelay: '150ms' }} />
+                      <span className="size-1.5 rounded-full bg-primary/40 animate-bounce" style={{ animationDelay: '300ms' }} />
                     </div>
                   </div>
                 </div>
@@ -393,7 +394,7 @@ export default function PlaygroundPage() {
               onKeyDown={handleKeyDown}
               placeholder="Type a message… (⏎ to send, ⇧⏎ for newline)"
               rows={1}
-              className="flex-1 resize-none rounded-lg border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50 min-h-[40px] max-h-[160px]"
+              className="flex-1 resize-none rounded-xl border bg-background px-3.5 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-primary/30 min-h-[44px] max-h-[160px]"
               style={{ height: 'auto', overflow: 'hidden' }}
               onInput={e => {
                 const el = e.target as HTMLTextAreaElement

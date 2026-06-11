@@ -112,16 +112,16 @@ function UnifiedKeySection() {
   }
 
   return (
-    <section className="rounded-3xl border bg-card p-5">
-      <div className="flex items-start justify-between gap-4 mb-3">
+    <section className="rounded-2xl border bg-card p-5">
+      <div className="flex items-start justify-between gap-4 mb-4">
         <div>
-          <h2 className="text-sm font-medium">Your unified API key</h2>
+          <h2 className="text-base font-medium">Your unified API key</h2>
           <p className="text-xs text-muted-foreground mt-0.5">
             Use this as your OpenAI <code className="font-mono">api_key</code>; it authenticates requests to this proxy.
           </p>
         </div>
         <Button
-          variant="ghost"
+          variant="outline"
           size="sm"
           onClick={() => regenerate.mutate()}
           disabled={regenerate.isPending || isError}
@@ -131,14 +131,14 @@ function UnifiedKeySection() {
       </div>
 
       {isError ? (
-        <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2.5 text-xs text-destructive">
+        <div className="rounded-xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-xs text-destructive">
           Can't reach the server on <code className="font-mono">{baseUrl.replace('/v1', '')}</code>. Make sure the
           backend is running. <code className="font-mono">npm run dev</code> starts both, and the server logs print
           under the <code className="font-mono">server</code> prefix.
         </div>
       ) : (
         <div className="flex items-center gap-2">
-          <code className="flex-1 font-mono text-xs bg-muted px-3 py-2 rounded-lg select-all truncate tabular-nums">
+          <code className="flex-1 font-mono text-xs bg-muted px-3.5 py-2.5 rounded-xl select-all truncate tabular-nums">
             {showKey ? apiKey : masked}
           </code>
           <Button variant="outline" size="sm" onClick={() => setShowKey(!showKey)}>
@@ -150,7 +150,7 @@ function UnifiedKeySection() {
         </div>
       )}
 
-      <div className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-xs">
+      <div className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-xs">
         <span className="text-muted-foreground">Base URL</span>
         <code className="font-mono">{baseUrl}</code>
         <span className="text-muted-foreground">Chat</span>
@@ -853,22 +853,24 @@ export default function KeysPage() {
     : null
   return (
     <div>
-      <PageHeader
-        title="Keys"
-        description="Provider credentials and the unified API key your apps connect with."
-        actions={
-          keys.length > 0 && (
-            <Button variant="outline" size="sm" onClick={() => checkAll.mutate()} disabled={checkAll.isPending}>
-              {checkAll.isPending ? 'Checking…' : 'Check all'}
-            </Button>
-          )
-        }
-      />
+      <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Keys</h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Provider credentials and the unified API key your apps connect with.
+          </p>
+        </div>
+        {keys.length > 0 && (
+          <Button variant="outline" size="sm" onClick={() => checkAll.mutate()} disabled={checkAll.isPending}>
+            {checkAll.isPending ? 'Checking…' : 'Check all'}
+          </Button>
+        )}
+      </div>
       <div className="space-y-8">
         <UnifiedKeySection />
         <section>
-          <h2 className="text-sm font-medium mb-3">Add a provider key</h2>
-          <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 rounded-3xl border p-4 bg-card">
+          <h2 className="text-base font-medium mb-3">Add a provider key</h2>
+          <form onSubmit={handleSubmit} className="flex flex-wrap gap-4 rounded-2xl border p-5 bg-card">
             <div className="space-y-1.5">
               <Label className="text-xs">Platform</Label>
               <Select value={platform} onValueChange={val => {
@@ -947,11 +949,11 @@ export default function KeysPage() {
         </section>
         <CustomModelsSection />
         <section>
-          <h2 className="text-sm font-medium mb-3">Configured keys</h2>
+          <h2 className="text-base font-medium mb-3">Configured keys</h2>
           {isLoading ? (
             <p className="text-sm text-muted-foreground">Loading…</p>
           ) : grouped.length === 0 ? (
-            <div className="rounded-3xl border border-dashed p-8 text-center">
+            <div className="rounded-2xl border border-dashed p-8 text-center">
               <p className="text-sm text-muted-foreground">
                 No provider keys yet. Add one above to start routing.
               </p>
@@ -1046,7 +1048,7 @@ export default function KeysPage() {
         </section>
         {archivedCustom.length > 0 && (
           <section>
-            <h2 className="text-sm font-medium mb-2 text-muted-foreground">Archived providers</h2>
+            <h2 className="text-base font-medium mb-2 text-muted-foreground">Archived providers</h2>
             <div className="rounded-2xl border divide-y bg-card overflow-hidden">
               {archivedCustom.map(cp => (
                 <div key={cp.slug} className="flex items-center gap-3 px-4 py-3">

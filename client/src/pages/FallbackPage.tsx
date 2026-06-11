@@ -17,14 +17,13 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { ChevronDown, SlidersHorizontal, Pencil } from 'lucide-react'
+import { ChevronDown, SlidersHorizontal, Pencil, GripVertical } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
-import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
 import { Tooltip } from '@/components/tooltip'
@@ -549,14 +548,10 @@ function SortableRow({ row, rank, onToggle, onEdit }: { row: Row; rank: number; 
     <button
       {...attributes}
       {...listeners}
-      className="cursor-grab active:cursor-grabbing text-muted-foreground/50 hover:text-foreground transition-colors"
+      className="cursor-grab active:cursor-grabbing text-muted-foreground/60 hover:text-primary transition-colors"
       aria-label="Drag to reorder"
     >
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-        <circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
-        <circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
-        <circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
-      </svg>
+      <GripVertical className="size-4" />
     </button>
   )
   return (
@@ -714,51 +709,54 @@ export default function FallbackPage() {
 
   const tableHead = (
     <thead>
-      <tr className="text-left text-muted-foreground border-b">
-        <th className="py-2 pl-3 pr-1 w-6"></th>
-        <th className="py-2 pr-2 w-6 text-center font-medium">#</th>
-        <th className="py-2 pr-3 font-medium">Model</th>
-        <th className="py-2 pr-3 font-medium">
+      <tr className="text-left text-muted-foreground border-b text-xs">
+        <th className="py-3 pl-3 pr-1 w-6"></th>
+        <th className="py-3 pr-2 w-6 text-center font-medium">#</th>
+        <th className="py-3 pr-3 font-medium">Model</th>
+        <th className="py-3 pr-3 font-medium">
           <span className="inline-flex items-center gap-1"><span className="size-2 rounded-sm" style={{ background: '#22c55e' }} />Reliability</span>
         </th>
-        <th className="py-2 pr-3 font-medium">
+        <th className="py-3 pr-3 font-medium">
           <span className="inline-flex items-center gap-1"><span className="size-2 rounded-sm" style={{ background: '#3b82f6' }} />Speed</span>
         </th>
-        <th className="py-2 pr-3 font-medium">
+        <th className="py-3 pr-3 font-medium">
           <span className="inline-flex items-center gap-1"><span className="size-2 rounded-sm" style={{ background: '#a855f7' }} />Intelligence</span>
         </th>
-        <th className="py-2 pr-3 font-medium">
+        <th className="py-3 pr-3 font-medium">
           <Tooltip text="Always-on guardrails: free-quota headroom × live rate-limit penalty. Below 1.0 means the model is being held back.">
             <span className="underline decoration-dotted underline-offset-2 cursor-help">Guardrails</span>
           </Tooltip>
         </th>
-        <th className="py-2 pr-3 font-medium text-right">
+        <th className="py-3 pr-3 font-medium text-right">
           <Tooltip text="Final routing score = weighted average of the three axes, multiplied by the guardrails. Higher routes first.">
             <span className="underline decoration-dotted underline-offset-2 cursor-help">Score</span>
           </Tooltip>
         </th>
-        <th className="py-2 pr-3 font-medium text-right">On</th>
+        <th className="py-3 pr-3 font-medium text-right">On</th>
       </tr>
     </thead>
   )
 
   return (
     <div>
-      <PageHeader
-        title="Models"
-        description="Pick a routing strategy. In Manual mode you drag to set the order; the other strategies route by live score across reliability, speed and intelligence."
-        divider={false}
-        actions={<ModelsTabs />}
-      />
+      <div className="flex flex-wrap items-end justify-between gap-4 mb-6">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold tracking-tight">Models</h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Pick a routing strategy. In Manual mode you drag to set the order; the other strategies route by live score.
+          </p>
+        </div>
+        <ModelsTabs />
+      </div>
 
       <div className="space-y-6">
         {/* Monthly token budget — moved to the top */}
         {tokenUsage && tokenUsage.totalBudget > 0 && <TokenUsageBar data={tokenUsage} />}
 
         {/* Strategy selector */}
-        <section className="rounded-3xl border bg-card p-5">
+        <section className="rounded-2xl border bg-card p-5">
           <div className="flex items-baseline justify-between mb-3">
-            <h2 className="text-sm font-medium">Routing strategy</h2>
+            <h2 className="text-base font-medium">Routing strategy</h2>
             {routing?.weights && (
               <span className="text-xs text-muted-foreground tabular-nums">
                 reliability {Math.round(routing.weights.reliability * 100)}% ·
@@ -768,15 +766,15 @@ export default function FallbackPage() {
             )}
           </div>
 
-          <div className="inline-flex flex-wrap items-center gap-1 rounded-xl border p-1">
+          <div className="inline-flex flex-wrap items-center gap-1 rounded-xl border p-0.5">
             {STRATEGIES.map(s => (
               <Tooltip key={s.key} text={s.blurb}>
                 <button
                   disabled={strategyMutation.isPending}
                   onClick={() => strategyMutation.mutate({ strategy: s.key })}
-                  className={`px-3 py-1.5 text-xs rounded-lg transition-colors ${
+                  className={`px-3.5 py-1.5 text-xs rounded-lg transition-colors ${
                     s.key === strategy
-                      ? 'bg-foreground text-background font-medium'
+                      ? 'bg-primary text-primary-foreground font-medium'
                       : 'text-muted-foreground hover:text-foreground hover:bg-muted'
                   }`}
                 >
@@ -793,7 +791,7 @@ export default function FallbackPage() {
             )}
           </div>
 
-          <p className="mt-2 text-xs text-muted-foreground">
+          <p className="mt-3 text-xs text-muted-foreground">
             {isManual
               ? 'Manual mode: requests follow the order below, top-to-bottom. Drag to reorder.'
               : 'Scores update from live traffic. The order below is how requests are routed right now.'}
@@ -801,25 +799,25 @@ export default function FallbackPage() {
         </section>
 
         {/* Global retry limit */}
-        <section className="rounded-3xl border bg-card p-5">
+        <section className="rounded-2xl border bg-card p-5">
           <div className="flex items-baseline justify-between mb-2">
-            <h2 className="text-sm font-medium">Exhaustion recovery</h2>
+            <h2 className="text-base font-medium">Exhaustion recovery</h2>
             <span className="text-xs text-muted-foreground">
               {globalRetryLimit === 0 ? '∞ infinite' : `${globalRetryLimit} cycle${globalRetryLimit > 1 ? 's' : ''}`}
             </span>
           </div>
-          <p className="text-xs text-muted-foreground mb-3">
+          <p className="text-xs text-muted-foreground mb-4">
             When all keys for all enabled models are rate-limited, the proxy enters 1 RPM recovery mode.
             Set how many recovery cycles before giving up (1–100), or 0 to keep retrying forever.
           </p>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-4">
             <input
               type="range"
               min={0}
               max={100}
               value={activeRetryLimit}
               onChange={e => setPendingRetryLimit(parseInt(e.target.value, 10))}
-              className="flex-1 h-1.5 rounded-full appearance-none bg-muted cursor-pointer accent-foreground"
+              className="flex-1 h-1.5 rounded-full appearance-none bg-muted cursor-pointer accent-primary"
             />
             <Input
               type="number"
@@ -839,9 +837,9 @@ export default function FallbackPage() {
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : ordered.length === 0 ? (
-          <div className="rounded-3xl border border-dashed p-8 text-center">
+          <div className="rounded-2xl border border-dashed p-8 text-center">
             <p className="text-sm text-muted-foreground">
-              No models available. Add API keys on the <a href="/keys" className="underline text-foreground">Keys page</a> first.
+              No models available. Add API keys on the <a href="/keys" className="underline text-primary">Keys page</a> first.
             </p>
           </div>
         ) : (

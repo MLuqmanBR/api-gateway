@@ -4,7 +4,6 @@ import { ArrowDown, ArrowUp } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
 
@@ -112,12 +111,15 @@ export default function EmbeddingsPage() {
 
   return (
     <div>
-      <PageHeader
-        title="Models"
-        description="Embeddings fail over within a family only: the same model served by another provider. Vectors from different models are incompatible, so the router never swaps models on you."
-        divider={false}
-        actions={<ModelsTabs />}
-      />
+      <div className="flex flex-wrap items-end justify-between gap-4 mb-6">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold tracking-tight">Models</h1>
+          <p className="text-sm text-muted-foreground mt-1">
+            Embeddings fail over within a family only: the same model served by another provider.
+          </p>
+        </div>
+        <ModelsTabs />
+      </div>
 
       <div className="space-y-6">
         <p className="text-xs text-muted-foreground">
@@ -133,26 +135,26 @@ export default function EmbeddingsPage() {
             const u = usageByFamily.get(f.family)
             const noKeys = f.providers.every(p => p.keyCount === 0)
             return (
-              <section key={f.family} className={`rounded-3xl border bg-card p-5 ${noKeys ? 'opacity-60' : ''}`}>
-                <div className="flex items-baseline justify-between gap-4 mb-3 flex-wrap">
+              <section key={f.family} className={`rounded-2xl border bg-card p-5 ${noKeys ? 'opacity-60' : ''}`}>
+                <div className="flex items-baseline justify-between gap-4 mb-4 flex-wrap">
                   <div className="flex items-baseline gap-2.5 min-w-0">
-                    <h2 className="text-sm font-medium font-mono truncate">{f.family}</h2>
-                    <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-muted text-muted-foreground tabular-nums">
+                    <h2 className="text-base font-medium font-mono truncate">{f.family}</h2>
+                    <span className="text-[10px] rounded-full px-2 py-0.5 bg-muted text-muted-foreground tabular-nums">
                       {f.dimensions}d
                     </span>
                     {f.maxInputTokens && (
-                      <span className="text-[11px] text-muted-foreground/70 tabular-nums">
+                      <span className="text-xs text-muted-foreground/70 tabular-nums">
                         {formatTokens(f.maxInputTokens)} tok max
                       </span>
                     )}
                     {f.family === defaultFamily ? (
-                      <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-foreground text-background font-medium">
+                      <span className="text-[10px] rounded-full px-2 py-0.5 bg-primary text-primary-foreground font-medium">
                         Default · auto
                       </span>
                     ) : (
                       <button
                         onClick={() => setLocalDefault(f.family)}
-                        className="text-[11px] text-muted-foreground hover:text-foreground underline decoration-dotted underline-offset-2 transition-colors"
+                        className="text-xs text-primary hover:text-primary/80 underline decoration-dotted underline-offset-2 transition-colors"
                       >
                         Make default
                       </button>
@@ -165,8 +167,8 @@ export default function EmbeddingsPage() {
 
                 <div className="divide-y">
                   {f.providers.map((p, i) => (
-                    <div key={p.id} className={`flex items-center gap-3 py-2 ${p.enabled ? '' : 'opacity-50'}`}>
-                      <span className="w-5 text-center font-mono text-xs text-muted-foreground tabular-nums">{i + 1}</span>
+                    <div key={p.id} className={`flex items-center gap-3 py-2.5 ${p.enabled ? '' : 'opacity-50'}`}>
+                      <span className="w-6 text-center font-mono text-xs text-muted-foreground tabular-nums bg-muted rounded-md py-0.5">{i + 1}</span>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2">
                           <span className="text-sm font-medium">{p.platform}</span>
