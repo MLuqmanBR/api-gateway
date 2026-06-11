@@ -441,6 +441,7 @@ function CustomModelsSection() {
     queryKey: ['custom-providers'],
     queryFn: () => apiFetch('/api/custom-providers'),
   })
+  const activeCustom = customProviders.filter(cp => !cp.archived)
   const { data: models = [] } = useQuery<Model[]>({
     queryKey: ['models'],
     queryFn: () => apiFetch('/api/models'),
@@ -451,11 +452,6 @@ function CustomModelsSection() {
   const [contextWindow, setContextWindow] = useState(128000)
   const [maxOutputTokens, setMaxOutputTokens] = useState(null as number | null)
   const [supportsTools, setSupportsTools] = useState(true)
-  const [supportsVision, setSupportsVision] = useState(false)
-  const [showAdvanced, setShowAdvanced] = useState(false)
-  const [intelligenceRank, setIntelligenceRank] = useState(50)
-  const [speedRank, setSpeedRank] = useState(50)
-  const [sizeLabel, setSizeLabel] = useState('Custom')
   const deleteModel = useMutation({
     mutationFn: (id: number) => apiFetch(`/api/custom-models/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
@@ -780,6 +776,7 @@ export default function KeysPage() {
     ...PLATFORMS,
     ...activeCustom.map(cp => ({ value: cp.slug, label: `${cp.displayName} (custom)`, url: '', keyless: cp.keyless })),
   ]
+  const selectedPlatform = allPlatforms.find(p => p.value === platform)
   const needsAccountId = platform === 'cloudflare'
   const isKeyless = selectedPlatform?.keyless === true
   const handleSubmit = (e: React.FormEvent) => {
@@ -790,8 +787,6 @@ export default function KeysPage() {
     const key = isKeyless ? '' : (needsAccountId ? `${accountId}:${apiKey}` : apiKey)
     addKey.mutate({ platform, key, label: label || undefined })
   }
-  const healthKeyMap = new Map<number, { status: string; lastCheckedAt: string | null }>()
-  for (const k of healthData?.keys ?? []) healthKeyMap.set(k.id, k)
   // The "Configured providers" list groups by platform string. PLATFORMS
   // only seeds the header label; any platform string on a key (built-in
   // or custom) gets its own group.
