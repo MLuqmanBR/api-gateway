@@ -197,41 +197,45 @@ function stopOne(port) {
   const inst = readInstances();
   const key = String(port);
   const pid = inst[key];
-  if (!pid) { console.log(`No server running on port ${port}.`); return; }
+  if (!pid) { console.log(`No server running on port ${port}.`); return Promise.resolve(); }
   if (!isRunning(pid)) {
     console.log(`PID ${pid} on port ${port} is not running. Cleaning up.`);
     delete inst[key];
     if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
     else { writeInstances(inst); }
-    return;
+    return Promise.resolve();
   }
   console.log(`Stopping server on port ${port} (PID ${pid})…`);
   try { process.kill(pid, 'SIGTERM'); } catch (e) { console.log(`Failed: ${e.message}`); }
-  let attempts = 0;
-  const check = setInterval(() => {
-    if (!isRunning(pid)) {
-      clearInterval(check);
-      delete inst[key];
-      if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-      else { writeInstances(inst); }
-      console.log('Server stopped.');
-      return;
-    }
-    if (++attempts > 10) {
-      try { process.kill(pid, 'SIGKILL'); } catch {}
-      clearInterval(check);
-      delete inst[key];
-      if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-      else { writeInstances(inst); }
-      console.log('Server force-stopped.');
-    }
-  }, 500);
+  return new Promise((resolve) => {
+    let attempts = 0;
+    const check = setInterval(() => {
+      if (!isRunning(pid)) {
+        clearInterval(check);
+        delete inst[key];
+        if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
+        else { writeInstances(inst); }
+        console.log('Server stopped.');
+        resolve();
+        return;
+      }
+      if (++attempts > 10) {
+        try { process.kill(pid, 'SIGKILL'); } catch {}
+        clearInterval(check);
+        delete inst[key];
+        if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
+        else { writeInstances(inst); }
+        console.log('Server force-stopped.');
+        resolve();
+      }
+    }, 500);
+  });
 }
 
 function stopAll() {
   const inst = cleanInstances();
-  if (Object.keys(inst).length === 0) { console.log('No servers running.'); return; }
-  for (const port of Object.keys(inst)) stopOne(parseInt(port, 10));
+  if (Object.keys(inst).length === 0) { console.log('No servers running.'); return Promise.resolve(); }
+  return Promise.all(Object.keys(inst).map(port => stopOne(parseInt(port, 10))));
 }
 
 function showList() {
@@ -294,13 +298,13 @@ async function main() {
   if (cmd === 'logs' || cmd === 'log') { showLogs(); return; }
 
   if (cmd === 'stop' || cmd === 'kill') {
-    if (flags.all) { stopAll(); }
-    else if (flags.port) { stopOne(flags.port); }
+    if (flags.all) { await stopAll(); }
+    else if (flags.port) { await stopOne(flags.port); }
     else {
       const inst = cleanInstances();
       const ports = Object.keys(inst);
       if (ports.length === 0) { console.log('No servers running.'); }
-      else if (ports.length === 1) { stopOne(parseInt(ports[0], 10)); }
+      else if (ports.length === 1) { await stopOne(parseInt(ports[0], 10)); }
       else { console.log('Multiple instances running. Use --port or --all:'); showList(); process.exit(1); }
     }
     return;
@@ -309,8 +313,7 @@ async function main() {
   if (cmd === 'restart') {
     const envPort = readPort();
     const inst = cleanInstances();
-    if (inst[String(envPort)]) stopOne(envPort);
-    await new Promise(r => setTimeout(r, 1500));
+    if (inst[String(envPort)]) await stopOne(envPort);
     await ensureBuilt();
     await startServer(envPort);
     return;
