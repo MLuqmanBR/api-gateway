@@ -80,12 +80,18 @@ modelsRouter.post('/sync-all', async (_req: Request, res: Response) => {
 
   let totalFetched = 0;
   const errors: { slug: string; error: string }[] = [];
+  // model_ids newly added per provider — surfaces as a toast on the client
+  // (manual click + auto-sync every 5min) so the user knows models appeared.
+  const added_by_provider: Record<string, string[]> = {};
 
   for (const t of targets) {
     const result = await syncModelsFromProvider(t.baseUrl, t.slug);
     totalFetched += result.fetched;
     if (result.error) {
       errors.push({ slug: t.slug, error: result.error });
+    }
+    if (result.added.length > 0) {
+      added_by_provider[t.slug] = result.added;
     }
   }
 
@@ -94,5 +100,6 @@ modelsRouter.post('/sync-all', async (_req: Request, res: Response) => {
     fetched: totalFetched,
     providers: targets.length,
     errors,
+    added_by_provider,
   });
 });

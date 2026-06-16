@@ -1,3 +1,4 @@
+import { addToast } from '@/lib/toast'
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
@@ -547,20 +548,53 @@ function CustomModelsSection() {
     },
   })
   const syncAll = useMutation({
-    mutationFn: () => apiFetch<{ fetched: number; providers: number; errors: { slug: string; error: string }[] }>(
+    mutationFn: () => apiFetch<{
+      fetched: number
+      providers: number
+      errors: { slug: string; error: string }[]
+      added_by_provider: Record<string, string[]>
+    }>(
       '/api/models/sync-all',
       { method: 'POST' },
     ),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['models'] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
+
+      const providers = Object.keys(data.added_by_provider)
+      const allAdded = providers.flatMap(s => data.added_by_provider[s])
+
+      if (allAdded.length > 0) {
+        // Group-by-provider summary in the description (e.g. "openrouter: 3, nvidia: 1")
+        // and the full per-model list in `details` so clicking the toast expands it.
+        const summary = providers
+          .map(slug => `${slug}: ${data.added_by_provider[slug].length}`)
+          .join(' · ')
+        addToast({
+          kind: 'success',
+          title: `Discovered ${allAdded.length} new model${allAdded.length === 1 ? '' : 's'}`,
+          description: summary,
+          details: providers.flatMap(slug =>
+            data.added_by_provider[slug].map(mid => `${slug}/${mid}`),
+          ),
+          sticky: true,
+        })
+      }
+
       if (data.errors.length > 0) {
+        // Each provider failure is its own toast so one bad slug doesn't bury
+        // the rest. The detail list contains the slug + reason text.
         const slugs = data.errors.map(e => e.slug).join(', ')
         console.warn(`Model sync errors on: ${slugs}`, data.errors)
+        addToast({
+          kind: 'warning',
+          title: `Model sync failed for ${data.errors.length} provider${data.errors.length === 1 ? '' : 's'}`,
+          description: `Affected: ${slugs}`,
+          details: data.errors.map(e => `${e.slug}: ${e.error}`),
+        })
       }
     },
   })
-  // Auto-discover persisted in localStorage so it survives page reloads.
   const [autoSync, setAutoSync] = useState(() => {
     try { return localStorage.getItem('auto-discover-models') === 'true' } catch { return false }
   })

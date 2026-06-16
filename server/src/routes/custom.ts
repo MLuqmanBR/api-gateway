@@ -96,9 +96,17 @@ function isKnownProvider(slug: string): boolean {
 // inserts them into the catalog with sensible defaults. Existing models
 // (matched by platform + model_id) are skipped so re-runs are safe.
 
-export async function syncModelsFromProvider(baseUrl: string, slug: string): Promise<{ fetched: number; error?: string }> {
+export type ProviderSyncResult = {
+  /** Count of newly inserted models (excludes already-registered rows). */
+  fetched: number
+  /** model_ids of rows this run actually inserted. */
+  added: string[]
+  error?: string
+}
+
+export async function syncModelsFromProvider(baseUrl: string, slug: string): Promise<ProviderSyncResult> {
   // Skip auto-discovery in test environments — fake provider URLs won't respond.
-  if (process.env.VITEST) return { fetched: 0 };
+  if (process.env.VITEST) return { fetched: 0, added: [] };
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
@@ -111,18 +119,18 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
 
     if (!res.ok) {
       console.log(`[Custom] ${slug}: /models returned ${res.status}, skipping auto-discovery`);
-      return { fetched: 0 };
+      return { fetched: 0, added: [] };
     }
 
     const body: any = await res.json();
     const models = body?.data;
     if (!Array.isArray(models) || models.length === 0) {
       console.log(`[Custom] ${slug}: no models in /models response`);
-      return { fetched: 0 };
+      return { fetched: 0, added: [] };
     }
 
     const db = getDb();
-    let added = 0;
+    const added: string[] = [];
     const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
 
     const insertModel = db.prepare(`
@@ -154,19 +162,18 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
           MODEL_DEFAULTS.monthlyTokenBudget, null, // context_window = unknown
           MODEL_DEFAULTS.supportsVision ? 1 : 0, MODEL_DEFAULTS.supportsTools ? 1 : 0,
         );
-        const modelDbId = Number(result.lastInsertRowid);
-        insertFb.run(modelDbId, maxPriority + added + 1);
-        added++;
+        insertFb.run(Number(result.lastInsertRowid), maxPriority + added.length + 1);
+        added.push(modelId);
       }
     });
     tx();
 
-    console.log(`[Custom] ${slug}: discovered ${added} models (${models.length} total, skipped ${models.length - added} existing)`);
-    return { fetched: added };
+    console.log(`[Custom] ${slug}: discovered ${added.length} models (${models.length} total, skipped ${models.length - added.length} existing)`);
+    return { fetched: added.length, added };
   } catch (err: any) {
     const msg = err.name === 'AbortError' ? 'timeout' : err.message;
     console.log(`[Custom] ${slug}: model sync failed: ${msg}`);
-    return { fetched: 0, error: msg };
+    return { fetched: 0, added: [], error: msg };
   } finally {
     clearTimeout(timeout);
   }

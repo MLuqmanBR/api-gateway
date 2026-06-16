@@ -12,7 +12,10 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { AuthGate } from '@/components/auth-gate'
+import { Toaster } from '@/components/toaster'
+import { drainPersisted } from '@/lib/toast'
 import { ErrorBoundary } from '@/components/error-boundary'
+
 
 const KeysPage = lazy(() => import('@/pages/KeysPage'))
 const PlaygroundPage = lazy(() => import('@/pages/PlaygroundPage'))
@@ -191,12 +194,17 @@ function Navbar() {
     </header>
   )
 }
-
 function App() {
+  // Replay any toasts that were queued while the tab was hidden (auto-
+  // discovered models, fallbacks exhausted, etc.) so the user sees them on
+  // their next visit rather than missing them entirely.
+  useEffect(() => { drainPersisted() }, [])
+
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter basename={import.meta.env.BASE_URL}>
         <AuthGate>
+          <Toaster />
           <div className={`min-h-screen ${isDesktopApp ? 'desktop-backdrop' : 'bg-background'}`}>
             <Navbar />
             <main className="max-w-6xl mx-auto px-6 py-8">
