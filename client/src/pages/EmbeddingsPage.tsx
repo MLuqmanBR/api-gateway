@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowDown, ArrowUp } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
@@ -7,6 +7,7 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
+import { ModelSearchBox, matchesModelQuery } from '@/components/model-search-box'
 
 interface ProviderEntry {
   id: number
@@ -71,9 +72,26 @@ export default function EmbeddingsPage() {
   })
 
   const families = localFamilies ?? data?.families ?? []
-  const defaultFamily = localDefault ?? data?.defaultFamily ?? ''
+  // Live filter across family name, provider slug, and modelId. Cheap
+  // enough to run on every keystroke; no debounce.
+  const [query, setQuery] = useState('')
+  const filteredFamilies = useMemo(
+    () => families
+      .map(f => ({
+        ...f,
+        providers: f.providers.filter(p =>
+          matchesModelQuery(query, { displayName: p.displayName, modelId: p.modelId, platform: p.platform })
+          || f.family.toLowerCase().includes(query.trim().toLowerCase()),
+        ),
+      }))
+      .filter(f => f.providers.length > 0),
+    [families, query],
+  )
+  const totalProviders = families.reduce((n, f) => n + f.providers.length, 0)
+  const matchedProviders = filteredFamilies.reduce((n, f) => n + f.providers.length, 0)
+  const families_ = filteredFamilies
   const hasChanges = localFamilies !== null || localDefault !== null
-
+  const defaultFamily = localDefault ?? data?.defaultFamily ?? ''
   function updateProvider(familyName: string, id: number, patch: Partial<ProviderEntry>) {
     if (isLoading) return
     setLocalFamilies(families.map(f =>
@@ -129,86 +147,118 @@ export default function EmbeddingsPage() {
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
         ) : (
-          families.map(f => {
-            const u = usageByFamily.get(f.family)
-            const noKeys = f.providers.every(p => p.keyCount === 0)
-            return (
-              <section key={f.family} className={`rounded-3xl border bg-card p-5 ${noKeys ? 'opacity-60' : ''}`}>
-                <div className="flex items-baseline justify-between gap-4 mb-3 flex-wrap">
-                  <div className="flex items-baseline gap-2.5 min-w-0">
-                    <h2 className="text-sm font-medium font-mono truncate">{f.family}</h2>
-                    <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-muted text-muted-foreground tabular-nums">
-                      {f.dimensions}d
-                    </span>
-                    {f.maxInputTokens && (
-                      <span className="text-[11px] text-muted-foreground/70 tabular-nums">
-                        {formatTokens(f.maxInputTokens)} tok max
-                      </span>
-                    )}
-                    {f.family === defaultFamily ? (
-                      <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-foreground text-background font-medium">
-                        Default · auto
-                      </span>
-                    ) : (
-                      <button
-                        onClick={() => setLocalDefault(f.family)}
-                        className="text-[11px] text-muted-foreground hover:text-foreground underline decoration-dotted underline-offset-2 transition-colors"
-                      >
-                        Make default
-                      </button>
-                    )}
-                  </div>
-                  <span className="text-xs text-muted-foreground tabular-nums">
-                    {u ? <>{u.requestsToday} req today · {formatTokens(u.tokensMonth)} tok this month</> : '—'}
-                  </span>
-                </div>
+          <>
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <ModelSearchBox
+                value={query}
+                onChange={setQuery}
+                showCount
+                total={totalProviders}
+                matched={matchedProviders}
+                placeholder="Filter embeddings by family, provider or model id…"
+              />
+              {query !== '' && totalProviders > 0 && matchedProviders > 0 && (
+                <p className="text-[11px] text-muted-foreground">
+                  Reorder is disabled while searching — clear the filter to drag rows.
+                </p>
+              )}
+            </div>
 
-                <div className="divide-y">
-                  {f.providers.map((p, i) => (
-                    <div key={p.id} className={`flex items-center gap-3 py-2 ${p.enabled ? '' : 'opacity-50'}`}>
-                      <span className="w-5 text-center font-mono text-xs text-muted-foreground tabular-nums">{i + 1}</span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm font-medium">{p.platform}</span>
-                          <span className="truncate font-mono text-[11px] text-muted-foreground">{p.modelId}</span>
-                          {p.keyCount === 0 && (
-                            <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-amber-600/15 text-amber-700 dark:bg-amber-400/15 dark:text-amber-400">
-                              no key
-                            </span>
-                          )}
-                        </div>
-                        <div className="text-[11px] text-muted-foreground/70">{p.quotaLabel}</div>
-                      </div>
-                      {f.providers.length > 1 && (
-                        <div className="flex gap-0.5">
-                          <button
-                            onClick={() => moveProvider(f.family, i, -1)}
-                            disabled={i === 0}
-                            aria-label="Move up"
-                            className="rounded-md p-1 text-muted-foreground/60 hover:text-foreground disabled:opacity-25 transition-colors"
-                          >
-                            <ArrowUp className="size-3.5" />
-                          </button>
-                          <button
-                            onClick={() => moveProvider(f.family, i, 1)}
-                            disabled={i === f.providers.length - 1}
-                            aria-label="Move down"
-                            className="rounded-md p-1 text-muted-foreground/60 hover:text-foreground disabled:opacity-25 transition-colors"
-                          >
-                            <ArrowDown className="size-3.5" />
-                          </button>
-                        </div>
+            {matchedProviders === 0 && query !== '' ? (
+              <div className="rounded-3xl border border-dashed p-8 text-center">
+                <p className="text-sm text-muted-foreground">
+                  No providers match <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono">{query}</code>.
+                </p>
+              </div>
+            ) : families_.map(f => {
+              const u = usageByFamily.get(f.family)
+              const noKeys = f.providers.every(p => p.keyCount === 0)
+              return (
+                <section key={f.family} className={`rounded-3xl border bg-card p-5 ${noKeys ? 'opacity-60' : ''}`}>
+                  <div className="flex items-baseline justify-between gap-4 mb-3 flex-wrap">
+                    <div className="flex items-baseline gap-2.5 min-w-0">
+                      <h2 className="text-sm font-medium font-mono truncate">{f.family}</h2>
+                      <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-muted text-muted-foreground tabular-nums">
+                        {f.dimensions}d
+                      </span>
+                      {f.maxInputTokens && (
+                        <span className="text-[11px] text-muted-foreground/70 tabular-nums">
+                          {formatTokens(f.maxInputTokens)} tok max
+                        </span>
                       )}
-                      <Switch
-                        checked={p.enabled}
-                        onCheckedChange={(c) => updateProvider(f.family, p.id, { enabled: c })}
-                      />
+                      {f.family === defaultFamily ? (
+                        <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-foreground text-background font-medium">
+                          Default · auto
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setLocalDefault(f.family)}
+                          className="text-[11px] text-muted-foreground hover:text-foreground underline decoration-dotted underline-offset-2 transition-colors"
+                        >
+                          Make default
+                        </button>
+                      )}
                     </div>
-                  ))}
-                </div>
-              </section>
-            )
-          })
+                    <span className="text-xs text-muted-foreground tabular-nums">
+                      {u ? <>{u.requestsToday} req today · {formatTokens(u.tokensMonth)} tok this month</> : '—'}
+                    </span>
+                  </div>
+
+                  <div className="divide-y">
+                    {f.providers.length === 0 ? (
+                      // Whole family matched by name but none of its providers matched — show that explicitly.
+                      <p className="text-xs text-muted-foreground py-3 text-center">
+                        No providers in this family match the filter.
+                      </p>
+                    ) : f.providers.map((p, i) => {
+                      const reorderDisabled = query !== ''
+                      return (
+                        <div key={p.id} className={`flex items-center gap-3 py-2 ${p.enabled ? '' : 'opacity-50'}`}>
+                          <span className="w-5 text-center font-mono text-xs text-muted-foreground tabular-nums">{i + 1}</span>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-medium">{p.platform}</span>
+                              <span className="truncate font-mono text-[11px] text-muted-foreground">{p.modelId}</span>
+                              {p.keyCount === 0 && (
+                                <span className="text-[10px] rounded-full px-1.5 py-0.5 bg-amber-600/15 text-amber-700 dark:bg-amber-400/15 dark:text-amber-400">
+                                  no key
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[11px] text-muted-foreground/70">{p.quotaLabel}</div>
+                          </div>
+                          {f.providers.length > 1 && (
+                            <div className="flex gap-0.5">
+                              <button
+                                onClick={() => moveProvider(f.family, i, -1)}
+                                disabled={i === 0 || reorderDisabled}
+                                aria-label="Move up"
+                                className="rounded-md p-1 text-muted-foreground/60 hover:text-foreground disabled:opacity-25 transition-colors"
+                              >
+                                <ArrowUp className="size-3.5" />
+                              </button>
+                              <button
+                                onClick={() => moveProvider(f.family, i, 1)}
+                                disabled={i === f.providers.length - 1 || reorderDisabled}
+                                aria-label="Move down"
+                                className="rounded-md p-1 text-muted-foreground/60 hover:text-foreground disabled:opacity-25 transition-colors"
+                              >
+                                <ArrowDown className="size-3.5" />
+                              </button>
+                            </div>
+                          )}
+                          <Switch
+                            checked={p.enabled}
+                            onCheckedChange={(c) => updateProvider(f.family, p.id, { enabled: c })}
+                          />
+                        </div>
+                      )
+                    })}
+                  </div>
+                </section>
+              )
+            })}
+          </>
         )}
 
         <FloatingBar show={hasChanges}>

@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef, type ReactNode } from 'react'
+import { useEffect, useMemo, useState, useRef, type ReactNode } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   DndContext,
@@ -28,6 +28,7 @@ import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
 import { Tooltip } from '@/components/tooltip'
+import { ModelSearchBox, matchesModelQuery } from '@/components/model-search-box'
 
 interface FallbackEntry {
   modelDbId: number
@@ -618,15 +619,30 @@ export default function FallbackPage() {
   const strategy: RoutingStrategy = routing?.strategy ?? 'balanced'
   const isManual = strategy === 'priority'
 
+  const allEntries = localEntries ?? entries
   // Merge fallback metadata with live scores, keyed by model.
   const scoreById = new Map((routing?.scores ?? []).map(s => [s.modelDbId, s]))
-  const allEntries = localEntries ?? entries
   const configured = allEntries.filter(e => e.keyCount > 0)
   const unconfiguredPlatforms = [...new Set(allEntries.filter(e => e.keyCount === 0).map(e => e.platform))]
 
+  // Live search filter on the configured rows. Cheap (~750 entries,
+  // <100-char string compares), so no debounce — runs on every keystroke.
+  const [query, setQuery] = useState('')
+  const filteredConfigured = useMemo(
+    () => configured.filter(e =>
+      matchesModelQuery(query, { displayName: e.displayName, modelId: e.modelId, platform: e.platform }),
+    ),
+    [configured, query],
+  )
+
   // Entry fields win on overlap: the routing snapshot also carries `enabled`
   // (and identity fields), which would otherwise clobber unsaved local toggles.
-  const rows: Row[] = configured.map(e => ({ ...(scoreById.get(e.modelDbId) ?? {}), ...e }))
+  const rows: Row[] = filteredConfigured.map(e => ({ ...(scoreById.get(e.modelDbId) ?? {}), ...e }))
+  // The unfiltered set is what drag-reorder operates on. If we let drag
+  // fire on a filtered slice, `setLocalEntries` would persist that *slice*
+  // and silently drop the rows the user hadn't seen. So when a query is
+  // active, drag is disabled at the row level (see `draggable` prop) and
+  // `ordered` falls back to the unfiltered list.
   // Manual → the order you set (by priority). Bandit → ranked by live score.
   const ordered = isManual
     ? [...rows].sort((a, b) => a.priority - b.priority)
@@ -640,8 +656,14 @@ export default function FallbackPage() {
   function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event
     if (!over || active.id === over.id) return
+    // SortableContext only ever sees the filtered `ordered` rows; drag-end
+    // re-emits a merged fallback list with the SAME permutation the user
+    // acted on, but applied to the unfiltered configured rows. Anything
+    // currently hidden by the search keeps its current priority, so the
+    // hidden block doesn't get reshuffled by a UI-level reorder.
     const oldIndex = ordered.findIndex(e => e.modelDbId === active.id)
     const newIndex = ordered.findIndex(e => e.modelDbId === over.id)
+    if (oldIndex < 0 || newIndex < 0) return
     const reorderedVisible = arrayMove(ordered, oldIndex, newIndex)
     const unconfigured = allEntries.filter(e => e.keyCount === 0)
     const merged: FallbackEntry[] = [
@@ -849,60 +871,86 @@ export default function FallbackPage() {
         {/* Unified routing / fallback table */}
         {isLoading ? (
           <p className="text-sm text-muted-foreground">Loading…</p>
-        ) : ordered.length === 0 ? (
+        ) : ordered.length === 0 && query === '' ? (
           <div className="rounded-3xl border border-dashed p-8 text-center">
             <p className="text-sm text-muted-foreground">
               No models available. Add API keys on the <a href="/keys" className="underline text-foreground">Keys page</a> first.
             </p>
           </div>
         ) : (
-          <>
-            {/* DndContext must wrap OUTSIDE the table: it renders hidden a11y
-                live-region <div>s, which are invalid as direct <table> children. */}
-            {isManual ? (
-              <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-                <div className="rounded-2xl border overflow-x-auto">
-                  <table className="w-full text-sm">
-                    {tableHead}
-                    <SortableContext items={ordered.map(e => e.modelDbId)} strategy={verticalListSortingStrategy}>
+          <section className="space-y-3">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <ModelSearchBox
+                value={query}
+                onChange={setQuery}
+                showCount
+                total={configured.length}
+                matched={ordered.length}
+                placeholder="Filter models by name, id, or platform…"
+              />
+              {query !== '' && isManual && (
+                <p className="text-[11px] text-muted-foreground">
+                  Reorder is disabled while searching — clear the filter to drag rows.
+                </p>
+              )}
+            </div>
+
+            {ordered.length === 0 ? (
+              <div className="rounded-2xl border border-dashed p-8 text-center">
+                <p className="text-sm text-muted-foreground">
+                  No models match <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono">{query}</code>.
+                </p>
+              </div>
+            ) : (
+              <>
+                {/* DndContext must wrap OUTSIDE the table: it renders hidden a11y
+                    live-region <div>s, which are invalid as direct <table> children. */}
+                {isManual && query === '' ? (
+                  <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+                    <div className="rounded-2xl border overflow-x-auto">
+                      <table className="w-full text-sm">
+                        {tableHead}
+                        <SortableContext items={ordered.map(e => e.modelDbId)} strategy={verticalListSortingStrategy}>
+                          <tbody>
+                            {ordered.map((row, i) => (
+                              <SortableRow key={row.modelDbId} row={row} rank={i + 1} onToggle={handleToggle} onEdit={setEditingModel} />
+                            ))}
+                          </tbody>
+                        </SortableContext>
+                      </table>
+                    </div>
+                  </DndContext>
+                ) : (
+                  <div className="rounded-2xl border overflow-x-auto">
+                    <table className="w-full text-sm">
+                      {tableHead}
                       <tbody>
                         {ordered.map((row, i) => (
-                          <SortableRow key={row.modelDbId} row={row} rank={i + 1} onToggle={handleToggle} onEdit={setEditingModel} />
+                          <tr key={row.modelDbId} className={`border-b last:border-0 ${row.enabled ? '' : 'opacity-50'}`}>
+                            <RowContent row={row} rank={i + 1} draggable={false} onToggle={handleToggle} onEdit={setEditingModel} />
+                          </tr>
                         ))}
                       </tbody>
-                    </SortableContext>
-                  </table>
-                </div>
-              </DndContext>
-            ) : (
-              <div className="rounded-2xl border overflow-x-auto">
-                <table className="w-full text-sm">
-                  {tableHead}
-                  <tbody>
-                    {ordered.map((row, i) => (
-                      <tr key={row.modelDbId} className={`border-b last:border-0 ${row.enabled ? '' : 'opacity-50'}`}>
-                        <RowContent row={row} rank={i + 1} draggable={false} onToggle={handleToggle} onEdit={setEditingModel} />
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
+                    </table>
+                  </div>
+                )}
 
-            {/* Floating action bar — fixed to the viewport so it's always visible,
-                sliding up when there are unsaved changes and back down on save/discard. */}
-            <FloatingBar show={hasChanges}>
-              <span className="text-xs text-muted-foreground">Unsaved changes</span>
-              <Button variant="outline" size="sm" onClick={handleDiscardAll}>Discard</Button>
-              <Button size="sm" onClick={() => { setSavingAll(true); handleSaveAll().finally(() => setSavingAll(false)) }} disabled={savingAll}>
-                {savingAll ? 'Saving…' : 'Save changes'}
-              </Button>
-            </FloatingBar>
+                {/* Floating action bar — fixed to the viewport so it's always visible,
+                    sliding up when there are unsaved changes and back down on save/discard. */}
+                <FloatingBar show={hasChanges}>
+                  <span className="text-xs text-muted-foreground">Unsaved changes</span>
+                  <Button variant="outline" size="sm" onClick={handleDiscardAll}>Discard</Button>
+                  <Button size="sm" onClick={() => { setSavingAll(true); handleSaveAll().finally(() => setSavingAll(false)) }} disabled={savingAll}>
+                    {savingAll ? 'Saving…' : 'Save changes'}
+                  </Button>
+                </FloatingBar>
 
-            {unconfiguredPlatforms.length > 0 && (
-              <p className="text-xs text-muted-foreground">Hidden (no keys): {unconfiguredPlatforms.join(', ')}</p>
+                {unconfiguredPlatforms.length > 0 && (
+                  <p className="text-xs text-muted-foreground">Hidden (no keys): {unconfiguredPlatforms.join(', ')}</p>
+                )}
+              </>
             )}
-          </>
+          </section>
         )}
         {editingModel && (
           <EditModelModal
