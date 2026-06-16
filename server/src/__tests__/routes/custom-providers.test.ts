@@ -75,14 +75,23 @@ describe('Custom providers (#230)', () => {
     }
   });
 
-  it('rejects a slug that collides with a built-in platform', async () => {
-    const { status, body } = await request(app, 'POST', '/api/custom-providers', {
-      slug: 'groq',
-      displayName: 'My Groq',
-      baseUrl: 'http://example.com/v1',
-    });
-    expect(status).toBe(400);
-    expect(body.error.message).toMatch(/reserved/);
+  // Every Platform from shared/types.ts is reserved — a custom provider using
+  // one of those slugs would shadow the built-in's routing table (#230).
+  it('rejects every built-in platform slug', async () => {
+    const builtins = [
+      'google', 'groq', 'cerebras', 'nvidia', 'mistral',
+      'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
+      'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode', 'ovh', 'commandcode',
+    ];
+    for (const slug of builtins) {
+      const { status, body } = await request(app, 'POST', '/api/custom-providers', {
+        slug,
+        displayName: `My ${slug}`,
+        baseUrl: 'http://example.com/v1',
+      });
+      expect(status, `slug '${slug}' should be rejected`).toBe(400);
+      expect(body.error.message).toMatch(/reserved/);
+    }
   });
 
   it('rejects a duplicate slug with 409', async () => {

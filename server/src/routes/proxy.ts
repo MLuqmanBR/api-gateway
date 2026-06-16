@@ -1087,8 +1087,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
         }
         // Normalize array-shaped message.content to a string on the way out (#166).
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-        if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
         res.json(normalizeOutboundContent(result));
 
         logRequest(

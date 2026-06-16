@@ -14,6 +14,7 @@ const BUILTIN_SLUGS = new Set([
   'google', 'groq', 'cerebras', 'nvidia', 'mistral',
   'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
   'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode',
+  'ovh', 'commandcode',
 ]);
 
 // Slug format: lowercase letters, digits, dashes. 2-32 chars. Cannot start or

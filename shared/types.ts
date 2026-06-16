@@ -62,6 +62,7 @@ export interface CustomProviderCreate {
   tpdLimit?: number | null;
   maxParallelRequests?: number | null;
   keyless?: boolean;
+  apiFormat?: 'openai' | 'anthropic';
 }
 
 export interface CustomProviderUpdate {
@@ -73,6 +74,7 @@ export interface CustomProviderUpdate {
   tpdLimit?: number | null;
   maxParallelRequests?: number | null;
   keyless?: boolean;
+  apiFormat?: 'openai' | 'anthropic';
 }
 
 export interface CustomModelCreate {
