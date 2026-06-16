@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
@@ -8,6 +8,42 @@ import http from 'node:http';
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const INSTANCES_FILE = join(ROOT, '.api-gateway.instances');
 const LOG_FILE = join(ROOT, 'server.log');
+
+// Log rotation: cap the active log at 50 MiB; keep at most 3 archived copies.
+// Worst-case footprint is therefore ~150 MiB. Rotation happens between
+// sessions (i.e. on `api start`, before opening the write fd) so we never
+// rename a file that the running server is still appending to.
+const LOG_MAX_BYTES = 50 * 1024 * 1024;
+const LOG_ARCHIVES = 3;
+const LOG_ARCHIVE_FMT = (i) => join(ROOT, `server.log.${i}`);
+
+function rotateLogIfNeeded() {
+  // One-shot rescue: if any prior archive is far above the cap, drop it
+  // outright. This handles the legacy 11 GB server.log case after this
+  // rotation policy was added; once everything is at ≤ LOG_MAX_BYTES, this
+  // path is dead code.
+  for (const path of [LOG_FILE, ...Array.from({ length: LOG_ARCHIVES }, (_, i) => LOG_ARCHIVE_FMT(i + 1))]) {
+    let size;
+    try { size = statSync(path).size; } catch { continue; }
+    if (size > 4 * LOG_MAX_BYTES) {
+      try { unlinkSync(path); } catch {}
+    }
+  }
+
+  let size;
+  try { size = statSync(LOG_FILE).size; }
+  catch { return; }
+  if (size < LOG_MAX_BYTES) return;
+  // Drop the oldest archive, shift the rest down, then move active → .1.
+  try { unlinkSync(LOG_ARCHIVE_FMT(LOG_ARCHIVES)); } catch {}
+  for (let i = LOG_ARCHIVES - 1; i >= 1; i--) {
+    try { renameSync(LOG_ARCHIVE_FMT(i), LOG_ARCHIVE_FMT(i + 1)); }
+    catch {}
+  }
+  try { renameSync(LOG_FILE, LOG_ARCHIVE_FMT(1)); }
+  catch {}
+}
+
 
 function usage() {
   console.log(`
@@ -93,6 +129,8 @@ function startServer(port) {
       return;
     }
   }
+
+  rotateLogIfNeeded();
 
   let out;
   try { out = openSync(LOG_FILE, 'a'); } catch { out = 'ignore'; }

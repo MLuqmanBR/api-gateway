@@ -13,6 +13,7 @@ server/data/
 .api-gateway.pid
 .api-gateway.instances
 server.log
+server.log.*
 
 # Personal deployment scripts (contain keys/credentials — kept local)
 deploy-pi.sh
