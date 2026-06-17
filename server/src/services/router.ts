@@ -42,6 +42,13 @@ interface ChainRow {
   supports_vision: number;
   supports_tools: number;
   context_window: number | null;
+  /** Hard upper bound on output tokens the provider/upstream enforces. Used
+   * as the default `max_tokens` when the caller doesn't supply one — some
+   * upstreams (NVIDIA NIM minimax-m3) refuse to generate without an explicit
+   * limit and return an empty 200 instead of an error, which the proxy can't
+   * diagnose. NULL means "no upper-bound known" and the proxy leaves whatever
+   * the caller sent (or omits the field entirely). */
+  max_output_tokens: number | null;
   // Custom models bind to the api_keys row carrying their endpoint (#212);
   // NULL for built-in platforms.
   key_id: number | null;
@@ -59,6 +66,10 @@ export interface RouteResult {
   // exhaustion (escalate the cooldown) from a transient per-minute spike.
   rpdLimit: number | null;
   tpdLimit: number | null;
+  /** Catalog's hard upper bound on the model's output tokens. Used by the
+   * proxy as a fallback `max_tokens` when the caller doesn't supply one
+   * (NVIDIA NIM minimax-m3 returns empty 200s without an explicit limit). */
+  maxOutputTokens: number | null;
   // Decrements the in-flight slot for the associated provider.
   // Callers MUST invoke this in a finally block after the request completes.
   release: () => void;
@@ -462,7 +473,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id
+           m.supports_tools, m.context_window, m.max_output_tokens, m.key_id
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     WHERE fc.enabled = 1
@@ -646,6 +657,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         displayName: entry.display_name,
         rpdLimit: limits.rpd,
         tpdLimit: limits.tpd,
+        maxOutputTokens: entry.max_output_tokens,
         release,
       };
     }
@@ -704,7 +716,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window
+           m.supports_tools, m.context_window, m.max_output_tokens
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     WHERE m.enabled = 1

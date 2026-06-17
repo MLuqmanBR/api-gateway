@@ -796,6 +796,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       injectedHandoffTokens = handoff.injectedTokens;
     }
 
+    // Fallback for `max_tokens`: if the caller didn't supply a value
+    // (some clients omit it entirely; OpenAI says "no limit" by default),
+    // use the catalog's recorded max_output_tokens for the resolved model.
+    // Some upstreams — notably NVIDIA NIM's minimax-m3 — return an empty
+    // 200 (choices:[]) when max_tokens is absent, making the request
+    // indistinguishable from "model just has nothing to say". Surfacing a
+    // real bound lets the model actually generate.
+    const effectiveMaxTokens = max_tokens ?? route.maxOutputTokens ?? undefined;
+
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
     let keySucceeded = false;
     keyRetry: for (let keyAttempt = 0; keyAttempt < PER_KEY_RETRIES; keyAttempt++) {
@@ -856,7 +865,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
-            { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+            { temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls },
           );
 
           for await (const chunk of gen) {
@@ -1028,7 +1037,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
-          { temperature, max_tokens, top_p, tools, tool_choice, parallel_tool_calls },
+          { temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls },
         );
 
         // Empty completion (no text, no tool calls) → fail over rather than
