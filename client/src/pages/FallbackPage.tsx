@@ -8,8 +8,6 @@ import {
   useSensor,
   useSensors,
   type DragEndEvent,
-  type DragMoveEvent,
-  type DragStartEvent,
 } from '@dnd-kit/core'
 import {
   arrayMove,
@@ -655,74 +653,12 @@ export default function FallbackPage() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   )
 
-  // Auto-scroll while dragging: a pointer near the top/bottom edge of the
-  // viewport scrolls the page in that direction so the user can reach rows
-  // far below the visible viewport in a single drag. This is a hard requirement
-  // for lists of hundreds/thousands of models where scrolling without it would
-  // take many trips. Speed ramps linearly from 0 (at EDGE_TRIGGER_PX away from
-  // the edge) to MAX_AUTO_SCROLL_PX (at the edge).
-  const EDGE_TRIGGER_PX = 96
-  const MAX_AUTO_SCROLL_PX = 22
-  const autoscrollRafRef = useRef<number | null>(null)
-  const dragStateRef = useRef<{ startClientY: number; deltaY: number } | null>(null)
-
-  function autoscrollStep() {
-    const drag = dragStateRef.current
-    if (!drag) {
-      autoscrollRafRef.current = null
-      return
-    }
-    const pointerY = drag.startClientY + drag.deltaY
-    const viewportH = window.innerHeight
-    let dy = 0
-    if (pointerY < EDGE_TRIGGER_PX) {
-      const distFromEdge = pointerY // small = near top
-      const t = Math.max(0, Math.min(1, 1 - distFromEdge / EDGE_TRIGGER_PX))
-      dy = -MAX_AUTO_SCROLL_PX * t
-    } else if (pointerY > viewportH - EDGE_TRIGGER_PX) {
-      const distFromEdge = viewportH - pointerY
-      const t = Math.max(0, Math.min(1, 1 - distFromEdge / EDGE_TRIGGER_PX))
-      dy = MAX_AUTO_SCROLL_PX * t
-    }
-    if (dy !== 0) {
-      window.scrollBy({ top: dy, behavior: 'auto' })
-    }
-    autoscrollRafRef.current = requestAnimationFrame(autoscrollStep)
-  }
-
-  function handleDragStart(event: DragStartEvent) {
-    // Capture the pointer's initial Y so handleDragMove can derive the live
-    // pointer Y by adding the cumulative delta. activatorEvent is the original
-    // pointerdown; we only need clientY, which on touch/pen is the contact point.
-    // @dnd-kit normalizes this for us.
-    const startY = (event.activatorEvent as PointerEvent | MouseEvent).clientY
-    dragStateRef.current = { startClientY: startY, deltaY: 0 }
-    autoscrollRafRef.current = requestAnimationFrame(autoscrollStep)
-  }
-
-  function handleDragMove(event: DragMoveEvent) {
-    if (dragStateRef.current) {
-      dragStateRef.current.deltaY = event.delta.y
-    }
-  }
-
-  function stopAutoscroll() {
-    if (autoscrollRafRef.current !== null) {
-      cancelAnimationFrame(autoscrollRafRef.current)
-      autoscrollRafRef.current = null
-    }
-    dragStateRef.current = null
-  }
-
-  // Belt-and-braces: kill the rAF loop if the component unmounts mid-drag
-  // (e.g. user navigates away). Otherwise the orphan rAF would tick forever
-  // against a stale dragStateRef and `scrollBy` against a detached window.
-  useEffect(() => {
-    return () => stopAutoscroll()
-  }, [])
 
   function handleDragEnd(event: DragEndEvent) {
-    stopAutoscroll()
+    // Auto-scroll is handled by dnd-kit's built-in useAutoScroller, which
+    // monitors the dragged item's rect against the scroll container's rect
+    // and ramps a setInterval-based scroll. dnd-kit cleans up its own
+    // interval on drag end.
     const { active, over } = event
     if (!over || active.id === over.id) return
     // SortableContext only ever sees the filtered `ordered` rows; drag-end
@@ -994,7 +930,36 @@ export default function FallbackPage() {
                 {/* DndContext must wrap OUTSIDE the table: it renders hidden a11y
                     live-region <div>s, which are invalid as direct <table> children. */}
                 {isManual && query === '' ? (
-                  <DndContext sensors={sensors} collisionDetection={closestCenter} onDragStart={handleDragStart} onDragMove={handleDragMove} onDragEnd={handleDragEnd} onDragCancel={stopAutoscroll}>
+                  <DndContext
+                    sensors={sensors}
+                    collisionDetection={closestCenter}
+                    onDragEnd={handleDragEnd}
+                    autoScroll={{
+                      // Smooth, decisive edge-scroll. dnd-kit watches the dragged
+                      // item's rect against the scroll container's rect and
+                      // ramps a setInterval-driven scrollBy. The drag handle
+                      // travels with the pointer, so this is equivalent to
+                      // "pointer near the edge of the viewport" but uses the
+                      // engine's optimised path.
+                      // - threshold.y = 12% of viewport height: autoscroll
+                      //   only fires when the dragged row is well inside the
+                      //   top/bottom edge band (~85 px on a 700-px viewport).
+                      //   Lower than the 20% default to avoid scrolling when
+                      //   the user is just resting the pointer near the edge.
+                      // - acceleration = 30 px per interval at the edge.
+                      //   With interval=8, peak scroll speed = 30 / 0.008 s
+                      //   = 3750 px/s, smooth on a 60 Hz display because
+                      //   each call is small (4..30 px).
+                      // - interval = 8 ms ≈ 125 Hz, clamped by the browser
+                      //   to 60 Hz on a 60 Hz display. The ramp is what
+                      //   reads as "smooth" — dnd-kit computes
+                      //   `acceleration * (distance / threshold)` per tick.
+                      enabled: true,
+                      acceleration: 30,
+                      interval: 8,
+                      threshold: { x: 0.05, y: 0.12 },
+                    }}
+                  >
                     <div className="rounded-2xl border overflow-x-auto">
                       <table className="w-full text-sm">
                         {tableHead}
