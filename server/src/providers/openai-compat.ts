@@ -68,6 +68,17 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
+    const body: Record<string, unknown> = { model: modelId, messages };
+    // Only include optional params when explicitly set — some providers
+    // (NVIDIA NIM minimax) reject unknown or zero-valued params.
+    if (options?.temperature !== undefined) body.temperature = options.temperature;
+    if (options?.max_tokens !== undefined && options.max_tokens > 0) body.max_tokens = options.max_tokens;
+    if (options?.top_p !== undefined) body.top_p = options.top_p;
+    if (options?.tools?.length) body.tools = options.tools;
+    if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
+    const parallel = this.resolveParallelToolCalls(options);
+    if (parallel !== undefined) body.parallel_tool_calls = parallel;
+
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -75,21 +86,16 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages,
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: this.resolveParallelToolCalls(options),
-      }),
+      body: JSON.stringify(body),
     }, options?.timeoutMs ?? this.timeoutMs);
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      let errBody: any;
+      try { errBody = await res.json(); } catch { errBody = {}; }
+      // Some providers (NVIDIA NIM) put the error message in `detail` instead
+      // of OpenAI's `error.message` shape. Others use `message` at the top level.
+      const detail = errBody?.error?.message ?? errBody?.detail ?? errBody?.message ?? res.statusText;
+      throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
     }
 
     let data: ChatCompletionResponse;
@@ -116,6 +122,17 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
+    const body: Record<string, unknown> = { model: modelId, messages, stream: true };
+    // Only include optional params when explicitly set — some providers
+    // (NVIDIA NIM minimax) reject unknown or zero-valued params.
+    if (options?.temperature !== undefined) body.temperature = options.temperature;
+    if (options?.max_tokens !== undefined && options.max_tokens > 0) body.max_tokens = options.max_tokens;
+    if (options?.top_p !== undefined) body.top_p = options.top_p;
+    if (options?.tools?.length) body.tools = options.tools;
+    if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
+    const parallel = this.resolveParallelToolCalls(options);
+    if (parallel !== undefined) body.parallel_tool_calls = parallel;
+
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -123,22 +140,16 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages,
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: this.resolveParallelToolCalls(options),
-        stream: true,
-      }),
+      body: JSON.stringify(body),
     }, options?.timeoutMs ?? this.timeoutMs);
 
     if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `${this.name} API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      let errBody: any;
+      try { errBody = await res.json(); } catch { errBody = {}; }
+      // Some providers (NVIDIA NIM) put the error message in `detail` instead
+      // of OpenAI's `error.message` shape. Others use `message` at the top level.
+      const detail = errBody?.error?.message ?? errBody?.detail ?? errBody?.message ?? res.statusText;
+      throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
     }
 
     yield* this.readSseStream(res);
