@@ -10,8 +10,11 @@ import { contentToString } from '../lib/content.js';
 
 const NPM_VERSION_URL = 'https://registry.npmjs.org/command-code/latest';
 const API_BASE = 'https://api.commandcode.ai';
-const DEFAULT_MAX_TOKENS = 64000;
-const DEFAULT_TEMPERATURE = 0.3;
+/** Fallback max_tokens when neither the caller nor the catalog specifies one.
+ *  Matches the Go reference proxy (proxy.go:92). */
+const FALLBACK_MAX_TOKENS = 64000;
+/** Default temperature. Matches the Go reference proxy (proxy.go:89, BuildRequest). */
+const DEFAULT_TEMPERATURE = 0.7;
 const STREAM_TIMEOUT_MS = 300000; // 5 min — same as BaseProvider.readSseStream
 const VERSION_FALLBACK = '0.18.10'; // upstream's minVersion — safe floor if npm is unreachable
 const MIN_SUPPORTED_VERSION = '0.18.10';
@@ -161,7 +164,7 @@ export class CommandCodeProvider extends BaseProvider {
           memory: '',
           taste: '',
           skills: '',
-          params: { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], system: '', max_tokens: 1, temperature: 0, stream: true, tools: [] },
+          params: { model: 'deepseek/deepseek-v4-flash', messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }], system: '', max_tokens: 1, temperature: 0.7, stream: true, tools: [] },
           threadId: crypto.randomUUID(),
         }),
       }, 15000);
@@ -182,7 +185,7 @@ export class CommandCodeProvider extends BaseProvider {
     const ccMessages = this.convertMessages(messages);
     const tools = this.convertTools(options?.tools);
     const temperature = options?.temperature ?? DEFAULT_TEMPERATURE;
-    const maxTokens = options?.max_tokens ?? DEFAULT_MAX_TOKENS;
+    const maxTokens = options?.max_tokens ?? FALLBACK_MAX_TOKENS;
 
     return {
       config: this.defaultConfig(),
@@ -198,7 +201,7 @@ export class CommandCodeProvider extends BaseProvider {
     return {
       workingDir: '.',
       date: new Date().toISOString().slice(0, 10),
-      environment: 'api',
+      environment: 'cli',
       structure: [],
       isGitRepo: false,
       currentBranch: '',
@@ -279,19 +282,69 @@ export class CommandCodeProvider extends BaseProvider {
     return out;
   }
 
-  private contentToBlocks(content: unknown): CCContentBlock[] {
+  /** Convert an OpenAI content value to CommandCode content blocks.
+   *  Matches the Go reference proxy's `parseContent()` in convert.go — every
+   *  block type the Go proxy preserves is preserved here so conversation
+   *  history is never silently truncated. */
+  private contentToBlocks(content: unknown, _toolNames?: Map<string, string>): CCContentBlock[] {
     if (content === null || content === undefined) return [];
     if (typeof content === 'string') {
       return content.length > 0 ? [{ type: 'text', text: content }] : [];
     }
     if (Array.isArray(content)) {
-      return content.map((c): CCContentBlock => {
-        if (typeof c === 'string') return { type: 'text', text: c };
-        const b = c as { type?: string; text?: string; tool_use_id?: string; content?: unknown };
-        if (b.type === 'tool_use' || b.tool_use_id) return { type: 'tool-call', tool_use_id: b.tool_use_id, input: b.content };
-        if (b.type === 'tool_result' && b.tool_use_id) return { type: 'tool-result', tool_use_id: b.tool_use_id, content: b.content };
-        return { type: 'text', text: contentToString(b) };
-      });
+      return content
+        .map((c): CCContentBlock | null => {
+          if (typeof c === 'string') return { type: 'text', text: c };
+          const b = c as Record<string, unknown>;
+          const typ = typeof b.type === 'string' ? b.type : '';
+
+          // ── text-like blocks (Go: text, input_text, output_text, refusal,
+          //     thinking, redacted_thinking, reasoning, document, search_result) ──
+          if (typ === 'text' || typ === 'input_text' || typ === 'output_text' ||
+              typ === 'refusal' || typ === 'thinking' || typ === 'redacted_thinking' ||
+              typ === 'reasoning' || typ === 'document' || typ === 'search_result') {
+            return { type: 'text', text: contentToString(b) };
+          }
+
+          // ── image-like blocks (Go: image_url, input_image, image → stringified text) ──
+          if (typ === 'image_url' || typ === 'input_image' || typ === 'image') {
+            return { type: 'text', text: contentToString(b) };
+          }
+
+          // ── tool-call blocks (Go: tool_use, tool-call) ──
+          if (typ === 'tool_use' || typ === 'tool-call' || b.tool_use_id) {
+            const id = (typeof b.id === 'string' ? b.id : '') ||
+                       (typeof b.toolCallId === 'string' ? b.toolCallId : '') ||
+                       (typeof b.tool_use_id === 'string' ? b.tool_use_id : '');
+            const name = (typeof b.name === 'string' ? b.name : '') ||
+                         (typeof b.toolName === 'string' ? b.toolName : '');
+            const input = b.input ?? b.arguments;
+            const block: CCContentBlock = { type: 'tool-call', input };
+            if (id) block.toolCallId = id;
+            if (name) block.toolName = name;
+            return block;
+          }
+
+          // ── tool-result blocks (Go: tool_result, tool-result) ──
+          if (typ === 'tool_result' || typ === 'tool-result') {
+            const toolUseId = (typeof b.tool_use_id === 'string' ? b.tool_use_id : '') ||
+                              (typeof b.toolCallId === 'string' ? b.toolCallId : '');
+            const toolName = typeof b.toolName === 'string' ? b.toolName : '';
+            const contentVal = contentToString(b.content ?? b.output);
+            const outputType = contentVal.startsWith('Error:') ? 'error-text' : 'text';
+            const block: CCContentBlock = {
+              type: 'tool-result',
+              output: { type: outputType, value: contentVal },
+            };
+            if (toolUseId) block.toolCallId = toolUseId;
+            if (toolName) block.toolName = toolName;
+            return block;
+          }
+
+          // ── fallthrough: unknown types become text ──
+          return { type: 'text', text: contentToString(b) };
+        })
+        .filter((b): b is CCContentBlock => b !== null);
     }
     return [];
   }
