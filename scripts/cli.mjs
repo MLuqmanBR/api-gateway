@@ -100,7 +100,7 @@ function cleanInstances() {
 function build() {
   return new Promise((resolve, reject) => {
     console.log('Building API-Gateway…');
-    const child = spawn('npm', ['run', 'build'], { cwd: ROOT, stdio: 'inherit', shell: true });
+    const child = spawn('npm', ['run', 'build'], { cwd: ROOT, stdio: 'inherit' });
     child.on('close', (code) => {
       if (code === 0) resolve();
       else reject(new Error(`Build failed with code ${code}`));

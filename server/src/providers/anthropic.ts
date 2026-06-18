@@ -10,6 +10,7 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { contentToString, normalizeOutboundContent } from '../lib/content.js';
+import { anthropicThinking, normalizeThinking } from '../lib/thinking.js';
 
 // Anthropic Messages API. The 2023-06-01 revision is the current stable version
 // (Anthropic pins clients to a specific date and the server negotiates the wire
@@ -40,6 +41,10 @@ interface AnthropicRequestBody {
   tool_choice?: AnthropicToolChoice;
   temperature?: number;
   top_p?: number;
+  /** Anthropic adaptive/extended-thinking control. See lib/thinking.ts. */
+  thinking?: { type: 'enabled' | 'adaptive' | 'disabled'; budget_tokens?: number; display?: 'summarized' | 'omitted' };
+  /** Effort is the Claude Opus 4.6/4.7/4.8 + Sonnet 4.6 lever for thinking depth. */
+  output_config?: { effort?: 'max' | 'xhigh' | 'high' | 'medium' | 'low' };
   stream?: boolean;
 }
 
@@ -53,6 +58,7 @@ type AnthropicUserContentBlock =
 
 type AnthropicAssistantContentBlock =
   | { type: 'text'; text: string }
+  | { type: 'thinking'; thinking: string; signature?: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown };
 
 interface AnthropicTool {
@@ -78,7 +84,6 @@ interface AnthropicResponse {
     output_tokens?: number;
   };
 }
-
 type AnthropicResponseBlock =
   | { type: 'text'; text: string }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
@@ -91,17 +96,18 @@ interface AnthropicStreamEvent {
   // rest pass through to the parser and are ignored if unmatched.
   message?: { id: string; model: string; usage?: { input_tokens?: number; output_tokens?: number } };
   index?: number;
-  content_block?: { type: string; id?: string; name?: string };
+  content_block?: { type: string; id?: string; name?: string; signature?: string };
   delta?: {
-    type: 'text_delta' | 'input_json_delta' | string;
+    type: 'text_delta' | 'input_json_delta' | 'thinking_delta' | 'signature_delta' | string;
     text?: string;
+    thinking?: string;
     partial_json?: string;
+    signature?: string;
     stop_reason?: 'end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence' | null;
     stop_sequence?: string | null;
   };
   usage?: { output_tokens?: number };
 }
-
 /**
  * Provider for Anthropic-compatible endpoints (api.anthropic.com, AWS Bedrock's
  * Anthropic-on-Claude routes, Google Vertex AI's Claude routes, and any
@@ -190,8 +196,24 @@ export class AnthropicCompatProvider extends BaseProvider {
       }
 
       if (role === 'assistant') {
+        // When the client preserves prior-turn reasoning, Anthropic requires
+        // the original thinking block be replayed alongside any tool_use —
+        // otherwise multi-turn tool loops reject with 400. We synthesize a
+        // block from the unified `reasoning_content` / `thinking_signature`
+        // pair carried on the assistant message. (#290)
+        const priorThinking = (m.reasoning_content && typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0)
+          || (typeof m.thinking_signature === 'string' && m.thinking_signature.length > 0);
         if (m.tool_calls && m.tool_calls.length > 0) {
           const blocks: AnthropicAssistantContentBlock[] = [];
+          if (priorThinking) {
+            blocks.push({
+              type: 'thinking',
+              thinking: m.reasoning_content ?? '',
+              ...(typeof m.thinking_signature === 'string' && m.thinking_signature.length > 0
+                ? { signature: m.thinking_signature }
+                : {}),
+            });
+          }
           const text = contentToString(m.content);
           if (text) blocks.push({ type: 'text', text });
           for (const tc of m.tool_calls) {
@@ -206,6 +228,24 @@ export class AnthropicCompatProvider extends BaseProvider {
             }
             blocks.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
           }
+          result.push({ role: 'assistant', content: blocks });
+          continue;
+        }
+        // Plain assistant turn. Anthropic requires that any assistant turn
+        // produced under extended thinking on the prior request carry a
+        // thinking block first. Mirror that to keep multi-turn continuity;
+        // Anthropic ignores an unrelated thinking block when thinking is now
+        // disabled. (#290)
+        if (priorThinking) {
+          const blocks: AnthropicAssistantContentBlock[] = [{
+            type: 'thinking',
+            thinking: m.reasoning_content ?? '',
+            ...(typeof m.thinking_signature === 'string' && m.thinking_signature.length > 0
+              ? { signature: m.thinking_signature }
+              : {}),
+          }];
+          const text = contentToString(m.content) || '';
+          if (text) blocks.push({ type: 'text', text });
           result.push({ role: 'assistant', content: blocks });
           continue;
         }
@@ -245,8 +285,10 @@ export class AnthropicCompatProvider extends BaseProvider {
   /** Build an OpenAI-shaped response from Anthropic's content-block response.
    *  - text blocks accumulate into `message.content`
    *  - tool_use blocks become `tool_calls` entries
-   *  - thinking blocks are dropped (no OpenAI field to carry them; see class
-   *    docstring on what this loses vs. preserving)
+   *  - thinking blocks fold into `message.reasoning_content` (text) and
+   *    `message.thinking_signature` (encrypted signature, for multi-turn
+   *    replay). The last signature wins; clients preserve it on the next
+   *    request and Anthropic uses it to decrypt the prior trace. (#290)
    *  - stop_reason is mapped end_turn→stop, max_tokens→length, tool_use→
    *    tool_calls, stop_sequence→stop
    *  - usage: input_tokens→prompt_tokens, output_tokens→completion_tokens
@@ -254,6 +296,8 @@ export class AnthropicCompatProvider extends BaseProvider {
   private translateResponse(body: AnthropicResponse, modelId: string): ChatCompletionResponse {
     let content = '';
     const toolCalls: ChatToolCall[] = [];
+    let reasoning = '';
+    let lastSignature: string | undefined;
 
     for (const block of body.content) {
       if (block.type === 'text') {
@@ -268,8 +312,17 @@ export class AnthropicCompatProvider extends BaseProvider {
             arguments: JSON.stringify(tu.input ?? {}),
           },
         });
+      } else if (block.type === 'thinking') {
+        const thinkBlock = block as { thinking?: string; signature?: string };
+        if (typeof thinkBlock.thinking === 'string' && thinkBlock.thinking.length > 0) {
+          reasoning = reasoning ? `${reasoning}\n${thinkBlock.thinking}` : thinkBlock.thinking;
+        }
+        if (typeof thinkBlock.signature === 'string' && thinkBlock.signature.length > 0) {
+          lastSignature = thinkBlock.signature;
+        }
       }
-      // 'thinking' (and any future block type) is intentionally dropped.
+      // Other block types (rare; we'll see redacted_thinking) pass through
+      // ignored today.
     }
 
     return {
@@ -286,6 +339,8 @@ export class AnthropicCompatProvider extends BaseProvider {
           // answer when both are returned.
           content: content || null,
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+          ...(reasoning.length > 0 ? { reasoning_content: reasoning } : {}),
+          ...(lastSignature ? { thinking_signature: lastSignature } : {}),
         },
         finish_reason: this.translateStopReason(body.stop_reason),
       }],
@@ -343,8 +398,20 @@ export class AnthropicCompatProvider extends BaseProvider {
     if (options?.temperature !== undefined) body.temperature = options.temperature;
     if (options?.top_p !== undefined) body.top_p = options.top_p;
     if (stream) body.stream = true;
+    // Wire the thinking/effort knobs into the Anthropic request body. We
+    // always use the unified helper so the per-provider shape is consistent
+    // — `thinking` vs `output_config.effort` never varies by call site. The
+    // proxy is responsible for choosing `enabled`/`adaptive` based on the
+    // model it routed to. (#290)
+    const thinkingWire = anthropicThinking(normalizeThinking({
+      reasoning_effort: options?.reasoning_effort,
+      thinking: options?.thinking,
+    }));
+    if (thinkingWire.thinking) body.thinking = thinkingWire.thinking as AnthropicRequestBody['thinking'];
+    if (thinkingWire.output_config) body.output_config = thinkingWire.output_config as AnthropicRequestBody['output_config'];
     return body;
   }
+
 
   private buildRequestHeaders(apiKey: string): Record<string, string> {
     // Keyless providers (self-hosted proxies that need no key) get an empty
@@ -456,16 +523,17 @@ export class AnthropicCompatProvider extends BaseProvider {
     let buffer = '';
     let upstreamId: string | undefined;
     let currentEvent: string | undefined;
-    // For each block index: 'text' | 'tool_use', plus the assembled JSON for
-    // tool_use. Block indices are 0-based and stable within a message.
-    const blockTypes = new Map<number, 'text' | 'tool_use'>();
+    // Block type per index. Anthropic lets a message carry text, tool_use,
+    // AND thinking blocks; we need to track each so the second- and third-
+    // branch delta handlers dispatch correctly. (#290)
+    const blockTypes = new Map<number, 'text' | 'tool_use' | 'thinking'>();
     const toolUseBuffers = new Map<number, string>();
     const toolUseMeta = new Map<number, { id: string; name: string }>();
+    let lastSignature = ''; // Anthropic thought signature, replay (#290)
     let finalStopReason: string | null = null;
     let finalUsage: TokenUsage | null = null;
     let emittedFinish = false;
     let sawFinishReason = false;
-
     const yieldFinishIfNeeded = () => {
       if (emittedFinish) return;
       emittedFinish = true;
@@ -479,7 +547,7 @@ export class AnthropicCompatProvider extends BaseProvider {
           index: 0,
           delta: {},
           finish_reason: finalStopReason ?? 'stop',
-        }],
+      },],
       };
       if (finalUsage) chunk.usage = finalUsage;
       return chunk;
@@ -551,6 +619,14 @@ export class AnthropicCompatProvider extends BaseProvider {
                 if (block.id && block.name) {
                   toolUseMeta.set(idx, { id: block.id, name: block.name });
                 }
+              } else if (block?.type === 'thinking') {
+                // Anthropic emits a single `signature_delta` against the
+                // thinking block; capture the block-level signature here if
+                // the start event carries one (rare; the deltas carry it). (#290)
+                blockTypes.set(idx, 'thinking');
+                if (typeof block.signature === 'string' && block.signature.length > 0) {
+                  lastSignature = block.signature;
+                }
               }
               break;
             }
@@ -573,6 +649,24 @@ export class AnthropicCompatProvider extends BaseProvider {
                 };
               } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
                 toolUseBuffers.set(idx, (toolUseBuffers.get(idx) ?? '') + delta.partial_json);
+              } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string' && delta.thinking.length > 0) {
+                blockTypes.set(idx, 'thinking');
+                yield {
+                  id: upstreamId ?? this.makeId(),
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: modelId,
+                  choices: [{
+                    index: 0,
+                    // OpenAI-shaped reasoning trace delta. Clients that
+                    // preserve it on the assistant message get the trace
+                    // replayed on the next turn. (#290)
+                    delta: { reasoning_content: delta.thinking },
+                    finish_reason: null,
+                  }],
+                };
+              } else if (delta.type === 'signature_delta' && typeof delta.signature === 'string' && delta.signature.length > 0) {
+                lastSignature = delta.signature;
               }
               break;
             }
@@ -595,6 +689,24 @@ export class AnthropicCompatProvider extends BaseProvider {
                         function: { name: meta.name, arguments: args },
                       }],
                     },
+                    finish_reason: null,
+                  }],
+                };
+              } else if (blockTypes.get(idx) === 'thinking' && lastSignature) {
+                // Emit a single terminating chunk carrying the signature so
+                // clients can persist it on the assistant message. Clients
+                // that build a this-turn assistant message emit just the
+                // text chunks + this signature chunk. (#290)
+                const sig = lastSignature;
+                lastSignature = '';
+                yield {
+                  id: upstreamId ?? this.makeId(),
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: modelId,
+                  choices: [{
+                    index: 0,
+                    delta: { thinking_signature: sig },
                     finish_reason: null,
                   }],
                 };

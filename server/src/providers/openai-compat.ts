@@ -5,7 +5,7 @@ import type {
   Platform,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
-
+import { extractErrorMessage } from '../lib/error-body.js';
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
  * Covers: Groq, Cerebras, NVIDIA NIM, Mistral, OpenRouter,
@@ -78,6 +78,12 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
     const parallel = this.resolveParallelToolCalls(options);
     if (parallel !== undefined) body.parallel_tool_calls = parallel;
+    // Pass through thinking knobs verbatim — every OpenAI-compat wrapper reads
+    // at least `reasoning_effort`, and many accept a richer `thinking`
+    // object too. Sending both is safe; the wrapper picks the one it
+    // understands. (#290)
+    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
+    if (options?.thinking) body.thinking = options.thinking;
 
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -90,11 +96,12 @@ export class OpenAICompatProvider extends BaseProvider {
     }, options?.timeoutMs ?? this.timeoutMs);
 
     if (!res.ok) {
-      let errBody: any;
-      try { errBody = await res.json(); } catch { errBody = {}; }
       // Some providers (NVIDIA NIM) put the error message in `detail` instead
-      // of OpenAI's `error.message` shape. Others use `message` at the top level.
-      const detail = errBody?.error?.message ?? errBody?.detail ?? errBody?.message ?? res.statusText;
+      // of OpenAI's `error.message` shape. Others use `message` at the top
+      // level. `extractErrorMessage` walks all three paths and returns
+      // `undefined` when nothing string-shaped is found. (#290)
+      const errBody = await res.json().catch(() => undefined);
+      const detail = extractErrorMessage(errBody) ?? res.statusText;
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
     }
 
@@ -132,6 +139,9 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
     const parallel = this.resolveParallelToolCalls(options);
     if (parallel !== undefined) body.parallel_tool_calls = parallel;
+    // Same thinking-knob pass-through as the non-streaming path. (#290)
+    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
+    if (options?.thinking) body.thinking = options.thinking;
 
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -142,13 +152,11 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify(body),
     }, options?.timeoutMs ?? this.timeoutMs);
-
     if (!res.ok) {
-      let errBody: any;
-      try { errBody = await res.json(); } catch { errBody = {}; }
-      // Some providers (NVIDIA NIM) put the error message in `detail` instead
-      // of OpenAI's `error.message` shape. Others use `message` at the top level.
-      const detail = errBody?.error?.message ?? errBody?.detail ?? errBody?.message ?? res.statusText;
+      // pulls the message out without `any` so we never coerce a graph
+      // into a string. (#290)
+      const errBody = await res.json().catch(() => undefined);
+      const detail = extractErrorMessage(errBody) ?? res.statusText;
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
     }
 
@@ -198,11 +206,18 @@ function normalizeChoices(data: ChatCompletionResponse): void {
         .map(seg => (typeof seg === 'string' ? seg : (seg.text ?? '')))
         .join('');
     }
-    // Fold reasoning into content if content is empty AND there are no
-    // tool_calls. With tool_calls present, content=null is the correct OpenAI
-    // shape; folding reasoning would confuse clients that branch on content.
-    // Field naming varies by provider: Z.ai uses `reasoning_content`, Ollama
-    // uses `reasoning`. Prefer `reasoning_content` when both are set.
+    // Fold `reasoning` into `content` ONLY when content is empty AND there
+    // are no tool_calls. With tool_calls present, content=null is the
+    // correct OpenAI shape. Field naming varies by provider: Z.ai uses
+    // `reasoning_content`, Ollama uses `reasoning`. Prefer
+    // `reasoning_content` when both are set. (#200, #290)
+    //
+    // Note: `reasoning_content` is NOT stripped here — clients that
+    // preserve it on the assistant message for multi-turn replay
+    // (Anthropic extended-thinking, DeepSeek reasoning models) still see
+    // the trace on the message object. The fold only kicks in when the
+    // provider left `content` empty AND there's nothing to fold into it;
+    // mirroring the original behavior. (#290)
     const hasToolCalls = Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0;
     if (!hasToolCalls && (msg.content === '' || msg.content == null)) {
       const fold = (typeof msg.reasoning_content === 'string' && msg.reasoning_content.length > 0)

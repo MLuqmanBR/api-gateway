@@ -6,15 +6,17 @@ import type {
   ChatToolChoice,
   ChatToolDefinition,
   TokenUsage,
+  ThinkingConfig,
+  ThinkingEffort,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { contentToString } from '../lib/content.js';
-
+import { extractErrorMessage } from '../lib/error-body.js';
+import { geminiThinkingConfig, normalizeThinking } from '../lib/thinking.js';
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 // Gemini 3 REQUIRES the `thoughtSignature` that accompanied a function call to
 // be echoed back whenever that call appears in conversation history, or it
-// rejects the request with 400 "Function call is missing a thought_sig". But
 // OpenAI-format clients (the API surface we expose) have no field to carry a
 // provider-specific signature, so it's dropped on the round-trip and every
 // multi-turn tool conversation through Gemini fails. To bridge this without a
@@ -53,6 +55,10 @@ interface GeminiPart {
     mimeType: string;
     data: string;
   };
+  // True when this part holds the model's reasoning trace (Gemini 3 +
+  // thinking-enabled 2.5). We fold these into `reasoning_content` on the
+  // OpenAI envelope. (#290)
+  thought?: boolean;
   thoughtSignature?: string;
   functionCall?: {
     id?: string;
@@ -298,6 +304,14 @@ async function toGeminiContents(messages: ChatMessage[]) {
       if (m.role === 'assistant') {
         const parts: GeminiPart[] = [];
 
+        // Replay any preserved reasoning trace as a thought part BEFORE any
+        // text/tool_use so the model sees the same shape it produced. Gemini
+        // uses thought:true parts to tie the new turn to the prior trace;
+        // absent the part, a follow-up tool-use round is rejected. (#290)
+        if (typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0) {
+          parts.push({ thought: true, text: m.reasoning_content });
+        }
+
         const assistantText = contentToString(m.content);
         if (assistantText.length > 0) {
           parts.push({ text: assistantText });
@@ -388,7 +402,19 @@ function extractToolCalls(parts: GeminiPart[] | undefined): ChatToolCall[] {
 
 function extractText(parts: GeminiPart[] | undefined): string | null {
   if (!parts) return null;
+  // `thought: true` parts carry the reasoning trace and MUST stay out of the
+  // user-visible text. (#290)
   const text = parts
+    .filter(p => !p.thought)
+    .map(p => p.text ?? '')
+    .join('');
+  return text.length > 0 ? text : null;
+}
+
+function extractReasoning(parts: GeminiPart[] | undefined): string | null {
+  if (!parts) return null;
+  const text = parts
+    .filter(p => p.thought && typeof p.text === 'string' && p.text.length > 0)
     .map(p => p.text ?? '')
     .join('');
   return text.length > 0 ? text : null;
@@ -412,6 +438,7 @@ export class GoogleProvider extends BaseProvider {
         temperature: options?.temperature,
         maxOutputTokens: options?.max_tokens,
         topP: options?.top_p,
+        ...this.buildGeminiThinkingConfig(options, modelId),
       },
       tools: toGeminiTools(options?.tools),
       toolConfig: toGeminiToolConfig(options?.tool_choice),
@@ -424,10 +451,9 @@ export class GoogleProvider extends BaseProvider {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Google API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
     const data = await res.json() as GeminiResponse;
@@ -442,6 +468,7 @@ export class GoogleProvider extends BaseProvider {
     const parts = candidate?.content?.parts;
     const toolCalls = extractToolCalls(parts);
     const text = extractText(parts);
+    const reasoning = extractReasoning(parts);
 
     const usage: TokenUsage = {
       prompt_tokens: data.usageMetadata?.promptTokenCount ?? 0,
@@ -460,11 +487,12 @@ export class GoogleProvider extends BaseProvider {
           role: 'assistant',
           content: text,
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+          ...(reasoning ? { reasoning_content: reasoning } : {}),
         },
         finish_reason: toolCalls.length > 0 ? 'tool_calls' : toGeminiFinishReason(candidate?.finishReason),
       }],
       usage,
-      _routed_via: { platform: 'google', model: modelId },
+      _routed_via: { platform: this.platform, model: modelId },
     };
   }
 
@@ -482,6 +510,7 @@ export class GoogleProvider extends BaseProvider {
         temperature: options?.temperature,
         maxOutputTokens: options?.max_tokens,
         topP: options?.top_p,
+        ...this.buildGeminiThinkingConfig(options, modelId),
       },
       tools: toGeminiTools(options?.tools),
       toolConfig: toGeminiToolConfig(options?.tool_choice),
@@ -494,10 +523,9 @@ export class GoogleProvider extends BaseProvider {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Google API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
     const reader = res.body?.getReader();
@@ -564,8 +592,8 @@ export class GoogleProvider extends BaseProvider {
           }
           const candidate = chunk.candidates?.[0];
           const parts = candidate?.content?.parts ?? [];
-
           const text = extractText(parts);
+          const reasoning = extractReasoning(parts);
           const toolCalls = extractToolCalls(parts).filter(call => {
             const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
             if (seenToolCallKeys.has(key)) return false;
@@ -573,7 +601,7 @@ export class GoogleProvider extends BaseProvider {
             return true;
           });
 
-          if ((text && text.length > 0) || toolCalls.length > 0) {
+          if ((text && text.length > 0) || toolCalls.length > 0 || (reasoning && reasoning.length > 0)) {
             sawToolCalls = sawToolCalls || toolCalls.length > 0;
             yield {
               id,
@@ -585,6 +613,10 @@ export class GoogleProvider extends BaseProvider {
                 delta: {
                   ...(text ? { content: text } : {}),
                   ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+                  // Emit reasoning as a separate delta so clients that
+                  // preserve `reasoning_content` for multi-turn replay see
+                  // the trace incrementally. (#290)
+                  ...(reasoning ? { reasoning_content: reasoning } : {}),
                 },
                 finish_reason: null,
               }],
@@ -626,6 +658,25 @@ export class GoogleProvider extends BaseProvider {
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
   }
+
+  /** Build the `generationConfig.thinkingConfig` block per Gemini model
+   * version — Gemini 3 takes `thinkingLevel`, 2.5 takes `thinkingBudget`.
+   * If neither knob is set, return {} so we never write an empty object into
+   * the body. (#290) */
+  private buildGeminiThinkingConfig(
+    options: CompletionOptions | undefined,
+    modelId: string,
+  ): Record<string, unknown> {
+    const cfg = geminiThinkingConfig(
+      normalizeThinking({
+        reasoning_effort: options?.reasoning_effort,
+        thinking: options?.thinking,
+      }),
+      modelId,
+    );
+    return cfg ? { thinkingConfig: cfg } : {};
+  }
+
 
   async validateKey(apiKey: string): Promise<boolean> {
     // Transport errors propagate — health.ts marks status='error' without

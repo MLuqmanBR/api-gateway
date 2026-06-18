@@ -225,7 +225,36 @@ export interface ChatMessage {
   // The model's thinking trace on an assistant turn. Some thinking models
   // (DeepSeek on OpenCode Zen) require it to be replayed verbatim on the next
   // turn or they 400; the proxy preserves and forwards it. See issue #255.
-  reasoning_content?: string;
+  reasoning_content?: string | null;
+  // Anthropic-specific extended-thinking signature (encrypted reasoning).
+  // Required to be replayed alongside `reasoning_content` so multi-turn tool
+  // loops don't reject the request. Provider-specific; other providers ignore.
+  thinking_signature?: string | null;
+}
+
+// Unified thinking-effort hint. Linear scale; providers map to their native
+// vocabulary (`thinking.level`, `thinkingBudget`, `output_config.effort`, etc.).
+// `xhigh` is Anthropic-only; providers that don't recognize it collapse it to
+// `high` so the user's intent is honored.
+export type ThinkingEffort = 'max' | 'xhigh' | 'high' | 'medium' | 'low' | 'minimal';
+
+// Reasoning trace replay hint. `enabled` carries Anthropic's `budget_tokens`
+// (and can coexist with `effort` for the newer Opus 4.6 / Sonnet 4.6 adaptive
+// mode). `adaptive` is Anthropic's newer mood; `disabled` is honored where the
+// model supports it. Providers that don't understand a given variant drop it.
+export interface ThinkingConfig {
+  // Anthropic-style: 'enabled' | 'adaptive' | 'disabled'.
+  // OpenAI-compat / Google: 'enabled' | 'disabled'.
+  type?: 'enabled' | 'adaptive' | 'disabled';
+  effort?: ThinkingEffort;
+  // Anthropic budget_tokens; Google Gemini 2.5 thinkingBudget. Optional.
+  budget?: number;
+  // Anthropic display hint ('summarized' | 'omitted'). Optional.
+  display?: 'summarized' | 'omitted';
+  // Google, also returned by some OpenAI-compat providers: include the raw
+  // (non-summarized) reasoning trace in the response. Default true when
+  // thinking is enabled.
+  includeThoughts?: boolean;
 }
 
 export interface ChatCompletionRequest {
@@ -238,8 +267,15 @@ export interface ChatCompletionRequest {
   tools?: ChatToolDefinition[];
   tool_choice?: ChatToolChoice;
   parallel_tool_calls?: boolean;
+  // OpenAI-compat "reasoning_effort" field. Equivalent to
+  // thinking.effort but separate for clients that already use it. Providers
+  // normalize into their native thinking config. (#290)
+  reasoning_effort?: ThinkingEffort;
+  // Richer thinking-control object. Forwarded per-provider with shape
+  // adaptation (`thinking` for Anthropic, `thinkingConfig` for Google,
+  // `reasoning_effort`/`reasoning` for OpenAI-compat). (#290)
+  thinking?: ThinkingConfig;
 }
-
 export interface ChatCompletionChoice {
   index: number;
   message: ChatMessage;
@@ -276,6 +312,13 @@ export interface ChatCompletionChunk {
       role?: 'assistant';
       content?: string;
       tool_calls?: ChatToolCall[];
+      // Streaming reasoning trace delta. Anthropic's `thinking_delta` and
+      // Gemini's `thought:true` parts arrive as incremental strings here.
+      // (#290)
+      reasoning_content?: string;
+      // Anthropic thought signature — emitted once per turn, on the chunk
+      // that closes the thinking block. Clients persist it for replay. (#290)
+      thinking_signature?: string;
     };
     finish_reason: string | null;
   }[];

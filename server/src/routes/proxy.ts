@@ -239,6 +239,10 @@ const assistantMessageSchema = z.object({
   // unless the prior turn's reasoning_content is replayed, so keep it through
   // validation instead of stripping it. See issue #255.
   reasoning_content: z.string().nullable().optional(),
+  // Anthropic thought signature — providers need both `reasoning_content`
+  // and this paired signature to fully reconstruct the prior turn's
+  // extended-thinking on a multi-turn tool loop. (#290)
+  thinking_signature: z.string().nullable().optional(),
 });
 
 // Tool results may arrive with null/missing content (a tool that returned
@@ -270,7 +274,6 @@ const toolDefinitionSchema = z.object({
     strict: z.boolean().optional(),
   }),
 });
-
 const toolChoiceSchema = z.union([
   // 'any' is the Mistral/Gemini wording for OpenAI's 'required'; mapped on
   // forward. (#200)
@@ -282,6 +285,22 @@ const toolChoiceSchema = z.union([
     }),
   }),
 ]);
+
+// Linear thinking-effort scale accepted across all platforms. Providers map
+// this to their native vocab (`thinking.level`, `reasoning_effort`,
+// `output_config.effort`, etc.). `xhigh` is Anthropic-only; providers that
+// don't recognize it collapse to `high`. (#290)
+const thinkingEffortSchema = z.enum(['max', 'xhigh', 'high', 'medium', 'low', 'minimal']);
+
+// Richer thinking-control object. Providers translate this into their native
+// wire shape on the way out. (#290)
+const thinkingConfigSchema = z.object({
+  type: z.enum(['enabled', 'adaptive', 'disabled']).optional(),
+  effort: thinkingEffortSchema.optional(),
+  budget: z.number().int().nonnegative().optional(),
+  display: z.enum(['summarized', 'omitted']).optional(),
+  includeThoughts: z.boolean().optional(),
+});
 
 const chatCompletionSchema = z.object({
   messages: z.array(z.union([
@@ -305,8 +324,12 @@ const chatCompletionSchema = z.object({
   tools: z.array(toolDefinitionSchema).nullable().optional(),
   tool_choice: toolChoiceSchema.nullable().optional(),
   parallel_tool_calls: z.boolean().nullable().optional(),
+  // Thinking controls — either the shorthand `reasoning_effort` or the
+  // richer `thinking` object is honored; provider code translates them
+  // into the wire shape each upstream accepts. (#290)
+  reasoning_effort: thinkingEffortSchema.nullable().optional(),
+  thinking: thinkingConfigSchema.nullable().optional(),
 });
-
 export function isRetryableError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
@@ -467,7 +490,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return;
   }
 
-  const { model: requestedModel, temperature, top_p, stream } = parsed.data;
+  const {
+    model: requestedModel, temperature, top_p, stream,
+    reasoning_effort: inboundReasoningEffort,
+    thinking: inboundThinking,
+  } = parsed.data;
   // Agent-tolerant knob normalization (#200): max_tokens <= 0 means "no
   // limit" in several clients → unset; tool_choice 'any' is OpenAI's
   // 'required'; tool definitions get their 'function' type re-defaulted.
@@ -476,7 +503,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const tool_choice = parsed.data.tool_choice === 'any' ? 'required' as const : parsed.data.tool_choice ?? undefined;
   const tools = parsed.data.tools?.map(t => ({ ...t, type: 'function' as const }));
   const parallel_tool_calls = parsed.data.parallel_tool_calls ?? undefined;
-
+  // Build the per-call thinking view once; providers receive it through
+  // CompletionOptions. Explicit nulls are normalized to undefined so the
+  // provider-side `if (options?.reasoning_effort)` pattern works. (#290)
+  const reasoning_effort = inboundReasoningEffort ?? undefined;
+  const thinking = inboundThinking ?? undefined;
   // Pairing state for id-less tool calls (#200): every tool_call id (given or
   // synthesized) queues up here; a tool message without a tool_call_id takes
   // the oldest unanswered one, which matches the single-call-per-turn flow
@@ -514,6 +545,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // thought_signature below. (#255)
         ...(typeof m.reasoning_content === 'string' && m.reasoning_content.length > 0
           ? { reasoning_content: m.reasoning_content }
+          : {}),
+        // Paired with `reasoning_content` so providers that need an encrypted
+        // signature to reconstruct the prior thinking block on a multi-turn
+        // tool loop (Anthropic, Gemini 3) receive it without the client
+        // having to ship a separate protocol. (#290)
+        ...(typeof m.thinking_signature === 'string' && m.thinking_signature.length > 0
+          ? { thinking_signature: m.thinking_signature }
           : {}),
         // hasToolCalls (not a bare truthiness check) so null AND empty-array
         // tool_calls are dropped rather than forwarded — strict upstreams
@@ -865,7 +903,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
-            { temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls },
+            {
+              temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
+              reasoning_effort, thinking,
+            },
           );
 
           for await (const chunk of gen) {
@@ -1031,15 +1072,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           // Headers never sent — bubble to the outer retry handler, which
           // cooldowns this model+key and tries the next one. Covers upstream
           // HTTP errors, in-band error frames, abrupt EOF, stalls, empty
-          // completions, and unparseable dialect turns alike.
           throw streamErr;
         }
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
-          { temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls },
+          {
+            temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
+            reasoning_effort, thinking,
+          },
         );
-
         // Empty completion (no text, no tool calls) → fail over rather than
         // return a transport-level "success" the caller can't act on. Mirrors
         // the zero-chunk streaming case above.

@@ -45,6 +45,13 @@ export interface CompletionOptions {
   tools?: ChatToolDefinition[];
   tool_choice?: ChatToolChoice;
   parallel_tool_calls?: boolean;
+  // OpenAI-compat reasoning effort level (mapped per-provider to the wire
+  // shape that controls thinking depth). Optional — providers that don't
+  // support thinking ignore it. (#290)
+  reasoning_effort?: 'max' | 'xhigh' | 'high' | 'medium' | 'low' | 'minimal';
+  // Richer thinking-control object. Providers translate into their native
+  // vocab (`thinking`, `thinkingConfig`, `reasoning_effort`). See #290.
+  thinking?: import('@api-gateway/shared/types.js').ThinkingConfig;
   /** Per-call HTTP timeout override. Not part of the OpenAI wire format (it is
    * stripped before the request body is built); used by the probe script so
    * NVIDIA's 15-60s serverless cold starts don't read as failures. */

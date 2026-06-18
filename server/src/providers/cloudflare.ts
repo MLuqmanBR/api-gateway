@@ -5,7 +5,7 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { contentToString } from '../lib/content.js';
-
+import { extractErrorMessage } from '../lib/error-body.js';
 /**
  * Cloudflare Workers AI provider.
  * API key format expected: "account_id:api_token"
@@ -39,7 +39,6 @@ export class CloudflareProvider extends BaseProvider {
     const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
 
     const res = await this.fetchWithTimeout(url, {
-      method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
@@ -53,12 +52,18 @@ export class CloudflareProvider extends BaseProvider {
         tools: options?.tools,
         tool_choice: options?.tool_choice,
         parallel_tool_calls: options?.parallel_tool_calls,
+        // Forward thinking knobs verbatim — Cloudflare silently drops fields
+        // it doesn't recognize for now, but newer reasoning models (DeepSeek
+        // R1 distill etc.) read `reasoning_effort` and pick the right depth.
+        // (#290)
+        ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
+        ...(options?.thinking ? { thinking: options.thinking } : {}),
       }),
     });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${(err as any).error?.message ?? (err as any).errors?.[0]?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
     const data = await res.json() as ChatCompletionResponse;
@@ -91,12 +96,15 @@ export class CloudflareProvider extends BaseProvider {
         tool_choice: options?.tool_choice,
         parallel_tool_calls: options?.parallel_tool_calls,
         stream: true,
+        // Thinking knobs — same rationale as the non-streaming path. (#290)
+        ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
+        ...(options?.thinking ? { thinking: options.thinking } : {}),
       }),
     });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${(err as any).error?.message ?? (err as any).errors?.[0]?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
     yield* this.readSseStream(res);
@@ -113,7 +121,13 @@ export class CloudflareProvider extends BaseProvider {
     );
     if (res.status === 401 || res.status === 403) return false;
     if (!res.ok) return true; // unexpected non-2xx that isn't auth — don't disable
-    const data = await res.json() as any;
-    return data.success === true && data.result?.status === 'active';
+    // Cloudflare's token-verify response is a narrow shape; we only check
+    // `success` and `result.status` per the documented contract. Anything
+    // else we treat as "key not verified by this transport" rather than
+    // disabling it. Use `unknown` instead of `any` so the API stays typed:
+    // the cast through `unknown` is a one-way boundary at the JSON-parse
+    // gateway, which is the only safe place to lose tracking. (#290)
+    const data = await res.json().catch(() => null) as unknown as { success?: unknown; result?: { status?: unknown } } | null;
+    return data?.success === true && data.result?.status === 'active';
   }
 }

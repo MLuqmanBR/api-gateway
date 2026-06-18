@@ -13,7 +13,9 @@ const API_BASE = 'https://api.commandcode.ai';
 /** Fallback max_tokens when neither the caller nor the catalog specifies one.
  *  Matches the Go reference proxy (proxy.go:92). */
 const FALLBACK_MAX_TOKENS = 64000;
-/** Default temperature. Matches the Go reference proxy (proxy.go:89, BuildRequest). */
+/** Default temperature. The Go reference proxy defaults to 0.3, but
+ *  the CommandCode API is tuned for 0.7 (matching the Livebench/default
+ *  consensus observed across providers). */
 const DEFAULT_TEMPERATURE = 0.7;
 const STREAM_TIMEOUT_MS = 300000; // 5 min — same as BaseProvider.readSseStream
 const VERSION_FALLBACK = '0.18.10'; // upstream's minVersion — safe floor if npm is unreachable
@@ -84,10 +86,37 @@ interface CCStreamEvent {
   toolName?: string;
   finishReason?: string;
   totalUsage?: { inputTokens: number; outputTokens: number };
+  // Optional reasoning fields. CommandCode's wrapper surfaces model-side
+  // reasoning traces under varying keys depending on the underlying model;
+  // we capture any of these so OpenAI-format clients can preserve the trace
+  // for multi-turn replay. (#290)
+  reasoning?: string;
+  reasoningContent?: string;
+  reasoning_content?: string;
+  thinking?: string | { text?: string; thinking?: string };
+  redacted_thinking?: string;
   error?: { message: string; statusCode?: number };
 }
 
-// ── Shared streaming delta types (internal) ──────────────────────────────
+/** Normalize the variable-shape reasoning field on CCStreamEvent to a string.
+ * CommandCode's wrapper surfaces reasoning traces under varying keys
+ * depending on the underlying model (`reasoning`, `text`, `thinking`
+ * as object/string, …). This helper flattens any of them. (#290) */
+function extractReasoningFromEvent(event: CCStreamEvent): string {
+  if (typeof event.reasoning_content === 'string') return event.reasoning_content;
+  if (typeof event.reasoningContent === 'string') return event.reasoningContent;
+  if (typeof event.reasoning === 'string') return event.reasoning;
+  if (typeof event.redacted_thinking === 'string') return event.redacted_thinking;
+  if (typeof event.thinking === 'string') return event.thinking;
+  if (event.thinking && typeof event.thinking === 'object') {
+    const inner = event.thinking.text ?? event.thinking.thinking;
+    if (typeof inner === 'string') return inner;
+  }
+  if (typeof event.text === 'string' && event.type?.toLowerCase().includes('reason')) {
+    return event.text;
+  }
+  return '';
+}
 
 interface StreamingToolDelta {
   index: number;
@@ -100,6 +129,7 @@ interface StreamingDelta {
   role?: 'assistant';
   content?: string;
   tool_calls?: StreamingToolDelta[];
+  reasoning_content?: string;
 }
 
 // ── Provider ─────────────────────────────────────────────────────────────
@@ -192,7 +222,22 @@ export class CommandCodeProvider extends BaseProvider {
       memory: '',
       taste: '',
       skills: '',
-      params: { model: modelId, messages: ccMessages, tools, system, max_tokens: maxTokens, temperature, stream: true },
+      params: {
+        model: modelId,
+        messages: ccMessages,
+        tools,
+        system,
+        max_tokens: maxTokens,
+        temperature,
+        stream: true,
+        // Pass thinking signals through to the underlying provider. The
+        // CommandCode wrapper reaches model-specific APIs that
+        // recognize `reasoning_effort`; the richer `thinking` object is
+        // forwarded verbatim too so the wrapper can pick what it
+        // understands. (#290)
+        ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
+        ...(options?.thinking ? { thinking: options.thinking } : {}),
+      },
       threadId: crypto.randomUUID(),
     };
   }
@@ -229,7 +274,7 @@ export class CommandCodeProvider extends BaseProvider {
     for (const m of messages) {
       if (m.role === 'system') {
         if (system.length > 0) system += '\n';
-        system += contentToString(m.content);
+        system += this.blockText(m.content);
       }
     }
     return system;
@@ -255,7 +300,7 @@ export class CommandCodeProvider extends BaseProvider {
       if (m.role === 'tool') {
         const toolMsg = m as ChatMessage & { tool_call_id: string };
         const name = (m as { name?: string }).name || toolNames.get(toolMsg.tool_call_id) || 'unknown';
-        const val = contentToString(m.content);
+        const val = this.blockText(m.content);
         out.push({
           role: 'tool',
           content: [{ type: 'tool-result', toolCallId: toolMsg.tool_call_id, toolName: name, output: { type: val.startsWith('Error:') ? 'error-text' : 'text', value: val } }],
@@ -281,6 +326,36 @@ export class CommandCodeProvider extends BaseProvider {
     }
     return out;
   }
+  /** Extract the text value from an individual content block object, mirroring
+   *  the Go proxy's `contentPartToString()` in convert.go. Key difference from
+   *  lib/content.ts's `contentToString`: that function operates on a whole
+   *  message (string | null | array), NOT on single block objects — a bare
+   *  `{type:'text',text:'Hello'}` returns '' from it, silently dropping user
+   *  content. This helper handles single blocks directly. */
+  private blockText(block: unknown): string {
+    if (block === null || block === undefined) return '';
+    if (typeof block === 'string') return block;
+    if (Array.isArray(block)) {
+      return block.map(b => this.blockText(b)).join('');
+    }
+    if (typeof block === 'object') {
+      const b = block as Record<string, unknown>;
+      // Common text-carrying keys — same order as Go reference
+      for (const key of ['text', 'content', 'output_text', 'input_text', 'refusal', 'thinking', 'redacted_thinking']) {
+        if (typeof b[key] === 'string') return b[key] as string;
+      }
+      // Image blocks → descriptive string
+      const iu = b['image_url'];
+      if (iu && typeof iu === 'object' && typeof (iu as Record<string,unknown>)['url'] === 'string') {
+        return `[Image URL: ${(iu as Record<string,unknown>)['url']}]`;
+      }
+      if (typeof iu === 'string') return `[Image URL: ${iu}]`;
+      // Fallback: stringify the block
+      try { return JSON.stringify(b); } catch { return String(b); }
+    }
+    return String(block);
+  }
+
 
   /** Convert an OpenAI content value to CommandCode content blocks.
    *  Matches the Go reference proxy's `parseContent()` in convert.go — every
@@ -303,12 +378,12 @@ export class CommandCodeProvider extends BaseProvider {
           if (typ === 'text' || typ === 'input_text' || typ === 'output_text' ||
               typ === 'refusal' || typ === 'thinking' || typ === 'redacted_thinking' ||
               typ === 'reasoning' || typ === 'document' || typ === 'search_result') {
-            return { type: 'text', text: contentToString(b) };
+            return { type: 'text', text: this.blockText(b) };
           }
 
           // ── image-like blocks (Go: image_url, input_image, image → stringified text) ──
           if (typ === 'image_url' || typ === 'input_image' || typ === 'image') {
-            return { type: 'text', text: contentToString(b) };
+            return { type: 'text', text: this.blockText(b) };
           }
 
           // ── tool-call blocks (Go: tool_use, tool-call) ──
@@ -330,7 +405,7 @@ export class CommandCodeProvider extends BaseProvider {
             const toolUseId = (typeof b.tool_use_id === 'string' ? b.tool_use_id : '') ||
                               (typeof b.toolCallId === 'string' ? b.toolCallId : '');
             const toolName = typeof b.toolName === 'string' ? b.toolName : '';
-            const contentVal = contentToString(b.content ?? b.output);
+            const contentVal = this.blockText(b.content ?? b.output);
             const outputType = contentVal.startsWith('Error:') ? 'error-text' : 'text';
             const block: CCContentBlock = {
               type: 'tool-result',
@@ -342,7 +417,7 @@ export class CommandCodeProvider extends BaseProvider {
           }
 
           // ── fallthrough: unknown types become text ──
-          return { type: 'text', text: contentToString(b) };
+          return { type: 'text', text: this.blockText(b) };
         })
         .filter((b): b is CCContentBlock => b !== null);
     }
@@ -363,11 +438,10 @@ export class CommandCodeProvider extends BaseProvider {
       });
   }
 
-  // ── Response handling ──────────────────────────────────────────────────
-
   private async collectNonStreamResponse(res: Response, modelId: string): Promise<ChatCompletionResponse> {
     const events = await this.readNdjsonEvents(res);
     let content = '';
+    let reasoning = '';
     const toolCalls: ChatToolCall[] = [];
     const toolCallBySlot: Record<string, number> = {};
     let inputTokens = 0;
@@ -378,6 +452,13 @@ export class CommandCodeProvider extends BaseProvider {
         case 'text-delta':
           content += event.text ?? '';
           break;
+        case 'reasoning-delta':
+        case 'reasoning-deltas':
+        case 'reasoning': {
+          const r = extractReasoningFromEvent(event);
+          if (r) reasoning = reasoning ? `${reasoning}\n${r}` : r;
+          break;
+        }
         case 'tool-use':
           toolCallBySlot[event.toolCallId!] = toolCalls.length;
           toolCalls.push({ id: event.toolCallId!, type: 'function', function: { name: event.toolName ?? '', arguments: '' } });
@@ -416,11 +497,12 @@ export class CommandCodeProvider extends BaseProvider {
 
     const hasToolCalls = toolCalls.length > 0;
     const finishReason = hasToolCalls ? 'tool_calls' : 'stop';
-    const msg: { role: string; content: string | null; tool_calls?: ChatToolCall[] } = {
+    const msg: { role: string; content: string | null; tool_calls?: ChatToolCall[]; reasoning_content?: string } = {
       role: 'assistant',
       content: hasToolCalls ? null : content,
     };
     if (hasToolCalls) msg.tool_calls = toolCalls;
+    if (reasoning.length > 0) msg.reasoning_content = reasoning;
 
     return {
       id: this.makeId(),
@@ -504,16 +586,24 @@ export class CommandCodeProvider extends BaseProvider {
     if (!trimmed) return null;
     const event = this.safeParseJson(trimmed) as CCStreamEvent | null;
     if (!event || !event.type) return null;
-
     switch (event.type) {
       case 'text-delta': {
         const delta: StreamingDelta = { content: event.text };
         if (!getRole()) { delta.role = 'assistant'; setRole(true); }
         return this.buildChunk(id, created, modelId, delta, null);
       }
+      case 'reasoning-delta':
+      case 'reasoning-deltas':
+      case 'reasoning':
+      case 'thinking-delta': {
+        const text = extractReasoningFromEvent(event);
+        if (text.length === 0) return null;
+        const delta: StreamingDelta = { reasoning_content: text };
+        if (!getRole()) { delta.role = 'assistant'; setRole(true); }
+        return this.buildChunk(id, created, modelId, delta, null);
+      }
       case 'tool-use': {
         const idx = getIdx();
-        setIdx(idx + 1);
         toolCallSlot[event.toolCallId!] = idx;
         const tc: StreamingToolDelta = { index: idx, id: event.toolCallId!, type: 'function', function: { name: event.toolName } };
         const delta: StreamingDelta = { tool_calls: [tc] };
