@@ -2,7 +2,12 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 
-// Mirrors server/src/services/events.ts LiveEvent union.
+// Mirrors server/src/services/events.ts LiveEvent union. Both ends drift
+// occasionally (the proxy added `request.aborted` for client-disconnect
+// tracking, and `stream.chunk` is reserved for live stream deltas); keep
+// these lists in lockstep so the `formatEvent` switch stays exhaustive —
+// otherwise an unhandled type reaches `addLine(undefined)` and the renderer
+// throws on `l.ts`/`l.text`, tripping the ErrorBoundary. (#fix:see-changelog)
 interface LiveEventBase {
   id: string;
   at: number;
@@ -11,12 +16,23 @@ interface LiveEventBase {
 interface RequestStartEvent extends LiveEventBase { type: 'request.start'; model?: string; stream: boolean; }
 interface RequestDoneEvent extends LiveEventBase { type: 'request.done'; model: string; provider: string; keyId: number; latencyMs: number; tokens?: { in: number; out: number }; }
 interface RequestErrorEvent extends LiveEventBase { type: 'request.error'; error: string; }
+// Client-disconnect signal (Stop button, socket close, session reset).
+// Emitted in three places in proxy.ts plus three in responses.ts — every
+// retry/recovery path triggers it on a graceful cancellation.
+interface RequestAbortedEvent extends LiveEventBase { type: 'request.aborted'; }
+// Reserved for future per-token live stream delta display. Not published
+// today; declared so adding a producer doesn't silently unbalance the
+// client union again.
+interface StreamChunkEvent extends LiveEventBase { type: 'stream.chunk'; text: string; }
 interface KeyExhaustedEvent extends LiveEventBase { type: 'routing.key_exhausted'; provider: string; keyId: number; model: string; reason: string; }
 interface KeyRetryEvent extends LiveEventBase { type: 'routing.key_retry'; provider: string; keyId: number; model: string; attempt: number; max: number; }
 interface ModelSwitchEvent extends LiveEventBase { type: 'routing.model_switch'; from: string; to: string; reason: string; }
 interface RecoveryEvent extends LiveEventBase { type: 'routing.recovery'; cycle: number; max: number | null; reason: string; }
 
-type LiveEvent = RequestStartEvent | RequestDoneEvent | RequestErrorEvent | KeyExhaustedEvent | KeyRetryEvent | ModelSwitchEvent | RecoveryEvent;
+type LiveEvent =
+  | RequestStartEvent | RequestDoneEvent | RequestErrorEvent | RequestAbortedEvent
+  | StreamChunkEvent
+  | KeyExhaustedEvent | KeyRetryEvent | ModelSwitchEvent | RecoveryEvent;
 
 interface LogEntry {
   id: string;
@@ -27,24 +43,61 @@ interface LogEntry {
 
 const MAX_LOG_LINES = 200;
 
-function formatEvent(evt: LiveEvent): LogEntry {
+function formatEvent(evt: LiveEvent): LogEntry | undefined {
+  // Defensive: a malformed or under-specified event (missing id/at fields
+  // from a future server-side addition that drifts from the union) must
+  // never reach `addLine` — `lines.map(...)` downstream reads `l.ts` and
+  // `l.text`, so a partial entry would throw and trip the ErrorBoundary.
+  // Id-safe slicing: some future event source might omit `id`; in that case
+  // fall back to the type-driven prefix so the line is still readable.
+  if (typeof evt?.id !== 'string' || typeof evt?.at !== 'number') return undefined;
   const ts = evt.at;
   const rId = evt.id.slice(0, 8);
-  switch (evt.type) {
+  const e = evt; // narrowed alias used below; safe to read any LiveEvent field.
+  switch (e.type) {
     case 'request.start':
-      return { id: evt.id, ts, kind: 'start', text: `▶ [${rId}] Request started${evt.model ? ` (pinned: ${evt.model})` : ' (auto)'} — ${evt.stream ? 'streaming' : 'non-stream'}` };
+      return { id: e.id, ts, kind: 'start', text: `▶ [${rId}] Request started${e.model ? ` (pinned: ${e.model})` : ' (auto)'} — ${e.stream ? 'streaming' : 'non-stream'}` };
     case 'request.done':
-      return { id: evt.id, ts, kind: 'done', text: `✓ [${rId}] ${evt.provider}/${evt.model} key#${evt.keyId} — ${evt.latencyMs}ms${evt.tokens ? `, ${evt.tokens.in}↓/${evt.tokens.out}↑ tokens` : ''}` };
+      return { id: e.id, ts, kind: 'done', text: `✓ [${rId}] ${e.provider}/${e.model} key#${e.keyId} — ${e.latencyMs}ms${e.tokens ? `, ${e.tokens.in}↓/${e.tokens.out}↑ tokens` : ''}` };
     case 'request.error':
-      return { id: evt.id, ts, kind: 'error', text: `✗ [${rId}] ${evt.error}` };
+      return { id: e.id, ts, kind: 'error', text: `✗ [${rId}] ${e.error}` };
+    case 'request.aborted':
+      // Client disconnection (Stop button, socket close, session reset).
+      // Before this case landed, an aborted-then-completed switch would
+      // fall through and `addLine(undefined)` would push undefined into
+      // `lines`, which then crashed the renderer.
+      return { id: e.id, ts, kind: 'info', text: `⏹ [${rId}] Request aborted (client disconnected)` };
+    case 'stream.chunk':
+      // Reserved for future per-token live delta; render as info so a
+      // producer can be enabled without further client changes.
+      return { id: e.id, ts, kind: 'info', text: `${e.text.length > 80 ? e.text.slice(0, 80) + '…' : e.text}` };
     case 'routing.key_exhausted':
-      return { id: evt.id, ts, kind: 'info', text: `⚠ [${rId}] Key #${evt.keyId} exhausted on ${evt.provider}/${evt.model}: ${evt.reason.slice(0, 80)}` };
+      return { id: e.id, ts, kind: 'info', text: `⚠ [${rId}] Key #${e.keyId} exhausted on ${e.provider}/${e.model}: ${e.reason.slice(0, 80)}` };
     case 'routing.key_retry':
-      return { id: evt.id, ts, kind: 'info', text: `↻ [${rId}] Retrying ${evt.provider}/${evt.model} key#${evt.keyId} (${evt.attempt}/${evt.max})` };
+      return { id: e.id, ts, kind: 'info', text: `↻ [${rId}] Retrying ${e.provider}/${e.model} key#${e.keyId} (${e.attempt}/${e.max})` };
     case 'routing.model_switch':
-      return { id: evt.id, ts, kind: 'info', text: `→ [${rId}] Switching model: ${evt.from} → ${evt.to}` };
+      return { id: e.id, ts, kind: 'info', text: `→ [${rId}] Switching model: ${e.from} → ${e.to}` };
     case 'routing.recovery':
-      return { id: evt.id, ts, kind: 'info', text: `⏳ [${rId}] Recovery cycle ${evt.cycle}${evt.max ? `/${evt.max}` : '/∞'}: ${evt.reason}` };
+      return { id: e.id, ts, kind: 'info', text: `⏳ [${rId}] Recovery cycle ${e.cycle}${e.max ? `/${e.max}` : '/∞'}: ${e.reason}` };
+    default: {
+      // Forward-compatibility net: a future server-side event type that the
+      // client switch above hasn't learned about yet MUST render as a
+      // generic info line rather than fall through to `undefined`. This is
+      // the single load-bearing line in the file — if it ever stops being
+      // the catch-all, we get the "Reload button on the dashboard" bug
+      // back. Co-located with the switch keeps the invariant local.
+      // Runtime `type` is the discriminator we just enumerated.
+      // `e` is `never` with a statically exhaustive switch; cast to the
+      // base interface so we can still read `id`/`type` for the fallback.
+      const anyEvent = e as { id?: unknown; type?: unknown };
+      const fallbackId = typeof anyEvent.id === 'string' ? anyEvent.id.slice(0, 8) : 'unknown';
+      return {
+        id: typeof anyEvent.id === 'string' ? anyEvent.id : `unknown-${ts}`,
+        ts,
+        kind: 'info',
+        text: `· [${fallbackId}] (unrecognised event: ${String(anyEvent.type ?? 'unknown')})`,
+      };
+    }
   }
 }
 
@@ -60,7 +113,13 @@ export function LiveEvents() {
   const [activeCount, setActiveCount] = useState(0);
   const logContainerRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef(new Set<string>());
-  const addLine = useCallback((entry: LogEntry) => {
+  // `addLine` accepts undefined and drops it; the render loop reads `l.ts`/
+  // `l.text` on every entry, so any nullish line is a renderer-crash hazard.
+  // `formatEvent` already filters unknown/malformed events by returning
+  // undefined; this is the second line of defence so the event handler below
+  // can stay terse.
+  const addLine = useCallback((entry: LogEntry | undefined) => {
+    if (!entry) return;
     setLines(prev => {
       const next = [...prev, entry];
       return next.length > MAX_LOG_LINES ? next.slice(next.length - MAX_LOG_LINES) : next;
@@ -71,14 +130,23 @@ export function LiveEvents() {
     const es = new EventSource('/api/events');
     es.onmessage = (msg) => {
       try {
-        const evt = JSON.parse(msg.data) as LiveEvent;
-        const entry = formatEvent(evt);
+        // Runtime guard (cheap): reject anything that doesn't even look like
+        // a LiveEvent before handing it to `formatEvent`. A peer connecting
+        // to /api/events with a non-JSON payload (or a tampered proxy) could
+        // otherwise push junk into the renderer and crash it.
+        const parsed = JSON.parse(msg.data);
+        if (!parsed || typeof parsed !== 'object' || typeof parsed.type !== 'string') return;
+        const entry = formatEvent(parsed as LiveEvent);
 
-        if (evt.type === 'request.start') {
-          activeRef.current.add(evt.id);
+        if (parsed.type === 'request.start') {
+          activeRef.current.add(parsed.id);
           setActiveCount(activeRef.current.size);
-        } else if (evt.type === 'request.done' || evt.type === 'request.error') {
-          activeRef.current.delete(evt.id);
+        } else if (parsed.type === 'request.done' || parsed.type === 'request.error' || parsed.type === 'request.aborted') {
+          // request.aborted also clears the in-flight counter — a request
+          // that completes via abort has no separate 'done' frame and would
+          // otherwise leak its 'start' id forever, leaving the pulsing dot
+          // stuck on screen.
+          activeRef.current.delete(parsed.id);
           setActiveCount(activeRef.current.size);
         }
 
@@ -90,7 +158,6 @@ export function LiveEvents() {
     };
     return () => es.close();
   }, [addLine]);
-
 
   // Auto-scroll only the terminal container — never the page.
   // Double-fire: immediate set catches the common case; rAF catches
