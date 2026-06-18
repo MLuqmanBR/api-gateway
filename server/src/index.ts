@@ -8,8 +8,8 @@ import { rebuildExhaustionFromDB } from './services/key-exhaustion.js';
 
 const PORT = process.env.PORT ?? 3001;
 // Dual-stack ('::') by default so the dashboard is reachable over both IPv4
-// and IPv6 (e.g. IPv6-enabled Docker networks — #180). Hosts with IPv6
-// disabled fall back to IPv4-only below; HOST overrides the default outright.
+// and IPv6. Hosts with IPv6 disabled fall back to IPv4-only; HOST overrides
+// the default outright.
 const HOST = process.env.HOST ?? '::';
 
 process.on('unhandledRejection', (reason: unknown) => {

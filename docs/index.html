@@ -413,7 +413,7 @@
         <div class="step">
           <div class="step-num">1</div>
           <h3>Install</h3>
-          <p>One command with Docker. Or clone + <code>npm run dev</code> for development (Node 20+, dev UI on :5173).</p>
+          <p>Clone the repo and run <code>npm run dev</code> for development (Node 20+, dev UI on :5173).</p>
         </div>
         <div class="step">
           <div class="step-num">2</div>
@@ -432,18 +432,21 @@
           <span class="dot"></span><span class="dot"></span><span class="dot"></span>
           <span class="filename">~/api-gateway · zsh</span>
         </div>
-        <pre class="terminal-body"><span class="c"># 1. one-line install (Docker; generates your encryption key, starts the container)</span>
-<span class="prompt">$</span><span class="k">curl</span> -fsSL https://tashfeenahmed.github.io/api-gateway/install.sh | bash
+        <pre class="terminal-body"><span class="c"># 1. clone and install</span>
+<span class="prompt">$</span><span class="k">git</span> clone https://github.com/MLuqmanBR/api-gateway.git
+<span class="prompt">$</span><span class="k">cd</span> api-gateway
+<span class="prompt">$</span><span class="k">npm</span> install
 <span class="blank"></span>
-<span class="c"># 2. open http://localhost:3001 — paste provider keys, copy your unified API key</span>
+<span class="c"># 2. set your encryption key, then:</span>
+<span class="prompt">$</span><span class="k">npm</span> run dev
 <span class="blank"></span>
-<span class="c"># 3. call it like OpenAI</span>
+<span class="c"># 3. open http://localhost:5173 — paste provider keys, copy your unified API key</span>
+<span class="c"># 4. call it like OpenAI</span>
 <span class="prompt">$</span><span class="k">curl</span> http://localhost:3001/v1/chat/completions \
     -H <span class="s">"Authorization: Bearer $API_GATEWAY_KEY"</span> \
     -H <span class="s">"Content-Type: application/json"</span> \
     -d <span class="s">'{"messages":[{"role":"user","content":"hi"}]}'</span>
-<span class="blank"></span>
-<span class="c"># developing instead? clone the repo, then: npm install &amp;&amp; npm run dev  (UI on :5173)</span></pre>
+<span class="blank"></span></pre>
       </div>
     </section>
 

@@ -25,7 +25,6 @@ Aggregate free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, G
 - [Features](#features)
 - [Not yet supported](#not-yet-supported)
 - [Quick start](#quick-start)
-- [Docker](#docker)
 - [Using the API](#using-the-api)
 - [Custom platforms and models](#custom-platforms-and-models)
 - [Screenshots](#screenshots)
@@ -147,7 +146,7 @@ PRs that add any of these are very welcome. See [Contributing](#contributing).
 
 ## Quick start
 
-**Prerequisites:** Node.js 20+, npm. (Docker also works — see [Docker](#docker).)
+**Prerequisites:** Node.js 20+, npm.
 
 ```bash
 git clone https://github.com/MLuqmanBR/api-gateway.git
@@ -166,7 +165,7 @@ Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Ke
 
 > **Reaching the dev UI from another device on your LAN?** Use `npm run dev:lan` — it passes `--host` through to Vite, which then prints a `Network: http://<your-ip>:5173` URL you can open from a phone or another machine. (Plain `npm run dev -- --host` does *not* work here: the root `dev` script is a `concurrently` wrapper, so the flag never reaches Vite.) API calls go through Vite's dev proxy, so no extra server config is needed.
 
-For a production build without Docker:
+For a production build:
 
 ```bash
 npm run build
@@ -177,30 +176,6 @@ node server/dist/index.js     # server + dashboard both served on :3001
 
 Request analytics are retained for 90 days or 100000 request rows by default, whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or `REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
 
-## Docker
-
-```bash
-git clone https://github.com/MLuqmanBR/api-gateway.git
-cd api-gateway
-
-# Generate an encryption key
-ENCRYPTION_KEY="$(openssl rand -hex 32)"
-printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
-
-docker compose up -d --build
-```
-
-Open http://localhost:3001. SQLite data is stored in the `api-gateway-data` volume at `/app/server/data`. Keep the same `.env` `ENCRYPTION_KEY` and volume when upgrading.
-
-> **Reaching it from another machine?** By default the container is published only on `127.0.0.1`. To expose it on your LAN — e.g. a Raspberry Pi at `http://192.168.1.x:3001` — start it with `HOST_BIND=0.0.0.0`:
->
-> ```bash
-> HOST_BIND=0.0.0.0 docker compose up -d --build
-> ```
->
-> Only do this on a trusted network: the proxy is single-user and guarded only by the unified API key.
-
-More Docker operations and examples live in [docker/README.md](./docker/README.md).
 
 ## Using the API
 
@@ -475,7 +450,7 @@ Contributors very welcome! Good first PRs:
 - **Add an endpoint** — images, moderations, audio. The provider base class can grow new methods; adapters declare which they support.
 - **Improve the router** — cost-aware routing (cheapest-healthy-fastest tradeoffs), better latency-weighted priority, regional pinning.
 - **Dashboard polish** — charts on the Analytics page, key rotation UX, batch import of keys from `.env`.
-- **Docs** — more examples, client library snippets for Go/Rust/etc., a deployment recipe for Docker or Fly.
+- **Docs** — more examples, client library snippets for Go/Rust/etc.
 
 **Development loop:**
 
