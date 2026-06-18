@@ -14,6 +14,7 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { publish } from '../services/events.js';
+import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
 
 export const proxyRouter = Router();
 
@@ -117,8 +118,73 @@ export function setStickyModel(messages: ChatMessage[], modelDbId: number, sessi
   }
 }
 
+// Derive the OpenAI-completions-compatible capability block for a given
+// catalog row. Capabilities are additive on top of the strict OpenAI
+// `/v1/models` envelope — OpenAI's parsers ignore unknown fields, and
+// clone gateways (OpenRouter/Groq/Together/etc.) do the same.
+//
+// Field rationale (keep aligned with `services/router.ts` / migrations):
+//   - `context_window`         input token cap (already exposed pre-change).
+//   - `max_tokens`             per-response output cap; matches the OpenAI
+//                              chat-completions `max_tokens` request param
+//                              semantics (clients read it from the listing
+//                              rather than probing).
+//   - `modalities.input`       ["text"] by default; ["text","image"] when
+//                              `supports_vision=1`.
+//   - `modalities.output`      ["text"] — none of the catalog models emit
+//                              image/audio, so clients only need image-input
+//                              awareness, not image-generation output flags.
+//   - `capabilities.tool_calls` mirrors `supports_tools` rule-based flag.
+//   - `capabilities.vision`    mirrors `supports_vision` rule-based flag.
+//   - `capabilities.json_mode` true: every chat-completions model here
+//                              accepts OpenAI `response_format` (the proxy
+//                              already translates that for non-OpenAI
+//                              providers — see `services/responses.ts`).
+//   - `capabilities.streaming` true: every chat model here supports SSE
+//                              through `/v1/chat/completions?stream=true`.
+//   - `capabilities.reasoning` derived from model_id patterns (mirrors the
+//                              rule-based V16/V22 family detector). True
+//                              for chat-tuned CoT families only — we never
+//                              claim reasoning capability on bare base
+//                              models. Heuristic, not a probe.
+function buildModelCapabilities(modelId: string, maxOutputTokens: number | null, supportsVision: boolean, supportsTools: boolean) {
+  const ml = modelId.toLowerCase();
+  const reasoningFamily =
+       ml.includes('-thinking')                       // k2-thinking, glm-thinking, etc.
+    || ml.includes('-think')                          // gpt-oss "think" tier variants
+    || ml.includes('reasoning')                       // nemotron-reasoning, command-a-reasoning
+    || ml.includes('deepseek-r1')                     // R1 family
+    || ml.includes('deepseek-v4')                     // V4 = V3.2 + reasoning
+    || ml.includes('qwq')                             // QwQ preview
+    || ml.includes('magistral')                       // Mistral Magi*
+    || ml.includes('o3-') || ml.includes('o4-')       // OpenAI o-series
+    || ml.includes('gpt-oss')                         // openai/gpt-oss-* = chain-of-thought tier
+    || ml.includes('minimax-m3')                       // MiniMax M3 = thinking tier
+    || ml.includes('minimax-m2')                       // MiniMax M2.x (m2.5/m2.7) = thinking tier (#292)
+    || ml.includes('minimaxai/minimax-m');            // NVIDIA-style id `minimaxai/minimax-mN` — catch M2.x/M3 family (#292)
+
+  const modalities: { input: string[]; output: string[] } = {
+    input: supportsVision ? ['text', 'image'] : ['text'],
+    output: ['text'],
+  };
+
+  return {
+    // OpenAI-aligned token caps. `max_tokens` is the per-completion output
+    // cap a client should send; `context_window` is the input+output cap.
+    max_tokens: maxOutputTokens ?? null,
+    modalities: modalities,
+    capabilities: {
+      tool_calls: supportsTools,
+      vision: supportsVision,
+      json_mode: true,
+      streaming: true,
+      reasoning: reasoningFamily,
+    },
+  };
+}
+
 // OpenAI-compatible /models endpoint (used by Hermes for metadata) 
-// shows API models which is linked by the user
+// shows API models which is linked by the user.
 proxyRouter.get('/models', (req: Request, res: Response) => {
   const token = extractApiToken(req);
   const unifiedKey = getUnifiedApiKey();
@@ -129,7 +195,10 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
 
   const db = getDb();
   const models = db.prepare(`
-    SELECT platform, model_id, display_name, context_window, intelligence_rank, id
+    SELECT
+      m.id, m.platform, m.model_id, m.display_name, m.context_window,
+      m.max_output_tokens, m.supports_vision, m.supports_tools,
+      m.intelligence_rank
     FROM models m
     WHERE m.enabled = 1
       AND EXISTS (
@@ -140,7 +209,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         WHERE k.platform = m.platform
           AND k.enabled = 1
       )
-    ORDER BY intelligence_rank ASC, id ASC
+    ORDER BY m.intelligence_rank ASC, m.id ASC
   `).all() as ModelListRow[];
 
   res.json({
@@ -154,14 +223,23 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         name: 'Auto (router picks the best available model)',
         context_window: null,
       },
-      ...models.map(m => ({
-        id: `${m.platform}/${m.model_id}`,
-        object: 'model',
-        created: 0,
-        owned_by: m.platform,
-        name: m.display_name,
-        context_window: m.context_window,
-      })),
+      ...models.map(m => {
+        const caps = buildModelCapabilities(m.model_id, m.max_output_tokens, m.supports_vision === 1, m.supports_tools === 1);
+        return {
+          id: `${m.platform}/${m.model_id}`,
+          object: 'model',
+          created: 0,
+          owned_by: m.platform,
+          name: m.display_name,
+          context_window: m.context_window,
+          // Extension fields below — additive on the strict OpenAI list
+          // envelope. Strict SDKs ignore them; capability-aware clients
+          // (Hermes, LangChain chat model pickers, OpenCode) read them.
+          max_tokens: caps.max_tokens,
+          modalities: caps.modalities,
+          capabilities: caps.capabilities,
+        };
+      }),
     ],
   });
 });
@@ -722,6 +800,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const pinnedModelId: string | undefined = requestedModel && !isAutoModel(requestedModel) ? requestedModel : undefined;
   const requestId = crypto.randomUUID();
   publish({ type: 'request.start', id: requestId, model: pinnedModelId, stream: !!stream, at: Date.now() });
+
+  // Client-disconnect abort wiring. The controller's signal is threaded into
+  // every upstream provider call AND every sleep in the retry loop, so a Stop
+  // / session-close cancels the in-flight request immediately and breaks out
+  // of the loop instead of grinding through recovery cycles. The watcher only
+  // fires on a REAL disconnect (close before `res.end()`), not normal
+  // completion. (#292)
+  const { controller: abortController, detach: detachAbortWatcher } = attachClientAbort(res);
+  const abortSignal = abortController.signal;
+
   // Retry loop: per-key 3-retry followed by model/key cycling.
   // In 1 RPM mode (after all keys/models are exhausted), retries are
   // throttled to 1 request/minute for the globally-configured number of
@@ -735,31 +823,71 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let oneRPMCycles = 0;
   let lastRequestTime = 0;
   const globalRetryMax = getGlobalRetryLimit();
+  // Total upstream call counter. The global recovery limit (user setting)
+  // counts ACTUAL upstream attempts, not "cycles" — so a limit of 10 means at
+  // most 10 provider calls across every key/model, enforced from the first
+  // retry rather than only once 1-RPM recovery kicks in. `0` = infinite, but
+  // the loop is still interruptible by a client disconnect. (#292)
+  let upstreamAttempts = 0;
 
   // Client-disconnect detection: if the agent presses Stop or closes the
   // session, abort the whole retry/recovery loop instead of grinding through
-  // 1-RPM cycles forever. `req.aborted` is set to true when the underlying
-  // connection is severed before `res.end()`. We deliberately do NOT use
-  // `req.on('close')` because that also fires when the response completes
-  // normally, which would break stream/path completions.
+  // 1-RPM cycles forever. The abort signal (wired via `req.on('close')` in
+  // `attachClientAbort`) fires the instant the socket tears down — event-driven,
+  // not polled, so a disconnect during a 60s sleep or an in-flight fetch is
+  // caught immediately and the loop exits. The watcher ignores the `close`
+  // that fires after a normal `res.end()` so successful completions are
+  // unaffected. (#292)
+  try {
   outerLoop: for (let totalAttempt = 0; ; totalAttempt++) {
     // ---- Exit: client disconnected ----
-    if (req.aborted) {
+    if (abortSignal.aborted) {
       publish({ type: 'request.aborted', id: requestId, at: Date.now() });
       return;
     }
-    // ---- Exit: global retries exhausted (1 RPM mode only) ----
-    if (inOneRPMMode && globalRetryMax > 0 && oneRPMCycles >= globalRetryMax) {
-      const msg = `All models rate-limited after ${oneRPMCycles} recovery cycle(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
+    // ---- Exit: global attempt limit reached ----
+    // Counts ACTUAL upstream attempts (every provider call), enforced from the
+    // very first retry — not only once 1-RPM recovery kicks in. `0` (the
+    // "infinite" setting) disables the cap but the loop is still interruptible
+    // by the client-disconnect abort above. Previously this only ran in 1-RPM
+    // mode and counted "cycles" (1 cycle = up to PER_KEY_RETRIES × keys ×
+    // models upstream calls), so a limit of 10 could produce 100+ requests and
+    // never tripped until everything was already exhausted. (#292)
+    //
+    // Safety net: when routing itself keeps failing (e.g. no keys configured —
+    // `routeRequest` throws before any upstream call is ever made), the
+    // upstream counter never moves. The loop iteration counter (`totalAttempt`)
+    // bounds that path so a no-keys request still returns instead of looping
+    // forever. The bound is the same `globalRetryMax` scaled to give each
+    // configured cycle a fair shot. (#292)
+    if (globalRetryMax > 0 && upstreamAttempts >= globalRetryMax) {
+      const msg = `Request aborted after ${upstreamAttempts} upstream attempt(s) (recovery limit reached). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
       publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
-      res.setHeader('X-Routed-Via', 'none');
-      res.setHeader('X-Recovery-Cycles', String(oneRPMCycles));
-      res.status(429).json({
-        error: {
-          message: msg,
-          type: 'rate_limit_error',
-        },
-      });
+      if (!res.headersSent) {
+        res.setHeader('X-Routed-Via', 'none');
+        res.setHeader('X-Upstream-Attempts', String(upstreamAttempts));
+        res.status(429).json({
+          error: {
+            message: msg,
+            type: 'rate_limit_error',
+          },
+        });
+      }
+      return;
+    }
+    if (globalRetryMax > 0 && totalAttempt >= globalRetryMax) {
+      const msg = `All models rate-limited after ${totalAttempt} recovery iteration(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
+      publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
+      if (!res.headersSent) {
+        res.setHeader('X-Routed-Via', 'none');
+        res.setHeader('X-Recovery-Iterations', String(totalAttempt));
+        res.status(429).json({
+          error: {
+            message: msg,
+            type: 'rate_limit_error',
+          },
+        });
+      }
       return;
     }
 
@@ -767,7 +895,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     if (inOneRPMMode && lastRequestTime > 0) {
       const elapsed = Date.now() - lastRequestTime;
       if (elapsed < 60_000) {
-        await new Promise(r => setTimeout(r, 60_000 - elapsed));
+        // Abortable: a client disconnect during the 60s wait rejects
+        // immediately instead of running out the clock. (#292)
+        await abortableSleep(60_000 - elapsed, abortSignal);
       }
     }
 
@@ -798,7 +928,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         skipKeys.clear();
         // First entry: try immediately. Subsequent: tiny pause so we don't
         // burn CPU when routeRequest still throws (e.g. no keys configured).
-        if (!firstEntry) await new Promise(r => setTimeout(r, 1000));
+        if (!firstEntry) await abortableSleep(1000, abortSignal);
         lastRequestTime = 0;
         publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: `Pinned model ${requestedModel} exhausted`, at: Date.now() });
         console.log(`[Proxy] Pinned model ${requestedModel} exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? `/${globalRetryMax}` : '/∞'})`);
@@ -809,7 +939,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       inOneRPMMode = true;
       oneRPMCycles++;
       skipKeys.clear();
-      if (!firstEntry) await new Promise(r => setTimeout(r, 1000));
+      if (!firstEntry) await abortableSleep(1000, abortSignal);
       lastRequestTime = 0;
       publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: 'All models exhausted', at: Date.now() });
       console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? `/${globalRetryMax}` : '/∞'})`);
@@ -901,11 +1031,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         const writeChunk = (c: unknown) => res.write(`data: ${JSON.stringify(c)}\n\n`);
 
         try {
+          upstreamAttempts++; // counted toward the global recovery limit. (#292)
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
             {
               temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
               reasoning_effort, thinking,
+              abortSignal,
             },
           );
 
@@ -1075,11 +1207,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           throw streamErr;
         }
       } else {
+        upstreamAttempts++; // counted toward the global recovery limit. (#292)
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
           {
             temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
             reasoning_effort, thinking,
+            abortSignal,
           },
         );
         // Empty completion (no text, no tool calls) → fail over rather than
@@ -1152,6 +1286,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         return;
       }
     } catch (err: any) {
+      // Client stopped the request (Stop button / closed session). This is NOT
+      // a provider failure — don't log an error, don't retry, don't 502. Just
+      // end the response silently. The abort signal already cancelled the
+      // in-flight upstream fetch; here we unwind the loop. (#292)
+      if (isAbortError(err) || abortSignal.aborted) {
+        if (!res.writableEnded) {
+          try { res.end(); } catch { /* socket already gone */ }
+        }
+        publish({ type: 'request.aborted', id: requestId, at: Date.now() });
+        return;
+      }
       const latency = Date.now() - start;
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
@@ -1259,6 +1404,25 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     publish({ type: 'routing.key_exhausted', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, reason: sanitizeProviderErrorMessage(lastError?.message), at: Date.now() });
     console.log(`[Proxy] Key ${route.keyId} exhausted after ${PER_KEY_RETRIES} failures from ${route.displayName}`);
     // Continue outer loop → routeRequest picks next key.
+  }
+  } catch (err: any) {
+    // A RequestAbortError from an abortableSleep at the outer-loop level
+    // (the 60s 1-RPM throttle or the 1s recovery pauses) propagates here on
+    // client disconnect. End the response silently — no error log, no retry,
+    // no 502. The abort signal already cancelled any in-flight upstream call.
+    // (#292)
+    if (isAbortError(err) || abortSignal.aborted) {
+      if (!res.writableEnded) {
+        try { res.end(); } catch { /* socket already gone */ }
+      }
+      publish({ type: 'request.aborted', id: requestId, at: Date.now() });
+      return;
+    }
+    // Any other unexpected error: surface as a 502 if nothing was sent yet.
+    console.error('[Proxy] Unhandled error in retry loop:', err);
+    if (!res.headersSent) {
+      res.status(502).json({ error: { message: `Internal error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'provider_error' } });
+    }
   }
 
   // Unreachable — the outer loop exits via the 1-RPM limit check above.

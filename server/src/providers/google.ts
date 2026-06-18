@@ -9,7 +9,7 @@ import type {
   ThinkingConfig,
   ThinkingEffort,
 } from '@api-gateway/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
 import { contentToString } from '../lib/content.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 import { geminiThinkingConfig, normalizeThinking } from '../lib/thinking.js';
@@ -450,7 +450,7 @@ export class GoogleProvider extends BaseProvider {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }, 60000, options?.abortSignal);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw providerHttpError(res, `Google API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
@@ -522,7 +522,7 @@ export class GoogleProvider extends BaseProvider {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }, 60000, options?.abortSignal);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw providerHttpError(res, `Google API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
@@ -539,8 +539,17 @@ export class GoogleProvider extends BaseProvider {
 
     const seenToolCallKeys = new Set<string>();
 
+    // Client disconnect must interrupt a stalled/slow Gemini stream
+    // immediately rather than waiting for the 300s inactivity timer. (#292)
+    const abortSignal = options?.abortSignal;
+    if (abortSignal?.aborted) throw new RequestAbortError();
+    let aborted = false;
+    const onAbort = () => { aborted = true; };
+    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+
     try {
       while (true) {
+        if (aborted) throw new RequestAbortError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
           reader.read(),
@@ -550,6 +559,10 @@ export class GoogleProvider extends BaseProvider {
               300000,
             );
           }),
+          // A client abort rejects the pending read first. (#292)
+          ...(abortSignal ? [new Promise<never>((_, reject) => {
+            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
+          })] : []),
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;
@@ -655,6 +668,7 @@ export class GoogleProvider extends BaseProvider {
         };
       }
     } finally {
+      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
   }

@@ -42,7 +42,7 @@ export class CohereProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-    });
+    }, 60000, options?.abortSignal);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -82,13 +82,13 @@ export class CohereProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
-    });
+    }, 60000, options?.abortSignal);
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw providerHttpError(res, `Cohere API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
-    yield* this.readSseStream(res);
+    yield* this.readSseStream(res, 300000, options?.abortSignal);
   }
 
   async validateKey(apiKey: string): Promise<boolean> {

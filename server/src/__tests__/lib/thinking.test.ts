@@ -4,6 +4,8 @@ import {
   anthropicThinking,
   geminiThinkingConfig,
   openaiCompatThinkingBody,
+  openAiCompatThinkingPolicy,
+  isGlmModel,
 } from '../../lib/thinking.js';
 
 // `thinking` is the unified inbound knob. The translators here emit wire-
@@ -99,22 +101,94 @@ describe('geminiThinkingConfig', () => {
   });
 });
 
+describe('openAiCompatThinkingPolicy', () => {
+  it('returns "glm_mapped" for GLM host platforms', () => {
+    expect(openAiCompatThinkingPolicy('glmaggregatorb')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('z-ai')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('zai')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('glmaggregatora')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('zhipu')).toBe('glm_mapped');
+  });
+
+  it('returns "reasoning_effort_only" for unknown hosts (safe default)', () => {
+    expect(openAiCompatThinkingPolicy('nvidia')).toBe('reasoning_effort_only');
+    expect(openAiCompatThinkingPolicy('groq')).toBe('reasoning_effort_only');
+    expect(openAiCompatThinkingPolicy('some-future-provider')).toBe('reasoning_effort_only');
+  });
+
+  it('returns "glm_mapped" for a GLM model id even on a non-GLM host', () => {
+    // nvidia/z-ai/glm-5.1 — a GLM model hosted on NVIDIA NIM must still get
+    // GLM's narrow effort enum; the rich `thinking` object would 400. (#292)
+    expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.1')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('openrouter', 'zai-org/glm-5.1-fp8')).toBe('glm_mapped');
+  });
+});
+
+describe('isGlmModel', () => {
+  it('matches GLM 4.x and 5.x ids with org prefixes', () => {
+    expect(isGlmModel('z-ai/glm-5.1')).toBe(true);
+    expect(isGlmModel('zai-org/GLM-5.1-FP8')).toBe(true);
+    expect(isGlmModel('glm-4.5-flash')).toBe(true);
+    expect(isGlmModel('glm-4-plus')).toBe(true);
+  });
+
+  it('does not match unrelated ids that merely contain "glm"', () => {
+    expect(isGlmModel('glmist-7b')).toBe(false);
+    expect(isGlmModel('llama-3.3-70b')).toBe(false);
+  });
+});
+
 describe('openaiCompatThinkingBody', () => {
-  it('emits reasoning_effort shorthand when only that is set', () => {
-    const out = openaiCompatThinkingBody(
-      { enabled: true, effort: 'medium' },
-      { reasoning_effort: 'medium' },
-    );
+  it('emits reasoning_effort shorthand when only that is set (default policy)', () => {
+    const out = openaiCompatThinkingBody('reasoning_effort_only', { reasoning_effort: 'medium' });
     expect(out).toEqual({ reasoning_effort: 'medium' });
   });
 
-  it('emits the rich `thinking` object when present in the request', () => {
+  it('derives reasoning_effort from thinking.effort when only the rich object was sent', () => {
+    const out = openaiCompatThinkingBody(
+      'reasoning_effort_only',
+      { thinking: { type: 'enabled', effort: 'high' } },
+    );
+    expect(out).toEqual({ reasoning_effort: 'high' });
+  });
+
+  it('clamps unsupported effort levels into GLM range under "glm_mapped" — never disables thinking (#292)', () => {
+    // GLM accepts ONLY low|medium|high. max/xhigh → high, minimal → low.
+    // Thinking stays ON; the user's more/less intent is preserved.
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'max' })).toEqual({ reasoning_effort: 'high' });
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'xhigh' })).toEqual({ reasoning_effort: 'high' });
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'minimal' })).toEqual({ reasoning_effort: 'low' });
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'low' })).toEqual({ reasoning_effort: 'low' });
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'medium' })).toEqual({ reasoning_effort: 'medium' });
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'high' })).toEqual({ reasoning_effort: 'high' });
+  });
+
+  it('DROPS the rich thinking object for GLM (glm_mapped) but keeps the mapped effort', () => {
+    // The rich `thinking` object (type/effort/budget) is what triggers GLM's
+    // literal_error — it must never be forwarded. The effort is extracted and
+    // mapped to GLM's enum instead. (#292)
+    expect(openaiCompatThinkingBody(
+      'glm_mapped',
+      { reasoning_effort: 'xhigh', thinking: { type: 'enabled', effort: 'xhigh', budget: 4000 } },
+    )).toEqual({ reasoning_effort: 'high' });
+    // effort from the rich object alone (no top-level reasoning_effort):
+    expect(openaiCompatThinkingBody(
+      'glm_mapped',
+      { thinking: { type: 'enabled', effort: 'minimal' } },
+    )).toEqual({ reasoning_effort: 'low' });
+  });
+
+  it('emits nothing for GLM when no effort was requested (GLM default = thinking on)', () => {
+    expect(openaiCompatThinkingBody('glm_mapped', undefined)).toEqual({});
+  });
+
+  it('forwards both fields verbatim under the "both" policy', () => {
     const obj = { type: 'enabled' as const, effort: 'high' as const, budget: 4000 };
-    const out = openaiCompatThinkingBody({ enabled: true, effort: 'high', budget: 4000 }, { thinking: obj });
-    expect(out).toEqual({ thinking: obj });
+    const out = openaiCompatThinkingBody('both', { reasoning_effort: 'high', thinking: obj });
+    expect(out).toEqual({ reasoning_effort: 'high', thinking: obj });
   });
 
   it('returns an empty object when no thinking info is present', () => {
-    expect(openaiCompatThinkingBody(undefined, undefined)).toEqual({});
+    expect(openaiCompatThinkingBody('reasoning_effort_only', undefined)).toEqual({});
   });
 });

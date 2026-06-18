@@ -60,6 +60,7 @@ export function migrateDbSchema(db: Database.Database) {
   applyModelPricing(db);
   migrateQuirksV1(db);
   migrateModelsV32CommandCode(db);
+  migrateModelsV33NvidiaMinimaxM3(db);
 }
 
 function createTables(db: Database.Database) {
@@ -2377,6 +2378,43 @@ function migrateModelsV32CommandCode(db: Database.Database) {
     ['commandcode', 'Qwen/Qwen3.6-Plus',            'Qwen 3.6 Plus (CommandCode)',      10, 4, 'Large',    131072],
     ['commandcode', 'stepfun/Step-3.5-Flash',       'Step 3.5 Flash (CommandCode)',     14, 4, 'Medium',   131072],
     ['commandcode', 'google/gemini-3.1-flash-lite', 'Gemini 3.1 Flash Lite (CommandCode)', 16, 3, 'Medium', 1048576],
+  ];
+
+  const tx = db.transaction(() => {
+    for (const a of additions) insert.run(...a);
+    const missing = db.prepare(`
+      SELECT m.id FROM models m
+      LEFT JOIN fallback_config f ON m.id = f.model_db_id
+      WHERE f.id IS NULL ORDER BY m.intelligence_rank ASC
+    `).all() as { id: number }[];
+    if (missing.length > 0) {
+      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS mx FROM fallback_config').get() as { mx: number }).mx;
+      const addFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+      for (let i = 0; i < missing.length; i++) addFb.run(missing[i].id, maxPriority + i + 1);
+    }
+  });
+  tx();
+}
+
+// NVIDIA NIM started serving `minimaxai/minimax-m3` (live-confirmed June 2026:
+// 200 + reasoning on a free-tier key) but the V11 NVIDIA catalog block only
+// seeded M2.7 — M3 was reachable only if a user manually added it via the
+// dashboard. Seed it here so every install gets it automatically. Mirrors the
+// M2.7 row's limits (40 RPM, shared credit budget, 196608 context). Runs every
+// boot via INSERT OR IGNORE; the fallback_config backfill mirrors V32. (#292)
+function migrateModelsV33NvidiaMinimaxM3(db: Database.Database) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null]> = [
+    // MiniMax M3 is the thinking-tier successor to M2.7. `buildModelCapabilities`
+    // already flags `minimax-m3` as a reasoning family, so /models advertises
+    // reasoning:true and the client enables thinking. Live-confirmed: M3 leaks
+    // its chain-of-thought into `content` (NIM's documented MiniMax behavior)
+    // rather than populating `reasoning_content`, but the gateway passes content
+    // through unchanged so the agent sees the full reasoning inline.
+    ['nvidia', 'minimaxai/minimax-m3', 'MiniMax M3 (NV)', 2, 9, 'Frontier', 40, null, null, null, '~2M (credits)', 196608],
   ];
 
   const tx = db.transaction(() => {

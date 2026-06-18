@@ -8,7 +8,7 @@ import type {
   TokenUsage,
   Platform,
 } from '@api-gateway/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
 import { contentToString, normalizeOutboundContent } from '../lib/content.js';
 import { anthropicThinking, normalizeThinking } from '../lib/thinking.js';
 
@@ -440,6 +440,7 @@ export class AnthropicCompatProvider extends BaseProvider {
         body: JSON.stringify(body),
       },
       options?.timeoutMs ?? this.timeoutMs,
+      options?.abortSignal,
     );
 
     if (!res.ok) {
@@ -482,6 +483,7 @@ export class AnthropicCompatProvider extends BaseProvider {
         body: JSON.stringify(body),
       },
       options?.timeoutMs ?? this.timeoutMs,
+      options?.abortSignal,
     );
 
     if (!res.ok) {
@@ -492,7 +494,7 @@ export class AnthropicCompatProvider extends BaseProvider {
       );
     }
 
-    yield* this.readAnthropicStream(res, modelId);
+    yield* this.readAnthropicStream(res, modelId, options?.abortSignal);
   }
 
   /**
@@ -515,9 +517,17 @@ export class AnthropicCompatProvider extends BaseProvider {
   private async *readAnthropicStream(
     res: Response,
     modelId: string,
+    abortSignal?: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk> {
     const reader = res.body?.getReader();
     if (!reader) throw new Error('No response body');
+
+    // Client disconnect must interrupt a stalled/slow Anthropic stream
+    // immediately rather than waiting for the inactivity timer. (#292)
+    if (abortSignal?.aborted) throw new RequestAbortError();
+    let aborted = false;
+    const onAbort = () => { aborted = true; };
+    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
 
     const decoder = new TextDecoder();
     let buffer = '';
@@ -555,6 +565,7 @@ export class AnthropicCompatProvider extends BaseProvider {
 
     try {
       while (true) {
+        if (aborted) throw new RequestAbortError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
           reader.read(),
@@ -564,6 +575,10 @@ export class AnthropicCompatProvider extends BaseProvider {
               STREAM_INACTIVITY_TIMEOUT_MS,
             );
           }),
+          // A client abort rejects the pending read first. (#292)
+          ...(abortSignal ? [new Promise<never>((_, reject) => {
+            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
+          })] : []),
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;
@@ -749,6 +764,7 @@ export class AnthropicCompatProvider extends BaseProvider {
       const finish = yieldFinishIfNeeded();
       if (finish) yield finish;
     } finally {
+      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
 

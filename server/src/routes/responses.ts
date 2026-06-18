@@ -26,6 +26,9 @@ import {
   logRequest,
 } from './proxy.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+import { attachClientAbort, isAbortError } from '../lib/abort.js';
+import { getGlobalRetryLimit } from '../services/router.js';
+import { publish } from '../services/events.js';
 
 export const responsesRouter = Router();
 
@@ -306,6 +309,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // the way back out (see lib/tool-args.ts).
   const toolSchemas = toolSchemaMap(tools);
   const tool_choice = toChatToolChoice(reqData.tool_choice);
+  // `abortSignal` is added per-call after the client-disconnect controller is
+  // created below; the base opts are built here for both call sites. (#292)
   const completionOpts = {
     temperature: reqData.temperature ?? undefined,
     max_tokens: reqData.max_output_tokens ?? undefined,
@@ -342,6 +347,18 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   }
 
   const responseId = newId('resp');
+  // Client-disconnect abort wiring — mirrors /chat/completions. A Stop /
+  // session-close cancels the in-flight upstream call and breaks out of the
+  // retry loop instead of running all MAX_RETRIES. (#292)
+  const { controller: abortController } = attachClientAbort(res);
+  const abortSignal = abortController.signal;
+  // Global recovery limit: counts actual upstream attempts (not cycles), same
+  // setting as /chat/completions. Falls back to MAX_RETRIES when the user
+  // configured 0 (infinite) so this Codex path never runs away. (#292)
+  const configuredLimit = getGlobalRetryLimit();
+  const attemptLimit = configuredLimit > 0 ? configuredLimit : MAX_RETRIES;
+  let upstreamAttempts = 0;
+
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
   let lastError: any = null;
@@ -354,7 +371,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     res.write(`data: ${JSON.stringify({ type: event, sequence_number: seq++, ...payload })}\n\n`);
   };
 
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+  try {
+  for (let attempt = 0; attempt < attemptLimit; attempt++) {
+    // ---- Exit: client disconnected ----
+    if (abortSignal.aborted) {
+      publish({ type: 'request.aborted', id: responseId, at: Date.now() });
+      return;
+    }
+    // ---- Exit: upstream attempt cap reached ----
+    if (upstreamAttempts >= attemptLimit) break;
     let route: RouteResult;
     try {
       route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined);
@@ -406,7 +431,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           }
         };
 
-        const gen = route.provider.streamChatCompletion(route.apiKey, messages, route.modelId, completionOpts);
+        upstreamAttempts++; // counted toward the global recovery limit. (#292)
+        const gen = route.provider.streamChatCompletion(route.apiKey, messages, route.modelId, { ...completionOpts, abortSignal });
 
         for await (const chunk of gen) {
           // In-band upstream error frame ({"error":...} inside a 200 SSE
@@ -593,7 +619,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
         return;
       } else {
-        const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, completionOpts);
+        upstreamAttempts++; // counted toward the global recovery limit. (#292)
+        const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, { ...completionOpts, abortSignal });
 
         const msg = result.choices[0]?.message;
         let text = contentToString(msg?.content ?? '');
@@ -648,6 +675,16 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         return;
       }
     } catch (err: any) {
+      // Client stopped the request — not a provider failure. End silently,
+      // don't retry, don't 502. The abort signal already cancelled the
+      // in-flight upstream call. (#292)
+      if (isAbortError(err) || abortSignal.aborted) {
+        if (!res.writableEnded) {
+          try { res.end(); } catch { /* socket already gone */ }
+        }
+        publish({ type: 'request.aborted', id: responseId, at: Date.now() });
+        return;
+      }
       const latency = Date.now() - start;
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
@@ -687,7 +724,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // (reachable since empty-completion failover can burn every attempt after
   // streamStarted) — close the SSE stream with a failed event instead of
   // writing JSON onto a committed event-stream response.
-  const exhaustedMsg = `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`;
+  const exhaustedMsg = `All models rate-limited after ${upstreamAttempts} attempt(s). Last: ${lastError?.message ?? 'unknown'}`;
   if (streamStarted) {
     sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: exhaustedMsg, type: 'rate_limit_error' } } });
     res.end();
@@ -696,4 +733,20 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   res.status(429).json({
     error: { message: exhaustedMsg, type: 'rate_limit_error' },
   });
+  } catch (err: any) {
+    // A RequestAbortError from an outer-loop abortableSleep (or any abort that
+    // escaped the inner catch) ends the response silently on client disconnect.
+    // (#292)
+    if (isAbortError(err) || abortSignal.aborted) {
+      if (!res.writableEnded) {
+        try { res.end(); } catch { /* socket already gone */ }
+      }
+      publish({ type: 'request.aborted', id: responseId, at: Date.now() });
+      return;
+    }
+    console.error('[Responses] Unhandled error in retry loop:', err);
+    if (!res.headersSent) {
+      res.status(502).json({ error: { message: `Internal error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'provider_error' } });
+    }
+  }
 });

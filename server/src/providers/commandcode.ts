@@ -5,7 +5,7 @@ import type {
   ChatToolCall,
   ChatToolDefinition,
 } from '@api-gateway/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
 import { contentToString } from '../lib/content.js';
 
 const NPM_VERSION_URL = 'https://registry.npmjs.org/command-code/latest';
@@ -152,7 +152,7 @@ export class CommandCodeProvider extends BaseProvider {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
-    }, options?.timeoutMs ?? 120000);
+    }, options?.timeoutMs ?? 120000, options?.abortSignal);
 
     if (!res.ok) {
       const err = await res.text().catch(() => '');
@@ -174,13 +174,13 @@ export class CommandCodeProvider extends BaseProvider {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
-    }, options?.timeoutMs ?? 120000);
+    }, options?.timeoutMs ?? 120000, options?.abortSignal);
     if (!res.ok) {
       const err = await res.text().catch(() => '');
       throw providerHttpError(res, `CommandCode API error ${res.status}: ${err}`);
     }
 
-    yield* this.streamNdjsonResponse(res, modelId);
+    yield* this.streamNdjsonResponse(res, modelId, options?.abortSignal);
   }
 
   async validateKey(apiKey: string): Promise<boolean> {
@@ -520,7 +520,7 @@ export class CommandCodeProvider extends BaseProvider {
 
   // ── Streaming ──────────────────────────────────────────────────────────
 
-  private async *streamNdjsonResponse(res: Response, modelId: string): AsyncGenerator<ChatCompletionChunk> {
+  private async *streamNdjsonResponse(res: Response, modelId: string, abortSignal?: AbortSignal): AsyncGenerator<ChatCompletionChunk> {
     const id = this.makeId();
     const created = Math.floor(Date.now() / 1000);
     let sentRole = false;
@@ -531,14 +531,26 @@ export class CommandCodeProvider extends BaseProvider {
     const decoder = new TextDecoder();
     let buf = '';
 
+    // Client disconnect must interrupt a stalled/slow CommandCode stream
+    // immediately rather than waiting for the inactivity timer. (#292)
+    if (abortSignal?.aborted) throw new RequestAbortError();
+    let aborted = false;
+    const onAbort = () => { aborted = true; };
+    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+
     try {
       while (true) {
+        if (aborted) throw new RequestAbortError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
           reader.read(),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => reject(new Error('CommandCode stream stalled')), STREAM_TIMEOUT_MS);
           }),
+          // A client abort rejects the pending read first. (#292)
+          ...(abortSignal ? [new Promise<never>((_, reject) => {
+            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
+          })] : []),
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;
@@ -558,6 +570,7 @@ export class CommandCodeProvider extends BaseProvider {
         }
       }
     } finally {
+      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       reader.cancel().catch(() => {});
     }
   }

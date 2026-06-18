@@ -59,7 +59,7 @@ export class CloudflareProvider extends BaseProvider {
         ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
         ...(options?.thinking ? { thinking: options.thinking } : {}),
       }),
-    });
+    }, 60000, options?.abortSignal);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -100,14 +100,14 @@ export class CloudflareProvider extends BaseProvider {
         ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
         ...(options?.thinking ? { thinking: options.thinking } : {}),
       }),
-    });
+    }, 60000, options?.abortSignal);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw providerHttpError(res, `Cloudflare API error ${res.status}: ${extractErrorMessage(err) ?? res.statusText}`);
     }
 
-    yield* this.readSseStream(res);
+    yield* this.readSseStream(res, 300000, options?.abortSignal);
   }
 
   async validateKey(apiKey: string): Promise<boolean> {

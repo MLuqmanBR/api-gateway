@@ -86,6 +86,87 @@ describe('Virtual "auto" model', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  it('exposes OpenAI-completions-compatible capabilities on /v1/models entries', async () => {
+    const { status, body } = await request(app, 'GET', '/v1/models', undefined, authHeaders());
+    expect(status).toBe(200);
+
+    // Strict OpenAI list envelope still parses cleanly (Hermes, openai-python).
+    expect(body.object).toBe('list');
+    for (const entry of body.data) {
+      expect(entry.object).toBe('model');
+      expect(typeof entry.id).toBe('string');
+      expect(typeof entry.owned_by).toBe('string');
+    }
+
+    // Extension fields are additive — every non-AUTO row must carry them.
+    const sampleEntry = body.data.find(
+      (m: { id: string }) => m.id !== 'auto' && typeof m.capabilities === 'object',
+    );
+    expect(sampleEntry).toBeDefined();
+    expect(sampleEntry.capabilities).toMatchObject({
+      // Streaming + json_mode are universal for our chat-completions adapter.
+      streaming: true,
+      json_mode: true,
+      // tool_calls/vision/reasoning keys present (boolean) so strict consumers
+      // can read them without undefined checks.
+    });
+    expect(typeof sampleEntry.capabilities.tool_calls).toBe('boolean');
+    expect(typeof sampleEntry.capabilities.vision).toBe('boolean');
+    expect(typeof sampleEntry.capabilities.reasoning).toBe('boolean');
+
+    // Modalities are arrays; per-model input is text-only when vision=0,
+    // text+image when vision=1.
+    expect(Array.isArray(sampleEntry.modalities.input)).toBe(true);
+    expect(sampleEntry.modalities.input).toContain('text');
+    if (sampleEntry.capabilities.vision) {
+      expect(sampleEntry.modalities.input).toContain('image');
+    }
+    expect(sampleEntry.modalities.output).toEqual(['text']);
+
+    // Token caps are surfaced: context_window on the row, max_tokens alongside.
+    expect('context_window' in sampleEntry || sampleEntry.context_window === null || typeof sampleEntry.context_window === 'number').toBe(true);
+    expect('max_tokens' in sampleEntry).toBe(true);
+    const maxTokens = sampleEntry.max_tokens;
+    expect(maxTokens === null || typeof maxTokens === 'number').toBe(true);
+
+    // Reasoning detector: families explicitly patterned in `buildModelCapabilities`
+    // must surface reasoning=true; non-reasoning families must surface false.
+    const reasoningOnFamily = body.data.find(
+      (m: { id: string; capabilities?: { reasoning?: boolean } }) =>
+        /\/.*(deepseek-r1|kimi-k2-thinking|minimax-m3|qwq-|magistral|gpt-oss|reasoning)/.test(m.id),
+    );
+    if (reasoningOnFamily) {
+      expect(reasoningOnFamily.capabilities.reasoning).toBe(true);
+    }
+    // MiniMax M2.7 via NVIDIA (`minimaxai/minimax-m2.7`) is a thinking-tier
+    // model but its id did NOT match the old `minimax-m3`/`minimax-m2.5`
+    // patterns, so /models advertised reasoning:false and the client never
+    // enabled thinking. The broadened pattern must surface reasoning=true.
+    // (#292)
+    const minimaxM27 = body.data.find(
+      (m: { id: string }) => m.id === 'nvidia/minimaxai/minimax-m2.7',
+    );
+    if (minimaxM27) {
+      expect(minimaxM27.capabilities.reasoning).toBe(true);
+    }
+    // MiniMax M3 via NVIDIA (`minimaxai/minimax-m3`) is seeded by the V33
+    // every-boot migration (it's live on NIM but was missing from the V11
+    // catalog). Asserted against the DB directly because /models filters to
+    // platforms with a configured key, and this test only adds a groq key.
+    // The reasoning capability is verified separately via the pattern in
+    // buildModelCapabilities (`minimax-m3` matches the reasoning family).
+    // (#292)
+    const m3Row = getDb().prepare(
+      `SELECT model_id FROM models WHERE platform = 'nvidia' AND model_id = 'minimaxai/minimax-m3' AND enabled = 1`,
+    ).get();
+    expect(m3Row).toBeDefined();
+    const nonReasoning = body.data.find(
+      (m: { id: string; capabilities?: { reasoning?: boolean } }) =>
+        m.id !== 'auto' && m.capabilities && m.capabilities.reasoning === false,
+    );
+    expect(nonReasoning).toBeDefined();
+  });
+
   it('treats model:"auto" as auto-route instead of a 400', async () => {
     const origFetch = global.fetch;
 

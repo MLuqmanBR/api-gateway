@@ -56,6 +56,72 @@ export interface CompletionOptions {
    * stripped before the request body is built); used by the probe script so
    * NVIDIA's 15-60s serverless cold starts don't read as failures. */
   timeoutMs?: number;
+  /** Caller-controlled abort signal tied to the client connection. When the
+   *  agent presses Stop / closes the session, the proxy aborts this signal so
+   *  the in-flight upstream `fetch` (and any mid-stream read) is cancelled
+   *  immediately instead of grinding through the rest of the retry/recovery
+   *  loop. Thrown rejections are `RequestAbortError` instances — the proxy
+   *  catches them and ends the response silently. (#292) */
+  abortSignal?: AbortSignal;
+}
+
+/** Thrown when a request is cancelled via the caller's `abortSignal` (the
+ *  client disconnected). Distinct from a provider HTTP error and from a
+ *  timeout so the proxy can tell "user stopped the request" apart from "the
+ *  upstream failed" and end the response without logging a failure or
+ *  burning another retry. (#292) */
+export class RequestAbortError extends Error {
+  readonly aborted = true;
+  constructor(message = 'request aborted by client') {
+    super(message);
+    this.name = 'RequestAbortError';
+  }
+}
+
+/** True for any abort — either our `RequestAbortError` or the native
+ *  `DOMException`/`AbortError` that `fetch` rejects with when its `signal`
+ *  fires. We surface our own class so the retry loop can distinguish a clean
+ *  client-stop from a transport hiccup, but accept either shape defensively
+ *  since some runtimes reject with the bare DOMException. (#292) */
+export function isAbortError(err: unknown): boolean {
+  if (!err) return false;
+  if (err instanceof RequestAbortError) return true;
+  if (err instanceof Error) {
+    const name = err.name;
+    return name === 'AbortError' || /aborted/i.test(err.message);
+  }
+  return false;
+}
+
+/** Combine an external caller-controlled abort signal with a timeout into a
+ *  single signal that fires when EITHER source aborts. Returns the timeout
+ *  signal directly when there's no external signal (preserving the original
+ *  behavior). The returned controller is owned by the caller, which must
+ *  clear the timeout once the fetch settles. (#292) */
+function linkAbortAndTimeout(
+  external: AbortSignal | undefined,
+  timeoutMs: number,
+): { signal: AbortSignal; cleanup: () => void; timedOut: () => boolean } {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const onExternalAbort = () => controller.abort();
+  if (external) {
+    if (external.aborted) {
+      clearTimeout(timeout);
+      controller.abort();
+    } else {
+      external.addEventListener('abort', onExternalAbort, { once: true });
+    }
+  }
+  const cleanup = () => {
+    clearTimeout(timeout);
+    if (external) external.removeEventListener('abort', onExternalAbort);
+  };
+  return { signal: controller.signal, cleanup, timedOut: () => timedOut };
 }
 
 export abstract class BaseProvider {
@@ -92,13 +158,22 @@ export abstract class BaseProvider {
     url: string,
     init: RequestInit,
     timeoutMs = 60000,
+    externalSignal?: AbortSignal,
   ): Promise<Response> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const { signal, cleanup, timedOut } = linkAbortAndTimeout(externalSignal, timeoutMs);
     try {
-      return await fetch(url, { ...init, signal: controller.signal });
+      return await fetch(url, { ...init, signal });
+    } catch (err) {
+      // Distinguish "the client stopped the request" from "we hit the
+      // timeout". The proxy's retry loop treats a client abort as terminal
+      // (no more retries, silent end); a timeout stays a retryable error.
+      // (#292)
+      if (!timedOut() && externalSignal?.aborted) {
+        throw new RequestAbortError();
+      }
+      throw err;
     } finally {
-      clearTimeout(timeout);
+      cleanup();
     }
   }
 
@@ -125,6 +200,7 @@ export abstract class BaseProvider {
   protected async *readSseStream(
     res: Response,
     inactivityTimeoutMs = 300000,
+    abortSignal?: AbortSignal,
   ): AsyncGenerator<ChatCompletionChunk> {
     const reader = res.body?.getReader();
     if (!reader) throw new Error('No response body');
@@ -133,8 +209,18 @@ export abstract class BaseProvider {
     let buffer = '';
     let sawFinishReason = false;
 
+    // A client disconnect mid-stream must cancel the upstream read
+    // immediately rather than waiting for the inactivity timer (which is
+    // 300s) or the provider's own EOF. We attach once and reject the pending
+    // read via the race below. (#292)
+    if (abortSignal?.aborted) throw new RequestAbortError();
+    let aborted = false;
+    const onAbort = () => { aborted = true; };
+    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+
     try {
       while (true) {
+        if (aborted) throw new RequestAbortError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
           reader.read(),
@@ -144,6 +230,11 @@ export abstract class BaseProvider {
               inactivityTimeoutMs,
             );
           }),
+          // Resolve-reject pair: if the client aborts, this rejects first and
+          // the pending `reader.read()` is cancelled in `finally`. (#292)
+          ...(abortSignal ? [new Promise<never>((_, reject) => {
+            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
+          })] : []),
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;
@@ -171,6 +262,7 @@ export abstract class BaseProvider {
         }
       }
     } finally {
+      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
 

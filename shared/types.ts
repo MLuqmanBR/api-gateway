@@ -133,10 +133,21 @@ export interface Model {
 }
 
 export interface ModelListRow {
+  // id is the row PK — not currently surfaced on /v1/models but useful
+  // for callers that want to deep-link to the admin edit page.
+  id: number;
   platform: string;
   model_id: string;
   display_name: string;
   context_window: number | null;
+  // Catalogued caps surfaced through /v1/models so clients can route
+  // requests to a model whose capabilities match the request shape
+  // (vision/tools/output budget) without probing blindly. Added for the
+  // OpenAI-completions-compatible capabilities payload.
+  max_output_tokens: number | null;
+  supports_vision: number;
+  supports_tools: number;
+  intelligence_rank: number;
 }
 
 export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unknown';

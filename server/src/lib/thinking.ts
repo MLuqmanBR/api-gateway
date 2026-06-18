@@ -194,35 +194,135 @@ export function geminiThinkingConfig(
 
 // ─── OpenAI-compat ────────────────────────────────────────────────────────
 
-/** OpenAI-compat helpers. Providers that accept `reasoning_effort` (the
- * DeepSeek/Z.ai/Ollama-style wrapper APIs through `OpenAICompatProvider`)
- * route the string through unchanged. The richer `thinking` object reaches
- * upstream verbatim too — some providers surface it differently, but we
- * never know which at the request layer, so the simplest legal move is to
- * pass it through. */
-/**
- * Decide whether `reasoning_effort` should be emitted alongside `thinking`.
+// Per-host thinking-field policy for OpenAI-compat providers. Each host
+// accepts a different subset of the thinking vocabulary, and forwarding a
+// field the host rejects produces a 400 — notably GLM-5.1 on GlmAggregatorB
+// returns a pydantic `literal_error` for the rich Anthropic-style `thinking`
+// object, killing every request (#292). The gateway therefore never forwards
+// a field unless the host is known to accept it.
+//
+//   'reasoning_effort_only'  default — emit the single `reasoning_effort`
+//                            string (derived from `reasoning_effort` OR
+//                            `thinking.effort`). Most OpenAI-compat hosts
+//                            (NVIDIA, OpenRouter, Groq, Cerebras, …) accept it.
+//   'none'                   GLM hosts — emit NOTHING. GLM's API rejects both
+//                            `reasoning_effort` (unknown field) and the rich
+//                            `thinking` object (literal_error on its
+//                            narrower enum), so the only safe move is to let
+//                            GLM run with its own default reasoning.
+//   'both'                   hosts verified to accept the rich `thinking`
+//                            object alongside `reasoning_effort`. Reserved for
+//                            explicit allowlisting once a host is confirmed.
+export type OpenAiCompatThinkingPolicy =
+  | 'reasoning_effort_only'   // default — emit reasoning_effort verbatim
+  | 'glm_mapped'              // GLM — map effort to GLM's narrow enum, drop the rich object
+  | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only);
+
+// Legacy alias kept for clarity in comments; 'none' is now 'glm_mapped' because
+// GLM does accept a (narrow) reasoning_effort — we just have to map it.
+
+// GLM-family hosts. GLM's OpenAI-compat wrapper accepts ONLY
+// `reasoning_effort` and ONLY the values `none | low | medium | high` — it
+// rejects `max`, `xhigh`, `minimal` with a pydantic literal_error, and rejects
+// the rich Anthropic-style `thinking` object outright. So for GLM we MAP the
+// unified effort onto GLM's allowed enum and never forward the rich object.
+// (#292 — confirmed live against GlmAggregatorB's zai-org/GLM-5.1-FP8.)
+const GLM_HOST_PLATFORMS = new Set<string>([
+  'glmaggregatorb', // zai-org/GLM-5.1-FP8
+  'z-ai',          // GLM hosted on NVIDIA NIM
+  'zai',
+  'glmaggregatora',    // z-ai/glm-5.1
+  'zhipu',         // Zhipu/GLM native
+]);
+
+/** True when the model id is a GLM-family model (glm-4.x / glm-5.x in any
+ *  case, with any org prefix like `z-ai/`, `zai-org/`). Used so GLM models
+ *  hosted on non-GLM platforms (e.g. `nvidia/z-ai/glm-5.1`) still get the
+ *  GLM effort-mapping treatment regardless of host. */
+export function isGlmModel(modelId: string): boolean {
+  const m = modelId.toLowerCase();
+  // Match `glm-4`, `glm-5`, `glm4`, `glm5` (with or without a separator)
+  // after an org prefix like `z-ai/`, `zai-org/`. The 4.x/5.x families are
+  // the reasoning GLM models. `glm` must be a token start (preceded by start
+  // or `/`) so unrelated ids (e.g. `glmist`) don't trip it.
+  return /(^|\/)glm[-_.]?[45]([-_.]|$)/.test(m);
+}
+
+/** Resolve the thinking-field policy for an OpenAI-compat host. `platform`
+ *  is the provider slug; `modelId` is the model being called. A GLM host OR
+ *  GLM model gets `'glm_mapped'` (GLM accepts a narrow `reasoning_effort`
+ *  enum but rejects the rich `thinking` object); everyone else gets the safe
+ *  `reasoning_effort_only` default so future providers never trigger a
+ *  literal_error from an unverified rich `thinking` object. Promote a host to
+ *  `'both'` only after live confirmation. */
+export function openAiCompatThinkingPolicy(platform: string, modelId?: string): OpenAiCompatThinkingPolicy {
+  if (GLM_HOST_PLATFORMS.has(platform)) return 'glm_mapped';
+  if (modelId && isGlmModel(modelId)) return 'glm_mapped';
+  return 'reasoning_effort_only';
+}
+
+/** Map a unified effort level onto GLM's accepted enum (`low|medium|high`).
+ *  GLM rejects `max` and `xhigh` (literal_error) and has no `minimal` slot, so
+ *  we clamp the out-of-range levels into GLM's range WITHOUT disabling
+ *  thinking — `max`/`xhigh` → `high` (most thinking GLM offers), `minimal` →
+ *  `low` (least thinking, but still on). The user's intent (more vs less
+ *  thinking) is preserved; thinking is never turned off by the mapping.
+ *  Confirmed live against GlmAggregatorB GLM-5.1-FP8. (#292) */
+function mapGlmEffort(effort: ThinkingEffort): 'low' | 'medium' | 'high' {
+  switch (effort) {
+    case 'minimal':
+    case 'low': return 'low';
+    case 'medium': return 'medium';
+    case 'high': return 'high';
+    case 'xhigh':
+    case 'max': return 'high';
+    default: return 'high';
+  }
+}
+
+/** Decide which thinking fields to put on the outbound OpenAI-compat body,
+ *  honoring the host's policy. Never forwards a field the host doesn't accept.
  *
- * Some providers reject the pair together; we pick the dominant field per the
- * convenience rule in the comment above. If both are present, prefer the
- * explicit `thinking` object and drop `reasoning_effort` (to avoid duplicate
- * semantics), but if only `reasoning_effort` is set, emit that.
- */
+ *  - `none`: drop everything (GLM).
+ *  - `reasoning_effort_only`: emit `reasoning_effort`, derived from either the
+ *    explicit `reasoning_effort` string or, when only a `thinking` object was
+ *    sent, from `thinking.effort`. The rich `thinking` object is NEVER
+ *    forwarded here — that's the field that triggers literal_errors.
+ *  - `both`: forward `reasoning_effort` and `thinking` verbatim (only for
+ *    hosts verified to accept the rich object).
+ *
+ *  (#292 — previously the live path forwarded both verbatim unconditionally;
+ *  this helper was defined but never imported, i.e. dead code.) */
 export function openaiCompatThinkingBody(
-  normalized: ThinkingRequest | undefined,
+  policy: OpenAiCompatThinkingPolicy,
   original: {
     reasoning_effort?: ThinkingEffort;
     thinking?: ThinkingConfig;
   } | undefined,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
-  if (!normalized) return out;
-  // If the caller passed an explicit `thinking` object, forward it unmodified.
-  // Otherwise emit `reasoning_effort` only.
-  if (original?.thinking) {
-    out.thinking = original.thinking;
-  } else if (original?.reasoning_effort) {
-    out.reasoning_effort = original.reasoning_effort;
+
+  if (policy === 'both') {
+    if (original?.reasoning_effort) out.reasoning_effort = original.reasoning_effort;
+    if (original?.thinking) out.thinking = original.thinking;
+    return out;
   }
+
+  // Resolve the effective effort: prefer explicit `reasoning_effort`, fall
+  // back to `thinking.effort` so a client that only sent a `thinking` object
+  // still has its level honored.
+  const effort = original?.reasoning_effort ?? original?.thinking?.effort;
+
+  if (policy === 'glm_mapped') {
+    // GLM accepts ONLY `reasoning_effort` in {none,low,medium,high} and rejects
+    // the rich `thinking` object. Map the unified effort onto GLM's enum; never
+    // forward the rich object. If no effort was requested, send nothing and let
+    // GLM use its default (which is thinking-enabled). (#292)
+    if (effort) out.reasoning_effort = mapGlmEffort(effort);
+    return out;
+  }
+
+  // policy === 'reasoning_effort_only'
+  if (effort) out.reasoning_effort = effort;
   return out;
 }

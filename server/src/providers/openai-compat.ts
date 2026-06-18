@@ -6,6 +6,10 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { extractErrorMessage } from '../lib/error-body.js';
+import {
+  openAiCompatThinkingPolicy,
+  openaiCompatThinkingBody,
+} from '../lib/thinking.js';
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
  * Covers: Groq, Cerebras, NVIDIA NIM, Mistral, OpenRouter,
@@ -46,6 +50,21 @@ export class OpenAICompatProvider extends BaseProvider {
     this.forceSingleToolCall = opts.forceSingleToolCall ?? false;
   }
 
+  /** Resolve the per-call thinking policy: the host's base policy, tightened
+   * to `'none'` when this specific model is a GLM model (e.g.
+   * `nvidia/z-ai/glm-5.1`) regardless of host. Then build only the fields the
+   * resolved policy permits. (#292) */
+  private buildThinkingFields(
+    modelId: string,
+    options?: CompletionOptions,
+  ): Record<string, unknown> {
+    const policy = openAiCompatThinkingPolicy(this.platform, modelId);
+    return openaiCompatThinkingBody(policy, {
+      reasoning_effort: options?.reasoning_effort,
+      thinking: options?.thinking,
+    });
+  }
+
   /** Resolve the parallel_tool_calls flag to send upstream. For providers that
    * only accept single tool calls (NVIDIA NIM), force `false` whenever tools are
    * present so the model never tries to emit two at once and 400s; otherwise pass
@@ -78,12 +97,15 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
     const parallel = this.resolveParallelToolCalls(options);
     if (parallel !== undefined) body.parallel_tool_calls = parallel;
-    // Pass through thinking knobs verbatim — every OpenAI-compat wrapper reads
-    // at least `reasoning_effort`, and many accept a richer `thinking`
-    // object too. Sending both is safe; the wrapper picks the one it
-    // understands. (#290)
-    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
-    if (options?.thinking) body.thinking = options.thinking;
+    // Thinking/reasoning knobs: forward ONLY fields this host (and this model)
+    // accept. GLM hosts/models reject both `reasoning_effort` and the rich
+    // `thinking` object (pydantic literal_error on the latter), so we send
+    // nothing and let the model use its default. Unknown hosts get the safe
+    // `reasoning_effort`-only default. The rich `thinking` object is never
+    // forwarded unless the host is explicitly allowlisted — that's the field
+    // that killed GLM-5.1. (#292, replaces the verbatim "send both" behavior
+    // from #290.)
+    Object.assign(body, this.buildThinkingFields(modelId, options));
 
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -93,13 +115,16 @@ export class OpenAICompatProvider extends BaseProvider {
         ...this.extraHeaders,
       },
       body: JSON.stringify(body),
-    }, options?.timeoutMs ?? this.timeoutMs);
+    }, options?.timeoutMs ?? this.timeoutMs, options?.abortSignal);
 
     if (!res.ok) {
       // Some providers (NVIDIA NIM) put the error message in `detail` instead
       // of OpenAI's `error.message` shape. Others use `message` at the top
       // level. `extractErrorMessage` walks all three paths and returns
-      // `undefined` when nothing string-shaped is found. (#290)
+      // `undefined` when nothing string-shaped is found. For 4xx validation
+      // errors (e.g. GLM's pydantic `literal_error`) the full `detail` string
+      // is surfaced so the offending field (`loc`) is visible in the log
+      // instead of truncated. (#290, #292)
       const errBody = await res.json().catch(() => undefined);
       const detail = extractErrorMessage(errBody) ?? res.statusText;
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
@@ -139,9 +164,8 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
     const parallel = this.resolveParallelToolCalls(options);
     if (parallel !== undefined) body.parallel_tool_calls = parallel;
-    // Same thinking-knob pass-through as the non-streaming path. (#290)
-    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
-    if (options?.thinking) body.thinking = options.thinking;
+    // Same host/model-aware thinking-knob handling as the non-streaming path. (#292)
+    Object.assign(body, this.buildThinkingFields(modelId, options));
 
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -151,7 +175,7 @@ export class OpenAICompatProvider extends BaseProvider {
         ...this.extraHeaders,
       },
       body: JSON.stringify(body),
-    }, options?.timeoutMs ?? this.timeoutMs);
+    }, options?.timeoutMs ?? this.timeoutMs, options?.abortSignal);
     if (!res.ok) {
       // pulls the message out without `any` so we never coerce a graph
       // into a string. (#290)
@@ -160,7 +184,7 @@ export class OpenAICompatProvider extends BaseProvider {
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${detail}`);
     }
 
-    yield* this.readSseStream(res);
+    yield* this.readSseStream(res, 300000, options?.abortSignal);
   }
 
   async validateKey(apiKey: string): Promise<boolean> {
