@@ -1338,13 +1338,23 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // unparseable dialect): in-band error means the key WORKS but this
         // specific model can't handle the request. Skip the model, not the
         // key — retrying a different model on the same key is valid.
+        //
+        // NOTE: `api error 400` is deliberately NOT in this list. A 400 can be
+        // a KEY-level failure (CommandCode returns 400/403 for quota/auth/key
+        // issues, not just bad params), and skipping the model immediately
+        // never rotates the key — so a request with one exhausted key and one
+        // healthy key would hammer the dead key forever (issue #293: only
+        // key#85 was ever tried, key#86 never got a chance). A 400 now falls
+        // through to the normal per-key retry → markExhausted → router rotates
+        // to the next key, which tries the SAME model on the healthy key. A
+        // genuine model-level 400 still converges: once every key 400s on it,
+        // the model is effectively ruled out by exhaustion.
         const msg = (err.message ?? '').toLowerCase();
         const skipImmediately = msg.includes('in-band provider error')
           || msg.includes('empty completion')
           || msg.includes('stream ended unexpectedly')
           || msg.includes('stream stalled')
-          || msg.includes('unparseable inline tool-call dialect')
-          || msg.includes('api error 400');
+          || msg.includes('unparseable inline tool-call dialect');
 
         if (skipImmediately && !(isPinned && route.modelDbId === preferredModel)) {
           skipModels.add(route.modelDbId);
