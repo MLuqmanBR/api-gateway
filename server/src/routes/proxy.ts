@@ -12,6 +12,7 @@ import { contentToString, messageHasImage, normalizeOutboundContent } from '../l
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
+import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
@@ -970,8 +971,29 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // Some upstreams — notably NVIDIA NIM's minimax-m3 — return an empty
     // 200 (choices:[]) when max_tokens is absent, making the request
     // indistinguishable from "model just has nothing to say". Surfacing a
-    // real bound lets the model actually generate.
     const effectiveMaxTokens = max_tokens ?? route.maxOutputTokens ?? undefined;
+
+    // MiniMax M2.x/M3 on aggregatorc / openrouter / nvidia returns reasoning
+    // inline in `content` wrapped in `` tags instead of using a separate
+    // `reasoning_content` field. The api-gateway splits that into the
+    // `reasoning_content` transport field so clients see a clean answer. The
+    // gate mirrors `buildModelCapabilities` (deepseek-r1, kimi-k2-thinking,
+    // etc. match the same pattern; if any of them ever emits the same tag
+    // the proxy handles it the same way).
+    const routeModelIdLower = route.modelId.toLowerCase();
+    const isReasoningModel =
+         routeModelIdLower.includes('-thinking')
+      || routeModelIdLower.includes('-think')
+      || routeModelIdLower.includes('reasoning')
+      || routeModelIdLower.includes('deepseek-r1')
+      || routeModelIdLower.includes('deepseek-v4')
+      || routeModelIdLower.includes('qwq')
+      || routeModelIdLower.includes('magistral')
+      || routeModelIdLower.includes('o3-') || routeModelIdLower.includes('o4-')
+      || routeModelIdLower.includes('gpt-oss')
+      || routeModelIdLower.includes('minimax-m3')
+      || routeModelIdLower.includes('minimax-m2')
+      || routeModelIdLower.includes('minimaxai/minimax-m');
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
     let keySucceeded = false;
@@ -1003,6 +1025,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // provably cannot (→ 'passthrough': flush and stream normally).
         let mode: 'undecided' | 'passthrough' | 'dialect' = 'undecided';
         let heldText = '';
+        // `` tag extraction state. Independent of the dialect detector:
+        // both machines consume the same `text` chunk, the dialect
+        // detector only ever sees visible text (post-extraction).
+        const thinkStream = new ThinkTagStream();
+        let bufferedReasoning = '';
         const preamble: unknown[] = []; // role-only chunks held until flush
         const toolCallAcc = new Map<number, { id?: string; name: string; args: string }>();
         let upstreamFinish: string | null = null;
@@ -1082,8 +1109,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             }
 
             normalizeOutboundContent(chunk);
-            const text = typeof choice.delta?.content === 'string' ? choice.delta.content : '';
-
+            let text = typeof choice.delta?.content === 'string' ? choice.delta.content : '';
             if (text.length === 0) {
               // Role preamble / keep-alive: hold until first payload decides
               // the mode, forward afterwards. tool_calls and finish_reason are
@@ -1100,10 +1126,35 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             totalOutputTokens += Math.ceil(text.length / 4);
 
             if (mode === 'passthrough') {
-              writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] });
+              // Strip `` tags from the chunk in-flight, emit any
+              // extracted reasoning as a `reasoning_content` delta, and
+              // forward the visible remainder. Reasoning arrives ahead of
+              // the visible text it described — typical for a long-form
+              // think block that closes before the answer begins.
+              if (isReasoningModel) {
+                const think = thinkStream.feed(text);
+                if (think.reasoning.length > 0) {
+                  writeChunk(mkChunk({ reasoning_content: think.reasoning }, null));
+                }
+                text = think.visible;
+                if (text.length === 0) continue;
+              }
+              writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, content: text, tool_calls: undefined }, finish_reason: null }] });
               continue;
             }
 
+            // mode is 'undecided' or 'dialect'. Route the chunk through the
+            // think extractor first so the dialect detector only ever sees
+            // visible text. Pure-reasoning chunks (visible==='') bypass
+            // the dialect detector entirely — nothing to feed.
+            if (isReasoningModel) {
+              const think = thinkStream.feed(text);
+              if (think.reasoning.length > 0) {
+                bufferedReasoning += think.reasoning;
+              }
+              text = think.visible;
+              if (text.length === 0) continue;
+            }
             heldText += text;
             if (mode === 'dialect') continue;
 
@@ -1113,6 +1164,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             } else if (!couldBecomeDialectMarker(probe) || probe.length > 256) {
               mode = 'passthrough';
               flushHeaders();
+              if (bufferedReasoning.length > 0) {
+                writeChunk(mkChunk({ reasoning_content: bufferedReasoning }, null));
+                bufferedReasoning = '';
+              }
               writeChunk(mkChunk({ content: heldText }, null));
               heldText = '';
             }
@@ -1151,8 +1206,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               console.log(`[Proxy] Rescued ${rescuedIds} inline tool call(s) from ${route.displayName} into structured tool_calls`);
             }
           }
+          // Flush the think stream. Residual (unclosed-opener tail) is
+          // appended to visible text — safe default, per the
+          // think-tags.ts comment. Any reasoning the stream still held
+          // (rare; complete blocks emit on the closing feed) is folded
+          // into the buffered reasoning emitted below.
+          const thinkFinal = thinkStream.flush();
+          if (thinkFinal.reasoning.length > 0) {
+            bufferedReasoning += thinkFinal.reasoning;
+          }
+          if (thinkFinal.residual.length > 0) {
+            heldText += thinkFinal.residual;
+          }
 
-          const hasText = headerSent || heldText.trim().length > 0;
+          const hasText = headerSent || heldText.trim().length > 0 || bufferedReasoning.length > 0;
           if (!hasText && completedCalls.length === 0) {
             // Nothing usable came out — same failover semantics as the
             // non-stream empty-completion path. Headers can't have been sent
@@ -1161,6 +1228,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
 
           flushHeaders();
+          if (bufferedReasoning.length > 0) {
+            writeChunk(mkChunk({ reasoning_content: bufferedReasoning }, null));
+          }
           if (heldText.length > 0) {
             writeChunk(mkChunk({ content: heldText }, null));
           }
@@ -1246,6 +1316,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             respMsg.content = rescue.cleanText.length > 0 ? rescue.cleanText : null;
             if (result.choices?.[0]) result.choices[0].finish_reason = 'tool_calls';
             console.log(`[Proxy] Rescued ${rescue.calls.length} inline tool call(s) from ${route.displayName} into structured tool_calls`);
+          }
+        }
+
+        // `` tag extraction (non-streaming path). Mirrors what the
+        // streaming path does on the complete response: move ``
+        // blocks from `content` to `reasoning_content` so clients see
+        // a clean answer and a separate reasoning trace. Skipped for
+        // non-reasoning models — the gate is the same model-id
+        // pattern used in the streaming path. Runs after the tool-
+        // call rescue so the dialect detector only ever saw visible
+        // text; the markers (`<|tool_call_begin|>` etc.) never appear
+        // inside a real think block, so the order is safe.
+        if (isReasoningModel && respMsg) {
+          const originalContent = contentToString(respMsg.content ?? '');
+          if (originalContent.length > 0) {
+            const think = extractThinkTags(originalContent);
+            if (think.extracted) {
+              respMsg.content = think.visible.length > 0 ? think.visible : null;
+              if (think.reasoning.length > 0) {
+                respMsg.reasoning_content = think.reasoning;
+              }
+            }
           }
         }
 
@@ -1365,7 +1457,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           // Transient limit: retry same key immediately.
           lastError = err;
           publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
-          console.log(`[Proxy] ${safeError.slice(0, 60)} from ${route.displayName}, retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
+          console.log(`[Proxy] ${safeError.slice(0, 300)} from ${route.displayName}, retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
           continue keyRetry;
         }
         // Last retry attempt exhausted → fall through to key exhaustion.
