@@ -20,6 +20,14 @@ const DEFAULT_TEMPERATURE = 0.7;
 const STREAM_TIMEOUT_MS = 300000; // 5 min — same as BaseProvider.readSseStream
 const VERSION_FALLBACK = '0.18.10'; // upstream's minVersion — safe floor if npm is unreachable
 const MIN_SUPPORTED_VERSION = '0.18.10';
+/** Hard upper bound the CommandCode /alpha/generate API enforces on
+ *  params.max_tokens. Verified live 2026-06-19: values above 200_000 return
+ *  400 BAD_REQUEST ("Too big: expected number to be <=200000 at
+ *  \"params.max_tokens\""). The catalog's max_output_tokens can be higher
+ *  (e.g. 262144 for deepseek-v4-pro, MiniMax-M3) — we clamp to this ceiling
+ *  so those models don't permanently 400. This is the maximum possible
+ *  output length the upstream allows, not an arbitrary default. */
+const API_MAX_TOKENS = 200000;
 
 let cachedVersion: string | undefined;
 let versionPromise: Promise<string> | undefined;
@@ -215,8 +223,11 @@ export class CommandCodeProvider extends BaseProvider {
     const ccMessages = this.convertMessages(messages);
     const tools = this.convertTools(options?.tools);
     const temperature = options?.temperature ?? DEFAULT_TEMPERATURE;
-    const maxTokens = options?.max_tokens ?? FALLBACK_MAX_TOKENS;
-
+    // The CommandCode API rejects max_tokens > 200_000 with 400. The catalog
+    // stores per-model max_output_tokens which can exceed this (e.g. 262144 for
+    // deepseek-v4-pro), and callers may also ask for more than the upstream
+    // accepts. Clamp to the API ceiling so every model can serve at least up
+    const maxTokens = Math.min(options?.max_tokens ?? FALLBACK_MAX_TOKENS, API_MAX_TOKENS);
     return {
       config: this.defaultConfig(),
       memory: '',
@@ -231,10 +242,9 @@ export class CommandCodeProvider extends BaseProvider {
         temperature,
         stream: true,
         // Pass thinking signals through to the underlying provider. The
-        // CommandCode wrapper reaches model-specific APIs that
-        // recognize `reasoning_effort`; the richer `thinking` object is
-        // forwarded verbatim too so the wrapper can pick what it
-        // understands. (#290)
+        // CommandCode wrapper reaches model-specific APIs that recognize
+        // `reasoning_effort`; the richer `thinking` object is forwarded
+        // verbatim too so the wrapper can pick what it understands. (#290)
         ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
         ...(options?.thinking ? { thinking: options.thinking } : {}),
       },
