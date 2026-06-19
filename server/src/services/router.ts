@@ -558,37 +558,49 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     };
 
     // Try all keys for this model before giving up on it.
-    // In 1 RPM mode, sort by exhaustion time (earliest first) so the key with
-    // the longest recovery window gets tried first. Otherwise use round-robin.
+    //   - 1 RPM mode: include exhausted keys (in exhaustion order, earliest
+    //     first) so the key that has had the longest time to recover is
+    //     retried first. Recovery semantics.
+    //   - Normal mode: exclude exhausted keys entirely. The markExhausted
+    //     signal is "exhausted until a successful request clears it", and
+    //     the round-robin index must not re-pick an exhausted key just
+    //     because enough successful requests have advanced the index past
+    //     the unexhausted keys. This is what stops the
+    //     "every-Nth-request-retry-the-just-exhausted-key" pattern. If
+    //     every key on this model is exhausted, the loop falls through
+    //     to the existing PINNED_MODEL_EXHAUSTED / fallthrough path,
+    //     which is the correct escalation.
     const rrKey = `${entry.platform}:${entry.model_id}`;
 
     let keyOrder: KeyRow[];
     if (oneRPM) {
-      // Order by exhaustion time: earliest exhausted first.
       const exhaustedOrder = getExhaustedKeysForModel(entry.platform, entry.model_id);
-      const exhaustedSet = new Set(exhaustedOrder.map(e => e.keyId));
-      // Unexhausted keys go first (they might work immediately), then exhausted
-      // keys sorted earliest→latest.
+      const exhaustedMap = new Map(exhaustedOrder.map(e => [e.keyId, e.exhaustedAt]));
       const unexhausted: KeyRow[] = [];
-      const exhausted: Array<{ row: KeyRow; exhaustedAt: number }> = [];
+      const exhausted: KeyRow[] = [];
       for (const k of keys) {
-        const ex = exhaustedOrder.find(e => e.keyId === k.id);
-        if (ex) {
-          exhausted.push({ row: k, exhaustedAt: ex.exhaustedAt });
+        if (exhaustedMap.has(k.id)) {
+          exhausted.push(k);
         } else {
           unexhausted.push(k);
         }
       }
-      exhausted.sort((a, b) => a.exhaustedAt - b.exhaustedAt);
-      // Shuffle unexhausted keys so every recovery cycle doesn't bias toward
+      // Earliest-exhausted first within the exhausted bucket.
+      exhausted.sort((a, b) => exhaustedMap.get(a.id)! - exhaustedMap.get(b.id)!);
+      // Shuffle unexhausted so every recovery cycle doesn't bias toward
       // the same key via DB insertion order.
       for (let i = unexhausted.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [unexhausted[i], unexhausted[j]] = [unexhausted[j], unexhausted[i]];
       }
-      keyOrder = [...unexhausted, ...exhausted.map(e => e.row)];
+      keyOrder = [...unexhausted, ...exhausted];
     } else {
-      keyOrder = keys;
+      // Normal mode: filter out exhausted keys entirely. Use a Set lookup
+      // for O(1) membership instead of the O(n) find used in 1RPM mode
+      // because the partition happens on every request.
+      const exhaustedOrder = getExhaustedKeysForModel(entry.platform, entry.model_id);
+      const exhaustedIds = new Set(exhaustedOrder.map(e => e.keyId));
+      keyOrder = keys.filter(k => !exhaustedIds.has(k.id));
     }
 
     let idx = oneRPM ? 0 : (roundRobinIndex.get(rrKey) ?? 0);
@@ -664,8 +676,12 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
     // If we reach here, this specific model has NO available keys.
     // Update round-robin index even if we failed so we don't get stuck.
-    if (!oneRPM) {
-      roundRobinIndex.set(rrKey, (idx + 1) % keys.length);
+    // Use keyOrder.length (not keys.length) so the modulo doesn't point
+    // past the end of the post-filter queue — the next request would
+    // wrap back to the start of keyOrder instead of skipping the only
+    // remaining key.
+    if (!oneRPM && keyOrder.length > 0) {
+      roundRobinIndex.set(rrKey, (idx + 1) % keyOrder.length);
     }
 
     // In pin mode, don't fall through to the next model.

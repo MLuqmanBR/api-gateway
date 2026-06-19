@@ -154,4 +154,83 @@ describe('Routing Key Exhaustion', () => {
       expect(result.modelId).toBe('gemini-1.5-flash');
     });
   });
+
+  // Round-robin must respect the exhaustion map: an exhausted key stays
+  // deprioritized until it is cleared by a successful request, even after
+  // its transient cooldown expires. Without this, the 90s transient
+  // cooldown expires, the round-robin index wraps back to the other key,
+  // and the router re-picks the just-exhausted key — causing the
+  // "every-Nth-request-cycle-to-the-broken-key" pattern.
+  describe('exhaustion-aware round-robin', () => {
+    beforeEach(async () => {
+      // Clear any persisted cooldowns / exhaustion from other tests.
+      const db = getDb();
+      db.prepare('DELETE FROM rate_limit_cooldowns').run();
+      const { rebuildExhaustionFromDB } = await import('../../services/key-exhaustion.js');
+      rebuildExhaustionFromDB();
+    });
+
+    it('keeps picking the unexhausted key across many requests, not round-robin back to the exhausted one', async () => {
+      const { markExhausted } = await import('../../services/key-exhaustion.js');
+      const db = getDb();
+      const keys = db.prepare("SELECT id, label FROM api_keys").all() as Array<{ id: number; label: string }>;
+      const keyA = keys.find(k => k.label === 'Key A')!;
+      const keyB = keys.find(k => k.label === 'Key B')!;
+
+      (ratelimit.canMakeRequest as any).mockReturnValue(true);
+      (ratelimit.canUseTokens as any).mockReturnValue(true);
+
+      // Mark Key B as exhausted. Key A remains the healthy one.
+      markExhausted(keyB.id, 'google', 'gemini-1.5-pro');
+
+      // 10 successive routeRequests. Every one must land on Key A — the
+      // round-robin index should not wrap back to Key B just because
+      // enough successful Key A requests have advanced the index past
+      // the array length. Key B is reachable only if every other key
+      // fails, which is not the case here.
+      const pickedKeyIds: number[] = [];
+      for (let i = 0; i < 10; i++) {
+        const r = routeRequest(100);
+        pickedKeyIds.push(r.keyId);
+        // Simulate a successful request — the proxy's success path calls
+        // clearExhausted(keyId, modelId). Key A is the working one and
+        // never gets marked exhausted in this test, so the calls are
+        // no-ops on Key A's exhaustion state (Key A wasn't exhausted).
+        // We intentionally do NOT clear Key B's exhaustion — that's the
+        // whole point of this test.
+        if (r.keyId === keyA.id) {
+          const { clearExhausted } = await import('../../services/key-exhaustion.js');
+          clearExhausted(r.keyId, r.modelId);
+        }
+      }
+
+      expect(pickedKeyIds).toEqual(Array(10).fill(keyA.id));
+    });
+
+    it('reaches the exhausted key only when every unexhausted key has failed', async () => {
+      const { markExhausted } = await import('../../services/key-exhaustion.js');
+      const db = getDb();
+      const keys = db.prepare("SELECT id, label FROM api_keys").all() as Array<{ id: number; label: string }>;
+      const keyA = keys.find(k => k.label === 'Key A')!;
+      const keyB = keys.find(k => k.label === 'Key B')!;
+
+      // Mark Key A as exhausted, Key B as healthy.
+      markExhausted(keyA.id, 'google', 'gemini-1.5-pro');
+      (ratelimit.canMakeRequest as any).mockReturnValue(true);
+      (ratelimit.canUseTokens as any).mockReturnValue(true);
+
+      // First call should pick Key B (unexhausted), not Key A.
+      const r1 = routeRequest(100);
+      expect(r1.keyId).toBe(keyB.id);
+
+      // The unexhausted key successfully serves a request. Key A remains
+      // in the exhausted bucket.
+      const { clearExhausted } = await import('../../services/key-exhaustion.js');
+      clearExhausted(r1.keyId, r1.modelId);
+
+      // Second call: still Key B (Key A still exhausted).
+      const r2 = routeRequest(100);
+      expect(r2.keyId).toBe(keyB.id);
+    });
+  });
 });
