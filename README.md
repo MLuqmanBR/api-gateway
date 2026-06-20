@@ -27,6 +27,7 @@ Aggregate free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRouter, G
 - [Quick start](#quick-start)
 - [Using the API](#using-the-api)
 - [Custom platforms and models](#custom-platforms-and-models)
+- [Settings &amp; backup](#settings--backup)
 - [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [Context Handoff](#context-handoff)
@@ -129,7 +130,7 @@ And when the built-in list isn't enough? You add your own. Any OpenAI-compatible
 - **Admin dashboard** — React + Vite UI to manage keys, reorder the fallback chain, edit any model's properties, register custom providers (models are auto-discovered on creation), inspect analytics, and run prompts in a playground. Dark mode included.
 - **Analytics** — Per-request logging with latency, token counts, success rate, and per-provider breakdowns over 24h / 7d / 30d windows.
 - **Context handoff on model switch** — Optional. When a session falls over to a different model, injects one compact system message so the new model knows it is continuing an existing task. Disabled by default; enable with `API_GATEWAY_CONTEXT_HANDOFF=on_model_switch`. See [Context Handoff](#context-handoff).
-- **Runs anywhere Node 20+ runs** — Windows, macOS, Linux servers, or a small ARM SBC (Raspberry Pi included). ~40 MB RSS at idle behind PM2 / systemd / whatever supervisor you prefer.
+- **Full configuration export / import** — One JSON file carries the entire gateway configuration: every model and its ranks/limits/capabilities, the fallback chain order, all custom providers and their base URLs, every API key (with optional passphrase encryption under PBKDF2-SHA256-310k + AES-256-GCM), embedding family routing, routing strategy / weights / retry limits, and your quirks. The Settings page lets you pick sections, optionally protect keys with a passphrase, preview the import as a dry-run diff, then apply it. Three modes: `skip-existing` (safest default), `overwrite`, and `replace`. Envelopes are versioned, Zod-validated, and the entire import commits atomically (rollback on any error).
 
 ## Not yet supported
 
@@ -342,6 +343,48 @@ The model joins the fallback chain at the lowest priority and shows up everywher
 Adding an API key for a custom platform works the same as for a built-in: pick the custom slug in the **Add a provider key** form, paste the bearer (or leave blank for local servers that don't need one), and the key routes to your endpoint.
 
 Removing a custom platform cascades — it drops every model on that platform, every key, and every fallback entry. There's no "leaving a model orphaned" state.
+Removing a custom platform cascades — it drops every model on that platform, every key, and every fallback entry. There's no "leaving a model orphaned" state.
+
+## Settings &amp; backup
+
+The **Settings** page is where you back up the entire gateway configuration and restore it elsewhere — useful when you promote a curated setup from your laptop to a server, sync tweaks between staging and production, or wipe and recover from a disaster. One versioned JSON envelope carries:
+
+- Every model in the catalog, with its ranks, capabilities, per-model rate limits, context window, max output tokens, and vision / tools flags.
+- The full fallback chain (ordered list of `(platform, model_id)` pairs with their enabled state).
+- All custom providers and their base URLs, rate limits, max-parallel ceiling, keyless / api-format flags.
+- Every API key — encrypted under a passphrase you supply at export time, so the file is safe to commit to a private repo, drop in a chat, or copy via scp.
+- Embedding family configuration (per-family provider order, dimensions, default family).
+- Routing strategy, custom weights, and global retry limit.
+- Your authored quirks (title / body / severity / per-target model globs).
+
+Three endpoints sit behind `/api/config` (gated by the dashboard session):
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET  /api/config/inventory`  | Row counts per exportable section. The Settings page calls this on load to populate the "Current configuration" card. |
+| `POST /api/config/export`     | Build an envelope. JSON body may include `sections`, `passphrase`, `label`, `download`. When `download` is true, the response carries a `Content-Disposition: attachment` header so the browser saves the file. |
+| `POST /api/config/preview`    | Parse + validate an envelope without committing. Returns the parsed section counts, schema version, generator, and whether the keys blob is encrypted. |
+| `POST /api/config/import`     | Apply an envelope. Body: `{ envelope, options: { mode, dryRun, passphrase, sections? } }`. The whole import runs inside a single SQLite transaction and rolls back atomically on any structural error. |
+
+### Merge modes
+
+- `skip-existing` *(default)* — never touch rows that already exist. New rows are inserted. Safest when restoring into a populated database.
+- `overwrite` — update existing rows in place, insert the rest.
+- `replace` — wipe the destination section, then insert from the envelope.
+
+### Passphrase protection
+
+If you supply a passphrase at export time, the envelope's `keysCipher` blob is a self-describing PBKDF2-SHA256-310,000-derived AES-256-GCM ciphertext holding the plaintext API keys. The `api_keys` section in the same envelope strips the plaintext `key` field — only the ciphertext fields (`encryptedKey`, `iv`, `authTag`) remain, so even a malicious actor with the file but no passphrase cannot recover the keys. On import, supply the same passphrase at the import side to decrypt. A wrong passphrase returns 401 with a clear "could not decrypt keysCipher" message.
+
+If you skip the passphrase, the `api_keys` section includes the plaintext `key` directly. Fine for an offline backup to your own machine; not safe to share. The UI nudges you toward providing one.
+
+### Built-in models
+
+Catalog rows for built-in platforms (`google`, `groq`, `cerebras`, …) are normally read-only on import — they're seeded by the server and shouldn't drift between instances. If you intentionally want to carry rank tweaks across installs, set `overwriteBuiltin: true` on the affected model record. Custom-provider models are never locked.
+
+### Dry-run
+
+Every import can be sent with `dryRun: true`. The server runs the exact same code path inside a SQLite `SAVEPOINT`, then rolls back. The response includes a `diff` summary — for each section: how many records were added, updated, skipped, or removed, plus any per-record errors. Always dry-run first when applying against a populated database; the UI's **Run dry-run** button is one click away from **Apply import**.
 
 ## Screenshots
 

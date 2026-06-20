@@ -40,3 +40,66 @@ export function formatIsoUtcToLocalChart(value: string, interval: 'hour' | 'day'
   }
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
+/**
+ * Build a polished, sortable backup filename for a config export.
+ *
+ * Format: `API_Gateway-Backup-YYYY-MM-DD-HH-mm-ss.json`
+ *
+ * The timestamp is rendered in the *user's local timezone* (the browser
+ * already knows it via `Intl.DateTimeFormat`), not UTC. Two-digit fields
+ * are zero-padded so the resulting filename sorts lexicographically.
+ */
+export function makeConfigBackupFilename(now: Date = new Date()): string {
+  const pad = (n: number): string => n.toString().padStart(2, '0');
+  const stamp =
+    `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
+    `-${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+  return `API_Gateway-Backup-${stamp}.json`;
+}
+
+/**
+ * Return the user's IANA timezone (e.g. `Europe/London`), falling back to
+ * `UTC` if the browser doesn't expose the resolved name. Useful for
+ * showing the operator which timezone a filename stamp represents.
+ */
+export function getLocalTimezoneName(): string {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return tz || 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+/**
+ * Trigger a browser file download for an in-memory payload.
+ *
+ * The standard pattern of `URL.createObjectURL(...) → anchor.click() →
+ * URL.revokeObjectURL(url)` is racy in Firefox: revoking the URL on the
+ * same tick as the click causes the browser to drop the download with
+ * a "could not load XPCOM" error, and the file never reaches the
+ * user's machine. We instead schedule the revoke on a `setTimeout(0)`
+ * microtask plus a 1s safety net so the download has plenty of time to
+ * read from the blob before the URL is invalidated.
+ */
+export function downloadBlob(filename: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.rel = 'noopener';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  try {
+    anchor.click();
+  } finally {
+    document.body.removeChild(anchor);
+    // Defer the revoke so the browser can read the blob first. Two
+    // timers cover both fast and slow pipelines:
+    //   1. `setTimeout(0)` is enough for Chromium / WebKit.
+    //   2. The 1s safety net catches Firefox and anything that
+    //      dispatches the download asynchronously.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+}

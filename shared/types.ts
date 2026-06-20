@@ -377,6 +377,219 @@ export interface RequestLog {
 
 // ---- Rate Limit Types ----
 
+// ──── Configuration Export / Import ─────────────────────────────────────────
+
+// Versioned, portable snapshot of the user's gateway configuration. Each
+// section is independent: an export may carry any subset, and the import
+// service processes only what's present. New fields are additive; old fields
+// are preserved on round-trip but ignored on import if unknown (forward
+// compatibility). The `schemaVersion` is bumped for non-additive changes.
+export const CONFIG_SCHEMA_VERSION = 1;
+export const CONFIG_GENERATOR = 'api-gateway';
+
+export type ConfigSection =
+  | 'models'
+  | 'fallback_chain'
+  | 'custom_providers'
+  | 'api_keys'
+  | 'embeddings'
+  | 'settings'
+  | 'quirks';
+
+// Imported record types — every field uses camelCase and matches the wire
+// shape returned by the relevant /api/* endpoints, except `id`/`keyId` (which
+// are remapped server-side because source IDs don't carry over).
+
+export interface ConfigModel {
+  platform: string;
+  modelId: string;
+  displayName: string;
+  intelligenceRank: number;
+  speedRank: number;
+  sizeLabel: string;
+  rpmLimit: number | null;
+  rpdLimit: number | null;
+  tpmLimit: number | null;
+  tpdLimit: number | null;
+  monthlyTokenBudget: string;
+  contextWindow: number | null;
+  enabled: boolean;
+  supportsVision: boolean;
+  supportsTools: boolean;
+  maxOutputTokens: number | null;
+  paidInputPerM: number | null;
+  paidOutputPerM: number | null;
+  /** When true, import will replace built-in catalog rows for this
+   * (platform, model_id) with the exported values. Built-in models are
+   * normally read-only on import; opt in explicitly so users can carry
+   * rank tweaks between instances. */
+  overwriteBuiltin?: boolean;
+}
+
+export interface ConfigFallbackEntry {
+  /** Natural key: the (platform, modelId) tuple this chain position points
+   * at. Resolved against the destination catalog at import time. */
+  platform: string;
+  modelId: string;
+  /** The stored `fallback_config.priority` at export time. Carried in the
+   * envelope so a no-op round-trip can detect "row already at this
+   * priority" and skip — without needing to infer it from the list
+   * position. Duplicates are possible (and preserved): two rows with
+   * the same priority stay at the same priority on re-import.
+   *
+   * Optional for backward compatibility with envelopes produced by
+   * earlier versions of the gateway, where the priority was implicit
+   * in the list order. New exports always include it. */
+  priority?: number;
+  enabled: boolean;
+}
+
+export interface ConfigCustomProvider {
+  slug: string;
+  displayName: string;
+  baseUrl: string;
+  rpmLimit: number | null;
+  rpdLimit: number | null;
+  tpmLimit: number | null;
+  tpdLimit: number | null;
+  maxParallelRequests: number | null;
+  archived: boolean;
+  keyless: boolean;
+  apiFormat: 'openai' | 'anthropic';
+}
+
+export interface ConfigApiKey {
+  platform: string;
+  label: string;
+  enabled: boolean;
+  /** Plaintext key. Required unless the envelope carries a `keysCipher`
+   * (passphrase-encrypted blob) AND the user supplies the passphrase at
+   * import time — in that case the import server unwraps keys into this
+   * field during ingest. */
+  key?: string;
+  /** When set, the import server treats `key` as already encrypted under
+   * the destination's AES key and skips re-encryption. Used when both the
+   * source and destination share the same ENCRYPTION_KEY. */
+  encryptedKey?: string;
+  iv?: string;
+  authTag?: string;
+  /** Optional base URL for custom providers whose base URL is denormalized
+   * onto the key row. */
+  baseUrl?: string | null;
+}
+
+export interface ConfigEmbeddingFamily {
+  family: string;
+  /** Ordered list of (platform, modelId, priority, enabled) entries.
+   * Position in the array defines the failover order; ties on `priority`
+   * fall back to position. */
+  providers: Array<{
+    platform: string;
+    modelId: string;
+    priority: number;
+    enabled: boolean;
+  }>;
+  dimensions: number;
+  maxInputTokens: number | null;
+  displayName: string;
+  quotaLabel: string;
+}
+
+export interface ConfigSettings {
+  routingStrategy?: 'priority' | 'balanced' | 'smartest' | 'fastest' | 'reliable' | 'custom';
+  globalRetryLimit?: number;
+  customWeights?: { reliability: number; speed: number; intelligence: number };
+}
+
+export interface ConfigQuirk {
+  slug: string;
+  title: string;
+  body: string;
+  severity: 'info' | 'warning' | 'critical';
+  targets: Array<{ platform: string | null; modelGlob: string | null }>;
+}
+
+export type ConfigMergeMode = 'skip-existing' | 'overwrite' | 'replace';
+
+export interface ConfigImportOptions {
+  mode: ConfigMergeMode;
+  /** When true, validate and report changes without committing. The
+   * response includes a `diff` summary plus any per-section errors. */
+  dryRun: boolean;
+  /** Optional passphrase for the exported `keysCipher` blob. Required when
+   * the envelope includes `keysCipher` and the import mode touches
+   * `api_keys`. */
+  passphrase?: string;
+  /** Per-section overrides. Missing sections are left untouched on the
+   * destination. Default: all sections present in the envelope are imported. */
+  sections?: ConfigSection[];
+}
+
+export interface ConfigEnvelope {
+  schemaVersion: number;
+  generator: string;
+  exportedAt: string;
+  /** Optional human-readable label ("Laptop staging" / "Production"). */
+  label?: string;
+  sections: {
+    models?: ConfigModel[];
+    fallbackChain?: ConfigFallbackEntry[];
+    customProviders?: ConfigCustomProvider[];
+    apiKeys?: ConfigApiKey[];
+    embeddings?: {
+      defaultFamily?: string;
+      families: ConfigEmbeddingFamily[];
+    };
+    settings?: ConfigSettings;
+    quirks?: ConfigQuirk[];
+  };
+  /** Passphrase-encrypted blob holding the plaintext API keys (one JSON
+   * array of `{ platform, key }`). When this is set, individual api_keys
+   * entries above should NOT include `key` — the import server pulls them
+   * from this blob. Always present when the export was created with a
+   * passphrase. */
+  keysCipher?: {
+    kdf: 'pbkdf2-sha256-310000';
+    salt: string;
+    iv: string;
+    authTag: string;
+    ciphertext: string;
+  };
+}
+
+export interface ConfigImportSummary {
+  /** True when dryRun=true and no changes were committed. */
+  dryRun: boolean;
+  mode: ConfigMergeMode;
+  /** ISO timestamp the import finished at. */
+  importedAt: string;
+  sections: Record<string, {
+    added: number;
+    updated: number;
+    skipped: number;
+    removed: number;
+    errors: string[];
+  }>;
+  /** When the import actually mutated data, a record of every created
+   * `models.id` and `custom_providers.id` so the client can refresh
+   * cached lists without re-fetching everything. */
+  ids?: {
+    models: Array<{ platform: string; modelId: string; id: number }>;
+    customProviders: Array<{ slug: string; id: number }>;
+  };
+}
+
+export interface ConfigExportRequest {
+  /** Sections to include. Defaults to every supported section. */
+  sections?: ConfigSection[];
+  /** Optional passphrase. When supplied, the export bundles a
+   * `keysCipher` blob so api_keys entries are stored encrypted and only
+   * the holder of the passphrase can decrypt them. Without a passphrase,
+   * plaintext api_keys are included directly. */
+  passphrase?: string;
+  label?: string;
+}
+
 export interface RateLimitStatus {
   platform: Platform;
   modelId: string;
