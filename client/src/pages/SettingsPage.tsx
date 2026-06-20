@@ -131,8 +131,11 @@ export default function SettingsPage() {
       // stamp; the client must use the browser's local time. We
       // always generate a fresh local-time filename here rather than
       // trusting the server's `Content-Disposition`, which would
-      // show a UTC timestamp and confuse the user.
-      const localFilename = makeConfigBackupFilename(new Date())
+      // show a UTC timestamp and confuse the user. The optional
+      // label ("Laptop staging" / "Production") is folded into the
+      // filename so multiple exports can be told apart at a glance.
+      const trimmedLabel = exportLabel.trim();
+      const localFilename = makeConfigBackupFilename(new Date(), trimmedLabel || undefined);
       return { res, body: text, envelope, filename: localFilename, localFilename }
     },
     onSuccess: ({ body, filename, envelope }, vars) => {
@@ -531,8 +534,14 @@ function ExportPreviewModal({
   // The download button always uses a fresh local-time filename so the
   // user gets a consistent `API_Gateway-Backup-YYYY-MM-DD-HH-mm-ss.json`
   // regardless of where the modal was opened or whether the server
-  // emitted a different Content-Disposition suggestion.
-  const downloadName = useMemo(() => makeConfigBackupFilename(new Date()), [])
+  // emitted a different Content-Disposition suggestion. The envelope's
+  // optional `label` ("Laptop staging", "Production") is folded in
+  // so the downloaded file's name matches what the operator saw in
+  // the label field on the export card.
+  const downloadName = useMemo(
+    () => makeConfigBackupFilename(new Date(), envelope.label),
+    [envelope.label],
+  )
   const tz = useMemo(() => getLocalTimezoneName(), [])
   const sectionCounts = useMemo(() => {
     return {

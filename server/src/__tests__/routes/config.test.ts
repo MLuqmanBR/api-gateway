@@ -139,8 +139,8 @@ describe('Config API', () => {
     // the user's timezone — direct downloads (curl, scripts) get a
     // file with a UTC stamp. The browser dashboard rebuilds the
     // filename in the user's local time before download, so the
-    // operator sees a familiar local timestamp. Either way, the
-    // format is `API_Gateway-Backup-YYYY-MM-DD-HH-mm-ss.json`.
+    // operator sees a familiar local timestamp. With a label, the
+    // slug is folded in between the prefix and the timestamp.
     const server = app.listen(0);
     const port = (server.address() as { port: number }).port;
     const res = await fetch(`http://127.0.0.1:${port}/api/config/export`, {
@@ -154,8 +154,58 @@ describe('Config API', () => {
     expect(res.status).toBe(200);
     const cd = res.headers.get('content-disposition') ?? '';
     expect(cd).toContain('attachment');
-    expect(cd).toMatch(/filename="API_Gateway-Backup-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.json"/);
+    // `API_Gateway-Backup-<optional-slug>-YYYY-MM-DD-HH-mm-ss.json`
+    expect(cd).toMatch(
+      /filename="API_Gateway-Backup-(?:[a-z0-9-]+-)?\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.json"/,
+    );
+    expect(cd).toContain('staging-laptop');
     server.close();
+  });
+
+  it('POST /api/config/export with download=true folds the label slug into the filename', async () => {
+    // Operator-friendly behavior: a label like "Production" becomes
+    // part of the filename so multiple exports in the same directory
+    // are easy to tell apart. The slug rules are mirrored on the
+    // client (client/src/lib/utils.ts) so dashboard downloads and
+    // direct API downloads produce the same shape.
+    async function fetchWith(label: string | undefined): Promise<string> {
+      const server = app.listen(0);
+      const port = (server.address() as { port: number }).port;
+      const res = await fetch(`http://127.0.0.1:${port}/api/config/export`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${dashToken}`,
+        },
+        body: JSON.stringify({ download: true, ...(label ? { label } : {}) }),
+      });
+      expect(res.status).toBe(200);
+      const cd = res.headers.get('content-disposition') ?? '';
+      server.close();
+      return cd;
+    }
+    // Slug rules:
+    expect(await fetchWith('Production')).toContain('production-');
+    expect(await fetchWith('Laptop staging')).toContain('laptop-staging-');
+    expect(await fetchWith('  Trim Me  ')).toContain('trim-me-');
+    expect(await fetchWith('Café résumé')).toContain('cafe-resume-');
+    // Punctuation collapses to a single hyphen.
+    expect(await fetchWith('a, b. c!')).toContain('a-b-c-');
+    // Non-Latin (e.g. Devanagari) collapses to a hyphen — but the slug
+    // is still defined; we just don't assert its exact characters.
+    const cyrillic = await fetchWith('Привет мир');
+    expect(cyrillic).toMatch(/API_Gateway-Backup-([a-z0-9-]+-)?\d{4}/);
+    // Long label gets truncated to <= 32 chars and trimmed at a hyphen
+    // boundary when one exists past index 16.
+    const long = await fetchWith('this-is-a-very-long-label-that-should-be-truncated-okay');
+    const longMatch = long.match(/filename="API_Gateway-Backup-([^-]+(?:-[^-]+)*?)-\d{4}/);
+    expect(longMatch).not.toBeNull();
+    expect(longMatch![1].length).toBeLessThanOrEqual(32);
+    // Missing label: no slug in the filename.
+    const none = await fetchWith(undefined);
+    expect(none).toMatch(
+      /filename="API_Gateway-Backup-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.json"/,
+    );
   });
 
   it('POST /api/config/export rejects unknown sections', async () => {

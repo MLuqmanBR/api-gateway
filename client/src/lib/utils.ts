@@ -43,18 +43,54 @@ export function formatIsoUtcToLocalChart(value: string, interval: 'hour' | 'day'
 /**
  * Build a polished, sortable backup filename for a config export.
  *
- * Format: `API_Gateway-Backup-YYYY-MM-DD-HH-mm-ss.json`
+ * Format:
+ *   - No label:  `API_Gateway-Backup-YYYY-MM-DD-HH-mm-ss.json`
+ *   - With label: `API_Gateway-Backup-<slug>-YYYY-MM-DD-HH-mm-ss.json`
  *
  * The timestamp is rendered in the *user's local timezone* (the browser
  * already knows it via `Intl.DateTimeFormat`), not UTC. Two-digit fields
  * are zero-padded so the resulting filename sorts lexicographically.
+ *
+ * The optional `label` ("Laptop staging", "Production") is slugified so
+ * the operator can tell multiple exports apart at a glance. Slug rules:
+ *   - lowercase, ASCII letters / digits / hyphens only
+ *   - max 32 chars (truncated on a word boundary if possible)
+ *   - leading/trailing hyphens stripped
+ *   - non-Latin letters (e.g. Cyrillic) collapse to a dash so the
+ *     filename stays portable across filesystems
  */
-export function makeConfigBackupFilename(now: Date = new Date()): string {
+export function makeConfigBackupFilename(now: Date = new Date(), label?: string): string {
   const pad = (n: number): string => n.toString().padStart(2, '0');
   const stamp =
     `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}` +
     `-${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
-  return `API_Gateway-Backup-${stamp}.json`;
+  const slug = labelSlugify(label);
+  return slug
+    ? `API_Gateway-Backup-${slug}-${stamp}.json`
+    : `API_Gateway-Backup-${stamp}.json`;
+}
+
+/**
+ * Convert a free-form label into a filename-safe slug.
+ * Returns an empty string when there's nothing useful to keep.
+ */
+function labelSlugify(label: string | undefined | null): string {
+  if (!label) return '';
+  // Replace runs of non-[a-z0-9] with a single hyphen; lowercase.
+  const ascii = label
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')   // strip combining marks (e.g. é → e)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!ascii) return '';
+  // Truncate at a word boundary when possible to keep the slug readable.
+  if (ascii.length <= 32) return ascii;
+  const cut = ascii.slice(0, 32);
+  const lastHyphen = cut.lastIndexOf('-');
+  // Only use the cut if the boundary isn't too aggressive (< 50% loss).
+  if (lastHyphen > 16) return cut.slice(0, lastHyphen);
+  return cut.replace(/-+$/, '');
 }
 
 /**

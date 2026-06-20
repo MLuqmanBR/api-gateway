@@ -70,13 +70,19 @@ configRouter.post('/export', (req: Request, res: Response) => {
   const body = JSON.stringify(envelope, null, 2);
   if (parsed.data.download) {
     // Match the client-side `API_Gateway-Backup-YYYY-MM-DD-HH-mm-ss.json`
-    // shape. The server is in UTC, but the client will rebuild the
-    // filename in its own local timezone on download — this header is
-    // a hint, not authoritative. We still emit a sane UTC filename so
-    // that direct fetches (curl, scripts) get a polished name too.
+    // shape (with an optional label slug inserted between the prefix
+    // and the timestamp — see slugifyLabel below). The server is in
+    // UTC, but the client will rebuild the filename in its own local
+    // timezone on download — this header is a hint, not authoritative.
+    // We still emit a sane UTC filename so that direct fetches (curl,
+    // scripts) get a polished name too.
     const stamp = exportedAtUtcStamp(envelope.exportedAt);
+    const slug = slugifyLabel(envelope.label);
+    const base = slug
+      ? `API_Gateway-Backup-${slug}-${stamp}`
+      : `API_Gateway-Backup-${stamp}`;
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename="API_Gateway-Backup-${stamp}.json"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${base}.json"`);
   } else {
     res.setHeader('Content-Type', 'application/json');
   }
@@ -88,6 +94,30 @@ function exportedAtUtcStamp(iso: string): string {
   // `envelope.exportedAt` is always ISO 8601 in UTC. Replace the `T`
   // separator and strip the trailing `Z` + sub-second fraction.
   return iso.replace(/\.\d+/, '').replace('T', '-').replace(/Z$/, '').replace(/:/g, '-');
+}
+
+/**
+ * Convert a free-form export label ("Laptop staging") into a
+ * filename-safe slug ("laptop-staging"). Returns an empty string when
+ * the label is missing or contains no filename-safe characters. Rules
+ * mirror the client-side `labelSlugify` in client/src/lib/utils.ts so
+ * the server's Content-Disposition filename matches what the client
+ * dashboard would generate.
+ */
+function slugifyLabel(label: string | undefined): string {
+  if (!label) return '';
+  const ascii = label
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!ascii) return '';
+  if (ascii.length <= 32) return ascii;
+  const cut = ascii.slice(0, 32);
+  const lastHyphen = cut.lastIndexOf('-');
+  if (lastHyphen > 16) return cut.slice(0, lastHyphen);
+  return cut.replace(/-+$/, '');
 }
 
 // ── Preview ───────────────────────────────────────────────────────────────
