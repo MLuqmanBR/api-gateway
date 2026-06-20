@@ -20,6 +20,7 @@ import {
   Loader2,
   AlertTriangle,
   Clipboard,
+  Check,
   X,
 } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
@@ -548,15 +549,38 @@ function ExportPreviewModal({
     downloadBlob(downloadName, new Blob([pretty], { type: 'application/json' }))
   }
 
+  // Copy-button feedback state. When the user clicks Copy, the button
+  // label changes to "Copied" (or "Copy failed" on error) and is
+  // disabled for `COPY_FEEDBACK_MS` so the operator gets immediate,
+  // in-place confirmation in addition to the toast. The toast remains
+  // for users who don't see the button (e.g. keyboard focus is
+  // elsewhere, or they're using a screen reader).
+  type CopyState = 'idle' | 'copied' | 'error'
+  const COPY_FEEDBACK_MS = 1500
+  const [copyState, setCopyState] = useState<CopyState>('idle')
+  const copyResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => () => {
+    if (copyResetTimer.current !== null) clearTimeout(copyResetTimer.current)
+  }, [])
+  function scheduleCopyReset(): void {
+    if (copyResetTimer.current !== null) clearTimeout(copyResetTimer.current)
+    copyResetTimer.current = setTimeout(() => {
+      setCopyState('idle')
+      copyResetTimer.current = null
+    }, COPY_FEEDBACK_MS)
+  }
   async function copy() {
     try {
       await navigator.clipboard.writeText(pretty)
+      setCopyState('copied')
       addToast({ kind: 'success', title: 'Envelope copied to clipboard', sticky: false })
     } catch (e) {
+      setCopyState('error')
       addToast({ kind: 'warning', title: 'Copy failed', description: (e as Error).message, sticky: false })
+    } finally {
+      scheduleCopyReset()
     }
   }
-
   // The envelope's exportedAt is in UTC (ISO 8601). Render an equivalent
   // in the user's local time so the operator can sanity-check it against
   // the timezone named below.
@@ -601,13 +625,16 @@ function ExportPreviewModal({
             </span>
           )}
         </div>
-        <pre className="flex-1 min-h-0 overflow-auto rounded-lg border bg-muted/30 p-3 text-[11px] font-mono leading-snug whitespace-pre-wrap break-all">
-          {pretty}
-        </pre>
         <div className="flex justify-end gap-2 mt-3">
-          <Button variant="outline" onClick={copy}>
-            <Clipboard className="size-4" />
-            Copy
+          <Button
+            variant="outline"
+            onClick={copy}
+            disabled={copyState !== 'idle'}
+            aria-live="polite"
+            className={copyState === 'copied' ? 'border-emerald-500/60 text-emerald-600 dark:text-emerald-400' : undefined}
+          >
+            {copyState === 'copied' ? <Check className="size-4" /> : <Clipboard className="size-4" />}
+            {copyState === 'copied' ? 'Copied' : copyState === 'error' ? 'Copy failed' : 'Copy'}
           </Button>
           <Button onClick={download}>
             <Download className="size-4" />
