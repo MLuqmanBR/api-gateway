@@ -625,6 +625,9 @@ function ExportPreviewModal({
             </span>
           )}
         </div>
+        <pre className="flex-1 min-h-0 overflow-auto rounded-lg border bg-muted/30 p-3 text-[11px] font-mono leading-snug whitespace-pre-wrap break-all">
+          {pretty}
+        </pre>
         <div className="flex justify-end gap-2 mt-3">
           <Button
             variant="outline"
