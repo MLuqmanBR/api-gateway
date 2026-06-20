@@ -437,11 +437,91 @@ describe('Config API', () => {
       envelope: env,
       options: { mode: 'replace', dryRun: false },
     });
-    expect(imp.status).toBe(200);
     // The seed inserted 1 fallback entry. After replace with the
     // custom model, exactly 1 entry remains (the new one).
     const count = (getDb().prepare(`SELECT COUNT(*) AS n FROM fallback_config`).get() as { n: number }).n;
     expect(count).toBe(1);
+  });
+
+  it('mode=replace wipes the models table before inserting from the envelope', async () => {
+    // Regression: replace mode previously left built-in rows in place
+    // because the per-row diff treated them as 'skip-existing'. The
+    // documented contract is: replace = the export is the authoritative
+    // source for the section. Build a destination with two custom
+    // models and a chain, then import an envelope that only carries
+    // ONE of those models. The other model and its chain entry must
+    // be gone after the import.
+    getDb().prepare(`INSERT INTO custom_providers (slug, display_name, base_url) VALUES ('replaceA', 'A', 'https://a.test/v1')`).run();
+    getDb().prepare(`INSERT INTO custom_providers (slug, display_name, base_url) VALUES ('replaceB', 'B', 'https://b.test/v1')`).run();
+    const insModel = getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
+        size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
+        context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+        paid_input_per_m, paid_output_per_m)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '', NULL, 1, 0, 0, NULL, NULL, NULL)
+    `);
+    insModel.run('replaceA', 'a-model', 'A Model', 10, 5, 'Medium');
+    insModel.run('replaceB', 'b-model', 'B Model', 11, 6, 'Medium');
+    // Seed fallback entries for both.
+    const idA = (getDb().prepare('SELECT id FROM models WHERE platform=? AND model_id=?').get('replaceA', 'a-model') as { id: number }).id;
+    const idB = (getDb().prepare('SELECT id FROM models WHERE platform=? AND model_id=?').get('replaceB', 'b-model') as { id: number }).id;
+    getDb().prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 1, 1), (?, 2, 1)').run(idA, idB);
+    // Build an envelope that only carries replaceA/a-model.
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        models: [{
+          platform: 'replaceA', modelId: 'a-model',
+          displayName: 'A Model', intelligenceRank: 10, speedRank: 5,
+          sizeLabel: 'Medium', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
+          monthlyTokenBudget: '', contextWindow: null,
+          enabled: true, supportsVision: false, supportsTools: false,
+          maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
+        }],
+        fallbackChain: [{
+          platform: 'replaceA', modelId: 'a-model', priority: 1, enabled: true,
+        }],
+      },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.models?.errors ?? []).toEqual([]);
+    // Only replaceA/a-model exists in the models table now.
+    const remaining = getDb().prepare(`
+      SELECT platform, model_id FROM models WHERE platform IN ('replaceA','replaceB')
+    `).all() as Array<{ platform: string; model_id: string }>;
+    expect(remaining.map((r) => `${r.platform}/${r.model_id}`).sort()).toEqual(['replaceA/a-model']);
+    // And the chain has exactly 1 entry (replaceA/a-model).
+    const chainCount = (getDb().prepare('SELECT COUNT(*) AS n FROM fallback_config').get() as { n: number }).n;
+    expect(chainCount).toBe(1);
+  });
+
+  it('mode=replace on api_keys re-inserts rows so status resets to unknown', async () => {
+    // In replace mode, deleting the existing row and re-inserting
+    // resets runtime state (status, created_at, last_checked_at).
+    // seedModels() (beforeEach) already inserts a groq/main key.
+    const db = getDb();
+    // Mark the existing row as 'unhealthy' with a known last_checked_at.
+    const before = db.prepare("SELECT id, status, last_checked_at FROM api_keys WHERE platform='groq'").get() as { id: number; status: string; last_checked_at: string | null };
+    db.prepare("UPDATE api_keys SET status='unhealthy', last_checked_at='2026-01-01 00:00:00' WHERE id=?").run(before.id);
+    // Build an envelope with the same key but only carrying enabled + baseUrl.
+    const exp = await request(app, 'POST', '/api/config/export', { sections: ['api_keys'] });
+    const env = exp.body as ConfigEnvelope;
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.api_keys?.errors ?? []).toEqual([]);
+    expect(imp.body.sections.api_keys?.added).toBeGreaterThan(0);
+    // After replace, the row's status should be 'unknown' (re-inserted fresh).
+    const after = db.prepare("SELECT status, last_checked_at FROM api_keys WHERE platform='groq'").get() as { status: string; last_checked_at: string | null };
+    expect(after.status).toBe('unknown');
   });
 
   it('passphrase-encrypted keys round-trip when passphrase is supplied', async () => {

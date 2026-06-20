@@ -135,6 +135,27 @@ function applyCustomProviders(
   ids: ConfigImportSummary['ids'],
 ): void {
   const diff = summary.custom_providers ?? emptyDiff();
+  if (mode === 'replace') {
+    // Wipe all custom providers before inserting. The export is the
+    // authoritative source for this section. We also unlink any
+    // api_keys, fallback_config entries, and models that reference
+    // these slugs so the operator doesn't end up with FK-orphaned
+    // rows in the destination. Order matters: fallback_config first
+    // (REFERENCES models), then models, then api_keys, then
+    // custom_providers.
+    const slugs = list.map((cp) => cp.slug);
+    if (slugs.length > 0) {
+      // Build a parameterized IN clause; never interpolate user input.
+      const placeholders = slugs.map(() => '?').join(',');
+      db.prepare(`
+        DELETE FROM fallback_config
+         WHERE model_db_id IN (SELECT id FROM models WHERE platform IN (${placeholders}))
+      `).run(...slugs);
+      db.prepare(`DELETE FROM models WHERE platform IN (${placeholders})`).run(...slugs);
+      db.prepare(`DELETE FROM api_keys WHERE platform IN (${placeholders})`).run(...slugs);
+    }
+    db.prepare('DELETE FROM custom_providers').run();
+  }
   for (const cp of list) {
     try {
       const existing = db.prepare(
@@ -230,6 +251,16 @@ function applyModels(
   ids: ConfigImportSummary['ids'],
 ): { okModels: Map<string, number>; skippedModels: Set<string> } {
   const diff = summary.models ?? emptyDiff();
+  if (mode === 'replace') {
+    // The export is the authoritative source for the model catalog. Wipe
+    // the entire table (and its dependent fallback_config rows) before
+    // re-inserting. The fallback_chain section is wiped+rebuilt by its
+    // own apply* function; if the operator didn't include it in this
+    // import, the chain will be empty (which is the documented
+    // behavior of replace mode).
+    db.prepare('DELETE FROM fallback_config').run();
+    db.prepare('DELETE FROM models').run();
+  }
   const okModels = new Map<string, number>();
   const skippedModels = new Set<string>();
   for (const m of list) {
@@ -359,12 +390,21 @@ function applyApiKeys(
   summary: Record<string, SectionDiff>,
 ): void {
   const diff = summary.api_keys ?? emptyDiff();
+  const inReplace = mode === 'replace';
   for (const k of list) {
     try {
       const existing = db.prepare(
         'SELECT id, enabled, base_url FROM api_keys WHERE platform = ? AND label = ? LIMIT 1',
       ).get(k.platform, k.label) as { id: number; enabled: number; base_url: string | null } | undefined;
-      if (existing) {
+      if (existing && inReplace) {
+        // In replace mode, drop the existing row so the re-insert starts
+        // fresh (resets status, created_at, last_checked_at — all runtime
+        // state the export doesn't carry). We also don't try to preserve
+        // the old ciphertext: the export's key material is authoritative
+        // and the operator is explicitly choosing destructive mode.
+        // Fall through to the insert path below.
+        db.prepare('DELETE FROM api_keys WHERE id = ?').run(existing.id);
+      } else if (existing) {
         if (mode === 'skip-existing') { diff.skipped++; continue; }
         if (k.enabled === undefined) { diff.skipped++; continue; }
         // The schema only carries enabled + base_url on the api_keys
@@ -380,7 +420,10 @@ function applyApiKeys(
         db.prepare('UPDATE api_keys SET enabled = ?, base_url = ? WHERE id = ?')
           .run(enabledNext, baseUrlNext, existing.id);
         diff.updated++;
-      } else {
+        continue;
+      }
+      // Fall through to insert (no existing row, OR replace-mode wipe just removed it).
+      {
         let encryptedKey: string;
         let iv: string;
         let authTag: string;
