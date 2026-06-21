@@ -557,6 +557,36 @@ export interface ConfigEnvelope {
   };
 }
 
+/**
+ * Compatibility status between an envelope's api_keys ciphertext and
+ * the destination gateway's ENCRYPTION_KEY. Computed cheaply on the
+ * preview endpoint (single-row decrypt probe, no DB writes) so the
+ * Settings UI can warn the operator before they apply an import.
+ *
+ * - 'no-keys'                    — envelope has no api_keys section.
+ * - 'encrypted-with-passphrase'  — envelope carries a keysCipher blob;
+ *                                  the destination will need a
+ *                                  passphrase to decrypt it. The
+ *                                  row-level ciphertext is irrelevant.
+ * - 'plaintext'                  — envelope ships plaintext keys
+ *                                  (`sections.apiKeys[*].key` set); no
+ *                                  destination-key dependency.
+ * - 'compatible'                 — row ciphertext decrypts under the
+ *                                  destination's key (same host or
+ *                                  matching ENCRYPTION_KEY).
+ * - 'mismatch'                   — row ciphertext does NOT decrypt
+ *                                  under the destination's key and
+ *                                  there is no keysCipher fallback.
+ *                                  Restoring these keys requires a
+ *                                  re-export with a passphrase.
+ */
+export type ConfigKeyCompatibility =
+  | 'no-keys'
+  | 'encrypted-with-passphrase'
+  | 'plaintext'
+  | 'compatible'
+  | 'mismatch';
+
 export interface ConfigImportSummary {
   /** True when dryRun=true and no changes were committed. */
   dryRun: boolean;
@@ -576,6 +606,29 @@ export interface ConfigImportSummary {
   ids?: {
     models: Array<{ platform: string; modelId: string; id: number }>;
     customProviders: Array<{ slug: string; id: number }>;
+  };
+  /** Diagnostic describing whether the envelope's api_keys section is
+   * restorable on this gateway. Surfaced on every import response so
+   * the UI can explain partial failures without forcing the operator
+   * to open the error details panel. Always present on a successful
+   * (200) response that touched the api_keys section; absent on
+   * envelopes that contain no api_keys at all. */
+  keyCompatibility?: {
+    /** Coarse classification. See ConfigKeyCompatibility for the
+     * semantics of each value. */
+    status: ConfigKeyCompatibility;
+    /** Total api_keys rows the envelope carries (regardless of
+     * compatibility). */
+    totalRows: number;
+    /** Rows that landed as errors during apply because their
+     * ciphertext didn't decrypt under the destination's key. Mirrors
+     * the per-row `errors` array on `sections.api_keys` but is folded
+     * up here for the UI banner. */
+    skippedDueToMismatch: number;
+    /** A representative failing row to show in the banner, when any
+     * were skipped. Just `platform/label` and the canonical error
+     * message — never plaintext. */
+    sampleFailure?: { platform: string; label: string; message: string };
   };
 }
 

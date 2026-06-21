@@ -17,7 +17,7 @@
 // returning the diff without committing.
 import type Database from 'better-sqlite3';
 import { getDb, setSetting, getSetting } from '../../db/index.js';
-import { encrypt } from '../crypto.js';
+import { encrypt, decrypt } from '../crypto.js';
 import type { Platform } from '@api-gateway/shared';
 import { hasProvider } from '../../providers/index.js';
 import {
@@ -27,6 +27,7 @@ import {
   type ConfigSection,
   type ConfigImportOptions,
   type ConfigImportSummary,
+  type ConfigKeyCompatibility,
   type ConfigModel,
   type ConfigCustomProvider,
   type ConfigApiKey,
@@ -36,6 +37,63 @@ import {
 } from '@api-gateway/shared';
 import { configEnvelopeSchema, configImportOptionsSchema } from './schema.js';
 import { decryptKeysWithPassphrase } from './passphrase-crypto.js';
+
+// Sentinel substring used by the per-row safety net inside applyApiKeys
+// when a row's source ciphertext doesn't decrypt under the destination's
+// ENCRYPTION_KEY. The post-import banner in runImport and the preview
+// probe both key off this single phrase so the UI banner, the error
+// details panel, and the test expectations stay in lockstep.
+const KEY_MISMATCH_ERROR_RE =
+  /row is encrypted under a different ENCRYPTION_KEY than this gateway/;
+
+/**
+ * Cheap, side-effect-free compatibility check between an envelope's
+ * api_keys section and the destination gateway's `ENCRYPTION_KEY`. Used
+ * by the Settings UI's preview flow so the operator gets a clear banner
+ * BEFORE they click Apply. Never writes to the DB.
+ *
+ * Precedence:
+ *   1. No api_keys section at all         → 'no-keys'
+ *   2. keysCipher blob present            → 'encrypted-with-passphrase'
+ *      (per-row ciphertext is irrelevant; the operator must supply
+ *      the passphrase at import time)
+ *   3. Any row carries plaintext `key`    → 'plaintext' (no key
+ *      dependency on the destination's ENCRYPTION_KEY)
+ *   4. Probe one row's `encryptedKey/iv/authTag` with `decrypt()`
+ *      under the destination's key.
+ *        - success → 'compatible'
+ *        - GCM auth-tag failure → 'mismatch'
+ *
+ * Only the FIRST row is probed — that's enough to decide the whole
+ * section's compatibility without paying for PBKDF2 / AES across
+ * potentially hundreds of rows.
+ */
+export function probeKeyCompatibility(env: ConfigEnvelope): ConfigKeyCompatibility {
+  const list = env.sections.apiKeys;
+  if (!list || list.length === 0) return 'no-keys';
+  if (env.keysCipher) return 'encrypted-with-passphrase';
+  if (list.some((k) => typeof k.key === 'string' && k.key.length > 0)) {
+    return 'plaintext';
+  }
+  // Find the first row that carries pre-encrypted material. Rows
+  // lacking any of the three fields are skipped — the apply path
+  // surfaces their own errors during import.
+  const probeTarget = list.find(
+    (k) => typeof k.encryptedKey === 'string' && typeof k.iv === 'string' && typeof k.authTag === 'string',
+  );
+  if (!probeTarget || !probeTarget.encryptedKey || !probeTarget.iv || !probeTarget.authTag) {
+    // Rows exist but none carry usable ciphertext — the apply path
+    // will collect the per-row "no key material" errors. Surface
+    // 'mismatch' anyway since the UI banner makes the operator look.
+    return 'mismatch';
+  }
+  try {
+    decrypt(probeTarget.encryptedKey, probeTarget.iv, probeTarget.authTag);
+    return 'compatible';
+  } catch {
+    return 'mismatch';
+  }
+}
 
 export class ConfigImportError extends Error {
   status: number;
@@ -427,12 +485,36 @@ function applyApiKeys(
         let encryptedKey: string;
         let iv: string;
         let authTag: string;
-        if (k.encryptedKey && k.iv && k.authTag) {
-          // Already encrypted under the destination's ENCRYPTION_KEY. Only
-          // safe when the source and destination share the key; otherwise
-          // the row will be silently undecryptable later. We assume the
-          // operator knows what they're doing — the UI surfaces the
-          // warning before they click Import.
+        if (keysByPlatform?.has(k.platform)) {
+          // The envelope carried a `keysCipher` blob that we successfully
+          // decrypted — the operator opted into passphrase-protected
+          // transport. The plaintext in `keysByPlatform` is the canonical,
+          // transport-independent value for every row at that platform; the
+          // `encryptedKey / iv / authTag` fields on this row were produced
+          // by the source machine's ENCRYPTION_KEY and will silently rot on
+          // the destination unless the keys happen to match. Always prefer
+          // the decrypted plaintext here so cross-machine restores work as
+          // long as the operator passed the correct passphrase.
+          const enc = encrypt(keysByPlatform.get(k.platform) as string);
+          encryptedKey = enc.encrypted;
+          iv = enc.iv;
+          authTag = enc.authTag;
+        } else if (k.encryptedKey && k.iv && k.authTag) {
+          // Pre-encrypted under the source's ENCRYPTION_KEY. Only safe when
+          // the source and destination share a key. Probe with the
+          // destination's key first; a GCM auth-tag mismatch means the row
+          // would land undecryptable in the DB and break every health check
+          // — refuse the row instead of silently corrupting state.
+          try {
+            decrypt(k.encryptedKey, k.iv, k.authTag);
+          } catch {
+            diff.errors.push(
+              `${k.platform}/${k.label}: row is encrypted under a different `
+              + `ENCRYPTION_KEY than this gateway. Re-export with a passphrase `
+              + `and re-import so the keys travel as a re-encrypted blob.`,
+            );
+            continue;
+          }
           encryptedKey = k.encryptedKey;
           iv = k.iv;
           authTag = k.authTag;
@@ -441,13 +523,8 @@ function applyApiKeys(
           encryptedKey = enc.encrypted;
           iv = enc.iv;
           authTag = enc.authTag;
-        } else if (keysByPlatform?.has(k.platform)) {
-          const enc = encrypt(keysByPlatform.get(k.platform) as string);
-          encryptedKey = enc.encrypted;
-          iv = enc.iv;
-          authTag = enc.authTag;
         } else {
-          diff.errors.push(`${k.platform}: no key material provided`);
+          diff.errors.push(`${k.platform}/${k.label}: no key material provided`);
           continue;
         }
         db.prepare(`
@@ -825,6 +902,38 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
     apply();
   }
 
+  // Build the post-import key compatibility summary. Counts every error
+  // in the api_keys section that the per-row safety net pushed with
+  // the canonical "different ENCRYPTION_KEY" message — that's the
+  // single signal the UI banner needs to render a clear remediation
+  // without forcing the operator to open the error details panel.
+  const apiKeysDiff = summary.api_keys;
+  const mismatchErrors = apiKeysDiff?.errors.filter((e) => KEY_MISMATCH_ERROR_RE.test(e)) ?? [];
+  const keyCompatibility: ConfigImportSummary['keyCompatibility'] = apiKeysDiff && (apiKeysDiff.added + apiKeysDiff.updated + apiKeysDiff.skipped + mismatchErrors.length) > 0
+    ? {
+        // Status reflects the most pessimistic outcome observed. A
+        // mismatch after a probe says "mismatch"; if any rows came in
+        // cleanly but others didn't, that's still "mismatch" overall
+        // because the operator must re-export with a passphrase to
+        // recover the failing ones.
+        status: ((): ConfigKeyCompatibility => {
+          if (env.keysCipher) return 'encrypted-with-passphrase';
+          if (mismatchErrors.length > 0) return 'mismatch';
+          // No mismatch errors — re-derive the verdict from a cheap
+          // probe so the banner explains why the import worked even
+          // when the operator didn't supply a passphrase.
+          return probeKeyCompatibility(env);
+        })(),
+        totalRows: env.sections.apiKeys?.length ?? 0,
+        skippedDueToMismatch: mismatchErrors.length,
+        sampleFailure: mismatchErrors[0] ? {
+          platform: (mismatchErrors[0].match(/^([^/]+)\/[^:]+:/) ?? [, ''])[1],
+          label: (mismatchErrors[0].match(/^[^/]+\/([^:]+):/) ?? [, ''])[1],
+          message: mismatchErrors[0],
+        } : undefined,
+      }
+    : undefined;
+
   return {
     dryRun: eff.dryRun,
     mode: eff.mode,
@@ -832,6 +941,7 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
     sections: summary,
     ids,
     effectiveOptions: eff,
+    keyCompatibility,
   };
 }
 
@@ -843,6 +953,7 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
 export function previewEnvelope(envelope: unknown): {
   envelope: ConfigEnvelope;
   sections: Record<ConfigSection, number>;
+  keyCompatibility: ConfigKeyCompatibility;
 } {
   const parsed = configEnvelopeSchema.safeParse(envelope);
   if (!parsed.success) {
@@ -861,5 +972,5 @@ export function previewEnvelope(envelope: unknown): {
     settings: env.sections.settings ? 1 : 0,
     quirks: env.sections.quirks?.length ?? 0,
   };
-  return { envelope: env, sections: counts };
+  return { envelope: env, sections: counts, keyCompatibility: probeKeyCompatibility(env) };
 }

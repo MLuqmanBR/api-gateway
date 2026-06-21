@@ -36,6 +36,7 @@ import type {
   ConfigEnvelope,
   ConfigSection,
   ConfigImportSummary,
+  ConfigKeyCompatibility,
   ConfigMergeMode,
 } from '../../../shared/types'
 
@@ -89,10 +90,10 @@ export default function SettingsPage() {
   const [importPassphrase, setImportPassphrase] = useState('')
   const [showImportPassphrase, setShowImportPassphrase] = useState(false)
   const [preview, setPreview] = useState<
-    | { ok: true; sections: Record<ConfigSection, number>; hasKeysCipher: boolean; label?: string; exportedAt: string; schemaVersion: number }
+    | { ok: true; sections: Record<ConfigSection, number>; hasKeysCipher: boolean; label?: string; exportedAt: string; schemaVersion: number; keyCompatibility: ConfigKeyCompatibility }
     | { ok: false; error: string }
     | null
-  >(null)
+  >(null);
   const [dryRunResult, setDryRunResult] = useState<ConfigImportSummary | null>(null)
 
   // Reset any stale state when the file picker changes.
@@ -161,6 +162,7 @@ export default function SettingsPage() {
         label?: string
         exportedAt: string
         schemaVersion: number
+        keyCompatibility: ConfigKeyCompatibility
       }>('/api/config/preview', {
         method: 'POST',
         body: JSON.stringify(importEnvelope),
@@ -338,9 +340,18 @@ export default function SettingsPage() {
                     {showExportPassphrase ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
                   </button>
                 </div>
+                {exportSections.api_keys && exportPassphrase.length === 0 && (
+                  <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-900 dark:text-amber-200 flex items-start gap-1.5">
+                    <AlertTriangle className="size-3 mt-0.5 shrink-0" />
+                    <div>
+                      Without a passphrase, this backup can only be restored on a gateway using the same
+                      <code className="font-mono mx-1">ENCRYPTION_KEY</code>. Add a passphrase if you're moving the
+                      file between machines.
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
-
             <div className="flex flex-wrap items-center gap-2">
               <Button
                 onClick={() => exportMutation.mutate({ download: true })}
@@ -357,6 +368,9 @@ export default function SettingsPage() {
                 <FileJson className="size-4" />
                 Preview in browser
               </Button>
+              <span className="text-xs text-muted-foreground">
+                Always run a dry-run first when applying against a populated database.
+              </span>
             </div>
           </CardContent>
         </Card>
@@ -496,6 +510,7 @@ export default function SettingsPage() {
               <PreviewPanel
                 sections={preview.sections}
                 hasKeysCipher={preview.hasKeysCipher}
+                keyCompatibility={preview.keyCompatibility}
                 label={preview.label}
                 exportedAt={preview.exportedAt}
                 schemaVersion={preview.schemaVersion}
@@ -680,38 +695,96 @@ function authHeaders(): Record<string, string> {
 function PreviewPanel({
   sections,
   hasKeysCipher,
+  keyCompatibility,
   label,
   exportedAt,
   schemaVersion,
 }: {
   sections: Record<ConfigSection, number>
   hasKeysCipher: boolean
+  keyCompatibility: ConfigKeyCompatibility
   label?: string
   exportedAt: string
   schemaVersion: number
 }) {
   return (
-    <div className="rounded-lg border bg-muted/40 px-4 py-3 text-xs">
-      <div className="flex items-center gap-2 mb-2">
-        <CheckCircle2 className="size-4 text-emerald-500" />
-        <span className="font-medium">Envelope parsed successfully</span>
+    <div className="space-y-3">
+      <div className="rounded-lg border bg-muted/40 px-4 py-3 text-xs">
+        <div className="flex items-center gap-2 mb-2">
+          <CheckCircle2 className="size-4 text-emerald-500" />
+          <span className="font-medium">Envelope parsed successfully</span>
+        </div>
+        <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1">
+          <Field label="Schema" value={`v${schemaVersion}`} />
+          <Field label="Exported at" value={exportedAt} />
+          {label && <Field label="Label" value={label} />}
+          <Field label="Encrypted keys" value={hasKeysCipher ? 'yes (passphrase required)' : 'no'} />
+        </dl>
+        <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1">
+          {SECTIONS.map((s) => (
+            <div key={s.value} className="flex justify-between gap-2">
+              <dt className="text-muted-foreground">{s.label}</dt>
+              <dd className="font-mono tabular-nums">{sections[s.value]}</dd>
+            </div>
+          ))}
+        </div>
       </div>
-      <dl className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1">
-        <Field label="Schema" value={`v${schemaVersion}`} />
-        <Field label="Exported at" value={exportedAt} />
-        {label && <Field label="Label" value={label} />}
-        <Field label="Encrypted keys" value={hasKeysCipher ? 'yes (passphrase required)' : 'no'} />
-      </dl>
-      <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1">
-        {SECTIONS.map((s) => (
-          <div key={s.value} className="flex justify-between gap-2">
-            <dt className="text-muted-foreground">{s.label}</dt>
-            <dd className="font-mono tabular-nums">{sections[s.value]}</dd>
-          </div>
-        ))}
-      </div>
+      <KeyCompatibilityBanner status={keyCompatibility} />
     </div>
   )
+}
+// Renders a context-sensitive banner explaining the api_keys compatibility
+// verdict for an envelope — BEFORE the operator clicks Apply. Three tones:
+//
+//   - 'mismatch' (destructive / amber): the row ciphertext cannot decrypt
+//     under this gateway's ENCRYPTION_KEY. Re-export with a passphrase
+//     on the source machine to recover the keys.
+//   - 'encrypted-with-passphrase' (info): the envelope is passphrase
+//     protected; the operator must supply the passphrase at import time.
+//   - 'plaintext' (info): keys are in plaintext in the file — fine for
+//     offline backups, but the operator should treat the file accordingly.
+//   - 'compatible' / 'no-keys': no banner needed.
+function KeyCompatibilityBanner({ status }: { status: ConfigKeyCompatibility }) {
+  if (status === 'compatible' || status === 'no-keys') return null;
+  if (status === 'mismatch') {
+    return (
+      <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2">
+        <AlertTriangle className="size-4 mt-0.5 shrink-0" />
+        <div className="space-y-1">
+          <div className="font-medium">These API keys were encrypted under a different gateway.</div>
+          <div className="text-amber-800 dark:text-amber-300">
+            The destination gateway's ENCRYPTION_KEY cannot decrypt these rows. Continuing will leave
+            those keys unusable. To recover them, re-export this backup <strong>with a passphrase</strong>
+            on the source machine and import the new file here.
+          </div>
+        </div>
+      </div>
+    );
+  }
+  if (status === 'encrypted-with-passphrase') {
+    return (
+      <div className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-3 py-2.5 text-xs text-sky-900 dark:text-sky-200 flex items-start gap-2">
+        <KeyRound className="size-4 mt-0.5 shrink-0" />
+        <div className="space-y-1">
+          <div className="font-medium">Passphrase required.</div>
+          <div className="text-sky-800 dark:text-sky-300">
+            Enter the passphrase used at export time below — the api_keys section will be re-encrypted
+            under this gateway's ENCRYPTION_KEY on import.
+          </div>
+        </div>
+      </div>
+    );
+  }
+  // 'plaintext'
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/40 px-3 py-2.5 text-xs text-muted-foreground flex items-start gap-2">
+      <AlertTriangle className="size-4 mt-0.5 shrink-0" />
+      <div>
+        API keys in this backup are stored in plaintext. Treat the file accordingly — anyone with
+        the file can read the keys. Re-export with a passphrase for safer transport.
+      </div>
+    </div>
+  );
 }
 
 function Field({ label, value }: { label: string; value: string }) {
@@ -733,59 +806,95 @@ function SummaryPanel({ summary, dryRun }: { summary: ConfigImportSummary; dryRu
     }),
     { added: 0, updated: 0, skipped: 0, errors: 0 },
   )
+  const showMismatchBanner =
+    summary.keyCompatibility?.status === 'mismatch' ||
+    // Fallback for older envelopes / future-proofing: surface the
+    // banner whenever api_keys errors mention the canonical
+    // "different ENCRYPTION_KEY" phrase, even if the structured
+    // diagnostic is missing.
+    (summary.sections.api_keys?.errors ?? []).some((e) =>
+      /different ENCRYPTION_KEY than this gateway/.test(e),
+    )
   return (
-    <div className={`rounded-lg border px-4 py-3 text-xs ${dryRun ? 'bg-muted/40' : 'bg-emerald-500/5 border-emerald-500/40'}`}>
-      <div className="flex items-center gap-2 mb-2">
-        {dryRun
-          ? <Eye className="size-4 text-muted-foreground" />
-          : <CheckCircle2 className="size-4 text-emerald-500" />}
-        <span className="font-medium">
-          {dryRun ? 'Dry-run diff (no changes committed)' : 'Import committed'}
-        </span>
-        <span className="ml-auto text-muted-foreground">{summary.mode}</span>
-      </div>
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1 mb-3">
-        <Counter label="Added" value={totals.added} />
-        <Counter label="Updated" value={totals.updated} />
-        <Counter label="Skipped" value={totals.skipped} />
-        <Counter label="Errors" value={totals.errors} muted={totals.errors === 0} />
-      </div>
-      <table className="w-full text-xs">
-        <thead className="text-muted-foreground">
-          <tr className="text-left">
-            <th className="py-1 font-normal">Section</th>
-            <th className="py-1 font-normal text-right">Added</th>
-            <th className="py-1 font-normal text-right">Updated</th>
-            <th className="py-1 font-normal text-right">Skipped</th>
-            <th className="py-1 font-normal text-right">Errors</th>
-          </tr>
-        </thead>
-        <tbody className="font-mono tabular-nums">
-          {Object.entries(summary.sections).map(([name, s]) => (
-            <tr key={name} className="border-t border-border/50">
-              <td className="py-1 font-sans">{name}</td>
-              <td className="py-1 text-right">{s.added}</td>
-              <td className="py-1 text-right">{s.updated}</td>
-              <td className="py-1 text-right">{s.skipped}</td>
-              <td className={`py-1 text-right ${s.errors.length > 0 ? 'text-destructive' : 'text-muted-foreground'}`}>
-                {s.errors.length}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {totals.errors > 0 && (
-        <details className="mt-3">
-          <summary className="cursor-pointer text-muted-foreground">Show error details</summary>
-          <ul className="mt-2 space-y-1 text-destructive">
-            {Object.entries(summary.sections).flatMap(([name, s]) =>
-              s.errors.map((msg, i) => (
-                <li key={`${name}-${i}`}><code className="font-mono">{name}</code>: {msg}</li>
-              )),
+    <div className="space-y-3">
+      {showMismatchBanner && (
+        <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2">
+          <AlertTriangle className="size-4 mt-0.5 shrink-0" />
+          <div className="space-y-1">
+            <div className="font-medium">
+              {summary.keyCompatibility?.skippedDueToMismatch ?? (
+                summary.sections.api_keys?.errors.length ?? 0
+              )}{' '}
+              key{summary.keyCompatibility?.skippedDueToMismatch === 1 ? '' : 's'} couldn't be restored
+              because they were encrypted under a different ENCRYPTION_KEY.
+            </div>
+            <div className="text-amber-800 dark:text-amber-300">
+              Re-export the source backup <strong>with a passphrase</strong> and re-import — the keys
+              will then travel as a re-encrypted blob and decrypt cleanly on this gateway.
+            </div>
+            {summary.keyCompatibility?.sampleFailure && (
+              <div className="text-amber-800 dark:text-amber-300 font-mono text-[11px] mt-1">
+                e.g. <span className="font-sans">{summary.keyCompatibility.sampleFailure.platform}</span>
+                {' / '}
+                <span className="font-sans">{summary.keyCompatibility.sampleFailure.label}</span>
+              </div>
             )}
-          </ul>
-        </details>
+          </div>
+        </div>
       )}
+      <div className={`rounded-lg border px-4 py-3 text-xs ${dryRun ? 'bg-muted/40' : 'bg-emerald-500/5 border-emerald-500/40'}`}>
+        <div className="flex items-center gap-2 mb-2">
+          {dryRun
+            ? <Eye className="size-4 text-muted-foreground" />
+            : <CheckCircle2 className="size-4 text-emerald-500" />}
+          <span className="font-medium">
+            {dryRun ? 'Dry-run diff (no changes committed)' : 'Import committed'}
+          </span>
+          <span className="ml-auto text-muted-foreground">{summary.mode}</span>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-x-6 gap-y-1 mb-3">
+          <Counter label="Added" value={totals.added} />
+          <Counter label="Updated" value={totals.updated} />
+          <Counter label="Skipped" value={totals.skipped} />
+          <Counter label="Errors" value={totals.errors} muted={totals.errors === 0} />
+        </div>
+        <table className="w-full text-xs">
+          <thead className="text-muted-foreground">
+            <tr className="text-left">
+              <th className="py-1 font-normal">Section</th>
+              <th className="py-1 font-normal text-right">Added</th>
+              <th className="py-1 font-normal text-right">Updated</th>
+              <th className="py-1 font-normal text-right">Skipped</th>
+              <th className="py-1 font-normal text-right">Errors</th>
+            </tr>
+          </thead>
+          <tbody className="font-mono tabular-nums">
+            {Object.entries(summary.sections).map(([name, s]) => (
+              <tr key={name} className="border-t border-border/50">
+                <td className="py-1 font-sans">{name}</td>
+                <td className="py-1 text-right">{s.added}</td>
+                <td className="py-1 text-right">{s.updated}</td>
+                <td className="py-1 text-right">{s.skipped}</td>
+                <td className={`py-1 text-right ${s.errors.length > 0 ? 'text-destructive' : 'text-muted-foreground'}`}>
+                  {s.errors.length}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {totals.errors > 0 && (
+          <details className="mt-3">
+            <summary className="cursor-pointer text-muted-foreground">Show error details</summary>
+            <ul className="mt-2 space-y-1 text-destructive">
+              {Object.entries(summary.sections).flatMap(([name, s]) =>
+                s.errors.map((msg, i) => (
+                  <li key={`${name}-${i}`}><code className="font-mono">{name}</code>: {msg}</li>
+                )),
+              )}
+            </ul>
+          </details>
+        )}
+      </div>
     </div>
   )
 }

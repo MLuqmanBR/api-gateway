@@ -132,6 +132,19 @@ configRouter.post('/preview', (req: Request, res: Response) => {
       exportedAt: result.envelope.exportedAt,
       label: result.envelope.label,
       hasKeysCipher: Boolean(result.envelope.keysCipher),
+      // Coarse classification of whether the envelope's api_keys
+      // section is restorable on this gateway without further input.
+      // 'compatible'              — row ciphertext decrypts under
+      //                             the destination's key.
+      // 'mismatch'                — row ciphertext does NOT decrypt
+      //                             and there's no keysCipher blob.
+      // 'encrypted-with-passphrase' — keysCipher present; operator
+      //                               must supply passphrase at
+      //                               import time.
+      // 'plaintext'               — apiKeys[*].key is set; no key
+      //                             dependency.
+      // 'no-keys'                 — no api_keys section.
+      keyCompatibility: result.keyCompatibility,
     });
   } catch (err) {
     if (err instanceof ConfigImportError) {

@@ -10,8 +10,20 @@ import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb } from '../../db/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
-import { encrypt } from '../../lib/crypto.js';
-import type { ConfigEnvelope, ConfigImportSummary } from '@api-gateway/shared';
+import { encrypt, decrypt } from '../../lib/crypto.js';
+import { encryptKeysWithPassphrase } from '../../lib/config/passphrase-crypto.js';
+import crypto from 'node:crypto';
+// Build an api_key ciphertext blob under a DIFFERENT AES-GCM key than the
+// one running on the gateway under test. Used to exercise the cross-
+// machine restore paths in import.ts — the source machine's ciphertext
+// cannot decrypt against the destination's key.
+function encryptWithForeignKey(plaintext: string): { encrypted: string; iv: string; authTag: string } {
+  const foreign = crypto.randomBytes(32);
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv('aes-256-gcm', foreign, iv);
+  const enc = Buffer.concat([cipher.update(Buffer.from(plaintext, 'utf8')), cipher.final()]);
+  return { encrypted: enc.toString('hex'), iv: iv.toString('hex'), authTag: cipher.getAuthTag().toString('hex') };
+}
 let dashToken = '';
 
 async function request(
@@ -546,6 +558,224 @@ describe('Config API', () => {
       `SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform='groq' LIMIT 1`,
     ).get() as { encrypted_key: string; iv: string; auth_tag: string };
     expect(stored.encrypted_key.length).toBeGreaterThan(0);
+  });
+
+  it('cross-machine restore: keysCipher plaintext wins over source-encrypted row ciphertext', async () => {
+    // Reproduce the "backup imported from another machine" scenario:
+    // the envelope's apiKeys rows carry ciphertext produced under a
+    // DIFFERENT ENCRYPTION_KEY than the one running on this gateway.
+    // When the operator supplies the correct passphrase, the import
+    // MUST honour the keysByPlatform path and re-encrypt with the
+    // destination's key, rather than copying the source ciphertext
+    // straight into the DB. Otherwise every health check fails with
+    // "Unsupported state or unable to authenticate data".
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+
+    // Build the apiKeys row with ciphertext that can never decrypt
+    // under the test ENCRYPTION_KEY (all-zeros).
+    const bogus = encryptWithForeignKey('sk-foreign-12345');
+
+    // Build the keysCipher blob that the source machine would have
+    // produced — the real plaintext, encrypted under the passphrase.
+    const cipher = encryptKeysWithPassphrase(
+      [{ platform: 'groq', key: 'sk-correct-54321' }],
+      'right horse battery staple',
+    );
+
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [{
+          platform: 'groq', label: 'main', enabled: true,
+          encryptedKey: bogus.encrypted, iv: bogus.iv, authTag: bogus.authTag,
+        }],
+      },
+      keysCipher: cipher,
+    };
+
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'overwrite', dryRun: false, passphrase: 'right horse battery staple' },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.api_keys?.errors ?? []).toEqual([]);
+    expect(imp.body.sections.api_keys?.added).toBe(1);
+
+    // The stored row's ciphertext must decrypt to the keysCipher
+    // plaintext under THIS gateway's key.
+    const stored = db.prepare(
+      `SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform='groq' LIMIT 1`,
+    ).get() as { encrypted_key: string; iv: string; auth_tag: string };
+    expect(decrypt(stored.encrypted_key, stored.iv, stored.auth_tag)).toBe('sk-correct-54321');
+  });
+
+  it('cross-machine without passphrase: source ciphertext is reported as an error, never stored', async () => {
+    // Operator drags a backup across machines without supplying a
+    // passphrase. The destination has no keysCipher fallback to draw
+    // from — the row's source-machine ciphertext cannot decrypt under
+    // the destination's key. The import MUST refuse the row (error in
+    // the section diff) rather than silently land undecryptable
+    // bytes that break every health check afterwards.
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+
+    const bogus = encryptWithForeignKey('sk-foreign-67890');
+
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [{
+          platform: 'groq', label: 'main', enabled: true,
+          encryptedKey: bogus.encrypted, iv: bogus.iv, authTag: bogus.authTag,
+        }],
+      },
+    };
+
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'overwrite', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    const errors = imp.body.sections.api_keys?.errors ?? [];
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/different\s+ENCRYPTION_KEY/);
+
+    // The row must NOT have been inserted — that would leave silently
+    // undecryptable bytes in the DB.
+    const stored = db.prepare(`SELECT COUNT(*) AS n FROM api_keys WHERE platform='groq'`).get() as { n: number };
+    expect(stored.n).toBe(0);
+  });
+
+  it('preview: surfaces keyCompatibility=mismatch when row ciphertext cannot decrypt and no keysCipher', async () => {
+    // The Settings UI calls /api/config/preview when the user picks a
+    // file. It must surface a clear `keyCompatibility: 'mismatch'`
+    // verdict on envelopes whose row ciphertext was encrypted under a
+    // different ENCRYPTION_KEY than the destination's. The UI uses
+    // that verdict to render a banner BEFORE the user clicks Apply.
+    const bogus = encryptWithForeignKey('sk-foreign-abc');
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [{
+          platform: 'groq', label: 'main', enabled: true,
+          encryptedKey: bogus.encrypted, iv: bogus.iv, authTag: bogus.authTag,
+        }],
+      },
+    };
+    const prev = await request(app, 'POST', '/api/config/preview', env);
+    expect(prev.status).toBe(200);
+    expect(prev.body.keyCompatibility).toBe('mismatch');
+    expect(prev.body.hasKeysCipher).toBe(false);
+  });
+
+  it('preview: surfaces keyCompatibility=encrypted-with-passphrase when keysCipher is present', async () => {
+    // Passphrase-protected envelopes: the row-level ciphertext is
+    // Real passphrase exports ALSO carry per-row ciphertext (the schema
+    // requires it). Use the test gateway's encryption key so the row
+    // also satisfies the "compatible" probe, then assert the
+    // verdict is `encrypted-with-passphrase` — the passphrase path
+    // wins over the row probe regardless of row-level compatibility.
+    const row = encrypt('sk-real-xyz');
+    const cipher = encryptKeysWithPassphrase(
+      [{ platform: 'groq', key: 'sk-real-xyz' }],
+      'right horse battery staple',
+    );
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: { apiKeys: [{
+        platform: 'groq', label: 'main', enabled: true,
+        encryptedKey: row.encrypted, iv: row.iv, authTag: row.authTag,
+      }] },
+      keysCipher: cipher,
+    };
+    const prev = await request(app, 'POST', '/api/config/preview', env);
+    expect(prev.status).toBe(200);
+    expect(prev.body.keyCompatibility).toBe('encrypted-with-passphrase');
+    expect(prev.body.hasKeysCipher).toBe(true);
+  });
+
+  it('preview: surfaces keyCompatibility=plaintext when rows carry plaintext keys', async () => {
+    // A backup exported without a passphrase that included plaintext
+    // keys (the legacy `key` field) — the destination re-encrypts
+    // them under its own ENCRYPTION_KEY, so there's nothing for the
+    // probe to verify. `plaintext` makes the UI render a neutral
+    // banner ("keys included in plaintext").
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [{ platform: 'groq', label: 'main', enabled: true, key: 'sk-plain-789' }],
+      },
+    };
+    const prev = await request(app, 'POST', '/api/config/preview', env);
+    expect(prev.status).toBe(200);
+    expect(prev.body.keyCompatibility).toBe('plaintext');
+  });
+
+  it('preview: surfaces keyCompatibility=no-keys when api_keys section is absent', async () => {
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        models: [{
+          platform: 'groq', modelId: 'foo', displayName: 'Foo',
+          intelligenceRank: 1, speedRank: 1, sizeLabel: '',
+          rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
+          monthlyTokenBudget: '', contextWindow: null,
+          enabled: true, supportsVision: false, supportsTools: false,
+          maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
+        }],
+      },
+    };
+    const prev = await request(app, 'POST', '/api/config/preview', env);
+    expect(prev.status).toBe(200);
+    expect(prev.body.keyCompatibility).toBe('no-keys');
+  });
+
+  it('commit: response includes keyCompatibility diagnostic when source ciphertext mismatched', async () => {
+    // End-to-end: a cross-machine commit (no passphrase) returns a
+    // `keyCompatibility` block on its summary so the UI can render a
+    // remediation banner without forcing the operator to open the
+    // error details panel.
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+
+    const bogus = encryptWithForeignKey('sk-foreign-zzzz');
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [{
+          platform: 'groq', label: 'main', enabled: true,
+          encryptedKey: bogus.encrypted, iv: bogus.iv, authTag: bogus.authTag,
+        }],
+      },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'overwrite', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.keyCompatibility).toBeDefined();
+    expect(imp.body.keyCompatibility.status).toBe('mismatch');
+    expect(imp.body.keyCompatibility.totalRows).toBe(1);
+    expect(imp.body.keyCompatibility.skippedDueToMismatch).toBe(1);
+    expect(imp.body.keyCompatibility.sampleFailure).toBeDefined();
+    expect(imp.body.keyCompatibility.sampleFailure.platform).toBe('groq');
+    expect(imp.body.keyCompatibility.sampleFailure.label).toBe('main');
+    expect(imp.body.keyCompatibility.sampleFailure.message).toMatch(/different ENCRYPTION_KEY/);
   });
 
   it('passphrase-encrypted keys fail with wrong passphrase', async () => {
