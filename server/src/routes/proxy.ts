@@ -162,7 +162,8 @@ function buildModelCapabilities(modelId: string, maxOutputTokens: number | null,
     || ml.includes('gpt-oss')                         // openai/gpt-oss-* = chain-of-thought tier
     || ml.includes('minimax-m3')                       // MiniMax M3 = thinking tier
     || ml.includes('minimax-m2')                       // MiniMax M2.x (m2.5/m2.7) = thinking tier (#292)
-    || ml.includes('minimaxai/minimax-m');            // NVIDIA-style id `minimaxai/minimax-mN` — catch M2.x/M3 family (#292)
+    || ml.includes('minimaxai/minimax-m')             // NVIDIA-style id `minimaxai/minimax-mN` — catch M2.x/M3 family (#292)
+    || ml === 'coding-glm-5.2-free';                  // aggregatord glm 5.2 free — exact-id match
 
   const modalities: { input: string[]; output: string[] } = {
     input: supportsVision ? ['text', 'image'] : ['text'],
