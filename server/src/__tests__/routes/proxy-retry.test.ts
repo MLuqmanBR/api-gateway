@@ -1,37 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../../routes/proxy.js';
-
-describe('isModelAccessForbiddenError (403 model-not-on-tier, drives whole-model skip — issue #256)', () => {
-  it('flags a 403 reaching the proxy by message or attached status', () => {
-    // GitHub Models / Cloudflare 403 a model the key's free tier can't reach.
-    expect(isModelAccessForbiddenError(new Error('GitHub Models API error 403: Model not available on your plan'))).toBe(true);
-    expect(isModelAccessForbiddenError(new Error('Cloudflare API error 403: this model requires a subscription'))).toBe(true);
-    expect(isModelAccessForbiddenError(new Error('Forbidden'))).toBe(true);
-    // #261 attaches the upstream status to the thrown error; honor it even if
-    // the message phrasing omits the code.
-    expect(isModelAccessForbiddenError(Object.assign(new Error('access denied'), { status: 403 }))).toBe(true);
-  });
-
-  it('does not flag rate limits, 404s, or payment errors', () => {
-    expect(isModelAccessForbiddenError(new Error('429 Too Many Requests'))).toBe(false);
-    expect(isModelAccessForbiddenError(new Error('OpenRouter API error 404: Provider returned error'))).toBe(false);
-    expect(isModelAccessForbiddenError(new Error('HuggingFace Router API error 402: Payment required'))).toBe(false);
-  });
-});
-
-describe('isModelNotFoundError (drives whole-model skip within a request)', () => {
-  it('flags 404 / not-found / no-endpoints phrasings', () => {
-    expect(isModelNotFoundError(new Error('OpenRouter API error 404: Provider returned error'))).toBe(true);
-    expect(isModelNotFoundError(new Error('Model not found'))).toBe(true);
-    expect(isModelNotFoundError(new Error('No endpoints found for openrouter/minimax/minimax-m2.5:free'))).toBe(true);
-  });
-
-  it('does not flag rate limits, 5xx, or payment errors', () => {
-    expect(isModelNotFoundError(new Error('429 Too Many Requests'))).toBe(false);
-    expect(isModelNotFoundError(new Error('503 Service Unavailable'))).toBe(false);
-    expect(isModelNotFoundError(new Error('HuggingFace Router API error 402: Payment required'))).toBe(false);
-  });
-});
+import { isRetryableError, isPaymentRequiredError } from '../../routes/proxy.js';
 
 describe('isRetryableError', () => {
   describe('413 Payload Too Large', () => {
@@ -85,7 +53,7 @@ describe('isRetryableError', () => {
     });
   });
 
-  describe('403 model not on this key\'s tier fails over instead of 502 (issue #256)', () => {
+  describe('403 model not on this key\'s tier is retryable (issue #256)', () => {
     it('treats a 403 from GitHub Models / Cloudflare as retryable', () => {
       expect(isRetryableError(new Error('GitHub Models API error 403: Model not available on your plan'))).toBe(true);
       expect(isRetryableError(new Error('Cloudflare API error 403: this model requires a subscription'))).toBe(true);
@@ -138,10 +106,8 @@ describe('isRetryableError', () => {
       expect(isRetryableError(new Error('401 Unauthorized'))).toBe(false);
       expect(isRetryableError(new Error('400 Bad Request'))).toBe(false);
       expect(isRetryableError(new Error('Invalid API key'))).toBe(false);
-      // 403 is deliberately NOT here anymore: a request-time 403 on a key that
-      // passed validateKey is a model-not-on-tier gate, so it fails over to the
-      // next model rather than 502-ing the request (issue #256). The 403 cases
-      // are covered in the dedicated describe block above.
+      // 403 isn't asserted here — it's covered in the dedicated '403…is retryable'
+      // block above, where it's classified as retryable. (issue #256)
     });
   });
 });

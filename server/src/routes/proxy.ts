@@ -426,13 +426,14 @@ export function isRetryableError(err: any): boolean {
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
     || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
-    // 403: the key is valid (it passed validateKey, and the health checker
-    // disables truly-forbidden keys) but this specific model is off-limits to
-    // the key's tier — e.g. gpt-4o on GitHub Models' free tier, subscription-only
-    // models on Cloudflare. Another model in the chain is reachable, so fail over
-    // instead of 502-ing the whole request. Paired with isModelAccessForbiddenError
-    // to rule the model out for this request and a day-long bench. See issue #256.
-    || isModelAccessForbiddenError(err)
+    // 403: the key is valid (passed validateKey, health checker disables
+    // truly-forbidden keys) but this specific model is off-limits to the
+    // key's tier. The normal retry path exhausts this key after
+    // PER_KEY_RETRIES, marks it exhausted, and rotates to a sibling key
+    // on the same model; if no siblings survive, the outer loop moves to
+    // the next model. Cooldown uses the standard computeRetryCooldownMs
+    // — no special day-long bench. See issue #256.
+    || msg.includes('403') || msg.includes('forbidden') || (err?.status === 403)
     // 400: one provider may reject parameters another accepts (e.g. max_tokens
     // limits, unsupported params). The matching pattern is "api error 400"
     // which comes from the OpenAI-compat provider's error formatting, not
@@ -462,28 +463,6 @@ export function isPaymentRequiredError(err: any): boolean {
   return msg.includes('402') || msg.includes('payment required')
     || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
     || msg.includes('insufficient balance');
-}
-
-// A 404 "model removed/deprecated upstream" error. It's a MODEL-level failure,
-// not a key-level one: every key for the platform will 404 the same way, so the
-// retry loop skips the entire model for the rest of the request instead of
-// burning one fallback attempt per key on the same dead route.
-// (PR #111, credits @barbotkonv.)
-export function isModelNotFoundError(err: any): boolean {
-  const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found');
-}
-
-// A 403 Forbidden returned for a specific model behind an otherwise-valid key.
-// Drives the same whole-model skip as a 404: every key on this platform's tier
-// would be forbidden the same model, so rule it out for the rest of the request
-// rather than trying it again with a sibling key. Distinct from a dead key —
-// validateKey returns false on 401/403, so the health checker disables genuinely
-// forbidden keys; a 403 reaching here is model-not-on-this-tier. See issue #256.
-export function isModelAccessForbiddenError(err: any): boolean {
-  if (err?.status === 403) return true;
-  const msg = (err?.message ?? '').toLowerCase();
-  return msg.includes('403') || msg.includes('forbidden');
 }
 
 // Pull the incremental text out of a streaming chunk for token counting.
@@ -1394,37 +1373,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const safeError = sanitizeProviderErrorMessage(err.message);
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
 
-      // Model-level 404/403: not a key issue — every key on this platform
-      // would hit the same dead route. Skip only the model and continue the
-      // outer loop without exhausting the key or burning retries.
-      //
-      // Pinned-model exception: when the caller explicitly named this model
-      // (model: "platform/model_id") they are asking for THIS specific
-      // model, not a fallback chain. A 404 means the model is gone upstream
-      // and trying sibling keys would just produce the same 404; falling
-      // through to the next model in the chain would silently serve the
-      // request from a different model than the one the user pinned, which
-      // is the very behaviour strict pinning is meant to prevent. Surface
-      // a 404/403 to the user so they know to pick a live model instead of
-      // silently getting a stranger.
-      if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) {
-        if (isPinned && route.modelDbId === preferredModel) {
-          publish({ type: 'request.error', id: requestId, error: `Pinned model ${requestedModel} returned ${isModelNotFoundError(err) ? '404 not found' : '403 forbidden'} upstream — no fallback in pin mode.`, at: Date.now() });
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-          res.setHeader('X-Pinned-Model-Dead', '1');
-          const code = isModelNotFoundError(err) ? 'model_not_found' : 'model_forbidden';
-          res.status(isModelNotFoundError(err) ? 404 : 403).json({
-            error: {
-              message: `Pinned model '${requestedModel}' is ${isModelNotFoundError(err) ? 'no longer available' : 'not accessible on this tier'} upstream. Pick a different model or omit the 'model' field to auto-route.`,
-              type: 'invalid_request_error',
-              code,
-            },
-          });
-          return;
-        }
-        skipModels.add(route.modelDbId);
-        continue outerLoop;
-      }
 
       if (isRetryableError(err)) {
         // Dead-turn errors (in-band error, empty completion, stream stall,
@@ -1489,19 +1437,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     markExhausted(route.keyId, route.platform, route.modelId);
     const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
     skipKeys.add(skipId);
-    if (!isModelNotFoundError(lastError) && !isModelAccessForbiddenError(lastError)) {
-      setCooldown(
-        route.platform,
-        route.modelId,
-        route.keyId,
-        computeRetryCooldownMs(
-          isPaymentRequiredError(lastError),
-          route.platform, route.modelId, route.keyId,
-          { rpd: route.rpdLimit, tpd: route.tpdLimit },
-          lastError?.retryAfterMs,
-        ),
-      );
-    }
+    setCooldown(
+      route.platform,
+      route.modelId,
+      route.keyId,
+      computeRetryCooldownMs(
+        isPaymentRequiredError(lastError),
+        route.platform, route.modelId, route.keyId,
+        { rpd: route.rpdLimit, tpd: route.tpdLimit },
+        lastError?.retryAfterMs,
+      ),
+    );
     recordRateLimitHit(route.modelDbId);
     lastRequestTime = Date.now();
     publish({ type: 'routing.key_exhausted', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, reason: sanitizeProviderErrorMessage(lastError?.message), at: Date.now() });

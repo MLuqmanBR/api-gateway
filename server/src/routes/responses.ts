@@ -17,8 +17,6 @@ import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarke
 import {
   isRetryableError,
   isPaymentRequiredError,
-  isModelNotFoundError,
-  isModelAccessForbiddenError,
   timingSafeStringEqual,
   extractApiToken,
   getStickyModel,
@@ -697,17 +695,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
 
       if (isRetryableError(err)) {
-        // Model-level 404/403: rule out the whole model for this request — its
-        // other keys would 404/403 the same way. (PR #111, credits @barbotkonv.)
-        if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        if (!isModelNotFoundError(err) && !isModelAccessForbiddenError(err)) {
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
-            isPaymentRequiredError(err),
-            route.platform, route.modelId, route.keyId,
-            { rpd: route.rpdLimit, tpd: route.tpdLimit },
-          ));
-        }
+        setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
+          isPaymentRequiredError(err),
+          route.platform, route.modelId, route.keyId,
+          { rpd: route.rpdLimit, tpd: route.tpdLimit },
+        ));
         recordRateLimitHit(route.modelDbId);
         lastError = err;
         continue;

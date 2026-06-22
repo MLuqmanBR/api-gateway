@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vite
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { setGlobalRetryLimit } from '../../services/router.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 
 let dashToken = '';
@@ -23,7 +24,7 @@ async function request(app: Express, method: string, path: string, body?: any, h
   let json: any = null;
   try { json = JSON.parse(data); } catch {}
 
-  return { status: res.status, body: json };
+  return { status: res.status, body: json, headers: Object.fromEntries(res.headers) };
 }
 
 function authHeaders() {
@@ -160,6 +161,7 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
   });
 
   beforeEach(async () => {
+    setGlobalRetryLimit(5);
     const db = getDb();
     db.prepare('DELETE FROM api_keys').run();
     db.prepare('DELETE FROM requests').run();
@@ -234,37 +236,58 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
     expect(fbHits).toEqual([]);
   });
 
-  it('returns 404 to the user when the pinned model is dead upstream, instead of silent fallback', async () => {
+  it('returns 429 after exhausting all keys on the pinned model on 403/404 (no model switch)', async () => {
+    // Add a second key on the pinned platform so we can test key cycling:
+    // PER_KEY_RETRIES=3 attempts on key 1 → markExhausted → key 2 → 3 attempts
+    // → markExhausted → 1-RPM recovery. The global retry limit (5) bounds the
+    // loop: 3 attempts on key 1 + 2 on key 2 = 5 upstream attempts, then the
+    // bound at proxy.ts:844 fires and the response returns 429.
+    const addKey2 = await request(app, 'POST', '/api/keys', {
+      platform: pinnedPlatform,
+      key: 'pinned-strict-test-key-2',
+      label: 'pinned-strict-2',
+    });
+    expect(addKey2.status).toBe(201);
+
     const origFetch = global.fetch;
     const calls: string[] = [];
     vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
       const urlStr = typeof url === 'string' ? url : url.toString();
       calls.push(urlStr);
       if (urlStr.includes(fallbackPlatform)) {
+        // Must NOT be reached — strict pinning must not fall through.
         return { ok: true, json: () => Promise.resolve({ id: 'x', choices: [{ message: { role: 'assistant', content: 'fb' }, finish_reason: 'stop' }] }) } as any;
       }
       if (urlStr.includes(pinnedPlatform)) {
-        // Provider returns a 404-style error message. The proxy classifies
-        // this as isModelNotFoundError, which previously added the pinned
-        // model to skipModels and fell through. With strict pinning, it
-        // must surface 404 instead.
-        return { ok: false, status: 404, statusText: 'Not Found', text: () => Promise.resolve('not found'), json: () => Promise.resolve({ error: { message: 'No such model' } }) } as any;
+        // Provider returns 403 (model not on this key's tier) for every key.
+        // The proxy classifies this as retryable, so it cycles through all
+        // keys for the same model and returns 429 once the global recovery
+        // limit is hit.
+        return { ok: false, status: 403, statusText: 'Forbidden', text: () => Promise.resolve('forbidden'), json: () => Promise.resolve({ error: { message: 'Model not available on your plan' } }) } as any;
       }
       return origFetch(url, init);
     });
 
-    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+    const { status, body, headers } = await request(app, 'POST', '/v1/chat/completions', {
       model: `${pinnedPlatform}/${pinnedModelName}`,
       messages: [{ role: 'user', content: 'hi' }],
     }, authHeaders());
 
-    expect(status).toBe(404);
-    expect(body?.error?.code).toBe('model_not_found');
-    expect(body?.error?.message).toMatch(/Pinned model/);
-    expect(body?.error?.message).toMatch(new RegExp(`${pinnedPlatform}/${pinnedModelName}`.replace(/\//g, '\\/')));
-
+    // Both keys on the pinned platform were tried (3 attempts each = 6 calls).
+    // The bound at proxy.ts:844 fires at the start of the next outer iteration
+    // once upstreamAttempts >= globalRetryMax (5), so 6 calls fit in before the
+    // 429 response is emitted.
+    const pinnedCalls = calls.filter(u => u.includes(pinnedPlatform));
+    expect(pinnedCalls.length).toBe(6);
+    // Fallback was never reached.
     const fbHits = calls.filter(u => u.includes(fallbackPlatform));
     expect(fbHits).toEqual([]);
+    // Final response: 429 (recovery limit reached), no model_not_found / model_forbidden.
+    expect(status).toBe(429);
+    expect(headers['x-upstream-attempts']).toBe('6');
+    expect(body?.error?.type).toBe('rate_limit_error');
+    expect(body?.error?.code).not.toBe('model_not_found');
+    expect(body?.error?.code).not.toBe('model_forbidden');
   });
 });
 
