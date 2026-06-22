@@ -54,6 +54,10 @@ const PLATFORMS: { value: Platform; label: string; url: string; keyless?: boolea
   { value: 'commandcode', label: 'CommandCode', url: '' },
 ];
 
+// Set of built-in platform slugs — used to widen the Edit button so built-in
+// providers (Groq, Cerebras, etc.) can be edited via /api/platforms/:slug/settings.
+const PLATFORMS_SLUGS: Set<string> = new Set(PLATFORMS.map(p => p.value));
+
 const statusDot: Record<string, string> = {
   healthy: 'bg-emerald-500',
   rate_limited: 'bg-amber-500',
@@ -379,40 +383,75 @@ function AddPlatformModal({
 // correct a typo in the baseUrl or the display name without re-registering
 // the slug (which is the platform id and would orphan existing models).
 
+// Per-platform settings shape returned by GET /api/platforms/:slug/settings.
+type BuiltInProviderSettings = {
+  rpmLimit: number | null;
+  rpdLimit: number | null;
+  tpmLimit: number | null;
+  tpdLimit: number | null;
+  stickySessionsEnabled: boolean;
+};
+
 function EditPlatformModal({
   slug,
   provider,
+  kind,
   onClose,
   onSaved,
 }: {
   slug: string
-  provider: CustomProvider
+  provider?: CustomProvider
+  kind: 'custom' | 'built-in'
   onClose: () => void
   onSaved: () => void
 }) {
   const queryClient = useQueryClient()
+  const isCustom = kind === 'custom' && provider !== undefined;
+  // Built-in providers fetch their settings fresh on modal open so the
+  // form seeds from current row state. Customs don't need this fetch
+  // (their fields come from the `provider` prop above).
+  const { data: builtInSettings } = useQuery<BuiltInProviderSettings | null>({
+    queryKey: ['platforms', slug, 'settings'],
+    queryFn: () => apiFetch(`/api/platforms/${slug}/settings`),
+    enabled: kind === 'built-in',
+ });
+  const initRpm = isCustom ? provider.rpmLimit : builtInSettings?.rpmLimit;
+  const initRpd = isCustom ? provider.rpdLimit : builtInSettings?.rpdLimit;
+  const initTpm = isCustom ? provider.tpmLimit : builtInSettings?.tpmLimit;
+  const initTpd = isCustom ? provider.tpdLimit : builtInSettings?.tpdLimit;
+  const initSticky = isCustom
+    ? (provider.stickySessionsEnabled ?? false)
+    : (builtInSettings?.stickySessionsEnabled ?? false);
+
   const [newSlug, setNewSlug] = useState(slug)
-  const [displayName, setDisplayName] = useState(provider.displayName)
-  const [baseUrl, setBaseUrl] = useState(provider.baseUrl)
-  const [rpmLimit, setRpmLimit] = useState(provider.rpmLimit?.toString() ?? '')
-  const [rpdLimit, setRpdLimit] = useState(provider.rpdLimit?.toString() ?? '')
-  const [tpmLimit, setTpmLimit] = useState(provider.tpmLimit?.toString() ?? '')
-  const [tpdLimit, setTpdLimit] = useState(provider.tpdLimit?.toString() ?? '')
-  const [parallelEnabled, setParallelEnabled] = useState(provider.maxParallelRequests != null)
-  const [maxParallelRequests, setMaxParallelRequests] = useState(provider.maxParallelRequests ?? 4)
-  const [stickySessionsEnabled, setStickySessionsEnabled] = useState(provider.stickySessionsEnabled ?? false)
-  const [keyless, setKeyless] = useState(provider.keyless)
-  const [apiFormat, setApiFormat] = useState<'openai' | 'anthropic'>(provider.apiFormat ?? 'openai')
+  const [displayName, setDisplayName] = useState(isCustom ? provider.displayName : '')
+  const [baseUrl, setBaseUrl] = useState(isCustom ? provider.baseUrl : '')
+  const [rpmLimit, setRpmLimit] = useState(initRpm?.toString() ?? '')
+  const [rpdLimit, setRpdLimit] = useState(initRpd?.toString() ?? '')
+  const [tpmLimit, setTpmLimit] = useState(initTpm?.toString() ?? '')
+  const [tpdLimit, setTpdLimit] = useState(initTpd?.toString() ?? '')
+  const [parallelEnabled, setParallelEnabled] = useState(isCustom ? provider.maxParallelRequests != null : false)
+  const [maxParallelRequests, setMaxParallelRequests] = useState(isCustom ? (provider.maxParallelRequests ?? 4) : 4)
+  const [stickySessionsEnabled, setStickySessionsEnabled] = useState(initSticky)
+  const [keyless, setKeyless] = useState(isCustom ? provider.keyless : false)
+  const [apiFormat, setApiFormat] = useState<'openai' | 'anthropic'>(
+    isCustom ? (provider.apiFormat ?? 'openai') : 'openai',
+  )
   const [showAdvanced, setShowAdvanced] = useState(false)
 
   const save = useMutation({
-    mutationFn: (body: Record<string, unknown>) =>
-      apiFetch(`/api/custom-providers/${slug}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    mutationFn: (body: Record<string, unknown>) => {
+      const endpoint = isCustom
+        ? `/api/custom-providers/${slug}`
+        : `/api/platforms/${slug}/settings`;
+      return apiFetch(endpoint, { method: 'PATCH', body: JSON.stringify(body) });
+    },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
-      queryClient.invalidateQueries({ queryKey: ['keys'] })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
-      onSaved()
+      queryClient.invalidateQueries({ queryKey: ['custom-providers'] });
+      queryClient.invalidateQueries({ queryKey: ['keys'] });
+      queryClient.invalidateQueries({ queryKey: ['health'] });
+      queryClient.invalidateQueries({ queryKey: ['platforms'] });
+      onSaved();
     },
   })
 
@@ -434,37 +473,54 @@ function EditPlatformModal({
         </div>
         <form
           onSubmit={e => {
-            e.preventDefault()
-            const body: Record<string, unknown> = {}
-            if (newSlug.trim() !== slug) body.slug = newSlug.trim()
-            if (displayName.trim() !== provider.displayName) body.displayName = displayName.trim()
-            if (baseUrl.trim() !== provider.baseUrl) body.baseUrl = baseUrl.trim()
-            if (rpmLimit !== (provider.rpmLimit?.toString() ?? '')) body.rpmLimit = rpmLimit ? parseInt(rpmLimit, 10) : null
-            if (rpdLimit !== (provider.rpdLimit?.toString() ?? '')) body.rpdLimit = rpdLimit ? parseInt(rpdLimit, 10) : null
-            if (tpmLimit !== (provider.tpmLimit?.toString() ?? '')) body.tpmLimit = tpmLimit ? parseInt(tpmLimit, 10) : null
-            if (tpdLimit !== (provider.tpdLimit?.toString() ?? '')) body.tpdLimit = tpdLimit ? parseInt(tpdLimit, 10) : null
-            const newMax = parallelEnabled ? maxParallelRequests : null
-            if (newMax !== provider.maxParallelRequests) body.maxParallelRequests = newMax
-            if (keyless !== provider.keyless) body.keyless = keyless
-            if (apiFormat !== (provider.apiFormat ?? 'openai')) body.apiFormat = apiFormat
-            if (stickySessionsEnabled !== (provider.stickySessionsEnabled ?? false)) body.stickySessionsEnabled = stickySessionsEnabled
-            if (Object.keys(body).length === 0) { onClose(); return }
-            save.mutate(body)
+            e.preventDefault();
+            const body: Record<string, unknown> = {};
+            if (isCustom) {
+              // Custom-only editable fields: slug, displayName, baseUrl,
+              // parallelRequests, keyless, apiFormat.
+              if (newSlug.trim() !== slug) body.slug = newSlug.trim();
+              if (displayName.trim() !== provider.displayName) body.displayName = displayName.trim();
+              if (baseUrl.trim() !== provider.baseUrl) body.baseUrl = baseUrl.trim();
+              const newMax = parallelEnabled ? maxParallelRequests : null;
+              if (newMax !== provider.maxParallelRequests) body.maxParallelRequests = newMax;
+              if (keyless !== provider.keyless) body.keyless = keyless;
+              if (apiFormat !== (provider.apiFormat ?? 'openai')) body.apiFormat = apiFormat;
+            }
+            // Common fields: limits + sticky toggle.
+            const oldRpm = initRpm ?? null;
+            const newRpm = rpmLimit ? parseInt(rpmLimit, 10) : null;
+            if (newRpm !== oldRpm) body.rpmLimit = newRpm;
+            const oldRpd = initRpd ?? null;
+            const newRpd = rpdLimit ? parseInt(rpdLimit, 10) : null;
+            if (newRpd !== oldRpd) body.rpdLimit = newRpd;
+            const oldTpm = initTpm ?? null;
+            const newTpm = tpmLimit ? parseInt(tpmLimit, 10) : null;
+            if (newTpm !== oldTpm) body.tpmLimit = newTpm;
+            const oldTpd = initTpd ?? null;
+            const newTpd = tpdLimit ? parseInt(tpdLimit, 10) : null;
+            if (newTpd !== oldTpd) body.tpdLimit = newTpd;
+            if (stickySessionsEnabled !== initSticky) body.stickySessionsEnabled = stickySessionsEnabled;
+            if (Object.keys(body).length === 0) { onClose(); return; }
+            save.mutate(body);
           }}
           className="space-y-3"
         >
-          <div className="space-y-1.5">
-            <Label className="text-xs">Slug</Label>
-            <Input value={newSlug} onChange={e => setNewSlug(e.target.value)} className="font-mono text-xs" />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">Display name</Label>
-            <Input value={displayName} onChange={e => setDisplayName(e.target.value)} />
-          </div>
-          <div className="space-y-1.5">
-            <Label className="text-xs">Base URL</Label>
-            <Input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} className="font-mono text-xs" />
-          </div>
+          {isCustom && (
+            <>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Slug</Label>
+                <Input value={newSlug} onChange={e => setNewSlug(e.target.value)} className="font-mono text-xs" />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Display name</Label>
+                <Input value={displayName} onChange={e => setDisplayName(e.target.value)} />
+              </div>
+              <div className="space-y-1.5">
+                <Label className="text-xs">Base URL</Label>
+                <Input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} className="font-mono text-xs" />
+              </div>
+            </>
+          )}
           <button type="button" onClick={() => setShowAdvanced(s => !s)} className="text-xs text-muted-foreground hover:text-foreground">
             {showAdvanced ? '▾' : '▸'} Advanced
           </button>
@@ -476,24 +532,32 @@ function EditPlatformModal({
                 <div className="space-y-1.5"><Label className="text-xs">TPM limit</Label><Input type="number" min={0} value={tpmLimit} onChange={e => setTpmLimit(e.target.value)} className="font-mono text-xs" /></div>
                 <div className="space-y-1.5"><Label className="text-xs">TPD limit</Label><Input type="number" min={0} value={tpdLimit} onChange={e => setTpdLimit(e.target.value)} className="font-mono text-xs" /></div>
               </div>
-              <div className="border-t pt-3 mt-1">
-                <Label className="text-xs">Parallel requests</Label>
-                <div className="flex items-center gap-3 mt-1">
-                  <label className="flex items-center gap-1.5 cursor-pointer text-xs"><Switch checked={parallelEnabled} onCheckedChange={setParallelEnabled} />Limit</label>
-                  {parallelEnabled && <Input type="number" min={1} max={100} value={maxParallelRequests} onChange={e => setMaxParallelRequests(parseInt(e.target.value, 10) || 1)} className="font-mono text-xs w-20" />}
-                </div>
-              </div>
-              <div className="border-t pt-3 mt-1">
-                <Label className="text-xs">API format</Label>
-                <p className="text-[10px] text-muted-foreground mb-1">
-                  OpenAI-compatible endpoints use /v1/chat/completions. Anthropic endpoints use /v1/messages.
-                </p>
-                <label className="flex items-center gap-2 cursor-pointer text-xs">
-                  <span className={apiFormat === 'openai' ? '' : 'text-muted-foreground'}>OpenAI</span>
-                  <Switch checked={apiFormat === 'anthropic'} onCheckedChange={c => setApiFormat(c ? 'anthropic' : 'openai')} />
-                  <span className={apiFormat === 'anthropic' ? '' : 'text-muted-foreground'}>Anthropic</span>
-                </label>
-              </div>
+              {isCustom && (
+                <>
+                  <div className="border-t pt-3 mt-1">
+                    <Label className="text-xs">Parallel requests</Label>
+                    <div className="flex items-center gap-3 mt-1">
+                      <label className="flex items-center gap-1.5 cursor-pointer text-xs"><Switch checked={parallelEnabled} onCheckedChange={setParallelEnabled} />Limit</label>
+                      {parallelEnabled && <Input type="number" min={1} max={100} value={maxParallelRequests} onChange={e => setMaxParallelRequests(parseInt(e.target.value, 10) || 1)} className="font-mono text-xs w-20" />}
+                    </div>
+                  </div>
+                  <div className="border-t pt-3 mt-1">
+                    <Label className="text-xs">API format</Label>
+                    <p className="text-[10px] text-muted-foreground mb-1">
+                      OpenAI-compatible endpoints use /v1/chat/completions. Anthropic endpoints use /v1/messages.
+                    </p>
+                    <label className="flex items-center gap-2 cursor-pointer text-xs">
+                      <span className={apiFormat === 'openai' ? '' : 'text-muted-foreground'}>OpenAI</span>
+                      <Switch checked={apiFormat === 'anthropic'} onCheckedChange={c => setApiFormat(c ? 'anthropic' : 'openai')} />
+                      <span className={apiFormat === 'anthropic' ? '' : 'text-muted-foreground'}>Anthropic</span>
+                    </label>
+                  </div>
+                  <div className="flex items-center gap-2 pt-1">
+                    <Switch checked={keyless} onCheckedChange={setKeyless} />
+                    <span className="text-xs text-muted-foreground">No API key required</span>
+                  </div>
+                </>
+              )}
               <div className="border-t pt-3 mt-1">
                 <Label className="text-xs">Sticky keys (cache affinity)</Label>
                 <p className="text-[10px] text-muted-foreground mb-1">
@@ -503,10 +567,6 @@ function EditPlatformModal({
                   <Switch checked={stickySessionsEnabled} onCheckedChange={setStickySessionsEnabled} />
                   <span>{stickySessionsEnabled ? 'Enabled' : 'Disabled'}</span>
                 </label>
-              </div>
-              <div className="flex items-center gap-2 pt-1">
-                <Switch checked={keyless} onCheckedChange={setKeyless} />
-                <span className="text-xs text-muted-foreground">No API key required</span>
               </div>
             </>
           )}
@@ -975,9 +1035,21 @@ export default function KeysPage() {
   const grouped = allPlatforms
     .map(p => ({ ...p, keys: keys.filter(k => k.platform === p.value) }))
     .filter(p => p.keys.length > 0)
-  const editingProvider = editingProviderSlug
-    ? customProviders.find(p => p.slug === editingProviderSlug) ?? null
-    : null
+  const editingProvider: {
+    kind: 'custom' | 'built-in';
+    slug: string;
+    provider?: CustomProvider;
+    builtInSettings?: BuiltInProviderSettings;
+  } | null = editingProviderSlug
+    ? (() => {
+        const cp = customProviders.find(p => p.slug === editingProviderSlug);
+        if (cp) return { kind: 'custom' as const, slug: cp.slug, provider: cp };
+        if (PLATFORMS_SLUGS.has(editingProviderSlug)) {
+          return { kind: 'built-in' as const, slug: editingProviderSlug };
+        }
+        return null;
+      })()
+    : null;
   return (
     <div>
       <PageHeader
@@ -1103,18 +1175,18 @@ export default function KeysPage() {
                       <span className="text-xs text-muted-foreground tabular-nums">
                         {group.keys.length} key{group.keys.length === 1 ? '' : 's'}
                       </span>
+                      {(customProviders.some(cp => cp.slug === group.value) || PLATFORMS_SLUGS.has(group.value)) && (
+                        <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-foreground"
+                          onClick={() => setEditingProviderSlug(group.value)}>
+                          Edit
+                        </Button>
+                      )}
                       {customProviders.some(cp => cp.slug === group.value) && (
-                        <>
-                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-foreground"
-                            onClick={() => setEditingProviderSlug(group.value)}>
-                            Edit
-                          </Button>
-                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
-                            onClick={() => { if (confirm(`Archive provider '${group.label}' and all its models? This can be undone by re-adding.`)) deleteProvider.mutate(group.value) }}
-                            disabled={deleteProvider.isPending}>
-                            Archive
-                          </Button>
-                        </>
+                        <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
+                          onClick={() => { if (confirm(`Archive provider '${group.label}' and all its models? This can be undone by re-adding.`)) deleteProvider.mutate(group.value) }}
+                          disabled={deleteProvider.isPending}>
+                          Archive
+                        </Button>
                       )}
                     </div>
                   </div>
@@ -1203,7 +1275,8 @@ export default function KeysPage() {
       {editingProvider && (
         <EditPlatformModal
           slug={editingProviderSlug!}
-          provider={editingProvider}
+          kind={editingProvider.kind}
+          provider={editingProvider.provider}
           onClose={() => setEditingProviderSlug(null)}
           onSaved={() => setEditingProviderSlug(null)}
         />

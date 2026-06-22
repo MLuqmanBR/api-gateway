@@ -16,6 +16,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateSchemaV29ArchiveProviders(db);
   migrateSchemaV30KeylessProviders(db);
   migrateSchemaV31ApiFormat(db);
+  seedBuiltInProviderSettings(db);
   migrateEmbeddingsV1(db);
   migrateCustomProvidersV24(db);
 
@@ -178,6 +179,17 @@ function createTables(db: Database.Database) {
       sticky_sessions_enabled INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS built_in_provider_settings (
+      platform TEXT PRIMARY KEY,
+      rpm_limit INTEGER,
+      rpd_limit INTEGER,
+      tpm_limit INTEGER,
+      tpd_limit INTEGER,
+      sticky_sessions_enabled INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 
   ensureRequestKeyIdColumn(db);
@@ -272,6 +284,26 @@ function ensureCustomProvidersStickySessionsColumn(db: Database.Database) {
   }
 }
 
+
+// Per-platform settings for built-in providers (Groq, Cerebras, etc.).
+// Mirrors the editable portion of `custom_providers` (rpm/rpd/tpm/tpd
+// limits + sticky_sessions_enabled) so the dashboard Edit modal can
+// operate uniformly on both built-ins and customs. Seeded once with
+// INSERT OR IGNORE so re-running is a no-op and existing rows aren't
+// overwritten. The router falls back to this row when a per-model limit
+// in `models` is NULL.
+const BUILT_IN_PLATFORMS = [
+  'google', 'groq', 'cerebras', 'nvidia', 'mistral', 'openrouter',
+  'github', 'cohere', 'cloudflare', 'zhipu', 'ollama', 'kilo',
+  'pollinations', 'llm7', 'huggingface', 'opencode', 'ovh', 'commandcode',
+];
+
+function seedBuiltInProviderSettings(db: Database.Database) {
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO built_in_provider_settings (platform) VALUES (?)`,
+  );
+  for (const slug of BUILT_IN_PLATFORMS) insert.run(slug);
+}
 function seedModels(db: Database.Database) {
   const count = db.prepare('SELECT COUNT(*) as cnt FROM models').get() as { cnt: number };
   if (count.cnt > 0) return;

@@ -4,6 +4,7 @@ import helmet from 'helmet';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { keysRouter } from './routes/keys.js';
+import { platformsRouter } from './routes/platforms.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
 import { responsesRouter } from './routes/responses.js';
@@ -72,6 +73,7 @@ export function createApp() {
 
   // API routes — all admin endpoints sit behind requireAuth.
   app.use('/api/keys', requireAuth, keysRouter);
+  app.use('/api/platforms', requireAuth, platformsRouter);
   app.use('/api/models', requireAuth, modelsRouter);
   app.use('/api/fallback', requireAuth, fallbackRouter);
   app.use('/api/embeddings', requireAuth, embeddingsRouter);

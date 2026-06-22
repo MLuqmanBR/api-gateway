@@ -552,12 +552,19 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       continue;
     }
 
-    // Get limits once for this model
+    // Get limits once for this model. Per-model row wins; if its limit is
+    // (e.g., tighter Groq limits) without editing every model row.
+    const platformDefaults = db.prepare(
+      `SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit
+         FROM built_in_provider_settings WHERE platform = ?`,
+    ).get(entry.platform) as
+      | { rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null }
+      | undefined;
     const limits = {
-      rpm: entry.rpm_limit,
-      rpd: entry.rpd_limit,
-      tpm: entry.tpm_limit,
-      tpd: entry.tpd_limit,
+      rpm: entry.rpm_limit ?? platformDefaults?.rpm_limit ?? null,
+      rpd: entry.rpd_limit ?? platformDefaults?.rpd_limit ?? null,
+      tpm: entry.tpm_limit ?? platformDefaults?.tpm_limit ?? null,
+      tpd: entry.tpd_limit ?? platformDefaults?.tpd_limit ?? null,
     };
 
     // Try all keys for this model before giving up on it.
@@ -609,10 +616,20 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // Sticky key selection: when a custom provider enables sticky sessions,
     // hash the session key to pick a deterministic key. This maximizes
     // upstream KV-cache reuse for cache-heavy providers like LongCAT.
-    const stickyRow = db.prepare(
-      'SELECT sticky_sessions_enabled FROM custom_providers WHERE slug = ?'
+    // Sticky key selection: pick the same key per session for cache-heavy
+    // providers (LongCAT-style KV-cache reuse). Either source enables it:
+    // `custom_providers.sticky_sessions_enabled` for user-added OpenAI-compat
+    // gateways, or `built_in_provider_settings.sticky_sessions_enabled` for
+    // built-in providers like Groq/Cerebras.
+    const stickyCustom = db.prepare(
+      'SELECT sticky_sessions_enabled FROM custom_providers WHERE slug = ?',
     ).get(entry.platform) as { sticky_sessions_enabled: number } | undefined;
-    const stickyEnabled = stickyRow?.sticky_sessions_enabled === 1;
+    const stickyBuiltin = db.prepare(
+      'SELECT sticky_sessions_enabled FROM built_in_provider_settings WHERE platform = ?',
+    ).get(entry.platform) as { sticky_sessions_enabled: number } | undefined;
+    const stickyEnabled =
+      stickyCustom?.sticky_sessions_enabled === 1 ||
+      stickyBuiltin?.sticky_sessions_enabled === 1;
 
     let idx: number;
     if (stickyEnabled && options?.stickySessionKey) {
