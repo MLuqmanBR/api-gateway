@@ -299,35 +299,35 @@ describe('sticky session integrity', () => {
       { role: 'system' as const, content: 'sys' },
       { role: 'user' as const, content: 'sticky turn gap probe' },
     ];
-    setStickyModel(t1, 42);
+    setStickyModel(undefined, t1, 42);
     const t2 = [...t1,
       { role: 'assistant' as const, content: 'answer' },
       { role: 'user' as const, content: 'follow-up' },
     ];
-    expect(getStickyModel(t2)).toBe(42);
+    expect(getStickyModel(undefined, t2)).toBe(42);
   });
 
   it('applies to array-of-blocks content (opencode-style agents)', () => {
     const t1 = [
       { role: 'user' as const, content: [{ type: 'text', text: 'array content sticky probe' }] as any },
     ];
-    setStickyModel(t1, 7);
+    setStickyModel(undefined, t1, 7);
     const t2 = [...t1,
       { role: 'assistant' as const, content: 'ok' },
       { role: 'user' as const, content: [{ type: 'text', text: 'next' }] as any },
     ];
-    expect(getStickyModel(t2)).toBe(7);
+    expect(getStickyModel(undefined, t2)).toBe(7);
   });
 
   it('honors an explicit x-session-id over message hashing', () => {
     const conv1 = [{ role: 'user' as const, content: 'conversation one' }];
-    setStickyModel(conv1, 11, 'session-abc');
+    setStickyModel(undefined, conv1, 11, 'session-abc');
     const conv2 = [
       { role: 'user' as const, content: 'completely different opener' },
       { role: 'assistant' as const, content: 'hi' },
       { role: 'user' as const, content: 'next' },
     ];
-    expect(getStickyModel(conv2, 'session-abc')).toBe(11);
-    expect(getStickyModel(conv2)).toBeUndefined();
+    expect(getStickyModel(undefined, conv2, 'session-abc')).toBe(11);
+    expect(getStickyModel(undefined, conv2)).toBeUndefined();
   });
 });

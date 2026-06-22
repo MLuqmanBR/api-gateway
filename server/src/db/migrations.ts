@@ -175,6 +175,7 @@ function createTables(db: Database.Database) {
       tpm_limit INTEGER,
       tpd_limit INTEGER,
       max_parallel_requests INTEGER,
+      sticky_sessions_enabled INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
@@ -186,6 +187,7 @@ function createTables(db: Database.Database) {
   ensureRequestRequestedModelColumn(db);
   ensureCustomProvidersMaxParallelColumn(db);
   ensureSessionsLastUsedColumn(db);
+  ensureCustomProvidersStickySessionsColumn(db);
 }
 
 // `requested_model` is the model id the CLIENT pinned in the request body.
@@ -257,6 +259,16 @@ function ensureCustomProvidersMaxParallelColumn(db: Database.Database) {
   const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
   if (!cols.some(c => c.name === 'max_parallel_requests')) {
     db.prepare('ALTER TABLE custom_providers ADD COLUMN max_parallel_requests INTEGER').run();
+  }
+}
+
+// `sticky_sessions_enabled` forces all requests in the same session to use
+// the same API key, maximizing upstream KV-cache hit rate for cache-heavy
+// providers like LongCAT. Off by default; gated behind the Advanced toggle.
+function ensureCustomProvidersStickySessionsColumn(db: Database.Database) {
+  const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
+  if (!cols.some(c => c.name === 'sticky_sessions_enabled')) {
+    db.prepare('ALTER TABLE custom_providers ADD COLUMN sticky_sessions_enabled INTEGER NOT NULL DEFAULT 0').run();
   }
 }
 

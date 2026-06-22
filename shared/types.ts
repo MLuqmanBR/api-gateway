@@ -50,6 +50,7 @@ export interface CustomProvider {
   maxParallelRequests: number | null;
   keyless: boolean;
   apiFormat: 'openai' | 'anthropic';
+  stickySessionsEnabled: boolean;
   archived: boolean;
 }
 export interface CustomProviderCreate {
@@ -63,6 +64,7 @@ export interface CustomProviderCreate {
   maxParallelRequests?: number | null;
   keyless?: boolean;
   apiFormat?: 'openai' | 'anthropic';
+  stickySessionsEnabled?: boolean;
 }
 
 export interface CustomProviderUpdate {
@@ -75,6 +77,7 @@ export interface CustomProviderUpdate {
   maxParallelRequests?: number | null;
   keyless?: boolean;
   apiFormat?: 'openai' | 'anthropic';
+  stickySessionsEnabled?: boolean;
 }
 
 export interface CustomModelCreate {

@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
@@ -459,6 +460,8 @@ export interface RouteOptions {
   pinMode?: boolean;
   /** 1 RPM recovery mode: ignore cooldowns and rate limits, try exhausted keys in exhaustion order. */
   oneRPM?: boolean;
+  /** Session key for sticky key selection — when set and the provider has sticky_sessions_enabled, key selection is deterministic. */
+  stickySessionKey?: string;
 }
 
 export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
@@ -603,7 +606,22 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       keyOrder = keys.filter(k => !exhaustedIds.has(k.id));
     }
 
-    let idx = oneRPM ? 0 : (roundRobinIndex.get(rrKey) ?? 0);
+    // Sticky key selection: when a custom provider enables sticky sessions,
+    // hash the session key to pick a deterministic key. This maximizes
+    // upstream KV-cache reuse for cache-heavy providers like LongCAT.
+    const stickyRow = db.prepare(
+      'SELECT sticky_sessions_enabled FROM custom_providers WHERE slug = ?'
+    ).get(entry.platform) as { sticky_sessions_enabled: number } | undefined;
+    const stickyEnabled = stickyRow?.sticky_sessions_enabled === 1;
+
+    let idx: number;
+    if (stickyEnabled && options?.stickySessionKey) {
+      const hash = crypto.createHash('sha1').update(options.stickySessionKey).digest();
+      const hashInt = hash.readUInt32BE(0);
+      idx = hashInt % keyOrder.length;
+    } else {
+      idx = oneRPM ? 0 : (roundRobinIndex.get(rrKey) ?? 0);
+    }
 
     for (let attempt = 0; attempt < keyOrder.length; attempt++) {
       const key = keyOrder[(idx + attempt) % keyOrder.length];
@@ -635,7 +653,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       // a custom provider row was deleted), we already continued.
 
       // We found a working key for this model!
-      if (!oneRPM) {
+      if (!oneRPM && !(stickyEnabled && options?.stickySessionKey)) {
         roundRobinIndex.set(rrKey, idx + attempt + 1);
       }
 
@@ -680,7 +698,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // past the end of the post-filter queue — the next request would
     // wrap back to the start of keyOrder instead of skipping the only
     // remaining key.
-    if (!oneRPM && keyOrder.length > 0) {
+    if (!oneRPM && keyOrder.length > 0 && !(stickyEnabled && options?.stickySessionKey)) {
       roundRobinIndex.set(rrKey, (idx + 1) % keyOrder.length);
     }
 

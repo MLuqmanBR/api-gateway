@@ -326,7 +326,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const preferredModel = getStickyModel(messages, sessionIdHeader);
+  const preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
   // endpoint) must stay on models that emit structured tool_calls — a model
@@ -613,7 +613,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
         recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
         logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
         return;
       } else {
@@ -659,7 +659,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? 0);
         recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));

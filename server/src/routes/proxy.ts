@@ -60,8 +60,9 @@ export function extractApiToken(req: Request): string | undefined {
 }
 
 // Sticky sessions: track which model served each "session"
-// Key: hash of first user message → model_db_id
+// Key: <api_key>:<session_hash> → model_db_id
 // This prevents model switching mid-conversation which causes hallucination
+const stickySessionEnabled = (process.env.STICKY_SESSION_ENABLED ?? 'true') !== 'false';
 const stickySessionMap = new Map<string, { modelDbId: number; lastUsed: number }>();
 const STICKY_TTL_MS = 30 * 60 * 1000; // 30 min session TTL
 
@@ -87,12 +88,24 @@ function getSessionKey(messages: ChatMessage[], sessionIdHeader?: string): strin
   return crypto.createHash('sha1').update(text).digest('hex');
 }
 
-export function getStickyModel(messages: ChatMessage[], sessionIdHeader?: string): number | undefined {
+function getSessionKeyWithApiKey(apiKey: string | undefined, messages: ChatMessage[], sessionIdHeader?: string): string {
+  // When sticky sessions are enabled, include the API key in the session key
+  // to make sessions per-API-key instead of global.
+  const sessionKey = getSessionKey(messages, sessionIdHeader);
+  if (!sessionKey) return '';
+  if (!apiKey) return sessionKey;
+  return `${apiKey}:${sessionKey}`;
+}
+
+export function getStickyModel(apiKey: string | undefined, messages: ChatMessage[], sessionIdHeader?: string): number | undefined {
   // Only apply sticky for multi-turn (has assistant messages = continuation)
+  // Skip if sticky sessions are disabled
+  if (!stickySessionEnabled) return undefined;
+
   const hasAssistant = messages.some(m => m.role === 'assistant');
   if (!hasAssistant) return undefined;
 
-  const key = getSessionKey(messages, sessionIdHeader);
+  const key = getSessionKeyWithApiKey(apiKey, messages, sessionIdHeader);
   if (!key) return undefined;
 
   const entry = stickySessionMap.get(key);
@@ -105,8 +118,11 @@ export function getStickyModel(messages: ChatMessage[], sessionIdHeader?: string
   return entry.modelDbId;
 }
 
-export function setStickyModel(messages: ChatMessage[], modelDbId: number, sessionIdHeader?: string) {
-  const key = getSessionKey(messages, sessionIdHeader);
+export function setStickyModel(apiKey: string | undefined, messages: ChatMessage[], modelDbId: number, sessionIdHeader?: string) {
+  // Only apply sticky if enabled
+  if (!stickySessionEnabled) return;
+
+  const key = getSessionKeyWithApiKey(apiKey, messages, sessionIdHeader);
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
 
@@ -721,7 +737,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // be semantically wrong.
   const isAutoRouted = !requestedModel || isAutoModel(requestedModel);
   const handoffMode = isAutoRouted ? getContextHandoffMode() : ('off' as const);
-  const sessionKey = handoffMode !== 'off' ? getSessionKey(messages, sessionIdHeader) : '';
+  // sessionKey is computed unconditionally — sticky-keys routing needs it
+  // regardless of handoff mode, since they're independent features.
+  const sessionKey = getSessionKey(messages, sessionIdHeader);
   if (handoffMode !== 'off' && sessionKey) {
     recordIncomingMessages(sessionKey, messages);
   }
@@ -738,7 +756,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let preferredModel: number | undefined;
   if (isAutoModel(requestedModel)) {
     // Explicit "auto" → behave exactly like an omitted model field.
-    preferredModel = getStickyModel(messages, sessionIdHeader);
+    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
   } else if (requestedModel) {
     const db = getDb();
     // Parse platform/model_id format: the first '/' separates the platform
@@ -772,7 +790,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       return;
     }
   } else {
-    preferredModel = getStickyModel(messages, sessionIdHeader);
+    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
@@ -895,7 +913,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         hasImage,
         wantsTools,
         skipModels.size > 0 ? skipModels : undefined,
-        { pinMode: isPinned, oneRPM: inOneRPMMode },
+        { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined },
       );
     } catch (err: any) {
       // Pinned model has no more keys — enter 1 RPM mode.
@@ -1232,7 +1250,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           recordRequest(route.platform, route.modelId, route.keyId);
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + injectedHandoffTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
-          setStickyModel(messages, route.modelDbId, sessionIdHeader);
+          setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: estimatedInputTokens + injectedHandoffTokens, out: totalOutputTokens }, at: Date.now() });
@@ -1325,7 +1343,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
-        setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
         if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);

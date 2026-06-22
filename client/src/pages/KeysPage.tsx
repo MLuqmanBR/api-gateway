@@ -190,6 +190,7 @@ function AddPlatformModal({
   const [tpdLimit, setTpdLimit] = useState<string>('')
   const [parallelEnabled, setParallelEnabled] = useState(false)
   const [maxParallelRequests, setMaxParallelRequests] = useState(4)
+  const [stickySessionsEnabled, setStickySessionsEnabled] = useState(false)
   const [keyless, setKeyless] = useState(false)
   const [apiFormat, setApiFormat] = useState<'openai' | 'anthropic'>('openai')
 
@@ -208,6 +209,7 @@ function AddPlatformModal({
       setTpmLimit('')
       setTpdLimit('')
       setParallelEnabled(false)
+      setStickySessionsEnabled(false)
       setKeyless(false)
       setApiFormat('openai')
     },
@@ -245,6 +247,7 @@ function AddPlatformModal({
               if (tpmLimit) body.tpmLimit = parseInt(tpmLimit, 10)
               if (tpdLimit) body.tpdLimit = parseInt(tpdLimit, 10)
               body.maxParallelRequests = parallelEnabled ? maxParallelRequests : null
+              body.stickySessionsEnabled = stickySessionsEnabled
             }
             create.mutate(body)
           }}
@@ -340,6 +343,16 @@ function AddPlatformModal({
                 <span className={apiFormat === 'anthropic' ? '' : 'text-muted-foreground'}>Anthropic</span>
               </label>
             </div>
+            <div className="border-t pt-3 mt-1">
+              <Label className="text-xs">Sticky keys (cache affinity)</Label>
+              <p className="text-[10px] text-muted-foreground mb-1">
+                Route the same conversation to the same API key for better cache hits on providers like LongCAT.
+              </p>
+              <label className="flex items-center gap-2 cursor-pointer text-xs">
+                <Switch checked={stickySessionsEnabled} onCheckedChange={setStickySessionsEnabled} />
+                <span>{stickySessionsEnabled ? 'Enabled' : 'Disabled'}</span>
+              </label>
+            </div>
             </>
           )}
           <div className="flex items-center gap-2 pt-1">
@@ -387,6 +400,7 @@ function EditPlatformModal({
   const [tpdLimit, setTpdLimit] = useState(provider.tpdLimit?.toString() ?? '')
   const [parallelEnabled, setParallelEnabled] = useState(provider.maxParallelRequests != null)
   const [maxParallelRequests, setMaxParallelRequests] = useState(provider.maxParallelRequests ?? 4)
+  const [stickySessionsEnabled, setStickySessionsEnabled] = useState(provider.stickySessionsEnabled ?? false)
   const [keyless, setKeyless] = useState(provider.keyless)
   const [apiFormat, setApiFormat] = useState<'openai' | 'anthropic'>(provider.apiFormat ?? 'openai')
   const [showAdvanced, setShowAdvanced] = useState(false)
@@ -433,6 +447,7 @@ function EditPlatformModal({
             if (newMax !== provider.maxParallelRequests) body.maxParallelRequests = newMax
             if (keyless !== provider.keyless) body.keyless = keyless
             if (apiFormat !== (provider.apiFormat ?? 'openai')) body.apiFormat = apiFormat
+            if (stickySessionsEnabled !== (provider.stickySessionsEnabled ?? false)) body.stickySessionsEnabled = stickySessionsEnabled
             if (Object.keys(body).length === 0) { onClose(); return }
             save.mutate(body)
           }}
@@ -477,6 +492,16 @@ function EditPlatformModal({
                   <span className={apiFormat === 'openai' ? '' : 'text-muted-foreground'}>OpenAI</span>
                   <Switch checked={apiFormat === 'anthropic'} onCheckedChange={c => setApiFormat(c ? 'anthropic' : 'openai')} />
                   <span className={apiFormat === 'anthropic' ? '' : 'text-muted-foreground'}>Anthropic</span>
+                </label>
+              </div>
+              <div className="border-t pt-3 mt-1">
+                <Label className="text-xs">Sticky keys (cache affinity)</Label>
+                <p className="text-[10px] text-muted-foreground mb-1">
+                  Route the same conversation to the same API key for better cache hits on providers like LongCAT.
+                </p>
+                <label className="flex items-center gap-2 cursor-pointer text-xs">
+                  <Switch checked={stickySessionsEnabled} onCheckedChange={setStickySessionsEnabled} />
+                  <span>{stickySessionsEnabled ? 'Enabled' : 'Disabled'}</span>
                 </label>
               </div>
               <div className="flex items-center gap-2 pt-1">
