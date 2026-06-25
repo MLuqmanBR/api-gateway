@@ -1,6 +1,7 @@
 // Sliding window rate limit tracker with SQLite persistence.
 
 import { getDb } from '../db/index.js';
+import { markKeyHealthyFromRequest } from './health.js';
 
 interface Window {
   timestamps: number[];
@@ -252,6 +253,12 @@ export function recordRequest(platform: string, modelId: string, keyId: number) 
   getWindow(rpdKey).timestamps.push(now);
 
   recordUsage(platform, modelId, keyId, 'request', 0, now);
+  // The fact that we just served a request through this key is the
+  // strongest possible signal that it's not actually broken — promote
+  // it back to 'healthy' if a transport error had previously marked it
+  // 'error'. Cheap (one indexed UPDATE) and self-healing: keys stuck
+  // on 'error' from a past network blip get cleared on their next use.
+  markKeyHealthyFromRequest(keyId);
 }
 
 export function recordTokens(

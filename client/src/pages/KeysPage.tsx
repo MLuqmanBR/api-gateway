@@ -957,6 +957,41 @@ export default function KeysPage() {
     mutationFn: () => apiFetch('/api/health/check-all', { method: 'POST' }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['health'] }),
   })
+  // Live progress for the "Check all" button. The previous version of this
+  // button just sat on "Checking…" for 15+ minutes on a 89-key fleet with
+  // zero feedback. Now we subscribe to the SSE /api/events stream and
+  // update a progress counter as each key resolves. The operator sees
+  // a live bar fill up + a per-key status flash as it happens.
+  const [checkProgress, setCheckProgress] = useState<{ completed: number; total: number } | null>(null)
+  useEffect(() => {
+    if (!checkAll.isPending) {
+      // Clean up the progress bar after a short delay so the user can
+      // see the final state (e.g. "12/89 healthy") before it disappears.
+      // The cleanup itself runs when the next effect fires or on unmount.
+      return
+    }
+    const es = new EventSource('/api/events')
+    es.onmessage = (msg) => {
+      try {
+        const e = JSON.parse(msg.data)
+        if (e?.type === 'health.check.start') {
+          setCheckProgress({ completed: 0, total: e.total })
+        } else if (e?.type === 'health.check.progress') {
+          setCheckProgress({ completed: e.completed, total: e.total })
+          // Invalidate the health query at the end of every progress event
+          // so the per-key status badges in the table update live. This
+          // is cheap because the data is small and the query is cached.
+          queryClient.invalidateQueries({ queryKey: ['health'] })
+        } else if (e?.type === 'health.check.done') {
+          // One last invalidation + a brief hold so the final 89/89
+          // count is visible before the bar clears.
+          queryClient.invalidateQueries({ queryKey: ['health'] })
+          window.setTimeout(() => setCheckProgress(null), 1500)
+        }
+      } catch { /* ignore malformed events */ }
+    }
+    return () => es.close()
+  }, [checkAll.isPending, queryClient])
   const checkKey = useMutation({
     mutationFn: (keyId: number) => apiFetch(`/api/health/check/${keyId}`, { method: 'POST' }),
     onSuccess: () => {
@@ -1043,7 +1078,7 @@ export default function KeysPage() {
   } | null = editingProviderSlug
     ? (() => {
         const cp = customProviders.find(p => p.slug === editingProviderSlug);
-        if (cp) return { kind: 'custom' as const, slug: cp.slug, provider: cp };
+        if (cp) return { kind: 'custom' as const, slug: editingProviderSlug, provider: cp };
         if (PLATFORMS_SLUGS.has(editingProviderSlug)) {
           return { kind: 'built-in' as const, slug: editingProviderSlug };
         }
@@ -1057,9 +1092,31 @@ export default function KeysPage() {
         description="Provider credentials and the unified API key your apps connect with."
         actions={
           keys.length > 0 && (
-            <Button variant="outline" size="sm" onClick={() => checkAll.mutate()} disabled={checkAll.isPending}>
-              {checkAll.isPending ? 'Checking…' : 'Check all'}
-            </Button>
+            <div className="flex items-center gap-3">
+              {checkProgress && (
+                // Live progress bar shown while checkAll is running.
+                // Renders "Checking 12/89…" with a thin filled bar
+                // so the operator can see something IS happening instead
+                // of a frozen "Checking…" spinner.
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <div className="w-32 h-1.5 rounded-full bg-muted overflow-hidden">
+                    <div
+                      className="h-full bg-primary transition-[width] duration-150"
+                      style={{ width: `${Math.min(100, (checkProgress.completed / checkProgress.total) * 100)}%` }}
+                    />
+                  </div>
+                  <span className="font-mono tabular-nums">{checkProgress.completed}/{checkProgress.total}</span>
+                </div>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => { setCheckProgress(null); checkAll.mutate() }}
+                disabled={checkAll.isPending}
+              >
+                {checkAll.isPending ? 'Checking…' : 'Check all'}
+              </Button>
+            </div>
           )
         }
       />

@@ -78,6 +78,17 @@ export class RequestAbortError extends Error {
   }
 }
 
+/** Thrown when a provider fetch hits its deadline (NOT a client disconnect).
+ *  Carries a distinct `name` so `isAbortError` does NOT match it — the proxy
+ *  retry loop treats timeouts as retryable provider errors rather than
+ *  publishing `request.aborted` and giving up on the request. (#256) */
+export class ProviderTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Provider request timed out after ${timeoutMs}ms`);
+    this.name = 'ProviderTimeoutError';
+  }
+}
+
 /** True for any abort — either our `RequestAbortError` or the native
  *  `DOMException`/`AbortError` that `fetch` rejects with when its `signal`
  *  fires. We surface our own class so the retry loop can distinguish a clean
@@ -138,6 +149,8 @@ export abstract class BaseProvider {
    * Cloudflare Workers AI — account_id embedded in the key) leave this empty. */
   baseUrl?: string;
 
+  abstract validateKey(apiKey: string): Promise<boolean>;
+
   abstract chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
@@ -152,8 +165,6 @@ export abstract class BaseProvider {
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk>;
 
-  abstract validateKey(apiKey: string): Promise<boolean>;
-
   protected async fetchWithTimeout(
     url: string,
     init: RequestInit,
@@ -167,9 +178,15 @@ export abstract class BaseProvider {
       // Distinguish "the client stopped the request" from "we hit the
       // timeout". The proxy's retry loop treats a client abort as terminal
       // (no more retries, silent end); a timeout stays a retryable error.
-      // (#292)
+      // Before #256 the raw AbortError from the timeout fell through
+      // `isAbortError` (name === 'AbortError') and got published as
+      // `request.aborted`, which made every pinned-model provider timeout
+      // look like a user-initiated disconnect and never retried. (#292, #256)
       if (!timedOut() && externalSignal?.aborted) {
         throw new RequestAbortError();
+      }
+      if (timedOut()) {
+        throw new ProviderTimeoutError(timeoutMs);
       }
       throw err;
     } finally {

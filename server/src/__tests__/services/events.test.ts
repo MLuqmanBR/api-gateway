@@ -61,9 +61,18 @@ describe('events service', () => {
       { type: 'request.aborted', id: 'a', at: 4 },
       { type: 'routing.key_exhausted', id: 'a', provider: 'p', keyId: 1, model: 'm', reason: 'r', at: 5 },
       { type: 'routing.key_retry', id: 'a', provider: 'p', keyId: 1, model: 'm', attempt: 1, max: 3, at: 6 },
+      { type: 'routing.key_switch', id: 'a', provider: 'p', model: 'm', fromKeyId: 1, toKeyId: 2, at: 6 },
       { type: 'routing.model_switch', id: 'a', from: 'a', to: 'b', reason: 'r', at: 7 },
       { type: 'routing.recovery', id: 'a', cycle: 1, max: 5, reason: 'r', at: 8 },
       { type: 'stream.chunk', id: 'a', text: 'hello', at: 9 },
+      // Health-check progress events. The KeysPage subscribes to these for
+      // live "Check all" feedback so the operator sees a progress bar
+      // update as each key resolves, instead of a frozen "Checking…"
+      // spinner that gave zero feedback for 15+ minutes on a 89-key
+      // fleet. (#256)
+      { type: 'health.check.start', total: 89, concurrency: 8, at: 10 },
+      { type: 'health.check.progress', keyId: 1, platform: 'nvidia', status: 'healthy', completed: 1, total: 89, at: 11 },
+      { type: 'health.check.done', total: 89, at: 12 },
     ];
     for (const evt of samples) publish(evt);
     expect(a.seen.length).toBe(samples.length);

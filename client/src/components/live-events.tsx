@@ -26,13 +26,29 @@ interface RequestAbortedEvent extends LiveEventBase { type: 'request.aborted'; }
 interface StreamChunkEvent extends LiveEventBase { type: 'stream.chunk'; text: string; }
 interface KeyExhaustedEvent extends LiveEventBase { type: 'routing.key_exhausted'; provider: string; keyId: number; model: string; reason: string; }
 interface KeyRetryEvent extends LiveEventBase { type: 'routing.key_retry'; provider: string; keyId: number; model: string; attempt: number; max: number; }
+// Key rotated to a sibling key for the same model after the previous one
+// exhausted. Distinct from `routing.model_switch` (which fires when the model
+// itself changes) so the live terminal can show the user that the proxy is
+// retrying on a different KEY, not a different MODEL. (#256)
+interface KeySwitchEvent extends LiveEventBase { type: 'routing.key_switch'; provider: string; model: string; fromKeyId: number; toKeyId: number; }
 interface ModelSwitchEvent extends LiveEventBase { type: 'routing.model_switch'; from: string; to: string; reason: string; }
 interface RecoveryEvent extends LiveEventBase { type: 'routing.recovery'; cycle: number; max: number | null; reason: string; }
+// Health-check progress. Mirrors server/src/services/events.ts — the
+// KeysPage subscribes to these for live "Check all" feedback so the
+// operator sees a progress bar update as each key resolves, instead of
+// a frozen spinner that gave zero feedback for 15+ minutes on a 89-key
+// fleet. The id/at fields come from LiveEventBase so the events flow
+// through the same SSE pipeline; the live-terminal formatter suppresses
+// them (they're owned by the KeysPage progress bar). (#256)
+interface HealthCheckStartEvent extends LiveEventBase { type: 'health.check.start'; total: number; concurrency: number; }
+interface HealthCheckProgressEvent extends LiveEventBase { type: 'health.check.progress'; keyId: number; platform: string; status: string; completed: number; total: number; }
+interface HealthCheckDoneEvent extends LiveEventBase { type: 'health.check.done'; total: number; }
 
 type LiveEvent =
   | RequestStartEvent | RequestDoneEvent | RequestErrorEvent | RequestAbortedEvent
   | StreamChunkEvent
-  | KeyExhaustedEvent | KeyRetryEvent | ModelSwitchEvent | RecoveryEvent;
+  | KeyExhaustedEvent | KeyRetryEvent | KeySwitchEvent | ModelSwitchEvent | RecoveryEvent
+  | HealthCheckStartEvent | HealthCheckProgressEvent | HealthCheckDoneEvent;
 
 interface LogEntry {
   id: string;
@@ -70,15 +86,28 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
     case 'stream.chunk':
       // Reserved for future per-token live delta; render as info so a
       // producer can be enabled without further client changes.
-      return { id: e.id, ts, kind: 'info', text: `${e.text.length > 80 ? e.text.slice(0, 80) + '…' : e.text}` };
+      return { id: e.id, ts, kind: 'info', text: `${e.text.length > 80 ? e.text.slice(0, 80) + '\u2026' : e.text}` };
+    case 'health.check.progress':
+    case 'health.check.done':
+      // Health-check progress events are owned by the KeysPage progress
+      // bar (client/src/pages/KeysPage.tsx). The live terminal is a
+      // request/error log; routing health-check traffic through it would
+      // spam the operator with no useful information. Drop them here. (#256)
+      return undefined;
     case 'routing.key_exhausted':
       return { id: e.id, ts, kind: 'info', text: `⚠ [${rId}] Key #${e.keyId} exhausted on ${e.provider}/${e.model}: ${e.reason.slice(0, 80)}` };
     case 'routing.key_retry':
       return { id: e.id, ts, kind: 'info', text: `↻ [${rId}] Retrying ${e.provider}/${e.model} key#${e.keyId} (${e.attempt}/${e.max})` };
+    case 'routing.key_switch':
+      // Same model, different key — the proxy rotated to a sibling key
+      // because the previous one exhausted. Distinct from
+      // routing.model_switch so the operator can see "this key was swapped
+      // out" vs "we fell through to a different model entirely". (#256)
+      return { id: e.id, ts, kind: 'info', text: `⇄ [${rId}] ${e.provider}/${e.model}: rotating key #${e.fromKeyId} → #${e.toKeyId}` };
     case 'routing.model_switch':
       return { id: e.id, ts, kind: 'info', text: `→ [${rId}] Switching model: ${e.from} → ${e.to}` };
     case 'routing.recovery':
-      return { id: e.id, ts, kind: 'info', text: `⏳ [${rId}] Recovery cycle ${e.cycle}${e.max ? `/${e.max}` : '/∞'}: ${e.reason}` };
+      return { id: e.id, ts, kind: 'info', text: `⏳ [${rId}] Recovery cycle ${e.cycle}${e.max ? `/${e.max}` : '/\u221E'}: ${e.reason}` };
     default: {
       // Forward-compatibility net: a future server-side event type that the
       // client switch above hasn't learned about yet MUST render as a

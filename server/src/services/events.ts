@@ -8,6 +8,7 @@
  * Capacity is capped so a stalled SSE client never balloons memory.
  */
 import type { Response } from 'express';
+import type { KeyStatus } from '@api-gateway/shared/types.js';
 
 export type LiveEvent =
   | { type: 'request.start'; id: string; model?: string; stream: boolean; at: number }
@@ -16,9 +17,23 @@ export type LiveEvent =
   | { type: 'request.aborted'; id: string; at: number }
   | { type: 'routing.key_exhausted'; id: string; provider: string; keyId: number; model: string; reason: string; at: number }
   | { type: 'routing.key_retry'; id: string; provider: string; keyId: number; model: string; attempt: number; max: number; at: number }
+  // Key switched within the same model after the previous key was exhausted.
+  // Distinct from `routing.model_switch` (which fires when the model itself
+  // changes) so the live terminal can show the user that the proxy rotated
+  // to a sibling key rather than a different model entirely. (#256)
+  | { type: 'routing.key_switch'; id: string; provider: string; model: string; fromKeyId: number; toKeyId: number; at: number }
   | { type: 'routing.model_switch'; id: string; from: string; to: string; reason: string; at: number }
   | { type: 'routing.recovery'; id: string; cycle: number; max: number | null; reason: string; at: number }
-  | { type: 'stream.chunk'; id: string; text: string; at: number };
+  | { type: 'stream.chunk'; id: string; text: string; at: number }
+  // Health-check progress. The KeysPage subscribes to these so the "Check
+  // all" button can show live per-key results instead of a frozen
+  // "Checking…" spinner that gave the operator zero feedback for 15+
+  // minutes on a 89-key fleet. The `id` is synthetic (set by the
+  // publisher in health.ts) because these events aren't request-scoped
+  // — they describe a background sweep. (#256)
+  | { type: 'health.check.start'; id: string; total: number; concurrency: number; at: number }
+  | { type: 'health.check.progress'; id: string; keyId: number; platform: string; status: KeyStatus; completed: number; total: number; at: number }
+  | { type: 'health.check.done'; id: string; total: number; at: number };
 
 const MAX_SUBSCRIBERS = 8;
 

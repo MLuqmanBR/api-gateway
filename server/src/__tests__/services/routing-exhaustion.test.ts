@@ -233,4 +233,49 @@ describe('Routing Key Exhaustion', () => {
       expect(r2.keyId).toBe(keyB.id);
     });
   });
+
+  // Pinned-model pre-filter fallback (#256): when every key for a pinned
+  // model is rejected by the cooldown/RPM/RPD pre-filter, the router used
+  // to throw PINNED_MODEL_EXHAUSTED immediately — leaving the proxy no
+  // chance to attempt the provider call or run its 3-retry cycle. The
+  // fix is a fallback that returns the first available key anyway so
+  // the proxy can confirm the rate limit with the provider.
+  describe('pinned-model pre-filter fallback (#256)', () => {
+    it('returns the first available key for a pinned model even when every key fails the pre-filter', () => {
+      const db = getDb();
+      const proId = db.prepare("SELECT id FROM models WHERE model_id = 'gemini-1.5-pro'").get().id;
+      const keys = db.prepare("SELECT id, label FROM api_keys").all() as Array<{ id: number; label: string }>;
+
+      // Every key is at the RPM cap — the main pass rejects both.
+      (ratelimit.canMakeRequest as any).mockReturnValue(false);
+      (ratelimit.canUseTokens as any).mockReturnValue(true);
+
+      // Before the fix this would throw PINNED_MODEL_EXHAUSTED. After the
+      // fix the pinned-model fallback returns one of the available keys so
+      // the proxy can attempt the call and run its 3-retry cycle. The
+      // specific key picked depends on the round-robin index — the main
+      // pass starts at the round-robin cursor and increments it even when
+      // no key passes, so the fallback starts at the next position.
+      const result = routeRequest(100, undefined, proId, false, false, undefined, { pinMode: true });
+      expect(result.modelId).toBe('gemini-1.5-pro');
+      expect(keys.map(k => k.id)).toContain(result.keyId);
+    });
+
+    it('still throws PINNED_MODEL_EXHAUSTED when no key is available at all (e.g. all keys disabled)', () => {
+      const db = getDb();
+      const proId = db.prepare("SELECT id FROM models WHERE model_id = 'gemini-1.5-pro'").get().id;
+
+      // Disable both keys so the SQL query at router.ts:541 returns empty.
+      db.prepare("UPDATE api_keys SET enabled = 0").run();
+
+      (ratelimit.canMakeRequest as any).mockReturnValue(true);
+      (ratelimit.canUseTokens as any).mockReturnValue(true);
+
+      // keys.length === 0 → throws PINNED_MODEL_EXHAUSTED at line 545-553,
+      // before the fallback even runs. This is the correct behavior — if
+      // there are literally no keys to try, there's nothing to fall back to.
+      expect(() => routeRequest(100, undefined, proId, false, false, undefined, { pinMode: true }))
+        .toThrow(/Pinned model exhausted/);
+    });
+  });
 });

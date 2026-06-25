@@ -289,6 +289,127 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
     expect(body?.error?.code).not.toBe('model_not_found');
     expect(body?.error?.code).not.toBe('model_forbidden');
   });
+
+
+  it('publishes routing.key_switch when the proxy rotates to a sibling key on the same model (#256)', async () => {
+    // Live-terminal feedback gap: the proxy used to publish routing.key_retry
+    // (same key) and routing.key_exhausted (key burnt out), but there was
+    // NO event for the moment of rotation to a sibling key. Users had to
+    // infer the rotation from a gap between the exhaust event on key A and
+    // the next retry event on key B. The new routing.key_switch event
+    // surfaces the rotation explicitly so the live terminal can show
+    // "rotating key #A → #B" at the moment it happens.
+    const addKey2 = await request(app, 'POST', '/api/keys', {
+      platform: pinnedPlatform,
+      key: 'pinned-keyswitch-test-key-2',
+      label: 'pinned-keyswitch-2',
+    });
+    expect(addKey2.status).toBe(201);
+
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes(fallbackPlatform)) {
+        return { ok: true, json: () => Promise.resolve({ id: 'x', choices: [{ message: { role: 'assistant', content: 'fb' }, finish_reason: 'stop' }] }) } as any;
+      }
+      if (urlStr.includes(pinnedPlatform)) {
+        return { ok: false, status: 429, statusText: 'Too Many Requests', text: () => Promise.resolve('rate limited'), json: () => Promise.resolve({ error: { message: 'rate limit exceeded' } }) } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    // Subscribe to the in-process event bus BEFORE the request fires so we
+    // capture the key_switch event when the proxy rotates from key 1 to key 2.
+    const { subscribe } = await import('../../services/events.js');
+    const events: any[] = [];
+    const unsub = subscribe((e) => events.push(e));
+    try {
+      const { status } = await request(app, 'POST', '/v1/chat/completions', {
+        model: `${pinnedPlatform}/${pinnedModelName}`,
+        messages: [{ role: 'user', content: 'hi' }],
+      }, authHeaders());
+      expect(status).toBe(429);
+    } finally {
+      unsub();
+    }
+
+    // Find the key_switch event(s) emitted by this request. There must be
+    // at least one — the proxy rotated from the first pinned key to the
+    // second when the first exhausts.
+    const switchEvents = events.filter(e => e.type === 'routing.key_switch');
+    expect(switchEvents.length).toBeGreaterThanOrEqual(1);
+    const sw = switchEvents[0];
+    expect(sw.provider).toBe(pinnedPlatform);
+    expect(sw.model).toBe(pinnedModelName);
+    expect(typeof sw.fromKeyId).toBe('number');
+    expect(typeof sw.toKeyId).toBe('number');
+    expect(sw.fromKeyId).not.toBe(sw.toKeyId);
+  });
+  it('cycles through ALL keys for a pinned model when every key is on cooldown (#256)', { timeout: 15000 }, async () => {
+    // Reproduces the user's nvidia scenario: every key for the pinned model
+    // is on cooldown, so the router's pre-filter would normally reject them
+    // all and throw PINNED_MODEL_EXHAUSTED before the proxy ever calls the
+    // provider. The fix adds a pinned-model fallback that returns the first
+    // available key anyway, so the proxy can attempt the call, run its
+    // 3-retry cycle, exhaust the key, and move to the next one. Without
+    // this, a pinned model with cooled-down keys surfaces as
+    // "Recovery cycle N/∞" forever with zero upstream calls per cycle.
+    const addKey2 = await request(app, 'POST', '/api/keys', {
+      platform: pinnedPlatform,
+      key: 'pinned-cooldown-test-key-2',
+      label: 'pinned-cooldown-2',
+    });
+    expect(addKey2.status).toBe(201);
+
+    // Force BOTH keys onto cooldown so the pre-filter rejects them. The
+    // pinned-model fallback in router.ts should still return a key so the
+    // proxy can attempt the call.
+    const { setCooldown } = await import('../../services/ratelimit.js');
+    const db = getDb();
+    const pinnedKeys = db.prepare(
+      "SELECT id FROM api_keys WHERE platform = ? AND enabled = 1"
+    ).all(pinnedPlatform) as Array<{ id: number }>;
+    expect(pinnedKeys.length).toBe(2);
+    for (const k of pinnedKeys) {
+      setCooldown(pinnedPlatform, pinnedModelName, k.id, 60_000);
+    }
+
+    const origFetch = global.fetch;
+    const calls: string[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      calls.push(urlStr);
+      if (urlStr.includes(fallbackPlatform)) {
+        // Must NOT be reached — strict pinning must not fall through.
+        return { ok: true, json: () => Promise.resolve({ id: 'x', choices: [{ message: { role: 'assistant', content: 'fb' }, finish_reason: 'stop' }] }) } as any;
+      }
+      if (urlStr.includes(pinnedPlatform)) {
+        // Provider returns 429 — the proxy's normal retryable path. Even
+        // though the key is on cooldown, the pinned-model fallback returns
+        // a key and the proxy attempts the call anyway.
+        return { ok: false, status: 429, statusText: 'Too Many Requests', text: () => Promise.resolve('rate limited'), json: () => Promise.resolve({ error: { message: 'rate limit exceeded' } }) } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: `${pinnedPlatform}/${pinnedModelName}`,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, authHeaders());
+
+    // Both keys were tried (3 attempts each = 6 upstream calls). Without
+    // the pinned-model fallback the router would have thrown
+    // PINNED_MODEL_EXHAUSTED on the very first call and zero upstream
+    // calls would have been made.
+    const pinnedCalls = calls.filter(u => u.includes(pinnedPlatform));
+    expect(pinnedCalls.length).toBe(6);
+    // Fallback was never reached.
+    const fbHits = calls.filter(u => u.includes(fallbackPlatform));
+    expect(fbHits).toEqual([]);
+    // Final response: 429 (recovery limit reached).
+    expect(status).toBe(429);
+    expect(body?.error?.type).toBe('rate_limit_error');
+  });
 });
 
 ;

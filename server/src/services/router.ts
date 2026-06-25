@@ -709,6 +709,57 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       };
     }
 
+    // Pinned-model fallback: if no key passed the pre-filter above (all are
+    // on cooldown, at RPM/RPD cap, or whatever), return the first available
+    // key anyway so the proxy can attempt the call. This is what gives the
+    // proxy's 3-retry-per-key cycle a chance to run — without this fallback
+    // the router would throw PINNED_MODEL_EXHAUSTED immediately and the
+    // request would enter the 1-RPM recovery loop without ever calling the
+    // provider. The user pinned this model deliberately, so we should
+    // confirm the rate limit with the provider rather than assuming it.
+    // Without this, a pinned model with a temporarily-cooled key surfaces
+    // as "Recovery cycle N/∞: Pinned model ... exhausted" forever, with
+    // zero upstream calls per cycle. (#256)
+    if (pinMode && preferredModelDbId && entry.model_db_id === preferredModelDbId && !oneRPM) {
+      for (let attempt = 0; attempt < keyOrder.length; attempt++) {
+        const key = keyOrder[(idx + attempt) % keyOrder.length];
+        const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
+        // Still honor skipKeys within this one request sweep — the proxy
+        // accumulated these from earlier failed attempts in the same sweep
+        // and we don't want to re-hammer a key it just exhausted.
+        if (skipKeys?.has(skipId)) continue;
+        // Parallel request gating — same gate as the main pass.
+        const cp = db.prepare(
+          'SELECT max_parallel_requests FROM custom_providers WHERE slug = ?'
+        ).get(entry.platform) as { max_parallel_requests: number | null } | undefined;
+        const maxPar = cp?.max_parallel_requests ?? null;
+        if (!tryReserveSlot(entry.platform, maxPar)) continue;
+        let decryptedKey: string;
+        try {
+          decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
+        } catch {
+          db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
+            .run(key.id);
+          releaseSlot(entry.platform);
+          continue;
+        }
+        const release = () => releaseSlot(entry.platform);
+        return {
+          provider: provider,
+          modelId: entry.model_id,
+          modelDbId: entry.model_db_id,
+          apiKey: decryptedKey,
+          keyId: key.id,
+          platform: entry.platform,
+          displayName: entry.display_name,
+          rpdLimit: limits.rpd,
+          tpdLimit: limits.tpd,
+          maxOutputTokens: entry.max_output_tokens,
+          release,
+        };
+      }
+    }
+
     // If we reach here, this specific model has NO available keys.
     // Update round-robin index even if we failed so we don't get stuck.
     // Use keyOrder.length (not keys.length) so the modulo doesn't point

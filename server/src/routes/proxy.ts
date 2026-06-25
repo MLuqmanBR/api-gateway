@@ -818,6 +818,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let lastError: any = null;
   const isPinned = !!(requestedModel && !isAutoModel(requestedModel));
   let prevModelKey: string | undefined;
+  let prevKeyId: number | undefined;
   let inOneRPMMode = false;
   let oneRPMCycles = 0;
   let lastRequestTime = 0;
@@ -860,7 +861,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // forever. The bound is the same `globalRetryMax` scaled to give each
     // configured cycle a fair shot. (#292)
     if (globalRetryMax > 0 && upstreamAttempts >= globalRetryMax) {
-      const msg = `Request aborted after ${upstreamAttempts} upstream attempt(s) (recovery limit reached). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
+      const msg = `Recovery limit reached after ${upstreamAttempts} upstream attempt(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
       publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
       if (!res.headersSent) {
         res.setHeader('X-Routed-Via', 'none');
@@ -921,35 +922,51 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         const firstEntry = !inOneRPMMode;
         inOneRPMMode = true;
         oneRPMCycles++;
-        // Clear skipKeys so exhausted keys become eligible for retry.
-        // In normal mode we accumulate skipKeys to avoid re-hammering the
-        // same key; in 1 RPM recovery every key gets a chance each cycle.
         skipKeys.clear();
-        // First entry: try immediately. Subsequent: tiny pause so we don't
-        // burn CPU when routeRequest still throws (e.g. no keys configured).
-        if (!firstEntry) await abortableSleep(1000, abortSignal);
-        lastRequestTime = 0;
+        // 1-RPM throttle: on the first recovery entry, try immediately
+        // (reset the clock). On subsequent entries, set lastRequestTime
+        // to now so the 60 s loop-top throttle spaces recovery cycles
+        // — otherwise routeRequest throw → 1 s sleep → retry loops at
+        // full speed when no upstream call ever sets lastRequestTime.
+        if (firstEntry) {
+          lastRequestTime = 0;
+        } else {
+          // Enforce the throttle only when we actually called a provider
+          // in the previous cycle — if routeRequest threw without any
+          // upstream attempt (no keys configured, all keys dead), there's
+          // nothing to rate-limit and the 60 s wait adds no value.
+          if (upstreamAttempts > 0) lastRequestTime = Date.now();
+          await abortableSleep(1000, abortSignal);
+        }
         publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: `Pinned model ${requestedModel} exhausted`, at: Date.now() });
-        console.log(`[Proxy] Pinned model ${requestedModel} exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? `/${globalRetryMax}` : '/∞'})`);
+        console.log(`[Proxy] Pinned model ${requestedModel} exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? '/' + globalRetryMax : '/∞'})`);
         continue;
       }
       // All models exhausted — enter 1 RPM mode.
       const firstEntry = !inOneRPMMode;
-      inOneRPMMode = true;
-      oneRPMCycles++;
-      skipKeys.clear();
-      if (!firstEntry) await abortableSleep(1000, abortSignal);
-      lastRequestTime = 0;
+      if (firstEntry) {
+        lastRequestTime = 0;
+      } else {
+        if (upstreamAttempts > 0) lastRequestTime = Date.now();
+        await abortableSleep(1000, abortSignal);
+      }
       publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: 'All models exhausted', at: Date.now() });
-      console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? `/${globalRetryMax}` : '/∞'})`);
+      console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? '/' + globalRetryMax : '/∞'})`);
       continue;
     }
-
     const modelKey = `${route.platform}:${route.modelId}`;
     if (prevModelKey && prevModelKey !== modelKey && !isPinned) {
       publish({ type: 'routing.model_switch', id: requestId, from: prevModelKey, to: modelKey, reason: 'auto-routing fallback', at: Date.now() });
+    } else if (prevKeyId !== undefined && prevKeyId !== route.keyId) {
+      // Same model, different key — the proxy just rotated to a sibling key
+      // because the previous one exhausted (or hit its pre-filter fallback).
+      // Surfaces in the live terminal so the user can see "this request is
+      // being retried on the next key" instead of inferring it from a gap
+      // between two retry/exhaust events. (#256)
+      publish({ type: 'routing.key_switch', id: requestId, provider: route.platform, model: route.modelId, fromKeyId: prevKeyId, toKeyId: route.keyId, at: Date.now() });
     }
     prevModelKey = modelKey;
+    prevKeyId = route.keyId;
     let outboundMessages = messages;
     // Extra input tokens the injected handoff adds on this turn (0 when not
     // injected). Folded into the streaming success accounting, where token
