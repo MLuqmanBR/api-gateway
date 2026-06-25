@@ -87,6 +87,7 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
       // Reserved for future per-token live delta; render as info so a
       // producer can be enabled without further client changes.
       return { id: e.id, ts, kind: 'info', text: `${e.text.length > 80 ? e.text.slice(0, 80) + '\u2026' : e.text}` };
+    case 'health.check.start':
     case 'health.check.progress':
     case 'health.check.done':
       // Health-check progress events are owned by the KeysPage progress

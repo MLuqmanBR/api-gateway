@@ -944,6 +944,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       }
       // All models exhausted — enter 1 RPM mode.
       const firstEntry = !inOneRPMMode;
+      inOneRPMMode = true;
+      oneRPMCycles++;
+      skipKeys.clear();
       if (firstEntry) {
         lastRequestTime = 0;
       } else {
@@ -951,7 +954,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         await abortableSleep(1000, abortSignal);
       }
       publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: 'All models exhausted', at: Date.now() });
-      console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? '/' + globalRetryMax : '/∞'})`);
+      console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? '/' + globalRetryMax : '/\u221E'})`);
       continue;
     }
     const modelKey = `${route.platform}:${route.modelId}`;
