@@ -4,7 +4,16 @@ import { decrypt } from '../lib/crypto.js';
 import { publish, type LiveEvent } from './events.js';
 import type { KeyStatus } from '@api-gateway/shared/types.js';
 
-const CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const DEFAULT_CHECK_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+// Read interval from env var to allow operators to disable or stretch the
+// health-cycle window. Validating 90+ keys every few minutes can saturate
+// upstream provider rate limits, making every chat request look broken
+// while the health checker is the cause. Set HEALTH_CHECK_INTERVAL_MS to
+// a large number (e.g. 999999999) to effectively disable the checker.
+const CHECK_INTERVAL_MS = Math.max(
+  60_000,
+  parseInt(process.env.HEALTH_CHECK_INTERVAL_MS ?? '', 10) || DEFAULT_CHECK_INTERVAL_MS,
+);
 const CONSECUTIVE_FAILURES_TO_DISABLE = 3;
 
 // Track consecutive failures per key

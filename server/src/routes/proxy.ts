@@ -759,21 +759,33 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
   } else if (requestedModel) {
     const db = getDb();
+    // Strip the `api-gateway/` extension prefix when present. The
+    // additional-providers-extension prefixes every model id with its
+    // provider-name ("api-gateway/...") so OMP's resolver doesn't pick a
+    // native provider that happens to share the same underlying model
+    // (deepseek, nvidia, huggingface, etc. all have native baked-in
+    // support). Once the prefix is stripped, the rest of the string is
+    // the actual routing id we want to look up.
+    const EXTENSION_PREFIX = 'api-gateway/';
+    let workingModel = requestedModel;
+    if (workingModel.startsWith(EXTENSION_PREFIX)) {
+      workingModel = workingModel.slice(EXTENSION_PREFIX.length);
+    }
     // Parse platform/model_id format: the first '/' separates the platform
     // from the provider-qualified model_id (e.g. nvidia/moonshotai/kimi-k2.6).
     // Falls back to bare model_id lookup for backward compatibility.
-    const slashIdx = requestedModel.indexOf('/');
+    const slashIdx = workingModel.indexOf('/');
     let enabled: { id: number } | undefined;
     if (slashIdx > 0) {
-      const platform = requestedModel.slice(0, slashIdx);
-      const modelId = requestedModel.slice(slashIdx + 1);
+      const platform = workingModel.slice(0, slashIdx);
+      const modelId = workingModel.slice(slashIdx + 1);
       enabled = db.prepare(
         'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1'
       ).get(platform, modelId) as { id: number } | undefined;
     }
     // Fallback: look up by model_id alone (backward compat for old clients).
     if (!enabled) {
-      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModel) as { id: number } | undefined;
+      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(workingModel) as { id: number } | undefined;
     }
     if (enabled) {
       preferredModel = enabled.id;
