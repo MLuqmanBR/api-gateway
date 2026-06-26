@@ -1128,13 +1128,25 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
             normalizeOutboundContent(chunk);
             let text = typeof choice.delta?.content === 'string' ? choice.delta.content : '';
+            // Native reasoning_content: some models (DeepSeek v4 Pro, etc.) emit
+            // reasoning in a dedicated delta key rather than in-band `` tags.
+            // Forward it as a reasoning_content chunk immediately so the client
+            // sees the thinking stream, then check for visible content normally.
+            const reasoningText = typeof choice.delta?.reasoning_content === 'string' ? choice.delta.reasoning_content : '';
+            if (reasoningText.length > 0) {
+              flushHeaders();
+              writeChunk(mkChunk({ reasoning_content: reasoningText }, null));
+            }
             if (text.length === 0) {
               // Role preamble / keep-alive: hold until first payload decides
               // the mode, forward afterwards. tool_calls and finish_reason are
               // stripped — both are re-emitted complete at the end (OpenRouter
               // attaches tool_call deltas to chunks that also carry role/
               // reasoning keys; forwarding them raw would duplicate the call).
-              if (choice.delta && Object.keys(choice.delta).some(k => k !== 'content' && k !== 'tool_calls' && choice.delta[k] != null)) {
+              // Skip if we just forwarded native reasoning_content above — the
+              // delta may still carry role/reasoning_content keys that would
+              // otherwise be queued as preamble.
+              if (choice.delta && Object.keys(choice.delta).some(k => k !== 'content' && k !== 'tool_calls' && k !== 'reasoning_content' && choice.delta[k] != null)) {
                 const cleaned = { ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] };
                 if (headerSent) writeChunk(cleaned); else preamble.push(cleaned);
               }
