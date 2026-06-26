@@ -59,7 +59,7 @@ export class CloudflareProvider extends BaseProvider {
         ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
         ...(options?.thinking ? { thinking: options.thinking } : {}),
       }),
-    }, 60000, options?.abortSignal);
+    }, 120000, options?.abortSignal);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -100,7 +100,7 @@ export class CloudflareProvider extends BaseProvider {
         ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
         ...(options?.thinking ? { thinking: options.thinking } : {}),
       }),
-    }, 60000, options?.abortSignal);
+    }, 120000, options?.abortSignal);
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
