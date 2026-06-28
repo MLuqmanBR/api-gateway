@@ -13,6 +13,7 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     SELECT m.*, fc.priority, fc.enabled as fallback_enabled
     FROM models m
     LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+    WHERE m.enabled = 1
     ORDER BY COALESCE(fc.priority, m.intelligence_rank) ASC
   `).all() as any[];
 
