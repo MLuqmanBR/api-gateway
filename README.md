@@ -155,9 +155,8 @@ cd api-gateway
 npm install
 cp .env.example .env
 
-# Generate an encryption key for at-rest key storage
-ENCRYPTION_KEY="$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
-printf "ENCRYPTION_KEY=%s\nPORT=3001\n" "$ENCRYPTION_KEY" > .env
+# Replace the placeholder encryption key with a real one
+node -e "const c=require('crypto');const k=c.randomBytes(32).toString('hex');const fs=require('fs');let e=fs.readFileSync('.env','utf8');e=e.replace('ENCRYPTION_KEY=your-64-char-hex-key-here','ENCRYPTION_KEY='+k);fs.writeFileSync('.env',e);console.log('ENCRYPTION_KEY set to '+k)"
 
 npm run dev
 ```
@@ -166,14 +165,32 @@ Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Ke
 
 > **Reaching the dev UI from another device on your LAN?** Use `npm run dev:lan` — it passes `--host` through to Vite, which then prints a `Network: http://<your-ip>:5173` URL you can open from a phone or another machine. (Plain `npm run dev -- --host` does *not* work here: the root `dev` script is a `concurrently` wrapper, so the flag never reaches Vite.) API calls go through Vite's dev proxy, so no extra server config is needed.
 
-For a production build:
+For a production-like run (server + dashboard both served on `:3001`):
 
 ```bash
 npm run build
-node server/dist/index.js     # server + dashboard both served on :3001
+node server/dist/index.js
 ```
 
-`ENCRYPTION_KEY` is required for startup. The server only falls back to a database-stored development key when `DEV_MODE=true` and `NODE_ENV` is not `production`; do not use that fallback with real provider keys.
+### CLI (`api` command)
+
+API-Gateway ships a CLI for managing the server as a background process:
+
+```bash
+# Make the `api` command available in your shell:
+npm link
+
+# Start/stop/restart the server in the background:
+api start
+api stop
+api restart
+api status
+api logs
+```
+
+The CLI auto-builds on `api start` if the build is missing, reads the port from `.env`, and rotates the server log (capped at 50 MiB with 3 archived copies). For a full command list run `api help`.
+
+`ENCRYPTION_KEY` is required for startup. The server only falls back to a database-stored development key when `NODE_ENV` is not `production`; do not use that fallback with real provider keys.
 
 Request analytics are retained for 90 days or 100000 request rows by default, whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or `REQUEST_ANALYTICS_MAX_ROWS=0` in `.env` to disable either retention limit.
 
@@ -500,7 +517,7 @@ Contributors very welcome! Good first PRs:
 ```bash
 npm install
 npm run dev      # server on :3001, dashboard on :5173, both with HMR
-npm test         # server vitest; also runs client tests if the workspace adds them
+npm test         # server vitest + client typecheck (tsc --noEmit)
 npm run build    # compile server and dashboard
 ```
 
