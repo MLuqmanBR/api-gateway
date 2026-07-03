@@ -216,6 +216,7 @@ export function geminiThinkingConfig(
 export type OpenAiCompatThinkingPolicy =
   | 'reasoning_effort_only'   // default — emit reasoning_effort verbatim
   | 'glm_mapped'              // GLM — map effort to GLM's narrow enum, drop the rich object
+  | 'glm_nvidia'              // GLM on NVIDIA NIM — needs chat_template_kwargs.enable_thinking; accepts full effort range
   | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only);
 
 // Legacy alias kept for clarity in comments; 'none' is now 'glm_mapped' because
@@ -248,14 +249,33 @@ export function isGlmModel(modelId: string): boolean {
   return /(^|\/)glm[-_.]?[45]([-_.]|$)/.test(m);
 }
 
+/** True for GLM 5.2 served on NVIDIA NIM (`nvidia` + `z-ai/glm-5.2`). This
+ *  host+model pair is special: unlike GLM's own OpenAI-compat wrapper (which
+ *  the `glm_mapped` policy handles), NVIDIA's GLM 5.2 endpoint ignores a bare
+ *  `reasoning_effort` — thinking stays OFF unless the request also carries
+ *  `chat_template_kwargs.enable_thinking: true`. It also accepts the FULL
+ *  effort range (`minimal`…`max`, all HTTP 200), so the narrow GLM enum-clamp
+ *  must not apply. Confirmed live against `z-ai/glm-5.2` on NVIDIA NIM (all six
+ *  effort levels return a populated `reasoning_content`; `reasoning_effort`
+ *  alone returns none). Scoped to 5.2 — GLM 5.1 on NVIDIA keeps `glm_mapped`. */
+export function isGlmNvidiaThinkingModel(platform: string, modelId?: string): boolean {
+  if (platform !== 'nvidia' || !modelId) return false;
+  // Match `glm-5.2` (any separator / org prefix / case), e.g. `z-ai/glm-5.2`.
+  return /(^|\/)glm[-_.]?5[-_.]?2([-_.]|$)/.test(modelId.toLowerCase());
+}
+
 /** Resolve the thinking-field policy for an OpenAI-compat host. `platform`
- *  is the provider slug; `modelId` is the model being called. A GLM host OR
- *  GLM model gets `'glm_mapped'` (GLM accepts a narrow `reasoning_effort`
- *  enum but rejects the rich `thinking` object); everyone else gets the safe
- *  `reasoning_effort_only` default so future providers never trigger a
- *  literal_error from an unverified rich `thinking` object. Promote a host to
- *  `'both'` only after live confirmation. */
+ *  is the provider slug; `modelId` is the model being called. GLM 5.2 on
+ *  NVIDIA NIM gets `'glm_nvidia'` (needs `chat_template_kwargs.enable_thinking`
+ *  and accepts the full effort range) — checked first so it wins over the
+ *  generic GLM handling. Any other GLM host OR GLM model gets `'glm_mapped'`
+ *  (GLM accepts a narrow `reasoning_effort` enum but rejects the rich
+ *  `thinking` object); everyone else gets the safe `reasoning_effort_only`
+ *  default so future providers never trigger a literal_error from an unverified
+ *  rich `thinking` object. Promote a host to `'both'` only after live
+ *  confirmation. */
 export function openAiCompatThinkingPolicy(platform: string, modelId?: string): OpenAiCompatThinkingPolicy {
+  if (isGlmNvidiaThinkingModel(platform, modelId)) return 'glm_nvidia';
   if (GLM_HOST_PLATFORMS.has(platform)) return 'glm_mapped';
   if (modelId && isGlmModel(modelId)) return 'glm_mapped';
   return 'reasoning_effort_only';
@@ -290,6 +310,11 @@ function mapGlmEffort(effort: ThinkingEffort): 'low' | 'medium' | 'high' {
  *    forwarded here — that's the field that triggers literal_errors.
  *  - `both`: forward `reasoning_effort` and `thinking` verbatim (only for
  *    hosts verified to accept the rich object).
+ *  - `glm_nvidia`: GLM 5.2 on NVIDIA NIM — emit the
+ *    `chat_template_kwargs.enable_thinking` switch that actually turns thinking
+ *    on (a bare `reasoning_effort` is ignored), plus the effort verbatim across
+ *    the full range. The rich `thinking` object is not forwarded (unverified on
+ *    this host); its effort is extracted.
  *
  *  (#292 — previously the live path forwarded both verbatim unconditionally;
  *  this helper was defined but never imported, i.e. dead code.) */
@@ -312,6 +337,27 @@ export function openaiCompatThinkingBody(
   // back to `thinking.effort` so a client that only sent a `thinking` object
   // still has its level honored.
   const effort = original?.reasoning_effort ?? original?.thinking?.effort;
+
+  if (policy === 'glm_nvidia') {
+    // NVIDIA's GLM 5.2 ignores a bare `reasoning_effort` — thinking stays OFF
+    // unless the request carries `chat_template_kwargs.enable_thinking: true`.
+    // It accepts the full effort range (`minimal`…`max`) verbatim, so no clamp.
+    // `clear_thinking: false` mirrors NVIDIA's documented sample. Confirmed
+    // live against `z-ai/glm-5.2`. (#292)
+    if (original?.thinking?.type === 'disabled') {
+      // Honor an explicit disable — turn the switch off, send no effort.
+      out.chat_template_kwargs = { enable_thinking: false, clear_thinking: false };
+      return out;
+    }
+    // Enable when the caller asked for thinking (an effort level OR any
+    // thinking object). With nothing requested, send nothing and let the model
+    // use its default (thinking off).
+    const requested = effort !== undefined || original?.thinking !== undefined;
+    if (!requested) return out;
+    out.chat_template_kwargs = { enable_thinking: true, clear_thinking: false };
+    if (effort) out.reasoning_effort = effort;
+    return out;
+  }
 
   if (policy === 'glm_mapped') {
     // GLM accepts ONLY `reasoning_effort` in {none,low,medium,high} and rejects

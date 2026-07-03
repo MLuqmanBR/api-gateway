@@ -6,6 +6,7 @@ import {
   openaiCompatThinkingBody,
   openAiCompatThinkingPolicy,
   isGlmModel,
+  isGlmNvidiaThinkingModel,
 } from '../../lib/thinking.js';
 
 // `thinking` is the unified inbound knob. The translators here emit wire-
@@ -122,6 +123,33 @@ describe('openAiCompatThinkingPolicy', () => {
     expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.1')).toBe('glm_mapped');
     expect(openAiCompatThinkingPolicy('openrouter', 'zai-org/glm-5.1-fp8')).toBe('glm_mapped');
   });
+
+  it('returns "glm_nvidia" for GLM 5.2 on NVIDIA NIM (wins over glm_mapped) (#292)', () => {
+    // NVIDIA's GLM 5.2 needs chat_template_kwargs.enable_thinking and accepts
+    // the full effort range — distinct from GLM's own narrow-enum wrapper.
+    expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.2')).toBe('glm_nvidia');
+  });
+
+  it('keeps GLM 5.2 on non-NVIDIA hosts on "glm_mapped" (the NVIDIA quirk is host-specific)', () => {
+    expect(openAiCompatThinkingPolicy('openrouter', 'z-ai/glm-5.2')).toBe('glm_mapped');
+    // GLM 5.1 on NVIDIA is unchanged — still the narrow-enum path.
+    expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.1')).toBe('glm_mapped');
+  });
+});
+
+describe('isGlmNvidiaThinkingModel', () => {
+  it('matches GLM 5.2 on NVIDIA with any prefix/separator/case', () => {
+    expect(isGlmNvidiaThinkingModel('nvidia', 'z-ai/glm-5.2')).toBe(true);
+    expect(isGlmNvidiaThinkingModel('nvidia', 'GLM-5.2')).toBe(true);
+    expect(isGlmNvidiaThinkingModel('nvidia', 'zai-org/glm_5_2')).toBe(true);
+  });
+
+  it('is scoped to NVIDIA + GLM 5.2 only', () => {
+    expect(isGlmNvidiaThinkingModel('nvidia', 'z-ai/glm-5.1')).toBe(false); // wrong version
+    expect(isGlmNvidiaThinkingModel('openrouter', 'z-ai/glm-5.2')).toBe(false); // wrong host
+    expect(isGlmNvidiaThinkingModel('nvidia', undefined)).toBe(false); // no model
+    expect(isGlmNvidiaThinkingModel('nvidia', 'qwen/qwen3-coder-480b')).toBe(false); // non-GLM
+  });
 });
 
 describe('isGlmModel', () => {
@@ -190,5 +218,42 @@ describe('openaiCompatThinkingBody', () => {
 
   it('returns an empty object when no thinking info is present', () => {
     expect(openaiCompatThinkingBody('reasoning_effort_only', undefined)).toEqual({});
+  });
+
+  describe('glm_nvidia policy — GLM 5.2 on NVIDIA NIM (#292)', () => {
+    it('emits chat_template_kwargs.enable_thinking + the effort VERBATIM across the full range', () => {
+      // NVIDIA GLM 5.2 accepts minimal…max unchanged (no clamp) but only thinks
+      // when enable_thinking is set. Confirmed live against z-ai/glm-5.2.
+      for (const effort of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
+        expect(openaiCompatThinkingBody('glm_nvidia', { reasoning_effort: effort })).toEqual({
+          chat_template_kwargs: { enable_thinking: true, clear_thinking: false },
+          reasoning_effort: effort,
+        });
+      }
+    });
+
+    it('derives the effort from a rich thinking object (still not forwarded verbatim)', () => {
+      expect(openaiCompatThinkingBody('glm_nvidia', { thinking: { type: 'enabled', effort: 'high' } })).toEqual({
+        chat_template_kwargs: { enable_thinking: true, clear_thinking: false },
+        reasoning_effort: 'high',
+      });
+    });
+
+    it('enables thinking (no effort) when a thinking object is present without an effort level', () => {
+      expect(openaiCompatThinkingBody('glm_nvidia', { thinking: { type: 'enabled' } })).toEqual({
+        chat_template_kwargs: { enable_thinking: true, clear_thinking: false },
+      });
+    });
+
+    it('honors an explicit disable — turns enable_thinking off, sends no effort', () => {
+      expect(openaiCompatThinkingBody('glm_nvidia', { thinking: { type: 'disabled' } })).toEqual({
+        chat_template_kwargs: { enable_thinking: false, clear_thinking: false },
+      });
+    });
+
+    it('sends nothing when no thinking was requested (model default = off)', () => {
+      expect(openaiCompatThinkingBody('glm_nvidia', undefined)).toEqual({});
+      expect(openaiCompatThinkingBody('glm_nvidia', {})).toEqual({});
+    });
   });
 });

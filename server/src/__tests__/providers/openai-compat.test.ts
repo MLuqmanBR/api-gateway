@@ -131,6 +131,56 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
+  describe('GLM 5.2 on NVIDIA NIM thinking wiring (#292)', () => {
+    const nim = () => new OpenAICompatProvider({
+      platform: 'nvidia',
+      name: 'NVIDIA NIM',
+      baseUrl: 'https://integrate.api.nvidia.com/v1',
+      forceSingleToolCall: true,
+    });
+    const okResponse = {
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as any;
+
+    it('sends chat_template_kwargs.enable_thinking + verbatim effort for z-ai/glm-5.2', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.2', { reasoning_effort: 'max' });
+      // enable_thinking is the switch that actually turns reasoning on; the
+      // effort is forwarded unclamped (NVIDIA accepts the full range).
+      expect(body.chat_template_kwargs).toEqual({ enable_thinking: true, clear_thinking: false });
+      expect(body.reasoning_effort).toBe('max');
+    });
+
+    it('does NOT clamp minimal/xhigh the way the GLM-native (glm_mapped) path does', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.2', { reasoning_effort: 'minimal' });
+      expect(body.reasoning_effort).toBe('minimal');
+    });
+
+    it('omits thinking fields entirely when no effort/thinking is requested', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.2', {});
+      expect(body.chat_template_kwargs).toBeUndefined();
+      expect(body.reasoning_effort).toBeUndefined();
+    });
+
+    it('leaves GLM 5.1 on NVIDIA on the glm_mapped path (no chat_template_kwargs; effort clamped)', async () => {
+      let body: any = null;
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
+      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.1', { reasoning_effort: 'max' });
+      expect(body.chat_template_kwargs).toBeUndefined();
+      expect(body.reasoning_effort).toBe('high'); // max → high under glm_mapped
+    });
+  });
+
   it('should throw on error response', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: false,

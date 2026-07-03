@@ -179,7 +179,7 @@ function buildModelCapabilities(modelId: string, maxOutputTokens: number | null,
     || ml.includes('minimax-m3')                       // MiniMax M3 = thinking tier
     || ml.includes('minimax-m2')                       // MiniMax M2.x (m2.5/m2.7) = thinking tier (#292)
     || ml.includes('minimaxai/minimax-m')             // NVIDIA-style id `minimaxai/minimax-mN` — catch M2.x/M3 family (#292)
-    || ml === 'coding-glm-5.2-free'                     // aggregatord glm 5.2 free — exact-id match
+    || ml.includes('glm-5.2')                          // GLM 5.2 — reasoning tier on every host (incl. aggregatord coding-glm-5.2-free) (#292)
     || ml.includes('mimo-v');                            // Xiaomi MiMo family — reasoning-capable
 
   const modalities: { input: string[]; output: string[] } = {
@@ -1025,6 +1025,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       || routeModelIdLower.includes('minimax-m3')
       || routeModelIdLower.includes('minimax-m2')
       || routeModelIdLower.includes('minimaxai/minimax-m')
+      || routeModelIdLower.includes('glm-5.2')
       || routeModelIdLower.includes('mimo-v');
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
