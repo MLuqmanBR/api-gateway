@@ -250,6 +250,49 @@ describe('proxy stream turn-integrity', () => {
     expect(JSON.parse(call.function.arguments)).toEqual({ file_path: '/x' });
   });
 
+  it('never doubles native reasoning_content when the provider repeats role on every delta (NVIDIA GLM 5.2 shape)', async () => {
+    // NVIDIA NIM streams z-ai/glm-5.2 reasoning as native reasoning_content
+    // deltas that ALSO carry role:"assistant" on EVERY chunk. The proxy
+    // forwards the reasoning once, then the role-preamble block must NOT
+    // re-emit the raw delta (which still holds reasoning_content) — else every
+    // reasoning token is delivered twice ("11.  **.  **Analyze theAnalyze the…"
+    // observed live). CommandCode is the same bug but role only on chunk 1, so
+    // only the first token doubled ("TheThe ball costs…").
+    // Pin a seeded reasoning model; add its key locally so auto-routing for
+    // the other tests (which only mock api.groq.com) is unaffected.
+    const mistralKey = await request(app, '/api/keys',
+      { platform: 'mistral', key: 'ms_reasoning_dup', label: 't' },
+      { Authorization: `Bearer ${dashToken}` });
+    expect(mistralKey.status).toBe(201);
+    const rc = (s: string) => ({ id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { role: 'assistant', reasoning_content: s }, finish_reason: null }] });
+    mockUpstream([{
+      body: sse(
+        rc('Analyze '), rc('the '), rc('request'), rc('.'),
+        textChunk('The answer is 42.'),
+        finishChunk('stop'),
+        '[DONE]',
+      ),
+    }]);
+    const r = await request(app, '/v1/chat/completions', {
+      stream: true,
+      model: 'mistral/magistral-medium-latest',
+      messages: [{ role: 'user', content: 'reasoning duplication regression' }],
+    });
+    if (r.status !== 200) throw new Error(`unexpected status ${r.status}: ${r.text.slice(0, 300)}`);
+    const fs = frames(r.text);
+    const reasoning = fs.map(f => f.choices?.[0]?.delta?.reasoning_content).filter((s): s is string => typeof s === 'string');
+    // Each reasoning token appears exactly once, in order — no doubling.
+    expect(reasoning).toEqual(['Analyze ', 'the ', 'request', '.']);
+    expect(reasoning.join('')).toBe('Analyze the request.');
+    // No two consecutive reasoning frames are identical (the doubling signature).
+    const consecutiveDups = reasoning.filter((s, i) => i > 0 && s === reasoning[i - 1]).length;
+    expect(consecutiveDups).toBe(0);
+    // Visible content is delivered once and intact.
+    const content = fs.map(f => f.choices?.[0]?.delta?.content ?? '').join('');
+    expect(content).toBe('The answer is 42.');
+    expect(fs.map(f => f.choices?.[0]?.finish_reason).filter(Boolean)).toEqual(['stop']);
+  });
+
   it('streams ordinary text through unmodified, always ending in a terminal finish_reason', async () => {
     mockUpstream([
       { body: sse(roleChunk, textChunk('Hello'), textChunk(' world'), finishChunk('stop'), '[DONE]') },

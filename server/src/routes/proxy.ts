@@ -1158,11 +1158,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               // stripped — both are re-emitted complete at the end (OpenRouter
               // attaches tool_call deltas to chunks that also carry role/
               // reasoning keys; forwarding them raw would duplicate the call).
-              // Skip if we just forwarded native reasoning_content above — the
-              // delta may still carry role/reasoning_content keys that would
-              // otherwise be queued as preamble.
-              if (choice.delta && Object.keys(choice.delta).some(k => k !== 'content' && k !== 'tool_calls' && k !== 'reasoning_content' && choice.delta[k] != null)) {
-                const cleaned = { ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] };
+              //
+              // MUST skip when we just forwarded native reasoning_content above
+              // (reasoningText > 0): a reasoning-only chunk carries role +
+              // reasoning_content, and re-emitting the raw delta here duplicates
+              // every reasoning token — NVIDIA NIM repeats role:"assistant" on
+              // every delta (whole thinking stream doubled), CommandCode only on
+              // the first (first token doubled). The earlier key-check version
+              // dropped `reasoning_content` from the .some() test but still
+              // re-emitted the raw delta (which retained it) because `role` was
+              // present. Visible content is unaffected — content chunks have
+              // text.length > 0 and never reach this block.
+              if (reasoningText.length === 0 && choice.delta && Object.keys(choice.delta).some(k => k !== 'content' && k !== 'tool_calls' && k !== 'reasoning_content' && choice.delta[k] != null)) {
+                const cleaned = { ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined, reasoning_content: undefined }, finish_reason: null }] };
                 if (headerSent) writeChunk(cleaned); else preamble.push(cleaned);
               }
               continue;
@@ -1184,7 +1192,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
                 text = think.visible;
                 if (text.length === 0) continue;
               }
-              writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, content: text, tool_calls: undefined }, finish_reason: null }] });
+              // reasoning_content is stripped here: any reasoning on this chunk
+              // was already forwarded above (line ~1153), so leaving it in the
+              // spread would re-emit it if a provider ever packs content and
+              // reasoning_content into the same delta.
+              writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, content: text, tool_calls: undefined, reasoning_content: undefined }, finish_reason: null }] });
               continue;
             }
 
