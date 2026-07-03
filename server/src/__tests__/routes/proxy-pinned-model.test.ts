@@ -236,6 +236,60 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
     expect(fbHits).toEqual([]);
   });
 
+  it('does NOT rotate to a sibling key when a pinned model returns an in-band error (#295)', { timeout: 15000 }, async () => {
+    // The user's bug: NVIDIA NIM returns an in-band `Internal server error`
+    // frame for glm-5.2 on ~100k-token inputs while minimax-m3 on the SAME
+    // key succeeds — a model-specific large-prefill failure. The old code
+    // suppressed the skipImmediately skip for pinned models and retried the
+    // SAME model across ALL keys (3 keys × 3 retries = 9 upstream calls)
+    // then entered 1-RPM recovery and looped ("Recovery cycle 1/∞"),
+    // burning ~90s and every key's cooldown on a verdict that a different
+    // key can't change. Now a pinned in-band error fails fast with 502
+    // after the FIRST key's PER_KEY_RETRIES — the model itself can't handle
+    // the request, so rotating keys is pure waste.
+    const addKey2 = await request(app, 'POST', '/api/keys', {
+      platform: pinnedPlatform,
+      key: 'pinned-inband-failfast-key-2',
+      label: 'pinned-inband-2',
+    });
+    expect(addKey2.status).toBe(201);
+
+    const origFetch = global.fetch;
+    const calls: string[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      calls.push(urlStr);
+      if (urlStr.includes(fallbackPlatform)) {
+        return { ok: true, json: () => Promise.resolve({ id: 'x', choices: [{ message: { role: 'assistant', content: 'fb' }, finish_reason: 'stop' }] }) } as any;
+      }
+      if (urlStr.includes(pinnedPlatform)) {
+        // In-band error frame inside a 200 SSE stream — the model itself
+        // rejects the request (NVIDIA's "Internal server error" for glm-5.2).
+        return { ok: true, body: makeInBandErrorStream(pinnedDisplayName) } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: `${pinnedPlatform}/${pinnedModelName}`,
+      messages: [{ role: 'user', content: 'hi' }],
+      stream: false,
+    }, authHeaders());
+
+    // Pinned in-band error surfaces as 502 with the model's name.
+    expect(status).toBe(502);
+    expect(body?.error?.message).toMatch(new RegExp(pinnedDisplayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+    // CRUCIAL: only ONE key's worth of upstream calls happened (PER_KEY_RETRIES
+    // = 3 attempts on the first key). The second key must NOT be rotated to —
+    // a different key on the same model gets the same in-band verdict.
+    const pinnedCalls = calls.filter(u => u.includes(pinnedPlatform));
+    expect(pinnedCalls.length).toBeLessThanOrEqual(3);
+    // Fallback was never reached.
+    const fbHits = calls.filter(u => u.includes(fallbackPlatform));
+    expect(fbHits).toEqual([]);
+  });
+
   it('returns 429 after exhausting all keys on the pinned model on 403/404 (no model switch)', async () => {
     // Add a second key on the pinned platform so we can test key cycling:
     // PER_KEY_RETRIES=3 attempts on key 1 → markExhausted → key 2 → 3 attempts
@@ -291,7 +345,7 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
   });
 
 
-  it('publishes routing.key_switch when the proxy rotates to a sibling key on the same model (#256)', async () => {
+  it('publishes routing.key_switch when the proxy rotates to a sibling key on the same model (#256)', { timeout: 15000 }, async () => {
     // Live-terminal feedback gap: the proxy used to publish routing.key_retry
     // (same key) and routing.key_exhausted (key burnt out), but there was
     // NO event for the moment of rotation to a sibling key. Users had to

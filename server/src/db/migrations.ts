@@ -62,6 +62,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateQuirksV1(db);
   migrateModelsV32CommandCode(db);
   migrateModelsV33NvidiaMinimaxM3(db);
+  migrateModelsV34NvidiaSharedQuota(db);
 }
 
 function createTables(db: Database.Database) {
@@ -2475,4 +2476,32 @@ function migrateModelsV33NvidiaMinimaxM3(db: Database.Database) {
     }
   });
   tx();
+}
+// NVIDIA NIM enforces ONE shared 40 RPM budget across EVERY model under one key
+// (account-level per-minute limit, not per-model). The gateway's per-
+// (platform, model, key) rpm ledger in canMakeRequest can't see that — each model
+// row is accounted in isolation. Two consequences this migration fixes:
+//
+//   1. Manually-added nvidia rows (e.g. minimax-m3, id 5369 in some installs)
+//      were seeded with rpm_limit=NULL and so escaped the per-model gate
+//      entirely while sibling GLM/DeepSeek/Nemotron rows self-throttled at 40 —
+//      the "glm-5.2 exhausts all keys, minimax-m3 works on the same key"
+//      asymmetry (#295). Backfill them to 40 so the per-model floor is uniform.
+//   2. The authoritative shared cap now lives at the provider level so a provider-WIDE per-minute gate (canUseProviderMinute) can enforce it; seed
+//      built_in_provider_settings.nvidia.rpm_limit = 40 (the documented NIM rate)
+//      so it's visible/overridable in the dashboard and the provider-minute gate
+//      reads it as the cap source. Env var PROVIDER_MINUTE_REQUEST_CAP_NVIDIA overrides both.
+//
+// Idempotent — both UPDATEs are absolute SETs guarded by IS NULL, safe to re-run
+// every boot. Per-model rpm_limit stays as a defensive floor (the provider gate
+// runs first in the router and is the tighter constraint for the shared quota).
+function migrateModelsV34NvidiaSharedQuota(db: Database.Database) {
+  db.prepare(
+    `UPDATE models SET rpm_limit = 40
+       WHERE platform = 'nvidia' AND rpm_limit IS NULL AND enabled = 1`,
+  ).run();
+  db.prepare(
+    `UPDATE built_in_provider_settings SET rpm_limit = 40
+       WHERE platform = 'nvidia' AND rpm_limit IS NULL`,
+  ).run();
 }

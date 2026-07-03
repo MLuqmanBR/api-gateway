@@ -700,6 +700,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           isPaymentRequiredError(err),
           route.platform, route.modelId, route.keyId,
           { rpd: route.rpdLimit, tpd: route.tpdLimit },
+          err.retryAfterMs,
         ));
         recordRateLimitHit(route.modelDbId);
         lastError = err;

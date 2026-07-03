@@ -1462,16 +1462,62 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           || msg.includes('stream stalled')
           || msg.includes('unparseable inline tool-call dialect');
 
-        if (skipImmediately && !(isPinned && route.modelDbId === preferredModel)) {
+        if (skipImmediately) {
+          if (isPinned && route.modelDbId === preferredModel) {
+            // Pinned + dead-turn (in-band error / empty completion / stall /
+            // unparseable dialect): the model ITSELF can't handle this request
+            // — a different key on the same model will get the same verdict, so
+            // retrying across all keys (3 keys × 3 retries = 9 upstream calls)
+            // then entering 1-RPM recovery and looping is pure waste. Fall
+            // through to a sibling model is forbidden by the pin. Surface the
+            // model's error to the user as 502 so they can adjust the request
+            // or unpin — same shape as the non-retryable path below. Observed
+            // live (#295): NVIDIA NIM returns an in-band `Internal server error`
+            // frame for glm-5.2 on ~100k-token inputs while minimax-m3 on the
+            // SAME key succeeds — a model-specific large-prefill failure that
+            // the gateway must not pretend is a transient retryable condition.
+            const errorMsg = `Provider error (${route.displayName}): ${safeError}`;
+            publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
+            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+            if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
+            res.status(502).json({ error: { message: errorMsg, type: 'provider_error' } });
+            return;
+          }
+          // Non-pinned dead-turn: skip this model, try the next one in the
+          // chain (the key works — a different model on it may succeed).
           skipModels.add(route.modelDbId);
           continue outerLoop;
         }
 
         if (keyAttempt < PER_KEY_RETRIES - 1) {
-          // Transient limit: retry same key immediately.
+          // Genuine upstream rate-limit 429: don't retry same key immediately.
+          // The old behavior fired 3 real upstream calls (PER_KEY_RETRIES) in
+          // <1.5s on the SAME key with zero backoff — and that burst burns the
+          // real per-minute account budget NVIDIA NIM enforces across ALL its
+          // models under one key (40 RPM). One failing request then self-DoS'd
+          // 3 keys × 3 retries = 9 real upstream 429 calls in <1.5s, exhausting
+          // the shared bucket for the whole account and every sibling model.
+          // Now: back off before the retry — honor an upstream Retry-After
+          // (capped at one minute) else a short escalating sleep (1s, 2s). The
+          // abortableSleep yields on client disconnect so a dead request stops
+          // consuming budget. Transient transport errors (timeout, econnreset,
+          // 5xx) keep the immediate retry — they don't draw on a shared
+          // per-minute quota, so backoff only helps the genuine 429 path.
+          const is429 = err.status === 429
+            || msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
+            || msg.includes('resource_exhausted');
+          if (is429) {
+            const sleepMs = err.retryAfterMs != null
+              ? Math.min(err.retryAfterMs, 60_000)
+              : 1000 * (keyAttempt + 1); // 1s then 2s
+            publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
+            console.log(`[Proxy] ${safeError.slice(0, 300)} from ${route.displayName}, rate-limited — backing off ${sleepMs}ms then retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
+            await abortableSleep(sleepMs, abortSignal);
+          } else {
+            publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
+            console.log(`[Proxy] ${safeError.slice(0, 300)} from ${route.displayName}, retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
+          }
           lastError = err;
-          publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
-          console.log(`[Proxy] ${safeError.slice(0, 300)} from ${route.displayName}, retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
           continue keyRetry;
         }
         // Last retry attempt exhausted → fall through to key exhaustion.

@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
-import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider } from './ratelimit.js';
+import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider, canUseProviderMinute } from './ratelimit.js';
 import { isExhausted, getExhaustedKeysForModel } from './key-exhaustion.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
@@ -660,6 +660,16 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         // total requests/day across ALL their models for the account, not per
         // model — skip every model on this provider once that key hits the cap.
         if (!canUseProvider(entry.platform, key.id)) continue;
+
+        // Provider-wide per-minute cap (#295): same idea as the daily cap above,
+        // but per-minute. Providers like NVIDIA NIM enforce ONE 40 RPM budget
+        // shared across every model under one key (account-level, not per-model),
+        // so the per-(platform,model,key) rpm ledger can't see it — without this
+        // gate sibling models escape (glm-5.2 throttled at 40, a NULL-rpm_limit
+        // minimax-m3 row slips through with zero pre-throttle) and the gateway
+        // then eats real upstream 429s. Run BEFORE canMakeRequest: the
+        // provider-wide cap is the tighter constraint for account-shared quotas.
+        if (!canUseProviderMinute(entry.platform, key.id, estimatedTokens)) continue;
 
         if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) continue;
         if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) continue;

@@ -242,6 +242,150 @@ export function canUseProvider(platform: string, keyId: number, now = Date.now()
   if (cap === null) return true;
   return providerDailyRequestCount(platform, keyId, now) < cap;
 }
+// ── Provider-wide per-minute caps (#295) ──
+// Mirror of the provider-wide daily cap above, but per-minute. Some providers
+// enforce ONE per-minute request (and/or per-minute token) quota across the
+// WHOLE account, shared by every model — not per model. NVIDIA NIM is the
+// case in point: a single 40 RPM budget is drawn from by glm-5.1, glm-5.2,
+// minimax-m3, deepseek, nemotron, and every other nvidia model under one key.
+// The per-(platform,model,key) rpm/tpm ledger in canMakeRequest/canUseTokens
+// can't see that — each model row is accounted in isolation, so the gateway
+// happily allows (models × rpm) requests/min against a key and then eats real
+// upstream 429s. Without this provider-wide gate, a manually-added model row
+// with rpm_limit=NULL (e.g. minimax-m3 before the backfill) slips through with
+// zero pre-throttling while its sibling GLM rows self-throttle at 40 — exactly
+// the asymmetry that surfaced as "glm-5.2 exhausts all keys, minimax-m3 works
+// on the same key".
+//
+// Cap sources, in precedence order (mirroring the per-model ladder in
+// router.ts): env var > built_in_provider_settings.<platform>.rpm_limit /
+// tpm_limit > DEFAULT_PROVIDER_MINUTE_*_CAPS > null (uncapped).
+const DEFAULT_PROVIDER_MINUTE_REQUEST_CAPS: Record<string, number> = {
+  nvidia: 40,
+};
+const DEFAULT_PROVIDER_MINUTE_TOKEN_CAPS: Record<string, number> = {};
+
+/** Resolve the shared per-minute request cap for a provider account+key.
+ *  Returns null (uncapped) when no env var, DB row, or default applies. */
+export function getProviderMinuteRequestCap(platform: string): number | null {
+  const raw = process.env[`PROVIDER_MINUTE_REQUEST_CAP_${platform.toUpperCase()}`];
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n === 0 ? null : n;
+  }
+  const persisted = withDb(db => {
+    const row = db.prepare(
+      'SELECT rpm_limit FROM built_in_provider_settings WHERE platform = ?',
+    ).get(platform) as { rpm_limit: number | null } | undefined;
+    return row?.rpm_limit ?? undefined;
+  });
+  if (persisted !== undefined) return persisted;
+  return DEFAULT_PROVIDER_MINUTE_REQUEST_CAPS[platform] ?? null;
+}
+
+/** Resolve the shared per-minute token cap for a provider account+key. */
+export function getProviderMinuteTokenCap(platform: string): number | null {
+  const raw = process.env[`PROVIDER_MINUTE_TOKEN_CAP_${platform.toUpperCase()}`];
+  if (raw !== undefined && raw.trim() !== '') {
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) return n === 0 ? null : n;
+  }
+  const persisted = withDb(db => {
+    const row = db.prepare(
+      'SELECT tpm_limit FROM built_in_provider_settings WHERE platform = ?',
+    ).get(platform) as { tpm_limit: number | null } | undefined;
+    return row?.tpm_limit ?? undefined;
+  });
+  if (persisted !== undefined) return persisted;
+  return DEFAULT_PROVIDER_MINUTE_TOKEN_CAPS[platform] ?? null;
+}
+
+function countPersistedProviderMinuteRequests(
+  platform: string,
+  keyId: number,
+  now: number,
+): number | undefined {
+  return withDb(db => {
+    const row = db.prepare(`
+      SELECT COUNT(*) AS used
+        FROM rate_limit_usage
+       WHERE platform = ?
+         AND key_id = ?
+         AND kind = 'request'
+         AND created_at_ms > ?
+    `).get(platform, keyId, now - MINUTE) as { used: number };
+    return row.used;
+  });
+}
+
+function sumPersistedProviderMinuteTokens(
+  platform: string,
+  keyId: number,
+  now: number,
+): number | undefined {
+  return withDb(db => {
+    const row = db.prepare(`
+      SELECT COALESCE(SUM(tokens), 0) AS used
+        FROM rate_limit_usage
+       WHERE platform = ?
+         AND key_id = ?
+         AND kind = 'tokens'
+         AND created_at_ms > ?
+    `).get(platform, keyId, now - MINUTE) as { used: number };
+    return row.used;
+  });
+}
+
+// Total requests in the last minute for a provider account+key, summed across
+// every model — the account-shared per-minute usage the upstream actually sees.
+export function providerMinuteRequestCount(platform: string, keyId: number, now = Date.now()): number {
+  const persisted = countPersistedProviderMinuteRequests(platform, keyId, now);
+  if (persisted !== undefined) return persisted;
+  // DB-unavailable fallback: sum the per-model rpm windows for this platform+key.
+  let total = 0;
+  for (const [key, w] of windows) {
+    if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpm`)) {
+      total += pruneTimestamps(w.timestamps, MINUTE, now).length;
+    }
+  }
+  return total;
+}
+
+// Total tokens in the last minute for a provider account+key, summed across
+// every model.
+export function providerMinuteTokenCount(platform: string, keyId: number, now = Date.now()): number {
+  const persisted = sumPersistedProviderMinuteTokens(platform, keyId, now);
+  if (persisted !== undefined) return persisted;
+  let total = 0;
+  for (const [key, w] of windows) {
+    if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:tpm`)) {
+      for (const t of w.tokenTimestamps ?? []) {
+        if (t.ts > now - MINUTE) total += t.tokens;
+      }
+    }
+  }
+  return total;
+}
+
+// False when this provider account+key has hit its shared per-minute request OR
+// token cap, so the router skips every model on that provider for this key
+// until the minute window slides. Different keys on the same provider each
+// have their own account budget, so the router still rotates across keys.
+export function canUseProviderMinute(
+  platform: string,
+  keyId: number,
+  estimatedTokens: number,
+  now = Date.now(),
+): boolean {
+  const rpmCap = getProviderMinuteRequestCap(platform);
+  if (rpmCap !== null && providerMinuteRequestCount(platform, keyId, now) >= rpmCap) return false;
+  const tpmCap = getProviderMinuteTokenCap(platform);
+  if (tpmCap !== null) {
+    const used = providerMinuteTokenCount(platform, keyId, now);
+    if (used + estimatedTokens > tpmCap) return false;
+  }
+  return true;
+}
 
 export function recordRequest(platform: string, modelId: string, keyId: number) {
   const now = Date.now();
