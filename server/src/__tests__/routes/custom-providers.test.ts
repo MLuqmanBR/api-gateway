@@ -65,6 +65,35 @@ describe('Custom providers (#230)', () => {
     expect(body.baseUrl).toBe('http://localhost:1234/v1');
   });
 
+  it('appends /v1 to an OpenAI-compat baseUrl that has no version segment', async () => {
+    const { status, body } = await request(app, 'POST', '/api/custom-providers', {
+      slug: 'bare-host', displayName: 'Bare', baseUrl: 'https://api.bare.example',
+      apiFormat: 'openai',
+    });
+    expect(status).toBe(201);
+    expect(body.baseUrl).toBe('https://api.bare.example/v1');
+    const row = getDb().prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get('bare-host') as { base_url: string };
+    expect(row.base_url).toBe('https://api.bare.example/v1');
+  });
+
+  it('leaves a baseUrl with /api/v1 unchanged', async () => {
+    const { status, body } = await request(app, 'POST', '/api/custom-providers', {
+      slug: 'or-style', displayName: 'OR', baseUrl: 'https://openrouter.example/api/v1',
+      apiFormat: 'openai',
+    });
+    expect(status).toBe(201);
+    expect(body.baseUrl).toBe('https://openrouter.example/api/v1');
+  });
+
+  it('does NOT append /v1 to anthropic-format baseUrls', async () => {
+    const { status, body } = await request(app, 'POST', '/api/custom-providers', {
+      slug: 'anthro-ish', displayName: 'An', baseUrl: 'https://api.an.example',
+      apiFormat: 'anthropic',
+    });
+    expect(status).toBe(201);
+    expect(body.baseUrl).toBe('https://api.an.example');
+  });
+
   it('rejects an invalid slug (uppercase, leading dash, too short)', async () => {
     for (const slug of ['BadSlug', '-leading', 'a', 'with space', 'a'.repeat(40)]) {
       const { status, body } = await request(app, 'POST', '/api/custom-providers', {
@@ -139,6 +168,24 @@ describe('Custom providers (#230)', () => {
 
     const keyRow = getDb().prepare('SELECT base_url FROM api_keys WHERE platform = ?').get('edited') as any;
     expect(keyRow.base_url).toBe('http://new.example.com/v1');
+  });
+
+  it('PATCH appends /v1 to a bare OpenAI-compat baseUrl and syncs api_keys.base_url', async () => {
+    await request(app, 'POST', '/api/custom-providers', {
+      slug: 'patchbare', displayName: 'PB', baseUrl: 'https://pb.test/v1', apiFormat: 'openai',
+    });
+    const { encrypted, iv, authTag } = encrypt('test-key');
+    getDb().prepare(`INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
+      VALUES ('patchbare', 'k', ?, ?, ?, 'unknown', 1, 'https://pb.test/v1')`).run(encrypted, iv, authTag);
+
+    const { status } = await request(app, 'PATCH', '/api/custom-providers/patchbare', {
+      baseUrl: 'https://pb2.test',
+    });
+    expect(status).toBe(200);
+    const row = getDb().prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get('patchbare') as { base_url: string };
+    expect(row.base_url).toBe('https://pb2.test/v1');
+    const keyRow = getDb().prepare('SELECT base_url FROM api_keys WHERE platform = ?').get('patchbare') as { base_url: string };
+    expect(keyRow.base_url).toBe('https://pb2.test/v1');
   });
 
   it('DELETE /api/custom-providers/:slug cascades models + keys + fallback entries', async () => {

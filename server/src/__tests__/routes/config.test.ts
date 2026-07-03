@@ -941,6 +941,40 @@ describe('Config API', () => {
     expect(imp.body.sections.custom_providers?.skipped).toBe(1);
   });
 
+  it('import normalizes a bare-host OpenAI-compat base_url to /v1 (replace mode)', async () => {
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        customProviders: [{
+          slug: 'bareimport',
+          displayName: 'Bare Import',
+          baseUrl: 'https://api.bareimport.example',
+          rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
+          maxParallelRequests: null, archived: false, keyless: false,
+          apiFormat: 'openai',
+        }],
+      },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.custom_providers?.errors ?? []).toEqual([]);
+    const row = getDb().prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get('bareimport') as { base_url: string };
+    expect(row.base_url).toBe('https://api.bareimport.example/v1');
+    // Re-importing the same bare envelope is idempotent — row already normalized, so skipped.
+    const imp2 = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(imp2.status).toBe(200);
+    const row2 = getDb().prepare('SELECT base_url FROM custom_providers WHERE slug = ?').get('bareimport') as { base_url: string };
+    expect(row2.base_url).toBe('https://api.bareimport.example/v1');
+  });
+
   it('fallback chain entries for built-in models resolve and do NOT error', async () => {
     // Seed a built-in platform with a model + fallback entry. The
     // import envelope references the same model. The chain entry

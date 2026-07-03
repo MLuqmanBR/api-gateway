@@ -35,6 +35,7 @@ import {
   type ConfigSettings,
   type ConfigQuirk,
 } from '@api-gateway/shared';
+import { normalizeOpenAiBaseUrl } from '../base-url.js';
 import { configEnvelopeSchema, configImportOptionsSchema } from './schema.js';
 import { decryptKeysWithPassphrase } from './passphrase-crypto.js';
 
@@ -214,6 +215,9 @@ function applyCustomProviders(
     }
     db.prepare('DELETE FROM custom_providers').run();
   }
+  const normUrl = (cp: { apiFormat: string; baseUrl: string }): string =>
+    cp.apiFormat === 'anthropic' ? cp.baseUrl.trim().replace(/\/+$/, '')
+                                 : normalizeOpenAiBaseUrl(cp.baseUrl);
   for (const cp of list) {
     try {
       const existing = db.prepare(
@@ -238,7 +242,7 @@ function applyCustomProviders(
         };
         const identical =
           existing.display_name === cp.displayName &&
-          existing.base_url === cp.baseUrl &&
+        existing.base_url === normUrl(cp) &&
           sameAsRow(existing.rpm_limit, cp.rpmLimit) &&
           sameAsRow(existing.rpd_limit, cp.rpdLimit) &&
           sameAsRow(existing.tpm_limit, cp.tpmLimit) &&
@@ -259,7 +263,7 @@ function applyCustomProviders(
             max_parallel_requests = ?, archived = ?, keyless = ?, api_format = ?
           WHERE id = ?
         `).run(
-          cp.displayName, cp.baseUrl,
+          cp.displayName, normUrl(cp),
           cp.rpmLimit, cp.rpdLimit, cp.tpmLimit, cp.tpdLimit,
           cp.maxParallelRequests, nextArchived, nextKeyless, cp.apiFormat,
           existing.id,
@@ -280,7 +284,7 @@ function applyCustomProviders(
             max_parallel_requests, archived, keyless, api_format)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
-          slug, cp.displayName, cp.baseUrl,
+          slug, cp.displayName, normUrl(cp),
           cp.rpmLimit, cp.rpdLimit, cp.tpmLimit, cp.tpdLimit,
           cp.maxParallelRequests, cp.archived ? 1 : 0, cp.keyless ? 1 : 0, cp.apiFormat,
         );
@@ -448,6 +452,14 @@ function applyApiKeys(
   summary: Record<string, SectionDiff>,
 ): void {
   const diff = summary.api_keys ?? emptyDiff();
+  const fmtByPlatform = new Map<string, string>();
+  const fmtRow = db.prepare('SELECT slug, api_format FROM custom_providers').all() as Array<{ slug: string; api_format: string }>;
+  for (const r of fmtRow) fmtByPlatform.set(r.slug, r.api_format ?? 'openai');
+  const normKeyUrl = (platform: string, url: string | null | undefined): string | null => {
+    if (!url) return null;
+    if ((fmtByPlatform.get(platform) ?? 'openai') === 'anthropic') return url.trim().replace(/\/+$/, '');
+    return normalizeOpenAiBaseUrl(url);
+  };
   const inReplace = mode === 'replace';
   for (const k of list) {
     try {
@@ -470,7 +482,7 @@ function applyApiKeys(
         // import — that's a destructive operation that would silently
         // swap ciphertext on the user. Treat a no-op as skipped.
         const enabledNext = k.enabled ? 1 : 0;
-        const baseUrlNext = k.baseUrl ?? null;
+        const baseUrlNext = normKeyUrl(k.platform, k.baseUrl);
         if (existing.enabled === enabledNext && (existing.base_url ?? null) === baseUrlNext) {
           diff.skipped++;
           continue;
@@ -530,7 +542,7 @@ function applyApiKeys(
         db.prepare(`
           INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
           VALUES (?, ?, ?, ?, ?, 'unknown', ?, ?)
-        `).run(k.platform, k.label, encryptedKey, iv, authTag, k.enabled ? 1 : 0, k.baseUrl ?? null);
+        `).run(k.platform, k.label, encryptedKey, iv, authTag, k.enabled ? 1 : 0, normKeyUrl(k.platform, k.baseUrl));
         diff.added++;
       }
     } catch (err) {

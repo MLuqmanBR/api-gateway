@@ -5,6 +5,7 @@ import { getDb } from '../db/index.js';
 import { clearRateLimitPenalty } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor } from '../providers/index.js';
+import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 
 export const customRouter = Router();
 
@@ -235,7 +236,9 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
     return;
   }
   const { slug, displayName, rpmLimit, rpdLimit, tpmLimit, tpdLimit, maxParallelRequests, keyless, apiFormat = 'openai', stickySessionsEnabled } = parsed.data;
-  const baseUrl = parsed.data.baseUrl.trim().replace(/\/+$/, '');
+  const baseUrl = parsed.data.apiFormat === 'anthropic'
+    ? parsed.data.baseUrl.trim().replace(/\/+$/, '')
+    : normalizeOpenAiBaseUrl(parsed.data.baseUrl);
 
   if (BUILTIN_SLUGS.has(slug)) {
     res.status(400).json({ error: { message: `slug '${slug}' is reserved by a built-in platform` } });
@@ -348,7 +351,11 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     values.push(parsed.data.displayName.trim());
   }
   if (parsed.data.baseUrl !== undefined) {
-    const trimmed = parsed.data.baseUrl.trim().replace(/\/+$/, '');
+    const existingRow = db.prepare('SELECT api_format FROM custom_providers WHERE slug = ?').get(slug) as { api_format: string } | undefined;
+    const fmt = existingRow?.api_format ?? 'openai';
+    const trimmed = fmt === 'anthropic'
+      ? parsed.data.baseUrl.trim().replace(/\/+$/, '')
+      : normalizeOpenAiBaseUrl(parsed.data.baseUrl);
     updates.push('base_url = ?');
     values.push(trimmed);
     // Keep api_keys.base_url denormalized in sync so older code paths
