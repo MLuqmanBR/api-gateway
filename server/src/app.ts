@@ -71,6 +71,17 @@ export function createApp() {
   // The /v1 proxy keeps its own unified-API-key auth and is NOT gated here.
   app.use('/api/auth', authRouter);
 
+  // Health check — intentionally above the /api blanket below so it
+  // stays public (load balancers and monitoring poll it).
+  app.get('/api/ping', (_req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+  });
+
+  // Default-deny: every /api/* route is gated by requireAuth unless
+  // deliberately mounted above this blanket.  Existing per-router
+  // requireAuth args stay as harmless redundancy.
+  app.use('/api', requireAuth);
+
   // API routes — all admin endpoints sit behind requireAuth.
   app.use('/api/keys', requireAuth, keysRouter);
   app.use('/api/platforms', requireAuth, platformsRouter);
@@ -84,22 +95,14 @@ export function createApp() {
   // Configuration export/import (versioned JSON envelope). Dashboard-
   // only — there's no operational reason a /v1 caller needs this.
   app.use('/api/config', requireAuth, configRouter);
-  // Custom providers + their models. The router declares its own
-  // `/api/custom-providers` paths. We mount the router at root, but
-  // requireAuth only runs for matching paths via a conditional. This
-  // keeps `/api/ping` and `/api/auth/*` (intentionally public) free.
-  app.use((req, res, next) => {
-    if (!/^\/api\/(custom-providers|custom-models)(\/|$)/.test(req.url)) return next();
-    requireAuth(req, res, next);
-  }, customRouter);
+  // Custom providers + their models — gated by the /api blanket above.
+  app.use('/api/custom-providers', requireAuth);
+  app.use('/api/custom-models', requireAuth);
+  app.use(customRouter);
   app.use('/v1', createProxyRateLimiter());
   app.use('/v1', proxyRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
-  // Health check
-  app.get('/api/ping', (_req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
   // Error handler (for API routes)
   app.use(errorHandler);
 
