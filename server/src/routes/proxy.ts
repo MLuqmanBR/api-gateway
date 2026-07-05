@@ -1399,7 +1399,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
         }
 
-        const totalTokens = result.usage?.total_tokens ?? 0;
+        const estCompletionTokens = respMsg
+          ? Math.ceil((respText.length + (respMsg.tool_calls ?? []).reduce((n, tc) => n + tc.function.arguments.length, 0)) / 4)
+          : 0;
+        const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
+        const completionTokens = result.usage?.completion_tokens ?? estCompletionTokens;
+        const totalTokens = result.usage?.total_tokens ?? (promptTokens + completionTokens);
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
@@ -1426,11 +1431,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         logRequest(
           route.platform, route.modelId, route.keyId, 'success',
-          result.usage?.prompt_tokens ?? 0,
-          result.usage?.completion_tokens ?? 0,
+          promptTokens,
+          completionTokens,
           Date.now() - start, null, null, pinnedModelId,
         );
-        publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: result.usage?.prompt_tokens ?? 0, out: result.usage?.completion_tokens ?? 0 }, at: Date.now() });
+        publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: promptTokens, out: completionTokens }, at: Date.now() });
         clearExhausted(route.keyId, route.modelId);
         if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
         return;
