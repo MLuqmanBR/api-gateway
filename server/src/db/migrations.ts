@@ -2333,7 +2333,7 @@ function ensureUnifiedKey(db: Database.Database) {
   if (!existing) {
     const key = `api-gateway-${crypto.randomBytes(24).toString('hex')}`;
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
-    console.log(`\n  Your unified API key: ${key}\n`);
+    console.log(`\n  Unified API key generated — view or rotate it on the Keys page. (prefix: ${key.slice(0,10)}…)\n`);
   }
 }
 
