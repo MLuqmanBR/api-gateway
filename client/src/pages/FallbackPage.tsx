@@ -19,6 +19,7 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { ChevronDown, SlidersHorizontal, Pencil } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
+import { addToast } from '@/lib/toast'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -992,8 +993,7 @@ export default function FallbackPage() {
                     sliding up when there are unsaved changes and back down on save/discard. */}
                 <FloatingBar show={hasChanges}>
                   <span className="text-xs text-muted-foreground">Unsaved changes</span>
-                  <Button variant="outline" size="sm" onClick={handleDiscardAll}>Discard</Button>
-                  <Button size="sm" onClick={() => { setSavingAll(true); handleSaveAll().finally(() => setSavingAll(false)) }} disabled={savingAll}>
+                  <Button size="sm" onClick={() => { setSavingAll(true); handleSaveAll().then(saved => addToast({ kind: 'success', title: 'Saved', description: `${saved.join(', ')} updated` })).catch(err => addToast({ kind: 'warning', title: 'Save failed', description: (err as Error).message })).finally(() => setSavingAll(false)) }} disabled={savingAll}>
                     {savingAll ? 'Saving…' : 'Save changes'}
                   </Button>
                 </FloatingBar>
