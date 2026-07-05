@@ -246,27 +246,28 @@ export default function PlaygroundPage() {
     } finally {
       clearTimeout(timeoutId)
       abortRef.current = null
-      if (!mountedRef.current) return
-      setLoading(false)
-      // Final update with complete metadata
-      setMessages(prev => {
-        const copy = [...prev]
-        const last = copy[copy.length - 1]
-        if (last?.role === 'assistant') {
-          copy[copy.length - 1] = {
-            ...last,
-            content: content || '(empty response)',
-            meta: {
-              platform: routedPlatform || undefined,
-              model: routedModel || undefined,
-              latency: latency > 0 ? latency : undefined,
-              fallbackAttempts: fallbackCount > 0 ? fallbackCount : undefined,
-            },
+      if (mountedRef.current) {
+        setLoading(false)
+        // Final update with complete metadata
+        setMessages(prev => {
+          const copy = [...prev]
+          const last = copy[copy.length - 1]
+          if (last?.role === 'assistant') {
+            copy[copy.length - 1] = {
+              ...last,
+              content: content || '(empty response)',
+              meta: {
+                platform: routedPlatform || undefined,
+                model: routedModel || undefined,
+                latency: latency > 0 ? latency : undefined,
+                fallbackAttempts: fallbackCount > 0 ? fallbackCount : undefined,
+              },
+            }
           }
-        }
-        return copy
-      })
-      setTimeout(() => inputRef.current?.focus(), 0)
+          return copy
+        })
+        setTimeout(() => inputRef.current?.focus(), 0)
+      }
     }
   }, [input, loading, messages, keyData, selectedModel])
 

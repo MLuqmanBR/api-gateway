@@ -21,7 +21,7 @@ import { cn } from '@/lib/utils'
  * (~750 entries today) and `filter` is O(n) over strings of <100 chars
  * each, so debouncing would add complexity without buying anything.
  */
-const TOKEN_CHARS_RE = /[\s._/:+\-]+/g
+const TOKEN_CHARS_RE = /[\s._/:+-]+/g
 
 /** Lowercase + collapse every "skip" character to a space, then re-trim. */
 export function normalizeForSearch(s: string): string {

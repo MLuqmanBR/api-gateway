@@ -105,7 +105,7 @@ function UnifiedKeySection() {
   })
 
   const apiKey = data?.apiKey ?? ''
-  const masked = apiKey ? apiKey.slice(0, 13) + '•'.repeat(32) : '…'
+  const masked = apiKey ? apiKey.slice(0, 6) + '•'.repeat(32) : '…'
   const baseUrl = import.meta.env.DEV
     ? `http://${window.location.hostname}:${__SERVER_PORT__}/v1`
     : `${window.location.origin}/v1`

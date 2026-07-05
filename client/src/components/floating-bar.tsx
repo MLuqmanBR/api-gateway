@@ -4,16 +4,16 @@ import { useEffect, useState, type ReactNode } from 'react'
 // vanishing — slides back down before unmounting (kept in the tree for the
 // duration of the exit animation).
 export function FloatingBar({ show, children }: { show: boolean; children: ReactNode }) {
-  const [render, setRender] = useState(show)
+  const [exitAnimating, setExitAnimating] = useState(false)
   useEffect(() => {
-    if (show) {
-      setRender(true)
-      return
+    if (!show) {
+      const t = setTimeout(() => setExitAnimating(false), 300)
+      return () => clearTimeout(t)
     }
-    const t = setTimeout(() => setRender(false), 300) // match animation duration
-    return () => clearTimeout(t)
+    setExitAnimating(true)
   }, [show])
-  if (!render) return null
+  const shouldRender = show || exitAnimating
+  if (!shouldRender) return null
   return (
     <div
       className={`fixed inset-x-0 bottom-6 z-50 flex justify-center px-6 pointer-events-none duration-300 ${

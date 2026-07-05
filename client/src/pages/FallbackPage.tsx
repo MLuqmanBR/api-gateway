@@ -996,6 +996,7 @@ export default function FallbackPage() {
                   <Button size="sm" onClick={() => { setSavingAll(true); handleSaveAll().then(saved => addToast({ kind: 'success', title: 'Saved', description: `${saved.join(', ')} updated` })).catch(err => addToast({ kind: 'warning', title: 'Save failed', description: (err as Error).message })).finally(() => setSavingAll(false)) }} disabled={savingAll}>
                     {savingAll ? 'Saving…' : 'Save changes'}
                   </Button>
+                  <Button size="sm" variant="outline" onClick={handleDiscardAll}>Discard</Button>
                 </FloatingBar>
 
                 {unconfiguredPlatforms.length > 0 && (
