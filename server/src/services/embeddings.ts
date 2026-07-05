@@ -60,16 +60,19 @@ export function resolveFamily(model: string | undefined): string | null {
   return byModelId?.family ?? null;
 }
 
-function getPlatformKey(platform: string): string | null {
-  const row = getDb().prepare(
-    "SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY id LIMIT 1",
-  ).get(platform) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
-  if (!row) return null;
-  try {
-    return decrypt(row.encrypted_key, row.iv, row.auth_tag);
-  } catch {
-    return null;
+function getPlatformKeys(platform: string): string[] {
+  const rows = getDb().prepare(
+    "SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY id",
+  ).all(platform) as { encrypted_key: string; iv: string; auth_tag: string }[];
+  const keys: string[] = [];
+  for (const row of rows) {
+    try {
+      keys.push(decrypt(row.encrypted_key, row.iv, row.auth_tag));
+    } catch {
+      // skip undecryptable rows
+    }
   }
+  return keys;
 }
 
 // Rough token estimate when the provider doesn't report usage (~4 chars/token).
@@ -204,32 +207,33 @@ export async function runEmbeddings(model: string | undefined, inputs: string[])
   if (chain.length === 0) {
     throw new EmbeddingsError(`No enabled providers for embedding family '${family}'.`, 503);
   }
-
   let lastError: EmbeddingsError | null = null;
   for (const row of chain) {
-    const key = getPlatformKey(row.platform);
-    if (!key) continue; // no usable key for this provider — try the next one
-    const started = Date.now();
-    try {
-      const out = await callProvider(row, key, inputs);
-      if (out.vectors.length !== inputs.length || out.vectors.some(v => !Array.isArray(v) || v.length === 0)) {
-        throw new EmbeddingsError('upstream returned malformed embeddings', 502);
+    const keys = getPlatformKeys(row.platform);
+    if (keys.length === 0) continue; // no usable key for this provider — try the next one
+    for (const key of keys) {
+      const started = Date.now();
+      try {
+        const out = await callProvider(row, key, inputs);
+        if (out.vectors.length !== inputs.length || out.vectors.some(v => !Array.isArray(v) || v.length === 0 || v.length !== row.dimensions)) {
+          throw new EmbeddingsError('upstream returned malformed embeddings', 502);
+        }
+        const tokens = out.inputTokens ?? estimateTokens(inputs);
+        logEmbeddingRequest(row, 'success', tokens, Date.now() - started, null);
+        return {
+          family,
+          platform: row.platform,
+          modelId: row.model_id,
+          dimensions: out.vectors[0].length,
+          vectors: out.vectors,
+          inputTokens: tokens,
+        };
+      } catch (err: any) {
+        const e = err instanceof EmbeddingsError ? err : new EmbeddingsError(String(err?.message ?? err), 502);
+        logEmbeddingRequest(row, 'error', 0, Date.now() - started, e.message.slice(0, 300));
+        lastError = e;
+        // try the next key for this provider
       }
-      const tokens = out.inputTokens ?? estimateTokens(inputs);
-      logEmbeddingRequest(row, 'success', tokens, Date.now() - started, null);
-      return {
-        family,
-        platform: row.platform,
-        modelId: row.model_id,
-        dimensions: out.vectors[0].length,
-        vectors: out.vectors,
-        inputTokens: tokens,
-      };
-    } catch (err: any) {
-      const e = err instanceof EmbeddingsError ? err : new EmbeddingsError(String(err?.message ?? err), 502);
-      logEmbeddingRequest(row, 'error', 0, Date.now() - started, e.message.slice(0, 300));
-      lastError = e;
-      // fall through to the next provider in the family
     }
   }
 

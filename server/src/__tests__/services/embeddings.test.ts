@@ -133,7 +133,7 @@ describe('embeddings service', () => {
 
     it('splits cloudflare account_id:token keys', async () => {
       addKey('cloudflare', 'acct-123:cf-token-xyz');
-      const fetchMock = vi.fn(async () => okEmbeddingResponse(1024));
+      const fetchMock = vi.fn(async () => okEmbeddingResponse(768));
       globalThis.fetch = fetchMock as any;
 
       const result = await runEmbeddings('embeddinggemma-300m', ['hello']);
@@ -146,12 +146,12 @@ describe('embeddings service', () => {
     it('normalizes hugging face feature-extraction output', async () => {
       // bge-m3: cloudflare first (no key) → falls through to huggingface
       addKey('huggingface');
-      const fetchMock = vi.fn(async () => new Response(JSON.stringify([[0.1, 0.2, 0.3]]), { status: 200 }));
+      const fetchMock = vi.fn(async () => new Response(JSON.stringify([Array(1024).fill(0.1)]), { status: 200 }));
       globalThis.fetch = fetchMock as any;
 
       const result = await runEmbeddings('bge-m3', ['hello']);
       expect(result.platform).toBe('huggingface');
-      expect(result.dimensions).toBe(3);
+      expect(result.dimensions).toBe(1024);
       expect(String(fetchMock.mock.calls[0][0])).toContain('feature-extraction');
     });
 
