@@ -1498,6 +1498,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
           // Non-pinned dead-turn: skip this model, try the next one in the
           // chain (the key works — a different model on it may succeed).
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          recordRateLimitHit(route.modelDbId);
           skipModels.add(route.modelDbId);
           continue outerLoop;
         }
