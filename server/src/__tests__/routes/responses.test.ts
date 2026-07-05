@@ -66,18 +66,38 @@ describe('POST /v1/responses (#96)', () => {
   });
 
   // #103: the x-api-key header (Anthropic wire format) must authenticate here
-  // too, not just on /v1/chat/completions.
+  // too, not just on /v1/chat/completions. Seed a route so the handler doesn't
+  // crash with `route.release()` on undefined and produce a false-positive pass.
   it('accepts the unified key via the x-api-key header', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return {
+          id: 'x-api-key-test',
+          object: 'chat.completion',
+          created: 0,
+          model: 'fake-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'x-api-key authenticated' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }));
+
     const server = app.listen(0);
-    const addr = server.address() as any;
+    const addr = server.address() as { port: number };
     const res = await fetch(`http://127.0.0.1:${addr.port}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-api-key': key },
       body: JSON.stringify({ input: 'hi' }),
     });
     server.close();
-    // Auth passes (not 401); body validity / routing is covered elsewhere.
-    expect(res.status).not.toBe(401);
+
+    // Auth passes and the handler completes with a real response
+    expect(res.status).toBe(200);
+    expect(mockRouteRequest).toHaveBeenCalled();
+    const body = await res.json() as Record<string, unknown>;
+    expect(body.object).toBe('response');
+    expect(body.output_text).toBe('x-api-key authenticated');
   });
 
   it('non-stream: returns a completed Responses object with usage', async () => {
