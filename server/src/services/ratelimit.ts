@@ -202,13 +202,13 @@ export function getProviderDailyRequestCap(platform: string): number | null {
   return DEFAULT_PROVIDER_DAILY_REQUEST_CAPS[platform] ?? null;
 }
 
-function countPersistedProviderRequests(
-  platform: string,
-  keyId: number,
-  windowMs: number,
-  now: number,
-): number | undefined {
-  return withDb(db => {
+// Total requests today for a provider account+key, summed across every model.
+// Uses midnight-UTC epoch-ms for the cutoff so the gate resets at a fixed wall-clock
+// boundary matching real provider caps (OpenRouter ~1000/day, NVIDIA per-account),
+// rather than a sliding 24h window that benches providers past their true reset time.
+export function providerDailyRequestCount(platform: string, keyId: number, now = Date.now()): number {
+  const dayStartMs = new Date(now).setUTCHours(0, 0, 0, 0);
+  const persisted = withDb(db => {
     const row = db.prepare(`
       SELECT COUNT(*) AS used
         FROM rate_limit_usage
@@ -216,28 +216,23 @@ function countPersistedProviderRequests(
          AND key_id = ?
          AND kind = 'request'
          AND created_at_ms > ?
-    `).get(platform, keyId, now - windowMs) as { used: number };
+    `).get(platform, keyId, dayStartMs) as { used: number };
     return row.used;
   });
-}
-
-// Total requests today for a provider account+key, summed across every model.
-export function providerDailyRequestCount(platform: string, keyId: number, now = Date.now()): number {
-  const persisted = countPersistedProviderRequests(platform, keyId, DAY, now);
   if (persisted !== undefined) return persisted;
   // DB-unavailable fallback: sum the per-model rpd windows for this platform+key.
   // Window key format is "platform:modelId:keyId:rpd" (modelId may contain ':').
   let total = 0;
   for (const [key, w] of windows) {
     if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpd`)) {
-      total += pruneTimestamps(w.timestamps, DAY, now).length;
+      total += w.timestamps.filter(ts => ts > dayStartMs).length;
     }
   }
   return total;
 }
 
 // False when this provider account+key has hit its shared daily request cap, so
-// the router skips every model on that provider for this key until UTC-ish reset.
+// the router skips every model on that provider for this key until UTC midnight reset.
 export function canUseProvider(platform: string, keyId: number, now = Date.now()): boolean {
   const cap = getProviderDailyRequestCap(platform);
   if (cap === null) return true;
