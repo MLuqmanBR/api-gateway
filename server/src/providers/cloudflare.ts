@@ -39,6 +39,7 @@ export class CloudflareProvider extends BaseProvider {
     const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
 
     const res = await this.fetchWithTimeout(url, {
+      method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
