@@ -10,7 +10,7 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
-import { getUnifiedApiKey } from '../db/index.js';
+import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -326,7 +326,37 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+  // Resolve the requested model exactly as proxy.ts does: strip the
+  // api-gateway/ prefix, split on platform/model_id, fall back to
+  // bare-id DB lookup. Only overrides sticky when the client pinned.
+  let preferredModel: number | undefined;
+  if (reqData.model && reqData.model !== 'auto') {
+    const db = getDb();
+    const requestedModel = reqData.model;
+    const EXTENSION_PREFIX = 'api-gateway/';
+    let workingModel = requestedModel;
+    if (workingModel.startsWith(EXTENSION_PREFIX)) {
+      workingModel = workingModel.slice(EXTENSION_PREFIX.length);
+    }
+    const slashIdx = workingModel.indexOf('/');
+    let platform: string | undefined;
+    let modelId: string | undefined;
+    let enabled: { id: number } | undefined;
+    if (slashIdx > 0) {
+      platform = workingModel.slice(0, slashIdx);
+      modelId = workingModel.slice(slashIdx + 1);
+      enabled = db.prepare(
+        'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1'
+      ).get(platform, modelId) as { id: number } | undefined;
+    }
+    if (!enabled) {
+      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(workingModel) as { id: number } | undefined;
+    }
+    if (enabled) preferredModel = enabled.id;
+  }
+  if (!preferredModel) {
+    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+  }
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
   // endpoint) must stay on models that emit structured tool_calls — a model
