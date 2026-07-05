@@ -276,6 +276,54 @@ function weightsFor(strategy: RoutingStrategy): RoutingWeights | null {
 const WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const HALF_LIFE_DAYS = 2; // a 2-day-old request counts half as much as a fresh one
 const CACHE_TTL_MS = 60 * 1000;
+const PROVIDER_CONFIG_TTL_MS = 30 * 1000;
+
+interface ProviderConfig {
+  rpm_limit: number | null;
+  rpd_limit: number | null;
+  tpm_limit: number | null;
+  tpd_limit: number | null;
+  sticky_sessions_enabled: number;
+  max_parallel_requests: number | null;
+}
+
+let providerConfigCache: Map<string, ProviderConfig> | null = null;
+let providerConfigCacheTime = 0;
+
+/** Fetch platform-level config once per TTL window. Aggregates what were
+ *  4-6 separate db.prepare().get() calls per chain entry into one lookup. */
+function getProviderConfig(db: Database, platform: string): ProviderConfig {
+  if (!providerConfigCache || Date.now() - providerConfigCacheTime >= PROVIDER_CONFIG_TTL_MS) {
+    providerConfigCache = new Map();
+    providerConfigCacheTime = Date.now();
+  }
+  let cfg = providerConfigCache.get(platform);
+  if (cfg) return cfg;
+
+  const builtin = db.prepare(
+    'SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit, sticky_sessions_enabled FROM built_in_provider_settings WHERE platform = ?',
+  ).get(platform) as { rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; sticky_sessions_enabled: number | null } | undefined;
+
+  const custom = db.prepare(
+    'SELECT sticky_sessions_enabled, max_parallel_requests FROM custom_providers WHERE slug = ?',
+  ).get(platform) as { sticky_sessions_enabled: number | null; max_parallel_requests: number | null } | undefined;
+
+  cfg = {
+    rpm_limit: builtin?.rpm_limit ?? null,
+    rpd_limit: builtin?.rpd_limit ?? null,
+    tpm_limit: builtin?.tpm_limit ?? null,
+    tpd_limit: builtin?.tpd_limit ?? null,
+    sticky_sessions_enabled: custom?.sticky_sessions_enabled ?? builtin?.sticky_sessions_enabled ?? 0,
+    max_parallel_requests: custom?.max_parallel_requests ?? null,
+  };
+  providerConfigCache.set(platform, cfg);
+  return cfg;
+}
+
+/** Clear a specific platform from the config cache (called when a custom provider is deleted). */
+export function clearProviderConfigCache(platform: string): void {
+  providerConfigCache?.delete(platform);
+}
 
 interface ModelStats {
   successes: number;   // decay-weighted pseudo-count
@@ -553,18 +601,15 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     }
 
     // Get limits once for this model. Per-model row wins; if its limit is
-    // (e.g., tighter Groq limits) without editing every model row.
-    const platformDefaults = db.prepare(
-      `SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit
-         FROM built_in_provider_settings WHERE platform = ?`,
-    ).get(entry.platform) as
-      | { rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null }
-      | undefined;
+    // NULL, fall back to the platform-wide built_in_provider_settings default.
+    // Both are fetched from the provider config cache (one query per platform
+    // per 30s TTL instead of a separate db.prepare().get() per chain entry).
+    const platformCfg = getProviderConfig(db, entry.platform);
     const limits = {
-      rpm: entry.rpm_limit ?? platformDefaults?.rpm_limit ?? null,
-      rpd: entry.rpd_limit ?? platformDefaults?.rpd_limit ?? null,
-      tpm: entry.tpm_limit ?? platformDefaults?.tpm_limit ?? null,
-      tpd: entry.tpd_limit ?? platformDefaults?.tpd_limit ?? null,
+      rpm: entry.rpm_limit ?? platformCfg.rpm_limit ?? null,
+      rpd: entry.rpd_limit ?? platformCfg.rpd_limit ?? null,
+      tpm: entry.tpm_limit ?? platformCfg.tpm_limit ?? null,
+      tpd: entry.tpd_limit ?? platformCfg.tpd_limit ?? null,
     };
 
     // Try all keys for this model before giving up on it.
@@ -612,24 +657,10 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       const exhaustedIds = new Set(exhaustedOrder.map(e => e.keyId));
       keyOrder = keys.filter(k => !exhaustedIds.has(k.id));
     }
-
-    // Sticky key selection: when a custom provider enables sticky sessions,
-    // hash the session key to pick a deterministic key. This maximizes
-    // upstream KV-cache reuse for cache-heavy providers like LongCAT.
     // Sticky key selection: pick the same key per session for cache-heavy
-    // providers (LongCAT-style KV-cache reuse). Either source enables it:
-    // `custom_providers.sticky_sessions_enabled` for user-added OpenAI-compat
-    // gateways, or `built_in_provider_settings.sticky_sessions_enabled` for
-    // built-in providers like Groq/Cerebras.
-    const stickyCustom = db.prepare(
-      'SELECT sticky_sessions_enabled FROM custom_providers WHERE slug = ?',
-    ).get(entry.platform) as { sticky_sessions_enabled: number } | undefined;
-    const stickyBuiltin = db.prepare(
-      'SELECT sticky_sessions_enabled FROM built_in_provider_settings WHERE platform = ?',
-    ).get(entry.platform) as { sticky_sessions_enabled: number } | undefined;
-    const stickyEnabled =
-      stickyCustom?.sticky_sessions_enabled === 1 ||
-      stickyBuiltin?.sticky_sessions_enabled === 1;
+    // providers (LongCAT-style KV-cache reuse). The flag is read from the
+    // provider config cache (already fetched above for limits).
+    const stickyEnabled = platformCfg.sticky_sessions_enabled === 1;
 
     let idx: number;
     if (stickyEnabled && options?.stickySessionKey) {
@@ -685,11 +716,8 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       }
 
       // ── Parallel request gating (provider-level) ──
-      // Check if this provider has a concurrency cap and try to reserve a slot.
-      const cp = db.prepare(
-        'SELECT max_parallel_requests FROM custom_providers WHERE slug = ?'
-      ).get(entry.platform) as { max_parallel_requests: number | null } | undefined;
-      const maxPar = cp?.max_parallel_requests ?? null;
+      // max_parallel_requests from the provider config cache (fetched above).
+      const maxPar = platformCfg.max_parallel_requests;
       if (!tryReserveSlot(entry.platform, maxPar)) continue; // at capacity, try next model
       let decryptedKey: string;
       try {
@@ -742,10 +770,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         // and we don't want to re-hammer a key it just exhausted.
         if (skipKeys?.has(skipId)) continue;
         // Parallel request gating — same gate as the main pass.
-        const cp = db.prepare(
-          'SELECT max_parallel_requests FROM custom_providers WHERE slug = ?'
-        ).get(entry.platform) as { max_parallel_requests: number | null } | undefined;
-        const maxPar = cp?.max_parallel_requests ?? null;
+        const maxPar = platformCfg.max_parallel_requests;
         if (!tryReserveSlot(entry.platform, maxPar)) continue;
         let decryptedKey: string;
         try {

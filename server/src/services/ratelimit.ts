@@ -2,6 +2,7 @@
 
 import { getDb } from '../db/index.js';
 import { markKeyHealthyFromRequest } from './health.js';
+import { clearProviderConfigCache } from './router.js';
 
 interface Window {
   timestamps: number[];
@@ -607,4 +608,5 @@ export function clearPlatformCaches(platform: string): void {
   for (const key of windows.keys()) {
     if (key.startsWith(prefix)) windows.delete(key);
   }
+  clearProviderConfigCache(platform);
 }
