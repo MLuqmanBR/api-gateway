@@ -511,6 +511,12 @@ function applyApiKeys(
           encryptedKey = enc.encrypted;
           iv = enc.iv;
           authTag = enc.authTag;
+        } else if (k.key) {
+          // Plaintext key — re-encrypt under the destination's key.
+          const enc = encrypt(k.key);
+          encryptedKey = enc.encrypted;
+          iv = enc.iv;
+          authTag = enc.authTag;
         } else if (k.encryptedKey && k.iv && k.authTag) {
           // Pre-encrypted under the source's ENCRYPTION_KEY. Only safe when
           // the source and destination share a key. Probe with the
@@ -530,11 +536,6 @@ function applyApiKeys(
           encryptedKey = k.encryptedKey;
           iv = k.iv;
           authTag = k.authTag;
-        } else if (k.key) {
-          const enc = encrypt(k.key);
-          encryptedKey = enc.encrypted;
-          iv = enc.iv;
-          authTag = enc.authTag;
         } else {
           diff.errors.push(`${k.platform}/${k.label}: no key material provided`);
           continue;
