@@ -103,14 +103,14 @@ export default function AnalyticsPage() {
   })
   const actualSavings = summary?.estimatedCostSavings ?? 0
   const baseSavings = summary30?.estimatedCostSavings ?? 0
-  const spanDays = (() => {
+  const spanDays = useMemo(() => {
     if (!summary30?.firstRequestAt) return 30
     // SQLite stores UTC "YYYY-MM-DD HH:MM:SS"
     const first = new Date(summary30.firstRequestAt.replace(' ', 'T') + 'Z').getTime()
     const days = (Date.now() - first) / 86_400_000
     if (!Number.isFinite(days)) return 30
     return Math.min(Math.max(days, 1 / 24), 30)
-  })()
+  }, [summary30?.firstRequestAt])
   const extrapolated = spanDays < 29.5
   const savings30d = extrapolated ? baseSavings * (30 / spanDays) : baseSavings
   const rangeLabel = range === '24h' ? '24 hours' : range === '7d' ? '7 days' : '30 days'

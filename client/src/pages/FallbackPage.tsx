@@ -250,12 +250,12 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
   // height (column count — and so row count — depends on viewport width).
   const [expanded, setExpanded] = useState(false)
   const [collapsible, setCollapsible] = useState(false)
+  const [scrollH, setScrollH] = useState(0)
   const legendRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const el = legendRef.current
     if (!el) return
-    const check = () => setCollapsible(el.scrollHeight > LEGEND_COLLAPSED_PX + 1)
-    check()
+    const check = () => { setCollapsible(el.scrollHeight > LEGEND_COLLAPSED_PX + 1); setScrollH(el.scrollHeight); }
     const ro = new ResizeObserver(check)
     ro.observe(el)
     return () => ro.disconnect()
@@ -302,7 +302,7 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
       <div
         ref={legendRef}
         className="mt-4 overflow-hidden transition-[max-height] duration-300 ease-in-out"
-        style={collapsible ? { maxHeight: expanded ? legendRef.current?.scrollHeight : LEGEND_COLLAPSED_PX } : undefined}
+        style={collapsible ? { maxHeight: expanded ? scrollH : LEGEND_COLLAPSED_PX } : undefined}
       >
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-5 gap-y-1.5 text-xs tabular-nums">
           {modelsWithWidth.map((m, i) => (

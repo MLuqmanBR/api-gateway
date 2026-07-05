@@ -9,6 +9,7 @@ import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
 import { ModelSearchBox, matchesModelQuery, normalizeForSearch } from '@/components/model-search-box'
 
+import { addToast } from '@/lib/toast'
 interface ProviderEntry {
   id: number
   platform: string
@@ -69,6 +70,7 @@ export default function EmbeddingsPage() {
       setLocalFamilies(null)
       setLocalDefault(null)
     },
+    onError: (e: Error) => addToast({ kind: 'warning', title: 'Save failed', description: e.message }),
   })
 
   const families = localFamilies ?? data?.families ?? []
