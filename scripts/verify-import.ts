@@ -22,12 +22,16 @@ import { decrypt } from '../server/src/lib/crypto.ts';
 import { encryptKeysWithPassphrase } from '../server/src/lib/config/passphrase-crypto.ts';
 import type { ConfigEnvelope } from '../shared/types.ts';
 
-const USER_BACKUP_PATH = path.join(
-  os.homedir(),
-  'Downloads',
-  'API_Gateway-Backup-fully-functioning-2026-06-21-05-35-31.json',
-);
-const PASSPHRASE = 'Namqul@07';
+const USER_BACKUP_PATH = process.env.VERIFY_IMPORT_BACKUP
+  ? path.resolve(process.env.VERIFY_IMPORT_BACKUP)
+  : path.join(
+      os.homedir(),
+      'Downloads',
+      'API_Gateway-Backup-fully-functioning-2026-06-21-05-35-31.json',
+    );
+// Synthetic scenarios use a dummy passphrase (the data is generated in-memory).
+// The real passphrase env var is required only when a user backup file exists.
+const PASSPHRASE = process.env.VERIFY_IMPORT_PASSPHRASE || 'synthetic-test-only';
 
 interface Scenario {
   name: string;
@@ -205,9 +209,10 @@ async function main(): Promise<void> {
   const scenarios: Scenario[] = [buildKeysCipherEnvelopes(), buildMismatchEnvelopes()];
 
   if (fs.existsSync(USER_BACKUP_PATH)) {
+    if (!process.env.VERIFY_IMPORT_PASSPHRASE) {
+      process.exit(2);
+    }
     const userEnvelope = JSON.parse(fs.readFileSync(USER_BACKUP_PATH, 'utf8')) as ConfigEnvelope;
-    scenarios.unshift(buildUserBackupScenario(userEnvelope));
-    console.log('User backup file found:', USER_BACKUP_PATH);
   } else {
     console.log('User backup file NOT found at', USER_BACKUP_PATH, '— running synthetic scenarios only.');
   }
