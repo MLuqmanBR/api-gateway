@@ -330,6 +330,7 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     res.status(400).json({ error: { message: 'invalid slug' } });
     return;
   }
+  const oldSlug = slug;
 
   const parsed = updateProviderSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -397,35 +398,34 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
 
   if (parsed.data.slug !== undefined) {
     const newSlug = parsed.data.slug;
-    if (newSlug !== slug) {
-      // Check for conflict with an existing non-archived provider.
-      const conflict = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ? AND archived = 0').get(newSlug);
+    if (newSlug !== oldSlug) {
+      // Check for conflict with any existing provider including archived.
+      const conflict = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(newSlug);
       if (conflict) {
-        res.status(409).json({ error: { message: `slug '${newSlug}' is already in use by an active provider` } });
+        res.status(409).json({ error: { message: `slug '${newSlug}' is already in use` } });
         return;
       }
-      // Cascade the slug change to all dependent tables.
+      // Cascade the slug change to all dependent tables — all inside
+      // one transaction so the rename is atomic.
       const tx = db.transaction(() => {
-        updates.push('slug = ?');
-        values.push(newSlug);
-        db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, slug);
-        db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, slug);
-        db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, slug);
+        db.prepare('UPDATE custom_providers SET slug = ? WHERE slug = ?').run(newSlug, oldSlug);
+        db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
+        db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
+        db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
       });
       tx();
-      slug = newSlug;
     }
   }
 
-  if (updates.length === 0) {
-    res.json({ success: true, slug });
+  if (updates.length === 0 && parsed.data.slug === undefined) {
+    res.json({ success: true, slug: oldSlug });
     return;
   }
 
-  values.push(slug);
+  values.push(oldSlug);
   db.prepare(`UPDATE custom_providers SET ${updates.join(', ')} WHERE slug = ?`).run(...values);
 
-  res.json({ success: true, slug });
+  res.json({ success: true, slug: parsed.data.slug !== undefined ? parsed.data.slug : oldSlug });
 });
 // Analytics retains historical request data. Re-adding the same slug+bare_url
 // revives the provider from the archive.
