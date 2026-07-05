@@ -281,6 +281,22 @@ export abstract class BaseProvider {
           }
         }
       }
+
+      // Parse any terminal SSE line that lacked a trailing newline — some
+      // providers close the stream right after the last `data:` frame with
+      // no terminal \n\n, which would otherwise be dropped as truncated.
+      // (#33 — truncated SSE frame)
+      if (buffer.trim().startsWith('data:')) {
+        const data = buffer.trim().slice(5).trim();
+        if (data === '[DONE]') return;
+        try {
+          const chunk = JSON.parse(data) as ChatCompletionChunk;
+          if (chunk.choices?.some(c => c.finish_reason != null)) sawFinishReason = true;
+          yield chunk;
+        } catch {
+          // Skip malformed trailing frame
+        }
+      }
     } finally {
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       reader.cancel().catch(() => { /* upstream already gone */ });
