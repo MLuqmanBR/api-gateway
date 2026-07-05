@@ -1317,6 +1317,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
           return;
         } catch (streamErr: any) {
+          if (isAbortError(streamErr) || abortSignal.aborted) throw streamErr;
           if (headerSent) {
             // Mid-stream error after real payload reached the client — finish
             // the SSE response honestly instead of leaving the client hanging.
