@@ -718,7 +718,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // (reachable since empty-completion failover can burn every attempt after
   // streamStarted) — close the SSE stream with a failed event instead of
   // writing JSON onto a committed event-stream response.
-  const exhaustedMsg = `All models rate-limited after ${upstreamAttempts} attempt(s). Last: ${lastError?.message ?? 'unknown'}`;
+  const exhaustedMsg = `All models rate-limited after ${upstreamAttempts} attempt(s). Last: ${lastError ? sanitizeProviderErrorMessage(lastError.message) : 'unknown'}`;
   if (streamStarted) {
     sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: exhaustedMsg, type: 'rate_limit_error' } } });
     res.end();
