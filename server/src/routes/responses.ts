@@ -396,6 +396,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       return;
     }
 
+        let attemptEmitted = false; // per-attempt: true when real output emitted beyond the skeleton
     try {
       if (stream) {
         let outputIndex = 0;
@@ -414,6 +415,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         // Open the text output item and stream `text` as its first delta.
         const openTextItem = (text: string) => {
+          attemptEmitted = true;
           msgItemId = newId('msg');
           sse('response.output_item.added', {
             output_index: outputIndex,
@@ -516,12 +518,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
                 output_index: acc.outputIndex,
                 item: { id: acc.itemId, type: 'function_call', status: 'in_progress', call_id: acc.callId, name: acc.name, arguments: '' },
               });
+              attemptEmitted = true;
             }
             const argFrag = tc.function?.arguments ?? '';
             if (tc.function?.name && !acc.name) acc.name = tc.function.name;
             if (argFrag) {
               acc.args += argFrag;
               sse('response.function_call_arguments.delta', { item_id: acc.itemId, output_index: acc.outputIndex, delta: argFrag });
+              attemptEmitted = true;
             }
           }
         }
@@ -688,7 +692,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
-      if (stream && streamStarted) {
+      // The attempt must have actually emitted output, not just the skeleton.
+      if (stream && streamStarted && attemptEmitted) {
         sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } } });
         res.end();
         return;
