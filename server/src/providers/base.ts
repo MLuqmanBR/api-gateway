@@ -232,7 +232,14 @@ export abstract class BaseProvider {
     // read via the race below. (#292)
     if (abortSignal?.aborted) throw new RequestAbortError();
     let aborted = false;
-    const onAbort = () => { aborted = true; };
+    let rejectAbort: ((e: Error) => void) | undefined;
+    const abortPromise: Promise<never> | undefined = abortSignal
+      ? new Promise<never>((_, rej) => { rejectAbort = rej; })
+      : undefined;
+    const onAbort = () => {
+      aborted = true;
+      rejectAbort?.(new RequestAbortError());
+    };
     if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
 
     try {
@@ -247,11 +254,7 @@ export abstract class BaseProvider {
               inactivityTimeoutMs,
             );
           }),
-          // Resolve-reject pair: if the client aborts, this rejects first and
-          // the pending `reader.read()` is cancelled in `finally`. (#292)
-          ...(abortSignal ? [new Promise<never>((_, reject) => {
-            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
-          })] : []),
+          ...(abortPromise ? [abortPromise] : []),
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;

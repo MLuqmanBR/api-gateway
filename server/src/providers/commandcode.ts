@@ -542,11 +542,16 @@ export class CommandCodeProvider extends BaseProvider {
     const decoder = new TextDecoder();
     let buf = '';
 
-    // Client disconnect must interrupt a stalled/slow CommandCode stream
-    // immediately rather than waiting for the inactivity timer. (#292)
     if (abortSignal?.aborted) throw new RequestAbortError();
     let aborted = false;
-    const onAbort = () => { aborted = true; };
+    let rejectAbort: ((e: Error) => void) | undefined;
+    const abortPromise: Promise<never> | undefined = abortSignal
+      ? new Promise<never>((_, rej) => { rejectAbort = rej; })
+      : undefined;
+    const onAbort = () => {
+      aborted = true;
+      rejectAbort?.(new RequestAbortError());
+    };
     if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
 
     try {
@@ -558,10 +563,7 @@ export class CommandCodeProvider extends BaseProvider {
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => reject(new Error('CommandCode stream stalled')), STREAM_TIMEOUT_MS);
           }),
-          // A client abort rejects the pending read first. (#292)
-          ...(abortSignal ? [new Promise<never>((_, reject) => {
-            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
-          })] : []),
+          ...(abortPromise ? [abortPromise] : []),
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;

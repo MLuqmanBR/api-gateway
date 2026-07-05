@@ -526,7 +526,14 @@ export class AnthropicCompatProvider extends BaseProvider {
     // immediately rather than waiting for the inactivity timer. (#292)
     if (abortSignal?.aborted) throw new RequestAbortError();
     let aborted = false;
-    const onAbort = () => { aborted = true; };
+    let rejectAbort: ((e: Error) => void) | undefined;
+    const abortPromise: Promise<never> | undefined = abortSignal
+      ? new Promise<never>((_, rej) => { rejectAbort = rej; })
+      : undefined;
+    const onAbort = () => {
+      aborted = true;
+      rejectAbort?.(new RequestAbortError());
+    };
     if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
 
     const decoder = new TextDecoder();
@@ -575,10 +582,7 @@ export class AnthropicCompatProvider extends BaseProvider {
               STREAM_INACTIVITY_TIMEOUT_MS,
             );
           }),
-          // A client abort rejects the pending read first. (#292)
-          ...(abortSignal ? [new Promise<never>((_, reject) => {
-            abortSignal.addEventListener('abort', () => reject(new RequestAbortError()), { once: true });
-          })] : []),
+          ...(abortPromise ? [abortPromise] : []),
         ]).finally(() => clearTimeout(timer));
 
         const { done, value } = result;
