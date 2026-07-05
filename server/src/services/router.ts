@@ -702,7 +702,10 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       }
 
       // Build the release function so callers can decrement the slot.
-      const release = () => releaseSlot(entry.platform);
+      // Idempotent — safe to call multiple times (e.g., from both a
+      // per-iteration and outer finally).
+      let released = false;
+      const release = () => { if (released) return; released = true; releaseSlot(entry.platform); };
 
       return {
         provider: provider,
@@ -753,7 +756,8 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
           releaseSlot(entry.platform);
           continue;
         }
-        const release = () => releaseSlot(entry.platform);
+        let released = false;
+        const release = () => { if (released) return; released = true; releaseSlot(entry.platform); };
         return {
           provider: provider,
           modelId: entry.model_id,
