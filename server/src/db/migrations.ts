@@ -63,6 +63,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateModelsV32CommandCode(db);
   migrateModelsV33NvidiaMinimaxM3(db);
   migrateModelsV34NvidiaSharedQuota(db);
+  migrateSchemaV35RateLimitIndex(db);
 }
 
 function createTables(db: Database.Database) {
@@ -2504,4 +2505,12 @@ function migrateModelsV34NvidiaSharedQuota(db: Database.Database) {
     `UPDATE built_in_provider_settings SET rpm_limit = 40
        WHERE platform = 'nvidia' AND rpm_limit IS NULL`,
   ).run();
+}
+
+// ── V35: rate_limit_usage created_at index (2026-07) ──
+// The per-insert prune DELETE … WHERE created_at_ms <= ? does a full
+// table scan without an index on created_at_ms.  Add one so the hot-path
+// prune is O(log n) instead of O(n).  Idempotent — IF NOT EXISTS.
+function migrateSchemaV35RateLimitIndex(db: Database.Database) {
+  db.exec('CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_created ON rate_limit_usage(created_at_ms)');
 }
