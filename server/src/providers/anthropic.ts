@@ -532,7 +532,6 @@ export class AnthropicCompatProvider extends BaseProvider {
     const decoder = new TextDecoder();
     let buffer = '';
     let upstreamId: string | undefined;
-    let currentEvent: string | undefined;
     // Block type per index. Anthropic lets a message carry text, tool_use,
     // AND thinking blocks; we need to track each so the second- and third-
     // branch delta handlers dispatch correctly. (#290)
@@ -596,7 +595,7 @@ export class AnthropicCompatProvider extends BaseProvider {
         for (const rawEvent of events) {
           // Parse the event: / data: lines. Anthropic events are short
           // (~200B), so this is cheap.
-          let eventType = currentEvent;
+          let eventType: string | undefined;
           let dataLine: string | undefined;
           for (const line of rawEvent.split('\n')) {
             const trimmed = line.trimEnd();
@@ -606,7 +605,6 @@ export class AnthropicCompatProvider extends BaseProvider {
               dataLine = trimmed.slice(6);
             }
           }
-          currentEvent = undefined;
           if (!eventType || dataLine == null) continue;
 
           let payload: AnthropicStreamEvent;

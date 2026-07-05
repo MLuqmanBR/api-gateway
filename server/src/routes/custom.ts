@@ -49,6 +49,7 @@ const updateProviderSchema = z.object({
   stickySessionsEnabled: z.boolean().optional(),
 }).refine(d => d.displayName !== undefined || d.baseUrl !== undefined
   || d.slug !== undefined || d.tpmLimit !== undefined || d.tpdLimit !== undefined
+  || d.rpmLimit !== undefined || d.rpdLimit !== undefined
   || d.maxParallelRequests !== undefined || d.keyless !== undefined || d.apiFormat !== undefined
   || d.stickySessionsEnabled !== undefined, {
     message: `At least one of displayName, slug, baseUrl, stickySessionsEnabled, or limit must be provided`,
@@ -628,9 +629,9 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
   });
 });
 
-// Edit any subset of a custom model. Built-in catalog rows return 400 — they
-// have a separate migration path (server migrations) and should not be
-// mutated through this endpoint.
+
+// Edit any subset of a custom or built-in model. Built-ins are editable
+// through this endpoint per the doc at line 93-94.
 customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   const id = parseInt(req.params.id as string, 10);
   if (isNaN(id)) {
@@ -645,7 +646,7 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const existing = db.prepare('SELECT platform FROM models WHERE id = ?').get(id) as { platform: string } | undefined;
+  const existing = db.prepare('SELECT 1 FROM models WHERE id = ?').get(id) as { 1: number } | undefined;
   if (!existing) {
     res.status(404).json({ error: { message: 'model not found' } });
     return;

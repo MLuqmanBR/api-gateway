@@ -525,6 +525,7 @@ export class CommandCodeProvider extends BaseProvider {
         completion_tokens: outputTokens,
         total_tokens: inputTokens + outputTokens,
       },
+      _routed_via: { platform: this.platform, model: modelId },
     };
   }
 
@@ -635,6 +636,7 @@ export class CommandCodeProvider extends BaseProvider {
       }
       case 'tool-delta': {
         const prevIdx = getIdx() - 1;
+        if (prevIdx < 0) return null;
         const delta: StreamingDelta = { tool_calls: [{ index: prevIdx, function: { arguments: event.text } }] };
         return this.buildChunk(id, created, modelId, delta, null);
       }

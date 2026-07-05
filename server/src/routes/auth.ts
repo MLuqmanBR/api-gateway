@@ -42,6 +42,22 @@ function recordFailure(email: string): void {
     a.count = 0;
   }
   attempts.set(key, a);
+  // Guard against unbounded growth — a remote attacker can POST unlimited
+  // random emails.  Evict stale entries past ~10k and, if still over cap,
+  // drop the oldest insertion.
+  if (attempts.size > 10_000) {
+    for (const [k, v] of attempts) {
+      if (v.lockedUntil < Date.now() && v.count === 0) attempts.delete(k);
+    }
+    if (attempts.size > 10_000) {
+      let oldestKey = '';
+      let oldestTime = Infinity;
+      for (const [k, v] of attempts) {
+        if (v.lockedUntil < oldestTime) { oldestTime = v.lockedUntil; oldestKey = k; }
+      }
+      attempts.delete(oldestKey);
+    }
+  }
 }
 function clearFailures(email: string): void {
   attempts.delete(email.toLowerCase());

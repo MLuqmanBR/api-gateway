@@ -184,6 +184,7 @@ export function resetErrorStatuses(): void {
   }
 }
 
+let checkRunning = false;
 export function startHealthChecker(): void {
   if (intervalId) return;
   // Clear any transport-error residue before the first check. Without this,
@@ -194,7 +195,11 @@ export function startHealthChecker(): void {
   resetErrorStatuses();
   console.log(`[Health] Starting health checker (every ${CHECK_INTERVAL_MS / 1000}s, concurrency ${CHECK_CONCURRENCY})`);
   intervalId = setInterval(() => {
-    checkAllKeys().catch(err => console.error('[Health] Check failed:', err));
+    if (checkRunning) return;
+    checkRunning = true;
+    checkAllKeys()
+      .catch(err => console.error('[Health] Check failed:', err))
+      .finally(() => { checkRunning = false; });
   }, CHECK_INTERVAL_MS);
 }
 

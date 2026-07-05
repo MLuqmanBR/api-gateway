@@ -47,7 +47,8 @@ export function initDb(dbPath?: string): Database.Database {
 
 export function getUnifiedApiKey(): string {
   const db = getDb();
-  const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string };
+  const row = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
+  if (!row) throw new Error('unified_api_key not initialized — run settings setup first');
   return row.value;
 }
 

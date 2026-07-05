@@ -82,7 +82,12 @@ export function deleteSession(token: string | undefined | null): void {
 }
 
 export function pruneSessions(): void {
-  const cutoff = Date.now() - SESSION_TTL_MS;
-  getDb().prepare('DELETE FROM sessions WHERE last_used IS NOT NULL AND last_used < ?').run(cutoff);
-  console.log(`[Auth] Pruned sessions not used since ${new Date(cutoff).toISOString()}`);
+  const now = Date.now();
+  // Prune on authoritative expires_at_ms (not last_used) so long-lived but
+  // expired sessions don't accumulate. Keep last_used as a second predicate
+  // for never-used sessions that lack an expiry.
+  getDb().prepare(
+    'DELETE FROM sessions WHERE (expires_at_ms IS NOT NULL AND expires_at_ms < ?) OR (last_used IS NOT NULL AND last_used < ?)',
+  ).run(now, now);
+  console.log(`[Auth] Pruned expired/stale sessions as of ${new Date(now).toISOString()}`);
 }

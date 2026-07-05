@@ -173,7 +173,7 @@ describe('requireAuth integration', () => {
     expect(await get('/api/keys')).toBe(200);
   });
 
-  it('still returns 401 for a non-loopback source when no X-Forwarded-For is present and trust proxy is off', async () => {
+  it('grants a loopback TCP peer even with no X-Forwarded-For', async () => {
     // TCP peer is 127.0.0.1 in tests; loopback is trusted regardless. The
     // only way to exercise the 401 path without trust proxy is impossible in
     // a fetch() from a Node test — the kernel peer is always 127.0.0.1. The

@@ -204,6 +204,7 @@ export class OpenAICompatProvider extends BaseProvider {
         ...this.extraHeaders,
       },
     }, 30000);
+    res.body?.cancel().catch(() => {});
     return res.status !== 401 && res.status !== 403;
   }
 }

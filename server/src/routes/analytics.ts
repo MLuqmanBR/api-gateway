@@ -195,7 +195,7 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
       model_id,
       CASE
         WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
-        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid.*key%' THEN 'Auth Error (401)'
+        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid%key%' THEN 'Auth Error (401)'
         WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
         WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
         WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
@@ -215,7 +215,7 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
     SELECT
       CASE
         WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
-        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid.*key%' THEN 'Auth Error (401)'
+        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid%key%' THEN 'Auth Error (401)'
         WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
         WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
         WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'

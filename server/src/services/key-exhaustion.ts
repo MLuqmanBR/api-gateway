@@ -29,11 +29,11 @@ export function rebuildExhaustionFromDB(): void {
   `).all(now) as Array<{ key_id: number; platform: string; model_id: string; expires_at_ms: number }>;
 
   for (const row of rows) {
-    // Estimate exhaustion time from expiry: a 90s cooldown means exhausted ~90s ago;
-    // a 24h cooldown means exhausted ~24h ago. Approximate by assuming default 90s.
-    const estimatedExhaustedAt = Math.min(row.expires_at_ms - 90_000, now);
+    // Preserve the actual expiry as the exhausted-at timestamp — the recovery-
+    // path ordering (router.ts:587-599) sorts by exhaustedAt earliest-first,
+    // which is exactly what the persisted expiry encodes.
     exhaustionMap.set(row.key_id, {
-      exhaustedAt: estimatedExhaustedAt > 0 ? estimatedExhaustedAt : now,
+      exhaustedAt: row.expires_at_ms,
       provider: row.platform,
       modelId: row.model_id,
     });

@@ -157,13 +157,13 @@ configRouter.post('/preview', (req: Request, res: Response) => {
 
 // ── Import ────────────────────────────────────────────────────────────────
 
-// Cap inbound envelope size to 5 MB — generous for thousands of models
-// and quirks, far below the app-wide 10 MB body limit. A schema-valid
-// envelope larger than this should be split, not blocked by the limiter.
-const IMPORT_BODY_LIMIT = '5mb';
-
-configRouter.post('/import', express.json({ limit: IMPORT_BODY_LIMIT }), (req: Request, res: Response) => {
+// Accepted by the app-level 10 MB cap; in-handler rejects oversized payloads.
+configRouter.post('/import', (req: Request, res: Response) => {
   try {
+    if (Buffer.byteLength(JSON.stringify(req.body)) > 5 * 1024 * 1024) {
+      res.status(413).json({ error: { message: 'Import envelope exceeds 5 MB' } });
+      return;
+    }
     const { envelope, options } = (req.body ?? {}) as { envelope?: unknown; options?: unknown };
     const result = runImport({ envelope, options: options as Parameters<typeof runImport>[0]['options'] });
     res.json(result);

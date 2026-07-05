@@ -126,11 +126,20 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
 
-  // Cleanup old entries
+  // Cleanup old entries — after the TTL sweep, still over the hard cap?
+  // Evict the oldest lastUsed entry to ensure the map never grows unbounded.
   if (stickySessionMap.size > 500) {
     const now = Date.now();
     for (const [k, v] of stickySessionMap) {
       if (now - v.lastUsed > STICKY_TTL_MS) stickySessionMap.delete(k);
+    }
+    if (stickySessionMap.size > 2000) {
+      let oldestKey = '';
+      let oldestTime = Infinity;
+      for (const [k, v] of stickySessionMap) {
+        if (v.lastUsed < oldestTime) { oldestTime = v.lastUsed; oldestKey = k; }
+      }
+      stickySessionMap.delete(oldestKey);
     }
   }
 }
@@ -776,22 +785,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // from the provider-qualified model_id (e.g. nvidia/moonshotai/kimi-k2.6).
     // Falls back to bare model_id lookup for backward compatibility.
     const slashIdx = workingModel.indexOf('/');
+    let platform: string | undefined;
+    let modelId: string | undefined;
     let enabled: { id: number } | undefined;
     if (slashIdx > 0) {
-      const platform = workingModel.slice(0, slashIdx);
-      const modelId = workingModel.slice(slashIdx + 1);
+      platform = workingModel.slice(0, slashIdx);
+      modelId = workingModel.slice(slashIdx + 1);
       enabled = db.prepare(
         'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1'
       ).get(platform, modelId) as { id: number } | undefined;
     }
-    // Fallback: look up by model_id alone (backward compat for old clients).
     if (!enabled) {
       enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(workingModel) as { id: number } | undefined;
     }
     if (enabled) {
       preferredModel = enabled.id;
     } else {
-      const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModel) as { id: number } | undefined;
+      let disabled: { id: number } | undefined;
+      if (slashIdx > 0) {
+        disabled = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(platform, modelId) as { id: number } | undefined;
+      } else {
+        disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(workingModel) as { id: number } | undefined;
+      }
       const reason = disabled ? 'is disabled' : 'is not in the catalog';
       res.status(400).json({
         error: {
@@ -1115,6 +1130,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               console.error(`[Proxy] In-band error frame from ${route.displayName} mid-stream:`, msg);
               writeChunk({ error: { message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(String(msg))}`, type: 'stream_error' } });
               try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
+              recordRateLimitHit(route.modelDbId);
               logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId);
               return;
             }
@@ -1603,6 +1619,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     if (!res.headersSent) {
       res.status(502).json({ error: { message: `Internal error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'provider_error' } });
     }
+  } finally {
+    detachAbortWatcher();
   }
 
   // Unreachable — the outer loop exits via the 1-RPM limit check above.

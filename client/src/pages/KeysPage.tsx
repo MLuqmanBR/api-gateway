@@ -1032,9 +1032,8 @@ export default function KeysPage() {
     setEditingLabel('')
   }
   function saveEditing(id: number) {
-    if (editingLabel !== undefined) {
-      updateKey.mutate({ id, label: editingLabel })
-    }
+    if (editingKeyId === null || editingLabel === undefined) return;
+    updateKey.mutate({ id, label: editingLabel });
   }
   useEffect(() => {
     if (editingKeyId !== null && editInputRef.current) {
@@ -1263,7 +1262,7 @@ export default function KeysPage() {
                               value={editingLabel}
                               onChange={e => setEditingLabel(e.target.value)}
                               onKeyDown={e => {
-                                if (e.key === 'Enter') saveEditing(k.id)
+                                if (e.key === 'Enter') { setEditingKeyId(null); saveEditing(k.id); }
                                 if (e.key === 'Escape') cancelEditing()
                               }}
                               onBlur={() => saveEditing(k.id)}

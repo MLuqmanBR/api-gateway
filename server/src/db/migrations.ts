@@ -2493,10 +2493,11 @@ function migrateModelsV33NvidiaMinimaxM3(db: Database.Database) {
 //      so it's visible/overridable in the dashboard and the provider-minute gate
 //      reads it as the cap source. Env var PROVIDER_MINUTE_REQUEST_CAP_NVIDIA overrides both.
 //
-// Idempotent — both UPDATEs are absolute SETs guarded by IS NULL, safe to re-run
-// every boot. Per-model rpm_limit stays as a defensive floor (the provider gate
-// runs first in the router and is the tighter constraint for the shared quota).
+// One-shot sentinel gates the backfill so an operator who intentionally clears
+// the nvidia rpm limit isn't silently reverted on restart.
 function migrateModelsV34NvidiaSharedQuota(db: Database.Database) {
+  const sentinel = db.prepare("SELECT value FROM settings WHERE key = 'migrated_v34_nvidia'").get() as { value: string } | undefined;
+  if (sentinel) return;
   db.prepare(
     `UPDATE models SET rpm_limit = 40
        WHERE platform = 'nvidia' AND rpm_limit IS NULL AND enabled = 1`,
@@ -2505,6 +2506,7 @@ function migrateModelsV34NvidiaSharedQuota(db: Database.Database) {
     `UPDATE built_in_provider_settings SET rpm_limit = 40
        WHERE platform = 'nvidia' AND rpm_limit IS NULL`,
   ).run();
+  db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated_v34_nvidia', '1')").run();
 }
 
 // ── V35: rate_limit_usage created_at index (2026-07) ──
