@@ -532,6 +532,7 @@ export class AnthropicCompatProvider extends BaseProvider {
     const decoder = new TextDecoder();
     let buffer = '';
     let upstreamId: string | undefined;
+    let promptTokens = 0;
     // Block type per index. Anthropic lets a message carry text, tool_use,
     // AND thinking blocks; we need to track each so the second- and third-
     // branch delta handlers dispatch correctly. (#290)
@@ -619,6 +620,7 @@ export class AnthropicCompatProvider extends BaseProvider {
           switch (eventType) {
             case 'message_start': {
               if (payload.message?.id) upstreamId = payload.message.id;
+              if (payload.message?.usage?.input_tokens != null) promptTokens = payload.message.usage.input_tokens;
               break;
             }
             case 'content_block_start': {
@@ -734,11 +736,10 @@ export class AnthropicCompatProvider extends BaseProvider {
               if (payload.usage) {
                 finalUsage = {
                   // input_tokens arrives on message_start; output_tokens is
-                  // updated on message_delta. If we missed message_start,
-                  // output is the only token we know.
-                  prompt_tokens: 0,
+                  // updated on message_delta.
+                  prompt_tokens: promptTokens,
                   completion_tokens: payload.usage.output_tokens ?? 0,
-                  total_tokens: payload.usage.output_tokens ?? 0,
+                  total_tokens: promptTokens + (payload.usage.output_tokens ?? 0),
                 };
               }
               const finish = yieldFinishIfNeeded();
