@@ -3,8 +3,10 @@ import Database from 'better-sqlite3';
 import { initEncryptionKey } from '../lib/crypto.js';
 import { applyModelPricing } from './model-pricing.js';
 
-// Bump this when adding a new data migration. Schema-level changes (column
-// additions, indexes, FKs) that use "IF NOT EXISTS" should stay unconditional.
+// FROZEN — do NOT bump. All new model-seed migrations MUST be idempotent and
+// unguarded (outside the `version < CURRENT_DATA_VERSION` transaction) so they
+// run every boot and existing installs don't miss them. If a step-wise data
+// migration is genuinely needed, adopt monotonic step-wise migrations instead.
 const CURRENT_DATA_VERSION = 1;
 
 export function migrateDbSchema(db: Database.Database) {
