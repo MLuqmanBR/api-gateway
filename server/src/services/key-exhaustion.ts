@@ -14,8 +14,8 @@
 
 import { getDb } from '../db/index.js';
 
-// keyId → { exhaustedAt (ms timestamp), provider slug, modelId }
-const exhaustionMap = new Map<number, { exhaustedAt: number; provider: string; modelId: string }>();
+// compositeKey (keyId:modelId) → { exhaustedAt, provider, modelId }
+const exhaustionMap = new Map<string, { exhaustedAt: number; provider: string; modelId: string }>();
 
 /** Rebuild the in-memory exhaustion map from persistent cooldowns on startup. */
 export function rebuildExhaustionFromDB(): void {
@@ -32,7 +32,7 @@ export function rebuildExhaustionFromDB(): void {
     // Preserve the actual expiry as the exhausted-at timestamp — the recovery-
     // path ordering (router.ts:587-599) sorts by exhaustedAt earliest-first,
     // which is exactly what the persisted expiry encodes.
-    exhaustionMap.set(row.key_id, {
+    exhaustionMap.set(`${row.key_id}:${row.model_id}`, {
       exhaustedAt: row.expires_at_ms,
       provider: row.platform,
       modelId: row.model_id,
@@ -42,23 +42,21 @@ export function rebuildExhaustionFromDB(): void {
 
 /** Mark a key as exhausted for a specific provider+model. */
 export function markExhausted(keyId: number, provider: string, modelId: string): void {
-  exhaustionMap.set(keyId, { exhaustedAt: Date.now(), provider, modelId });
+  exhaustionMap.set(`${keyId}:${modelId}`, { exhaustedAt: Date.now(), provider, modelId });
 }
 
-/** Clear exhaustion — called when a key successfully handles a request. */
 export function clearExhausted(keyId: number, modelId: string): void {
-  exhaustionMap.delete(keyId);
-  // Also remove any persisted cooldown for this key so a restart
+  exhaustionMap.delete(`${keyId}:${modelId}`);
+  // Also remove any persisted cooldown for this key+model so a restart
   // doesn't resurrect a stale exhaustion.
   const db = getDb();
   db.prepare('DELETE FROM rate_limit_cooldowns WHERE key_id = ? AND model_id = ?').run(keyId, modelId);
 }
 
 /** Check whether a key is currently marked exhausted. */
-export function isExhausted(keyId: number): boolean {
-  return exhaustionMap.has(keyId);
+export function isExhausted(keyId: number, modelId: string): boolean {
+  return exhaustionMap.has(`${keyId}:${modelId}`);
 }
-
 /**
  * Get all exhausted keys for a given provider, sorted by exhaustion time
  * ascending (earliest exhausted first). Excludes keys that have naturally
@@ -66,29 +64,29 @@ export function isExhausted(keyId: number): boolean {
  */
 export function getExhaustedKeysForProvider(provider: string): Array<{ keyId: number; exhaustedAt: number; modelId: string }> {
   const result: Array<{ keyId: number; exhaustedAt: number; modelId: string }> = [];
-  for (const [keyId, info] of exhaustionMap) {
+  for (const [compositeKey, info] of exhaustionMap) {
     if (info.provider === provider) {
+      const keyId = Number(compositeKey.split(':')[0]);
       result.push({ keyId, exhaustedAt: info.exhaustedAt, modelId: info.modelId });
     }
   }
   result.sort((a, b) => a.exhaustedAt - b.exhaustedAt);
   return result;
 }
-
 /**
  * Same as getExhaustedKeysForProvider but scoped to a specific model.
  */
 export function getExhaustedKeysForModel(provider: string, modelId: string): Array<{ keyId: number; exhaustedAt: number }> {
   const result: Array<{ keyId: number; exhaustedAt: number }> = [];
-  for (const [keyId, info] of exhaustionMap) {
+  for (const [compositeKey, info] of exhaustionMap) {
     if (info.provider === provider && info.modelId === modelId) {
+      const keyId = Number(compositeKey.split(':')[0]);
       result.push({ keyId, exhaustedAt: info.exhaustedAt });
     }
   }
   result.sort((a, b) => a.exhaustedAt - b.exhaustedAt);
   return result;
 }
-
 /** Check if all enabled keys for a provider+model combo are exhausted. */
 export function areAllKeysExhausted(provider: string, modelId: string): boolean {
   const db = getDb();
@@ -97,7 +95,7 @@ export function areAllKeysExhausted(provider: string, modelId: string): boolean 
   ).all(provider) as Array<{ id: number }>;
 
   if (keys.length === 0) return true;
-  return keys.every(k => exhaustionMap.has(k.id));
+  return keys.every(k => exhaustionMap.has(`${k.id}:${modelId}`));
 }
 
 /** Check if all enabled keys for a provider (across all models) are exhausted. */
@@ -108,5 +106,11 @@ export function areAllProviderKeysExhausted(provider: string): boolean {
   ).all(provider) as Array<{ id: number }>;
 
   if (keys.length === 0) return true;
-  return keys.every(k => exhaustionMap.has(k.id));
+  const prefix = (id: number) => `${id}:`;
+  return keys.every(k => {
+    for (const compositeKey of exhaustionMap.keys()) {
+      if (compositeKey.startsWith(prefix(k.id))) return true;
+    }
+    return false;
+  });
 }

@@ -3,7 +3,7 @@ import { getDb, getSetting, setSetting } from '../db/index.js';
 import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider, canUseProviderMinute } from './ratelimit.js';
-import { isExhausted, getExhaustedKeysForModel } from './key-exhaustion.js';
+import { getExhaustedKeysForModel } from './key-exhaustion.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
   reliabilityPosterior, expectedReliability, sampleBeta,
