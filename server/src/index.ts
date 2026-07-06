@@ -22,6 +22,8 @@ process.on('uncaughtException', (err: Error) => {
 async function main() {
   initDb();
   pruneSessions();
+  // Re-prune hourly so expired/stale sessions don't accumulate between boots.
+  setInterval(() => pruneSessions(), 60 * 60 * 1000).unref();
   rebuildExhaustionFromDB();
   startRequestRetentionPruner();
   const app = createApp();
