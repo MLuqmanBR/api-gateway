@@ -13,7 +13,7 @@
 //
 // All three are gated by requireAuth via the app-level mount. The export
 // endpoint never includes server-side secrets beyond the user's own API
-import express, { Router } from 'express';
+import { Router } from 'express';
 import type { Request, Response } from 'express';
 
 import { z } from 'zod';
@@ -160,7 +160,7 @@ configRouter.post('/preview', (req: Request, res: Response) => {
 // Accepted by the app-level 10 MB cap; in-handler rejects oversized payloads.
 configRouter.post('/import', (req: Request, res: Response) => {
   try {
-    if (Buffer.byteLength(JSON.stringify(req.body)) > 5 * 1024 * 1024) {
+    if (Buffer.byteLength(JSON.stringify(req.body ?? {})) > 5 * 1024 * 1024) {
       res.status(413).json({ error: { message: 'Import envelope exceeds 5 MB' } });
       return;
     }
