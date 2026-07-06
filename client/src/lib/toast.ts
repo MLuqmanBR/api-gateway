@@ -11,7 +11,8 @@
  * Public surface:
  *   addToast({kind, title, description?, details?, sticky?, href?})
  *   subscribe(fn)             — Toaster subscribes once
- *   drainPersisted()          — App.tsx calls once on mount to replay
+ *   drainPersisted()          — App.tsx calls on mount and on each
+ *                               visibilitychange-to-visible, to replay
  *   dismissToast(id), dismissAll(), clearPersisted()
  */
 
@@ -87,14 +88,22 @@ export function subscribe(fn: (toasts: Toast[]) => void): () => void {
 }
 
 /**
- * Replay toasts queued while the user was away. Called once on App mount;
- * consumer subscribes BEFORE calling so the bus already has listeners.
+ * Replay toasts queued while the user was away. Called on App mount, and
+ * again on every `visibilitychange` back to "visible" (a still-mounted tab
+ * that was merely backgrounded, not reloaded, never re-runs the mount
+ * effect). Safe to call repeatedly / redundantly: it no-ops on an empty
+ * queue, and filters out any queued toast whose id is already on screen so a
+ * stray double-call can't double-display the same toast.
  */
 export function drainPersisted(): void {
   const queued = readPersisted()
   if (queued.length === 0) return
-  emit((active) => [...active, ...queued])
   writePersisted([])
+  emit((active) => {
+    const activeIds = new Set(active.map(t => t.id))
+    const fresh = queued.filter(t => !activeIds.has(t.id))
+    return fresh.length > 0 ? [...active, ...fresh] : active
+  })
 }
 
 // ── internal store: pub/sub hides the active array. ──────────────────────────

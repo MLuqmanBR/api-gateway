@@ -197,8 +197,20 @@ function Navbar() {
 function App() {
   // Replay any toasts that were queued while the tab was hidden (auto-
   // discovered models, fallbacks exhausted, etc.) so the user sees them on
-  // their next visit rather than missing them entirely.
-  useEffect(() => { drainPersisted() }, [])
+  // their next visit rather than missing them entirely. Draining only on
+  // mount misses the common case where the dashboard tab stays mounted in
+  // the background (e.g. another tab/app has focus) and is later switched
+  // back to without a reload — so also drain on the visibilitychange that
+  // marks the tab visible again. drainPersisted() is a safe no-op when the
+  // queue is already empty.
+  useEffect(() => {
+    drainPersisted()
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') drainPersisted()
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+  }, [])
 
   return (
     <QueryClientProvider client={queryClient}>
