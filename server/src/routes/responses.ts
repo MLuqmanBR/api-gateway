@@ -607,23 +607,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           heldText = '';
         }
 
-        // Empty completion — the provider returned 200 with no text AND no
-        // tool calls. Seen in production from nemotron-3-super on ~65k-token
-        // contexts: transport-level "success", zero usable output, so the
-        // agent client records a successful run it can't act on and its issue
-        // dead-ends. Nothing substantive has been emitted yet (output_item
-        // events only fire on the first delta; only the created/in_progress
-        // skeletons are out), so it's safe to fail over to the next model on
-        // the same SSE stream.
-        if (msgText.length === 0 && toolAcc.size === 0) {
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
-          skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
-          recordRateLimitHit(route.modelDbId);
-          lastError = new Error(`empty completion from ${route.displayName}`);
-          continue;
-        }
-
         // Finalize any open text item.
         if (msgItemId !== null) {
           sse('response.output_text.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, text: msgText });
@@ -636,12 +619,41 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // Codex hard-rejects the call ("invalid type: string, expected a
         // sequence"). Clients consume the *.done events / final response for
         // arguments, so repairing here covers the streamed path too.
+        //
+        // Validity filter mirrors proxy.ts's streaming finalize (the
+        // /v1/chat/completions path): drop any accumulator whose name never
+        // arrived, or whose repaired arguments still aren't valid JSON, so a
+        // malformed call is never forwarded as a completed function_call —
+        // Codex hard-rejects those.
         const finalToolCalls: ChatToolCall[] = [];
         for (const acc of toolAcc.values()) {
           const repairedArgs = repairToolArguments(acc.args, toolSchemas.get(acc.name));
+          let validArgs = false;
+          try { JSON.parse(repairedArgs); validArgs = true; } catch { /* not valid JSON — drop below */ }
+          if (!(acc.name.length > 0 && validArgs)) continue;
           sse('response.function_call_arguments.done', { item_id: acc.itemId, output_index: acc.outputIndex, arguments: repairedArgs });
           sse('response.output_item.done', { output_index: acc.outputIndex, item: { id: acc.itemId, type: 'function_call', status: 'completed', call_id: acc.callId, name: acc.name, arguments: repairedArgs } });
           finalToolCalls.push({ id: acc.callId, type: 'function', function: { name: acc.name, arguments: repairedArgs } });
+        }
+
+        // Empty completion — the provider returned 200 with no usable output:
+        // no text AND no tool calls that survived the validity filter above
+        // (either the provider never sent any, or every accumulated call was
+        // dropped as malformed). Seen in production from nemotron-3-super on
+        // ~65k-token contexts: transport-level "success", zero usable output,
+        // so the agent client records a successful run it can't act on and
+        // its issue dead-ends. The output_item events already emitted so far
+        // are either none (no content case) or `added`-only for dropped
+        // calls (no matching `.done` — same as a truncated stream the client
+        // already has to tolerate), so it's safe to fail over to the next
+        // model on the same SSE stream.
+        if (msgText.length === 0 && finalToolCalls.length === 0) {
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no valid tool_calls)');
+          skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          recordRateLimitHit(route.modelDbId);
+          lastError = new Error(`empty completion from ${route.displayName}`);
+          continue;
         }
 
         const finalResponse = buildResponseObject({
