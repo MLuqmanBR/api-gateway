@@ -970,8 +970,10 @@ export default function KeysPage() {
       // The cleanup itself runs when the next effect fires or on unmount.
       return
     }
-    const es = new EventSource('/api/events')
-    es.onmessage = (msg) => {
+    let es: EventSource | undefined
+    let cancelled = false
+
+    const onMessage = (msg: MessageEvent) => {
       try {
         const e = JSON.parse(msg.data)
         if (e?.type === 'health.check.start') {
@@ -990,7 +992,23 @@ export default function KeysPage() {
         }
       } catch { /* ignore malformed events */ }
     }
-    return () => es.close()
+
+    // EventSource can't send an Authorization header, so a remote (non-LAN)
+    // operator first mints a short-lived single-use ticket and passes it in the
+    // query string (#43). LAN-trusted callers don't need one; mint failure
+    // falls back to the bare stream (still authenticated by source IP).
+    ;(async () => {
+      let url = '/api/events'
+      try {
+        const { ticket } = await apiFetch<{ ticket: string }>('/api/events/ticket')
+        url = `/api/events?ticket=${encodeURIComponent(ticket)}`
+      } catch { /* fall back to bare stream (LAN trust path) */ }
+      if (cancelled) return
+      es = new EventSource(url)
+      es.onmessage = onMessage
+    })()
+
+    return () => { cancelled = true; es?.close() }
   }, [checkAll.isPending, queryClient])
   const checkKey = useMutation({
     mutationFn: (keyId: number) => apiFetch(`/api/health/check/${keyId}`, { method: 'POST' }),

@@ -14,7 +14,7 @@ import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
 import { authRouter } from './routes/auth.js';
-import { eventsRouter } from './routes/events.js';
+import { eventsRouter, eventsStreamHandler } from './routes/events.js';
 import { customRouter } from './routes/custom.js';
 import { configRouter } from './routes/config.js';
 import { requireAuth } from './middleware/requireAuth.js';
@@ -76,6 +76,13 @@ export function createApp() {
   app.get('/api/ping', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
   });
+
+  // SSE stream — intentionally above the /api requireAuth blanket (#43).
+  // EventSource can't send an Authorization header, so a remote operator
+  // authenticates with a short-lived single-use `?ticket=` (minted from the
+  // authed /api/events/ticket route below); the handler validates+consumes it
+  // when the caller isn't LAN-trusted. LAN-trusted callers stream unchanged.
+  app.get('/api/events', eventsStreamHandler);
 
   // Default-deny: every /api/* route is gated by requireAuth unless
   // deliberately mounted above this blanket.  Existing per-router

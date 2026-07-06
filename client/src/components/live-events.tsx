@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ChevronDown, ChevronUp } from 'lucide-react';
+import { apiFetch } from '@/lib/api';
 
 // Mirrors server/src/services/events.ts LiveEvent union. Both ends drift
 // occasionally (the proxy added `request.aborted` for client-disconnect
@@ -157,8 +158,10 @@ export function LiveEvents() {
   }, []);
 
   useEffect(() => {
-    const es = new EventSource('/api/events');
-    es.onmessage = (msg) => {
+    let es: EventSource | undefined;
+    let cancelled = false;
+
+    const onMessage = (msg: MessageEvent) => {
       try {
         // Runtime guard (cheap): reject anything that doesn't even look like
         // a LiveEvent before handing it to `formatEvent`. A peer connecting
@@ -183,10 +186,26 @@ export function LiveEvents() {
         addLine(entry);
       } catch { /* malformed event — skip */ }
     };
-    es.onerror = () => {
-      // EventSource auto-reconnects; just wait.
-    };
-    return () => es.close();
+
+    // EventSource can't send an Authorization header, so a remote (non-LAN)
+    // operator first mints a short-lived single-use ticket and passes it in the
+    // query string (#43). A LAN-trusted caller doesn't need one — mint failure
+    // falls back to the bare stream, which still authenticates by source IP.
+    (async () => {
+      let url = '/api/events';
+      try {
+        const { ticket } = await apiFetch<{ ticket: string }>('/api/events/ticket');
+        url = `/api/events?ticket=${encodeURIComponent(ticket)}`;
+      } catch { /* fall back to bare stream (LAN trust path) */ }
+      if (cancelled) return;
+      es = new EventSource(url);
+      es.onmessage = onMessage;
+      es.onerror = () => {
+        // EventSource auto-reconnects; just wait.
+      };
+    })();
+
+    return () => { cancelled = true; es?.close(); };
   }, [addLine]);
 
   // Auto-scroll only the terminal container — never the page.
