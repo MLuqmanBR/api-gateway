@@ -548,6 +548,9 @@ export class CommandCodeProvider extends BaseProvider {
     const abortPromise: Promise<never> | undefined = abortSignal
       ? new Promise<never>((_, rej) => { rejectAbort = rej; })
       : undefined;
+    // Pre-attach a no-op catch so an abort that fires while no Promise.race
+    // is pending doesn't become an unhandled rejection.
+    abortPromise?.catch(() => {});
     const onAbort = () => {
       aborted = true;
       rejectAbort?.(new RequestAbortError());
