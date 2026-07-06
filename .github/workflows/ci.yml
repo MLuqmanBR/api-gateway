@@ -24,5 +24,8 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Lint client
+        run: npm run lint -w client
+
       - name: Build workspaces
         run: npm run build
