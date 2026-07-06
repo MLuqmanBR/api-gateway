@@ -55,4 +55,7 @@ function Button({
   )
 }
 
+// Generated shadcn/base-ui primitive: the component and its cva variant map
+// legitimately live together. Fast Refresh only cares in dev.
+// eslint-disable-next-line react-refresh/only-export-components
 export { Button, buttonVariants }

@@ -29,7 +29,8 @@ import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
 import { Tooltip } from '@/components/tooltip'
-import { ModelSearchBox, matchesModelQuery } from '@/components/model-search-box'
+import { ModelSearchBox } from '@/components/model-search-box'
+import { matchesModelQuery } from '@/lib/model-search'
 
 interface FallbackEntry {
   modelDbId: number

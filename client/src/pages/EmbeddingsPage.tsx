@@ -7,7 +7,8 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
-import { ModelSearchBox, matchesModelQuery, normalizeForSearch } from '@/components/model-search-box'
+import { ModelSearchBox } from '@/components/model-search-box'
+import { matchesModelQuery, normalizeForSearch } from '@/lib/model-search'
 
 import { addToast } from '@/lib/toast'
 interface ProviderEntry {

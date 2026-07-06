@@ -687,14 +687,23 @@ function CustomModelsSection() {
     setAutoSync(v)
     try { localStorage.setItem('auto-discover-models', String(v)) } catch { /* ignore */ }
   }
-  // Auto-sync every 5 minutes when enabled.
+  // Keep the latest mutation object in a ref so the auto-sync interval below
+  // can read `isPending`/`mutate` without listing `syncAll` as an effect
+  // dependency — otherwise the 5-minute timer would be torn down and rebuilt
+  // on every isPending flip (i.e. on every sync).
+  const syncAllRef = useRef(syncAll)
+  useEffect(() => {
+    syncAllRef.current = syncAll
+  })
+  // Auto-sync every 5 minutes when enabled. Depends only on `autoSync` so the
+  // interval stays stable across sync-triggered re-renders.
   useEffect(() => {
     if (!autoSync) return
     const id = setInterval(() => {
-      if (!syncAll.isPending) syncAll.mutate()
+      if (!syncAllRef.current.isPending) syncAllRef.current.mutate()
     }, 5 * 60 * 1000)
     return () => clearInterval(id)
-  }, [autoSync, syncAll.isPending, syncAll.mutate])
+  }, [autoSync])
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
     if (!provider || !modelId || !displayName) return

@@ -5,13 +5,21 @@ import { useEffect, useState, type ReactNode } from 'react'
 // duration of the exit animation).
 export function FloatingBar({ show, children }: { show: boolean; children: ReactNode }) {
   const [exitAnimating, setExitAnimating] = useState(false)
+  const [prevShow, setPrevShow] = useState(show)
+  // Detect the show→hide transition during render (React's sanctioned
+  // "adjust state when a prop changes" pattern) so we never call setState
+  // synchronously inside an effect.
+  if (prevShow !== show) {
+    setPrevShow(show)
+    if (!show) setExitAnimating(true)
+  }
+  // The only effect left drives the delayed unmount: once we start exiting,
+  // clear the flag after the slide-down animation completes.
   useEffect(() => {
-    if (!show) {
-      const t = setTimeout(() => setExitAnimating(false), 300)
-      return () => clearTimeout(t)
-    }
-    setExitAnimating(true)
-  }, [show])
+    if (!exitAnimating) return
+    const t = setTimeout(() => setExitAnimating(false), 300)
+    return () => clearTimeout(t)
+  }, [exitAnimating])
   const shouldRender = show || exitAnimating
   if (!shouldRender) return null
   return (
