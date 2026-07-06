@@ -113,6 +113,19 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
   // Skip auto-discovery in test environments — fake provider URLs won't respond.
   if (process.env.VITEST) return { fetched: 0, added: [] };
 
+  // SSRF guard: block cloud-metadata link-local (169.254.0.0/16, e.g.
+  // 169.254.169.254) before the server-side GET. RFC1918 / loopback are NOT
+  // blocked — LAN Ollama and localhost providers are supported.
+  try {
+    const host = new URL(`${baseUrl}/models`).hostname;
+    if (/^169\.254\./.test(host)) {
+      console.log(`[Custom] ${slug}: refusing metadata-range host ${host}`);
+      return { fetched: 0, added: [], error: 'metadata address blocked' };
+    }
+  } catch {
+    return { fetched: 0, added: [], error: 'invalid base URL' };
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
 
@@ -127,7 +140,45 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
       return { fetched: 0, added: [] };
     }
 
-    const body: any = await res.json();
+    // Cap the response before parsing (unbounded res.json() lets a hostile
+    // endpoint stream gigabytes → DoS). Reject an over-large Content-Length up
+    // front, then read the body via a byte-counted loop that aborts past 5 MB.
+    const MAX_BODY_BYTES = 5 * 1024 * 1024;
+    const declared = Number(res.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      controller.abort();
+      console.log(`[Custom] ${slug}: /models Content-Length ${declared} exceeds ${MAX_BODY_BYTES}, skipping`);
+      return { fetched: 0, added: [], error: 'response too large' };
+    }
+    const reader = res.body?.getReader();
+    let text: string;
+    if (reader) {
+      const decoder = new TextDecoder();
+      let received = 0;
+      let acc = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > MAX_BODY_BYTES) {
+          try { await reader.cancel(); } catch { /* ignore */ }
+          controller.abort();
+          console.log(`[Custom] ${slug}: /models body exceeded ${MAX_BODY_BYTES}, aborting`);
+          return { fetched: 0, added: [], error: 'response too large' };
+        }
+        acc += decoder.decode(value, { stream: true });
+      }
+      acc += decoder.decode();
+      text = acc;
+    } else {
+      // No readable stream (shouldn't happen with fetch, but be safe).
+      text = await res.text();
+      if (text.length > MAX_BODY_BYTES) {
+        return { fetched: 0, added: [], error: 'response too large' };
+      }
+    }
+
+    const body: any = JSON.parse(text);
     const models = body?.data;
     if (!Array.isArray(models) || models.length === 0) {
       console.log(`[Custom] ${slug}: no models in /models response`);
@@ -149,8 +200,10 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
 
     const tx = db.transaction(() => {
       for (const m of models) {
+        // Cap inserted rows to bound DB/routing growth from a hostile response.
+        if (added.length >= 2000) break;
         const modelId = typeof m.id === 'string' ? m.id.trim() : '';
-        if (!modelId) continue;
+        if (!modelId || modelId.length > 200) continue;
 
         // Skip if already registered
         const exists = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?').get(slug, modelId);
