@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
@@ -82,6 +82,37 @@ function readPort() {
 
 function isRunning(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// PIDs get recycled by the OS. `isRunning` only proves *some* process has
+// that PID right now — if the server we started has since died and the PID
+// was reassigned to an unrelated process, a liveness check alone can't tell
+// the difference, and SIGTERM would land on the wrong process. Before
+// signalling, confirm the PID still looks like our server.
+//
+// On Linux we can read /proc/<pid>/cmdline and /proc/<pid>/cwd to check.
+// Platforms without /proc (macOS, Windows) have no equivalently cheap,
+// dependency-free way to inspect another process's argv/cwd, so we fall
+// back to trusting the liveness check there, same as before this fix.
+function isOurServerProcess(pid) {
+  if (process.platform !== 'linux') return true;
+  let cmdline;
+  try {
+    cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+  } catch {
+    // /proc/<pid> vanished between the liveness check and now, or isn't
+    // readable — can't confirm identity, so don't kill it.
+    return false;
+  }
+  if (!cmdline.replace(/\0/g, ' ').includes('server/dist/index.js')) return false;
+  try {
+    const cwd = readlinkSync(`/proc/${pid}/cwd`);
+    if (cwd !== ROOT) return false;
+  } catch {
+    // cwd link unreadable (e.g. permissions) — the cmdline match is
+    // already a strong signal, don't fail identity over this alone.
+  }
+  return true;
 }
 
 function cleanInstances() {
@@ -238,6 +269,13 @@ function stopOne(port) {
   if (!pid) { console.log(`No server running on port ${port}.`); return Promise.resolve(); }
   if (!isRunning(pid)) {
     console.log(`PID ${pid} on port ${port} is not running. Cleaning up.`);
+    delete inst[key];
+    if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
+    else { writeInstances(inst); }
+    return Promise.resolve();
+  }
+  if (!isOurServerProcess(pid)) {
+    console.warn(`PID ${pid} recorded for port ${port} no longer looks like our server (identity check failed — likely PID reuse). Not sending a signal; cleaning up the stale entry instead.`);
     delete inst[key];
     if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
     else { writeInstances(inst); }
