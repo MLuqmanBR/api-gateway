@@ -146,6 +146,27 @@ describe('ThinkTagStream', () => {
     expect(f.reasoning).toBe('');
   });
 
+  it('holds a partial opener split across feeds and does not leak it as visible', () => {
+    const s = new ThinkTagStream();
+    // delta1 ends mid-opener (`...<thi`), delta2 completes it.
+    const first = s.feed('answer <thi');
+    expect(first).toEqual({ visible: 'answer ', reasoning: '' });
+    const second = s.feed('nk>secret reasoning</think>the real answer');
+    expect(second).toEqual({ visible: 'the real answer', reasoning: 'secret reasoning' });
+    const f = s.flush();
+    expect(f.residual).toBe('');
+    expect(f.reasoning).toBe('');
+  });
+
+  it('emits a genuine partial-opener tail as residual at flush when never completed', () => {
+    const s = new ThinkTagStream();
+    const first = s.feed('hello <thi');
+    expect(first).toEqual({ visible: 'hello ', reasoning: '' });
+    const f = s.flush();
+    expect(f.residual).toBe('<thi');
+    expect(f.reasoning).toBe('');
+  });
+
   it('returns empty result for an empty feed', () => {
     const s = new ThinkTagStream();
     expect(s.feed('')).toEqual({ visible: '', reasoning: '' });

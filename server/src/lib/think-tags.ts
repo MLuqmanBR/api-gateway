@@ -115,8 +115,26 @@ export class ThinkTagStream {
     while (cursor < this.buffer.length) {
       const openIdx = this.buffer.indexOf(THINK_OPEN, cursor);
       if (openIdx < 0) {
-        visibleParts.push(this.buffer.slice(cursor));
-        cursor = this.buffer.length;
+        // No complete opener. Before flushing the rest as visible, retain the
+        // longest suffix of the buffer that is a proper prefix of THINK_OPEN,
+        // so a `` opener split across feeds (e.g. `...<thi` | `nk>...`)
+        // isn't leaked as visible text. flush() emits a genuine trailing
+        // partial opener at true end-of-stream.
+        const len = this.buffer.length;
+        let holdLen = 0;
+        const maxHold = Math.min(THINK_OPEN.length - 1, len - cursor);
+        for (let k = maxHold; k >= 1; k--) {
+          if (this.buffer.startsWith(THINK_OPEN.slice(0, k), len - k)) {
+            holdLen = k;
+            break;
+          }
+        }
+        visibleParts.push(this.buffer.slice(cursor, len - holdLen));
+        if (holdLen > 0) {
+          this.buffer = this.buffer.slice(len - holdLen);
+          return { visible: visibleParts.join(''), reasoning: this.takeReasoning() };
+        }
+        cursor = len;
         break;
       }
       if (openIdx > cursor) visibleParts.push(this.buffer.slice(cursor, openIdx));
