@@ -29,6 +29,24 @@ interface ChatMessage {
   }
 }
 
+// Shape of an OpenAI-style error envelope returned by the proxy on a non-2xx.
+interface ErrorBody {
+  error?: { type?: string; message?: string }
+}
+
+// Minimal shape of a streaming chat-completion SSE frame we read from.
+interface StreamChunk {
+  error?: { message?: string }
+  choices?: { delta?: { content?: string } }[]
+}
+
+// Request body sent to /v1/chat/completions from the playground.
+interface ChatRequestBody {
+  messages: { role: string; content: string }[]
+  stream: boolean
+  model?: string
+}
+
 export default function PlaygroundPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
@@ -63,7 +81,7 @@ export default function PlaygroundPage() {
   }, [])
 
   // ── Error formatting (Fix 5) ──────────────────────────────────────────────
-  const formatError = (status: number, body: any): string => {
+  const formatError = (status: number, body: ErrorBody): string => {
     const errType: string = body?.error?.type ?? ''
     const errMsg: string = body?.error?.message ?? `HTTP ${status}`
     if (status === 401 || errType === 'authentication_error')
@@ -133,7 +151,7 @@ export default function PlaygroundPage() {
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
 
-      const body: any = {
+      const body: ChatRequestBody = {
         messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
         stream: true,
       }
@@ -213,7 +231,7 @@ export default function PlaygroundPage() {
           }
 
           try {
-            const chunk = JSON.parse(payload)
+            const chunk = JSON.parse(payload) as StreamChunk
             // In-band error frame (e.g. mid-stream provider error)
             if (chunk.error) {
               content += content ? '\n\n' : ''
@@ -234,14 +252,16 @@ export default function PlaygroundPage() {
       }
 
       latency = Date.now() - start
-    } catch (err: any) {
+    } catch (err: unknown) {
       latency = Date.now() - start
-      if (err.name === 'AbortError') {
+      const name = err instanceof Error ? err.name : ''
+      const message = err instanceof Error ? err.message : String(err)
+      if (name === 'AbortError') {
         if (!content) content = '(cancelled)'
-      } else if (err.message === 'Failed to fetch') {
+      } else if (message === 'Failed to fetch') {
         content = '🔌 Connection failed — is the server running?'
       } else {
-        content = `❌ ${err.message}`
+        content = `❌ ${message}`
       }
     } finally {
       clearTimeout(timeoutId)

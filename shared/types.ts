@@ -348,6 +348,12 @@ export interface AnalyticsSummary {
   totalOutputTokens: number;
   avgLatencyMs: number;
   estimatedCostSavings: number;
+  // Pinned = requests that named a specific model; honored = the pinned model
+  // actually served it. firstRequestAt is the SQLite UTC "YYYY-MM-DD HH:MM:SS"
+  // of the oldest request in range (null when there is no data yet).
+  pinnedRequests: number;
+  pinHonoredRequests: number;
+  firstRequestAt: string | null;
 }
 
 export interface PlatformStats {
@@ -364,6 +370,51 @@ export interface TimelinePoint {
   requests: number;
   successCount: number;
   failureCount: number;
+}
+
+// Per-model breakdown row (GET /api/analytics/by-model).
+export interface ModelStats {
+  platform: string;
+  modelId: string;
+  displayName: string;
+  requests: number;
+  successRate: number;
+  avgLatencyMs: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  pinnedRequests: number;
+  estimatedCost: number;
+}
+
+// Recent-errors row (GET /api/analytics/errors).
+export interface ErrorLogEntry {
+  id: number;
+  platform: string;
+  modelId: string;
+  error: string;
+  latencyMs: number;
+  createdAt: string;
+}
+
+// Error distribution (GET /api/analytics/error-distribution).
+export interface ErrorCategoryCount {
+  category: string;
+  count: number;
+}
+export interface ErrorPlatformCount {
+  platform: string;
+  count: number;
+}
+export interface ErrorDetailRow {
+  platform: string;
+  model_id: string;
+  error_category: string;
+  count: number;
+}
+export interface ErrorDistribution {
+  byCategory: ErrorCategoryCount[];
+  byPlatform: ErrorPlatformCount[];
+  detailed: ErrorDetailRow[];
 }
 
 export interface RequestLog {

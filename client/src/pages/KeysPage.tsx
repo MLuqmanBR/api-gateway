@@ -620,7 +620,7 @@ function CustomModelsSection() {
     },
   })
   const addModel = useMutation({
-    mutationFn: (body: any) =>
+    mutationFn: (body: { providerSlug: string; fields: Record<string, unknown> }) =>
       apiFetch(`/api/custom-providers/${body.providerSlug}/models`, {
         method: 'POST',
         body: JSON.stringify(body.fields),
