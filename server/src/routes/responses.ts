@@ -378,7 +378,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Client-disconnect abort wiring — mirrors /chat/completions. A Stop /
   // session-close cancels the in-flight upstream call and breaks out of the
   // retry loop instead of running all MAX_RETRIES. (#292)
-  const { controller: abortController } = attachClientAbort(res);
+  const { controller: abortController, detach: detachAbortWatcher } = attachClientAbort(res);
   const abortSignal = abortController.signal;
   // Global recovery limit: counts actual upstream attempts (not cycles), same
   // setting as /chat/completions. Falls back to MAX_RETRIES when the user
@@ -777,5 +777,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     if (!res.headersSent) {
       res.status(502).json({ error: { message: `Internal error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'provider_error' } });
     }
+  } finally {
+    detachAbortWatcher();
   }
 });
