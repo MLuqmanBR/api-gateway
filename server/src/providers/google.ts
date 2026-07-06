@@ -264,8 +264,8 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
 
 /** Check whether hostname resolves to a private/internal IP range. */
 function isInternalHost(hostname: string): boolean {
-  // IPv4 loopback / private ranges
-  if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(hostname)) return true;
+  // IPv4 loopback / private ranges / link-local (cloud metadata: 169.254.169.254) / unspecified
+  if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.0\.0\.0$)/.test(hostname)) return true;
   // IPv6 loopback / link-local / ULA / unique-local
   if (hostname === '::1' || hostname.startsWith('fe80:') || hostname.startsWith('fc') || hostname.startsWith('fd')) return true;
   // localhost / .local mDNS
