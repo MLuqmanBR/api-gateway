@@ -43,13 +43,23 @@ const newId = (): string =>
     ? crypto.randomUUID()
     : `t_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 
-/** Fire a toast. If the tab is hidden, also persist so the next visit shows it. */
+/**
+ * Fire a toast. If the tab is hidden, persist it for replay on the next
+ * visit INSTEAD OF also emitting live — the user can't see a hidden tab, and
+ * emitting anyway would add the toast to the in-memory store (where it runs
+ * its normal auto-dismiss lifecycle) while ALSO leaving it in the persisted
+ * queue until `drainPersisted()` clears it. Since the in-memory store never
+ * survives a real page load, that persisted copy replays as a stale
+ * duplicate the next time the app mounts. Persist-only when hidden fixes
+ * that: `drainPersisted()` is the sole path that shows it.
+ */
 export function addToast(input: Omit<Toast, 'id' | 'ts'>): void {
   const toast: Toast = { ...input, id: newId(), ts: Date.now() }
 
   if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
     const queued = readPersisted()
     writePersisted([...queued, toast])
+    return
   }
 
   emit((active) => [...active, toast])
