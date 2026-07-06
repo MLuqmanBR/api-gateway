@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
@@ -107,10 +107,15 @@ function isOurServerProcess(pid) {
   if (!cmdline.replace(/\0/g, ' ').includes('server/dist/index.js')) return false;
   try {
     const cwd = readlinkSync(`/proc/${pid}/cwd`);
-    if (cwd !== ROOT) return false;
+    // Canonicalize both sides: readlinkSync gives the raw target, and ROOT
+    // (derived from import.meta.url) may itself traverse a symlink — either
+    // one containing a symlinked path component makes a raw string compare
+    // false-negative and leaves a real, still-running server untracked.
+    if (realpathSync(cwd) !== realpathSync(ROOT)) return false;
   } catch {
-    // cwd link unreadable (e.g. permissions) — the cmdline match is
-    // already a strong signal, don't fail identity over this alone.
+    // cwd link unreadable, or either path failed to canonicalize (e.g.
+    // dangling symlink, permissions) — the cmdline match is already a
+    // strong signal, don't fail identity over this alone.
   }
   return true;
 }
