@@ -37,29 +37,41 @@ export type LiveEvent =
 
 const MAX_SUBSCRIBERS = 8;
 
-const subscribers = new Set<(evt: LiveEvent) => void>();
+// Value is a teardown invoked when a subscriber is evicted for capacity (NOT
+// on a normal unsubscribe — the returned unsubscribe function just removes
+// the entry). Pure `subscribe` callers get a default no-op teardown so an
+// eviction never throws or has any effect beyond dropping the listener.
+const subscribers = new Map<(evt: LiveEvent) => void, () => void>();
 
 export function publish(evt: LiveEvent): void {
-  for (const fn of subscribers) {
+  for (const fn of subscribers.keys()) {
     try { fn(evt); } catch { /* subscriber error — drop */ }
   }
 }
+
+const noopTeardown = () => {};
 
 /** Add a listener and return an unsubscribe function.
  *
  * Capacity policy: allow up to {@link MAX_SUBSCRIBERS} concurrent listeners.
  * When a new subscription would push the count over that cap, the OLDEST
  * subscriber (first-inserted) is evicted — that one is most likely a stale
- * tab still holding a socket but no longer rendering.
+ * tab still holding a socket but no longer rendering. The evicted entry's
+ * `teardown` is invoked so any resources it holds (SSE heartbeat timer,
+ * HTTP response) are released rather than left open with no listener.
  *
  * Exported so the multi-subscriber invariant is testable without booting
  * Express. `subscribeSse` is a thin wrapper for the SSE use-case. */
-export function subscribe(fn: (evt: LiveEvent) => void): () => void {
+export function subscribe(fn: (evt: LiveEvent) => void, teardown: () => void = noopTeardown): () => void {
   if (subscribers.size >= MAX_SUBSCRIBERS) {
-    const first = subscribers.values().next().value;
-    if (first) subscribers.delete(first);
+    const firstKey = subscribers.keys().next().value;
+    if (firstKey) {
+      const firstTeardown = subscribers.get(firstKey);
+      subscribers.delete(firstKey);
+      try { firstTeardown?.(); } catch { /* evicted subscriber's teardown failed — drop */ }
+    }
   }
-  subscribers.add(fn);
+  subscribers.set(fn, teardown);
   let unsubscribed = false;
   return () => {
     if (unsubscribed) return;
@@ -70,15 +82,6 @@ export function subscribe(fn: (evt: LiveEvent) => void): () => void {
 
 /** Register an SSE response as a subscriber. Returns an unsubscribe function. */
 export function subscribeSse(res: Response): () => void {
-  const cleanupSub = subscribe((evt: LiveEvent) => {
-    if (res.destroyed) return;
-    try {
-      res.write(`data: ${JSON.stringify(evt)}\n\n`);
-    } catch {
-      /* socket gone; the 'close' handler will tear down the listener */
-    }
-  });
-
   // Heartbeat every 30s to keep the connection alive through proxies.
   // Tests for the eviction/limit behaviour don't need the timer — the
   // pure `subscribe` API above is what they exercise, and the timer is
@@ -87,6 +90,21 @@ export function subscribeSse(res: Response): () => void {
     if (res.destroyed) return;
     try { res.write(': heartbeat\n\n'); } catch { /* socket gone */ }
   }, 30_000);
+
+  const cleanupSub = subscribe((evt: LiveEvent) => {
+    if (res.destroyed) return;
+    try {
+      res.write(`data: ${JSON.stringify(evt)}\n\n`);
+    } catch {
+      /* socket gone; the 'close' handler will tear down the listener */
+    }
+  }, () => {
+    // Evicted for capacity: this response no longer receives events, so
+    // stop the heartbeat and end the connection instead of leaving it open
+    // and silently dead.
+    clearInterval(heartbeat);
+    try { res.end(); } catch { /* already gone */ }
+  });
 
   // Tear down promptly when the client disconnects: stop the heartbeat and
   // drop the listener so a stalled-but-not-closed socket doesn't keep
