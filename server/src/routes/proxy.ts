@@ -985,6 +985,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? '/' + globalRetryMax : '/\u221E'})`);
       continue;
     }
+    // The provider slot acquired by routeRequest above is released exactly
+    // once per acquire, in the single finally at the end of this iteration —
+    // held across same-key retries (`continue keyRetry`), released on every
+    // exit (return, break keyRetry, continue outerLoop, or throw). (#9)
+    try {
     const modelKey = `${route.platform}:${route.modelId}`;
     if (prevModelKey && prevModelKey !== modelKey && !isPinned) {
       publish({ type: 'routing.model_switch', id: requestId, from: prevModelKey, to: modelKey, reason: 'auto-routing fallback', at: Date.now() });
@@ -1573,8 +1578,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
         return;
       }
-    } finally {
-      route.release();
     }
     } // end keyRetry
 
@@ -1600,6 +1603,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     publish({ type: 'routing.key_exhausted', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, reason: sanitizeProviderErrorMessage(lastError?.message), at: Date.now() });
     console.log(`[Proxy] Key ${route.keyId} exhausted after ${PER_KEY_RETRIES} failures from ${route.displayName}`);
     // Continue outer loop → routeRequest picks next key.
+    } finally {
+      route.release();
+    }
   }
   } catch (err: any) {
     // A RequestAbortError from an abortableSleep at the outer-loop level
