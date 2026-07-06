@@ -230,13 +230,27 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
   }
   if (/^https?:\/\//i.test(url)) {
     try {
-      const parsed = new URL(url);
       // Block internal / private IPs to prevent SSRF probing of local services.
       // Single-user self-hosted proxy — but the unified API key is portable,
       // so internal-network requests a leaked key could make are worth blocking.
-      if (isInternalHost(parsed.hostname)) return null;
-      const res = await fetchWithTimeout(url);
-      if (!res.ok) return null;
+      // Follow redirects manually so isInternalHost is re-checked on EACH hop's
+      // hostname before we fetch it: a public URL 302-redirecting to an internal
+      // host (e.g. http://169.254.169.254/) must never reach that host.
+      let currentUrl = url;
+      let res: Response | null = null;
+      for (let hop = 0; hop < 3; hop++) {
+        if (isInternalHost(new URL(currentUrl).hostname)) return null;
+        const hopRes = await fetchWithTimeout(currentUrl, { redirect: 'manual' });
+        if (hopRes.status >= 300 && hopRes.status < 400) {
+          const location = hopRes.headers.get('location');
+          if (!location) return null;
+          currentUrl = new URL(location, currentUrl).toString();
+          continue;
+        }
+        res = hopRes;
+        break;
+      }
+      if (!res || !res.ok) return null;
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
       const mimeType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/jpeg';
