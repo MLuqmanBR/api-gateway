@@ -25,6 +25,7 @@ import {
 } from './proxy.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { attachClientAbort, isAbortError } from '../lib/abort.js';
+import { resolvePinnedModel } from '../lib/pinned-model.js';
 import { getGlobalRetryLimit } from '../services/router.js';
 import { publish } from '../services/events.js';
 
@@ -326,33 +327,36 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  // Resolve the requested model exactly as proxy.ts does: strip the
-  // api-gateway/ prefix, split on platform/model_id, fall back to
-  // bare-id DB lookup. Only overrides sticky when the client pinned.
+  // Resolve the requested model via the shared resolver so behavior matches
+  // /chat/completions exactly: ambiguous bare/non-platform pins return 400
+  // model_not_found instead of silently rowid-first routing to a platform
+  // that may have zero healthy keys (which would spin the recovery loop).
   let preferredModel: number | undefined;
   if (reqData.model && reqData.model !== 'auto') {
     const db = getDb();
     const requestedModel = reqData.model;
-    const EXTENSION_PREFIX = 'api-gateway/';
-    let workingModel = requestedModel;
-    if (workingModel.startsWith(EXTENSION_PREFIX)) {
-      workingModel = workingModel.slice(EXTENSION_PREFIX.length);
+    const resolution = resolvePinnedModel(db, requestedModel);
+    if (resolution.kind === 'resolved') {
+      preferredModel = resolution.modelDbId;
+    } else {
+      let reason: string;
+      if (resolution.kind === 'ambiguous') {
+        const plats = resolution.platforms.slice().sort();
+        reason = `is served by multiple providers (${plats.join(', ')}). Pin it with a 'platform/model_id' prefix (e.g. '${plats[0]}/<model_id>') to disambiguate`;
+      } else if (resolution.kind === 'disabled') {
+        reason = 'is disabled';
+      } else {
+        reason = 'is not in the catalog';
+      }
+      res.status(400).json({
+        error: {
+          message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
     }
-    const slashIdx = workingModel.indexOf('/');
-    let platform: string | undefined;
-    let modelId: string | undefined;
-    let enabled: { id: number } | undefined;
-    if (slashIdx > 0) {
-      platform = workingModel.slice(0, slashIdx);
-      modelId = workingModel.slice(slashIdx + 1);
-      enabled = db.prepare(
-        'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1'
-      ).get(platform, modelId) as { id: number } | undefined;
-    }
-    if (!enabled) {
-      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(workingModel) as { id: number } | undefined;
-    }
-    if (enabled) preferredModel = enabled.id;
   }
   if (!preferredModel) {
     preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);

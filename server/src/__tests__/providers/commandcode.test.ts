@@ -88,4 +88,53 @@ describe('CommandCodeProvider', () => {
       provider.chatCompletion('my-key', [{ role: 'user', content: 'hi' }], 'test-model'),
     ).rejects.toThrow('CommandCode API error 429');
   });
+  describe('validateKey — quota/credit signals are valid, not invalid', () => {
+    const mockRes = (status: number, body: string) => ({
+      ok: status >= 200 && status < 300,
+      status,
+      text: () => Promise.resolve(body),
+    } as Response);
+
+    it('treats a 429 weekly-usage-limit as a valid key', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce(mockRes(429,
+        JSON.stringify({ success:false, error:{ code:'RATE_LIMITED', status:429, message:"You've reached your weekly usage limit for your plan. Your limit resets at 2026-07-07T22:52:49.619Z." } })));
+      expect(await provider.validateKey('k')).toBe(true);
+    });
+
+    it('treats a 400 "insufficient credits" as a valid key', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce(mockRes(400,
+        JSON.stringify({ success:false, error:{ code:'BAD_REQUEST', status:400, message:'You have insufficient credits to make this request. Please purchase more credits to continue using the service.' } })));
+      expect(await provider.validateKey('k')).toBe(true);
+    });
+
+    it('treats a 402 payment-required as a valid key', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce(mockRes(402,
+        JSON.stringify({ success:false, error:{ code:'PAYMENT_REQUIRED', status:402, message:'insufficient_quota' } })));
+      expect(await provider.validateKey('k')).toBe(true);
+    });
+
+    it('still marks a 401 as invalid', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce(mockRes(401,
+        JSON.stringify({ success:false, error:{ code:'UNAUTHORIZED', status:401, message:"Invalid 'Authorization' header or token." } })));
+      expect(await provider.validateKey('bad')).toBe(false);
+    });
+
+    it('does NOT treat a genuine malformed-request 400 as valid', async () => {
+      // e.g. a body-schema rejection — must stay invalid so a real config/key
+      // mismatch is not hidden behind the quota carve-out.
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce(mockRes(400,
+        JSON.stringify({ success:false, error:{ code:'BAD_REQUEST', status:400, message:'Validation error: expected string at "config.gitStatus"' } })));
+      expect(await provider.validateKey('k')).toBe(false);
+    });
+
+    it('treats a 5xx upstream fault as valid (upstream problem, not the key)', async () => {
+      vi.spyOn(global, 'fetch').mockResolvedValueOnce(mockRes(503, 'upstream unavailable'));
+      expect(await provider.validateKey('k')).toBe(true);
+    });
+
+    it('treats a transport throw as valid (no proof the key is bad)', async () => {
+      vi.spyOn(global, 'fetch').mockRejectedValueOnce(new Error('ECONNREFUSED'));
+      expect(await provider.validateKey('k')).toBe(true);
+    });
+  });
 });

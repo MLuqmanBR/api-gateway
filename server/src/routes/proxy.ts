@@ -16,6 +16,7 @@ import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
+import { resolvePinnedModel } from '../lib/pinned-model.js';
 
 export const proxyRouter = Router();
 
@@ -769,45 +770,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
   } else if (requestedModel) {
     const db = getDb();
-    // Strip the `api-gateway/` extension prefix when present. The
-    // additional-providers-extension prefixes every model id with its
-    // provider-name ("api-gateway/...") so OMP's resolver doesn't pick a
-    // native provider that happens to share the same underlying model
-    // (deepseek, nvidia, huggingface, etc. all have native baked-in
-    // support). Once the prefix is stripped, the rest of the string is
-    // the actual routing id we want to look up.
-    const EXTENSION_PREFIX = 'api-gateway/';
-    let workingModel = requestedModel;
-    if (workingModel.startsWith(EXTENSION_PREFIX)) {
-      workingModel = workingModel.slice(EXTENSION_PREFIX.length);
-    }
-    // Parse platform/model_id format: the first '/' separates the platform
-    // from the provider-qualified model_id (e.g. nvidia/moonshotai/kimi-k2.6).
-    // Falls back to bare model_id lookup for backward compatibility.
-    const slashIdx = workingModel.indexOf('/');
-    let platform: string | undefined;
-    let modelId: string | undefined;
-    let enabled: { id: number } | undefined;
-    if (slashIdx > 0) {
-      platform = workingModel.slice(0, slashIdx);
-      modelId = workingModel.slice(slashIdx + 1);
-      enabled = db.prepare(
-        'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1'
-      ).get(platform, modelId) as { id: number } | undefined;
-    }
-    if (!enabled) {
-      enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(workingModel) as { id: number } | undefined;
-    }
-    if (enabled) {
-      preferredModel = enabled.id;
+    const resolution = resolvePinnedModel(db, requestedModel);
+    if (resolution.kind === 'resolved') {
+      preferredModel = resolution.modelDbId;
     } else {
-      let disabled: { id: number } | undefined;
-      if (slashIdx > 0) {
-        disabled = db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(platform, modelId) as { id: number } | undefined;
+      let reason: string;
+      if (resolution.kind === 'ambiguous') {
+        const plats = resolution.platforms.slice().sort();
+        reason = `is served by multiple providers (${plats.join(', ')}). Pin it with a 'platform/model_id' prefix (e.g. '${plats[0]}/<model_id>') to disambiguate`;
+      } else if (resolution.kind === 'disabled') {
+        reason = 'is disabled';
       } else {
-        disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(workingModel) as { id: number } | undefined;
+        reason = 'is not in the catalog';
       }
-      const reason = disabled ? 'is disabled' : 'is not in the catalog';
       res.status(400).json({
         error: {
           message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,

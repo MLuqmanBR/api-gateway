@@ -206,7 +206,27 @@ export class CommandCodeProvider extends BaseProvider {
           threadId: crypto.randomUUID(),
         }),
       }, 15000);
-      return res.ok || res.status >= 500;
+      // A 2xx, or any 5xx (upstream fault, not a key problem) → key is valid.
+      if (res.ok || res.status >= 500) return true;
+      // CommandCode surfaces "key is authentic but can't serve right now" as:
+      //   - 429  code:"RATE_LIMITED"   → weekly plan usage limit hit (resets later)
+      //   - 400  code:"BAD_REQUEST"     → "You have insufficient credits to make this
+      //                                   request." (balance exhausted; works after a top-up)
+      // Both mean the key passed auth — marking it permanently `invalid` (the prior
+      // behavior) excludes it from routing forever and, after 3 sweeps, auto-disables
+      // it (`enabled=0`) so the health checker never re-validates it. Treat them as
+      // valid: the key stays routable and self-heals when the quota resets; the chat
+      // path's retry/cooldown already benches it transiently when an actual call 429s.
+      // A genuine 401/403 (bad/expired token) still falls through to `false`.
+      if (res.status === 429 || res.status === 402) return true;
+      if (res.status === 400) {
+        const err = await res.text().catch(() => '');
+        // Match the exact exhausted-credits phrasing from the live upstream, not bare
+        // 400, so a real bad-request (e.g. a body the API rejects on shape) is NOT
+        // misclassified as a valid key.
+        if (/insufficient credits|insufficient\s+balance|weekly usage limit|rate[-_ ]?limited|quota|out of credit/i.test(err)) return true;
+      }
+      return false;
     } catch {
       return true;
     }

@@ -211,3 +211,152 @@ describe('Virtual "auto" model', () => {
     expect(body.error.code).toBe('model_not_found');
   });
 });
+
+describe('Pinned model resolution (ambiguous bare/slash pins)', () => {
+  // PINNING CONTRACT: a client pins `model` and the gateway resolves it to a
+  // `models.id`. When the same `model_id` is served by multiple enabled
+  // platforms the bare pin is silently cross-platform — the gateway must
+  // reject it with 400 model_not_found enumerating the candidate platforms,
+  // NOT rowid-first route to a platform that may have zero healthy keys
+  // (which spins the recovery loop forever). The platform-prefixed
+  // `platform/model_id` form (the wire contract /v1/models advertises) must
+  // still resolve uniquely and reach the upstream.
+  let app: Express;
+
+  beforeAll(() => {
+    // Sibling describe (NOT nested in the "Virtual auto model" describe), so
+    // it needs its own DB + app + dashboard token.
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+    app = createApp();
+    dashToken = mintDashboardToken();
+
+    // Seed TWO ambiguity fixtures, both across the same pair of built-in
+    // platforms (groq + nvidia — both have registered providers, so a
+    // platform-prefixed pin can actually route to upstream):
+    //   (1) `baremod` — a bare id shared across groq + nvidia. A bare pin
+    //       `baremod` is the cross-platform ambiguous case the resolver must
+    //       reject with 400 enumerating the candidate platforms.
+    //   (2) `MiniMax-M3/slashmod` — a slash-bearing id whose first segment
+    //       (`MiniMax-M3`) is a vendor namespace fragment, NOT a platform.
+    //       The platform-qualified query misses; with no disabled sibling,
+    //       the resolver falls through to Path B and finds the same id stored
+    //       on both platforms → ambiguous. This is the user's actual bug
+    //       shape (the live `MiniMaxAI/MiniMax-M3` id is stored whole across
+    //       huggingface + commandcode).
+    const db = getDb();
+    const insertModel = db.prepare(
+      `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+       VALUES (?, ?, ?, 5, 5, '', 1)`,
+    );
+    insertModel.run('groq', 'baremod', 'Bare G');
+    insertModel.run('nvidia', 'baremod', 'Bare N');
+    insertModel.run('groq', 'MiniMax-M3/slashmod', 'Slash G');
+    insertModel.run('nvidia', 'MiniMax-M3/slashmod', 'Slash N');
+  });
+
+  beforeEach(async () => {
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+    db.prepare('DELETE FROM requests').run();
+    // Add a groq key so the platform-prefixed pin can route to upstream.
+    // groq is a built-in provider, so POST /api/keys accepts it.
+    const add = await request(app, 'POST', '/api/keys', { platform: 'groq', key: 'gsk_pinned_resolution_test', label: 'pin-res' });
+    expect(add.status).toBe(201);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('rejects the bare ambiguous pin with 400 model_not_found listing candidate platforms', async () => {
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'baremod',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 3,
+    }, authHeaders());
+
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('model_not_found');
+    expect(body.error.type).toBe('invalid_request_error');
+    // Message must name BOTH candidate platforms (sorted) and hint at the
+    // platform-prefixed form so the client can correct the pin.
+    const msg: string = body.error.message;
+    expect(msg).toContain("Model 'baremod'");
+    expect(msg).toContain('groq');
+    expect(msg).toContain('nvidia');
+    expect(msg).toMatch(/platform\/model_id/);
+    expect(msg).toContain('/v1/models');
+  });
+
+  it('rejects a slash-bearing pin whose first segment is NOT a real platform (falls through to Path B → ambiguous)', async () => {
+    // `MiniMax-M3/slashmod` — `MiniMax-M3` is a vendor namespace fragment,
+    // NOT a platform; the platform-qualified query misses and no disabled
+    // sibling exists for that exact pair, so the resolver falls through to
+    // Path B and tries the FULL string as a bare model_id. The same id is
+    // stored whole on groq + nvidia → ambiguous. This is the user's actual
+    // bug shape (live: `MiniMaxAI/MiniMax-M3` stored whole on huggingface +
+    // commandcode, mis-routed to huggingface which has zero healthy keys).
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'MiniMax-M3/slashmod',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 3,
+    }, authHeaders());
+
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('model_not_found');
+    expect((body.error.message as string)).toContain('groq');
+    expect((body.error.message as string)).toContain('nvidia');
+  });
+
+  it('resolves the platform-prefixed form (the documented wire contract) and reaches upstream', async () => {
+    const origFetch = global.fetch;
+    let calledGroq = false;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      // The router calls groq's upstream for the `groq/baremod` pin.
+      if (urlStr.includes('api.groq.com')) {
+        calledGroq = true;
+        return new Response(JSON.stringify({
+          id: 'chatcmpl-pin',
+          object: 'chat.completion',
+          created: 1,
+          model: 'groq/baremod',
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: 'routed via pinned groq' },
+            finish_reason: 'stop',
+          }],
+          usage: { prompt_tokens: 2, completion_tokens: 4, total_tokens: 6 },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return origFetch(url as unknown as RequestInfo, init as unknown as RequestInit);
+    });
+
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'groq/baremod',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 3,
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(calledGroq).toBe(true);
+    expect(body.choices[0].message.content).toBe('routed via pinned groq');
+  });
+
+  it('rejects the api-gateway/ extension-prefixed ambiguous form (prefix stripped, then ambiguous)', async () => {
+    // OMP additional-providers-extension prepends `api-gateway/`. After
+    // stripping, the bare `baremod` is still ambiguous → 400.
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'api-gateway/baremod',
+      messages: [{ role: 'user', content: 'hi' }],
+      max_tokens: 3,
+    }, authHeaders());
+
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('model_not_found');
+    expect((body.error.message as string)).toContain('groq');
+    expect((body.error.message as string)).toContain('nvidia');
+  });
+});
