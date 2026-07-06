@@ -188,6 +188,52 @@ describe('Custom providers (#230)', () => {
     expect(keyRow.base_url).toBe('https://pb2.test/v1');
   });
 
+  it('PATCH with only {slug} renames the provider row and cascades dependents', async () => {
+    await request(app, 'POST', '/api/custom-providers', {
+      slug: 'renameonly', displayName: 'RO', baseUrl: 'http://ro.example.com/v1',
+    });
+    await request(app, 'POST', '/api/custom-providers/renameonly/models', {
+      modelId: 'ro-m1', displayName: 'RO M1',
+    });
+    const { encrypted, iv, authTag } = encrypt('test-key');
+    getDb().prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, base_url)
+      VALUES ('renameonly', 'k', ?, ?, ?, 'unknown', 1, 'http://ro.example.com/v1')
+    `).run(encrypted, iv, authTag);
+
+    const { status, body } = await request(app, 'PATCH', '/api/custom-providers/renameonly', {
+      slug: 'renamedonly',
+    });
+    expect(status).toBe(200);
+    expect(body.success).toBe(true);
+    expect(body.slug).toBe('renamedonly');
+
+    const db = getDb();
+    expect(db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get('renameonly')).toBeUndefined();
+    expect(db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get('renamedonly')).toBeDefined();
+    expect(db.prepare('SELECT COUNT(*) AS c FROM api_keys WHERE platform = ?').get('renamedonly')).toEqual({ c: 1 });
+    expect(db.prepare('SELECT COUNT(*) AS c FROM models WHERE platform = ?').get('renamedonly')).toEqual({ c: 1 });
+    expect(db.prepare('SELECT COUNT(*) AS c FROM api_keys WHERE platform = ?').get('renameonly')).toEqual({ c: 0 });
+  });
+
+  it('PATCH with {slug, displayName} applies both in one pass', async () => {
+    await request(app, 'POST', '/api/custom-providers', {
+      slug: 'renameboth', displayName: 'Before', baseUrl: 'http://rb.example.com/v1',
+    });
+
+    const { status, body } = await request(app, 'PATCH', '/api/custom-providers/renameboth', {
+      slug: 'renamedboth', displayName: 'After',
+    });
+    expect(status).toBe(200);
+    expect(body.slug).toBe('renamedboth');
+
+    const db = getDb();
+    expect(db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get('renameboth')).toBeUndefined();
+    const row = db.prepare('SELECT display_name FROM custom_providers WHERE slug = ?').get('renamedboth') as any;
+    expect(row).toBeDefined();
+    expect(row.display_name).toBe('After');
+  });
+
   it('DELETE /api/custom-providers/:slug cascades models + keys + fallback entries', async () => {
     await request(app, 'POST', '/api/custom-providers', {
       slug: 'doomed', displayName: 'Doomed', baseUrl: 'http://d.example.com/v1',

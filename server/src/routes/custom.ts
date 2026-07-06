@@ -352,6 +352,7 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     updates.push('display_name = ?');
     values.push(parsed.data.displayName.trim());
   }
+  let denormBaseUrl: string | undefined;
   if (parsed.data.baseUrl !== undefined) {
     const existingRow = db.prepare('SELECT api_format FROM custom_providers WHERE slug = ?').get(slug) as { api_format: string } | undefined;
     const fmt = existingRow?.api_format ?? 'openai';
@@ -360,9 +361,8 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
       : normalizeOpenAiBaseUrl(parsed.data.baseUrl);
     updates.push('base_url = ?');
     values.push(trimmed);
-    // Keep api_keys.base_url denormalized in sync so older code paths
-    // (health checks) see the new endpoint immediately.
-    db.prepare('UPDATE api_keys SET base_url = ? WHERE platform = ?').run(trimmed, slug);
+    // api_keys.base_url denorm write happens inside the transaction below.
+    denormBaseUrl = trimmed;
   }
   if (parsed.data.rpmLimit !== undefined) {
     updates.push('rpm_limit = ?');
@@ -397,36 +397,48 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     values.push(parsed.data.stickySessionsEnabled ? 1 : 0);
   }
 
-  if (parsed.data.slug !== undefined) {
-    const newSlug = parsed.data.slug;
-    if (newSlug !== oldSlug) {
-      // Check for conflict with any existing provider including archived.
-      const conflict = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(newSlug);
-      if (conflict) {
-        res.status(409).json({ error: { message: `slug '${newSlug}' is already in use` } });
-        return;
-      }
-      // Cascade the slug change to all dependent tables — all inside
-      // one transaction so the rename is atomic.
-      const tx = db.transaction(() => {
-        db.prepare('UPDATE custom_providers SET slug = ? WHERE slug = ?').run(newSlug, oldSlug);
-        db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
-        db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
-        db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
-      });
-      tx();
+  const newSlug = parsed.data.slug;
+  const slugChanged = newSlug !== undefined && newSlug !== oldSlug;
+  if (slugChanged) {
+    // Check for conflict with any existing provider including archived.
+    const conflict = db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(newSlug);
+    if (conflict) {
+      res.status(409).json({ error: { message: `slug '${newSlug}' is already in use` } });
+      return;
     }
+    // The slug change is just another entry in the single UPDATE below —
+    // never a separate statement, or a slug-only PATCH would leave the
+    // UPDATE with an empty SET clause and a slug+fields PATCH would bind
+    // WHERE slug = oldSlug after the row already moved.
+    updates.push('slug = ?');
+    values.push(newSlug);
   }
 
-  if (updates.length === 0 && parsed.data.slug === undefined) {
+  if (updates.length === 0) {
     res.json({ success: true, slug: oldSlug });
     return;
   }
 
   values.push(oldSlug);
-  db.prepare(`UPDATE custom_providers SET ${updates.join(', ')} WHERE slug = ?`).run(...values);
+  // One transaction: cascade the rename to dependent tables (fallback_config
+  // references models by row id, so it needs no rename), keep
+  // api_keys.base_url denormalized in sync so older code paths (health
+  // checks) see the new endpoint immediately, then apply every field change
+  // in a single UPDATE bound to the old slug.
+  const tx = db.transaction(() => {
+    if (denormBaseUrl !== undefined) {
+      db.prepare('UPDATE api_keys SET base_url = ? WHERE platform = ?').run(denormBaseUrl, oldSlug);
+    }
+    if (slugChanged) {
+      db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
+      db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
+      db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
+    }
+    db.prepare(`UPDATE custom_providers SET ${updates.join(', ')} WHERE slug = ?`).run(...values);
+  });
+  tx();
 
-  res.json({ success: true, slug: parsed.data.slug !== undefined ? parsed.data.slug : oldSlug });
+  res.json({ success: true, slug: slugChanged ? newSlug : oldSlug });
 });
 // Analytics retains historical request data. Re-adding the same slug+bare_url
 // revives the provider from the archive.
