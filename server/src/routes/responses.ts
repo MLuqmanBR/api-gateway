@@ -432,6 +432,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         let outputIndex = 0;
         let msgItemId: string | null = null;
         let msgText = '';
+        // The output_index the text item was opened at. Text delta/done/
+        // content_part events for the message item must all agree with the
+        // index in its `response.output_item.added` — captured here since
+        // `outputIndex` is mutated afterward by tool-call handling and a
+        // late-opened text item (after tool calls) is no longer at 0.
+        let msgOutputIndex = 0;
         // tool-call accumulator keyed by the provider's tool_call index
         const toolAcc = new Map<number, { outputIndex: number; itemId: string; callId: string; name: string; args: string }>();
         let totalOutputTokens = 0;
@@ -447,16 +453,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         const openTextItem = (text: string) => {
           attemptEmitted = true;
           msgItemId = newId('msg');
+          msgOutputIndex = outputIndex;
           sse('response.output_item.added', {
-            output_index: outputIndex,
+            output_index: msgOutputIndex,
             item: { id: msgItemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
           });
           sse('response.content_part.added', {
-            item_id: msgItemId, output_index: outputIndex, content_index: 0,
+            item_id: msgItemId, output_index: msgOutputIndex, content_index: 0,
             part: { type: 'output_text', text: '', annotations: [] },
           });
           if (text) {
-            sse('response.output_text.delta', { item_id: msgItemId, output_index: outputIndex, content_index: 0, delta: text });
+            sse('response.output_text.delta', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, delta: text });
             msgText += text;
           }
         };
@@ -510,7 +517,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             if (dialectMode === 'passthrough') {
               if (msgItemId === null) openTextItem('');
               sse('response.output_text.delta', {
-                item_id: msgItemId, output_index: 0, content_index: 0, delta: text,
+                item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, delta: text,
               });
               msgText += text;
             } else {
@@ -535,10 +542,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             if (!acc) {
               // First time we see this tool call: open a new output item.
               if (msgItemId !== null && msgText.length > 0) {
-                // close the text item (always output index 0) before starting a function_call item
-                sse('response.output_text.done', { item_id: msgItemId, output_index: 0, content_index: 0, text: msgText });
-                sse('response.content_part.done', { item_id: msgItemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
-                sse('response.output_item.done', { output_index: 0, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
+                // close the text item (at the index it was opened at) before starting a function_call item
+                sse('response.output_text.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, text: msgText });
+                sse('response.content_part.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
+                sse('response.output_item.done', { output_index: msgOutputIndex, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
                 msgItemId = null;
               }
               outputIndex = toolAcc.size + (msgText.length > 0 ? 1 : 0);
@@ -619,9 +626,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         // Finalize any open text item.
         if (msgItemId !== null) {
-          sse('response.output_text.done', { item_id: msgItemId, output_index: 0, content_index: 0, text: msgText });
-          sse('response.content_part.done', { item_id: msgItemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
-          sse('response.output_item.done', { output_index: 0, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
+          sse('response.output_text.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, text: msgText });
+          sse('response.content_part.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
+          sse('response.output_item.done', { output_index: msgOutputIndex, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
         }
         // Finalize tool-call items. Arguments are repaired against the tool's
         // parameter schema at this point (after the full string accumulated):
