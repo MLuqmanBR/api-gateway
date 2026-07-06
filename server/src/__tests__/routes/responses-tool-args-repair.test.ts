@@ -57,6 +57,21 @@ async function* brokenToolCallStream() {
   yield { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'update_plan', arguments: BROKEN_ARGS } }] } }] };
 }
 
+// A tool call whose name arrives but with zero argument deltas (e.g. a
+// no-parameter tool). The accumulator's `args` stays '' the whole time —
+// regression coverage for Issue 68's validity filter treating '' as
+// unrepairable (repairToolArguments('') threw on JSON.parse) and dropping a
+// legitimate call, triggering a bogus empty-completion failover.
+async function* noArgToolCallStream() {
+  yield { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'get_time', arguments: '' } }] } }] };
+}
+
+const GET_TIME_TOOL = {
+  type: 'function',
+  name: 'get_time',
+  parameters: { type: 'object', properties: {} },
+};
+
 describe('Tool-argument repair on /v1/responses (double-encoded nested JSON)', () => {
   let app: Express;
   let key: string;
@@ -116,6 +131,31 @@ describe('Tool-argument repair on /v1/responses (double-encoded nested JSON)', (
     expect(fc).toBeDefined();
     const repaired = JSON.parse(fc.arguments);
     expect(Array.isArray(repaired.plan)).toBe(true);
+  });
+
+  it('stream: forwards a no-argument tool call as a valid function_call (args default to {}), not an empty completion', async () => {
+    streamChatCompletion.mockReturnValueOnce(noArgToolCallStream());
+
+    const { status, raw } = await post(app, '/v1/responses', {
+      input: 'what time is it',
+      stream: true,
+      tools: [GET_TIME_TOOL],
+    }, key);
+
+    expect(status).toBe(200);
+    expect(raw).not.toContain('empty completion');
+    const doneLine = raw.split('\n').find((l) => l.startsWith('data:') && l.includes('response.function_call_arguments.done'));
+    expect(doneLine).toBeDefined();
+    const done = JSON.parse(doneLine!.slice('data: '.length));
+    expect(done.arguments).toBe('{}');
+
+    const completedLine = raw.split('\n').find((l) => l.startsWith('data:') && l.includes('"type":"response.completed"'));
+    expect(completedLine).toBeDefined();
+    const completed = JSON.parse(completedLine!.slice('data: '.length));
+    const fc = completed.response.output.find((o: any) => o.type === 'function_call');
+    expect(fc).toBeDefined();
+    expect(fc.name).toBe('get_time');
+    expect(fc.arguments).toBe('{}');
   });
 
   it('non-stream /v1/chat/completions: repairs tool_calls in the message', async () => {

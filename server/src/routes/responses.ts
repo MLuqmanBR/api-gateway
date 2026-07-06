@@ -627,7 +627,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // Codex hard-rejects those.
         const finalToolCalls: ChatToolCall[] = [];
         for (const acc of toolAcc.values()) {
-          const repairedArgs = repairToolArguments(acc.args, toolSchemas.get(acc.name));
+          const repairedArgs = repairToolArguments(acc.args || '{}', toolSchemas.get(acc.name));
           let validArgs = false;
           try { JSON.parse(repairedArgs); validArgs = true; } catch { /* not valid JSON — drop below */ }
           if (!(acc.name.length > 0 && validArgs)) continue;
