@@ -11,6 +11,8 @@ import {
   canUseProvider,
   providerDailyRequestCount,
   getProviderDailyRequestCap,
+  reserveRequest,
+  releaseReservation,
 } from '../../services/ratelimit.js';
 import { parseRetryAfterMs } from '../../providers/base.js';
 
@@ -56,6 +58,33 @@ describe('Rate Limiter', () => {
       expect(canMakeRequest('nvidia', 'nemotron', testId, {
         rpm: null, rpd: null, tpm: null, tpd: null,
       })).toBe(true);
+    });
+
+    // #42 check-then-act race: two concurrent selections reserve provisionally
+    // at route time (before either records), and the second must see the cap.
+    it('counts optimistic reservations toward the cap so concurrent picks see the limit', () => {
+      const limits = { rpm: 2, rpd: null, tpm: null, tpd: null };
+      // First concurrent request picks the key and reserves.
+      const r1 = reserveRequest('groq', 'race-model', testId, 100);
+      expect(canMakeRequest('groq', 'race-model', testId, limits)).toBe(true);
+      // Second concurrent request picks the same key and reserves — now at cap
+      // even though NEITHER has called recordRequest yet.
+      const r2 = reserveRequest('groq', 'race-model', testId, 100);
+      expect(canMakeRequest('groq', 'race-model', testId, limits)).toBe(false);
+      // Rolling back one reservation (abandon/error path) frees a slot again.
+      releaseReservation(r2);
+      expect(canMakeRequest('groq', 'race-model', testId, limits)).toBe(true);
+      releaseReservation(r1);
+    });
+
+    it('a reservation also gates token (tpm) and provider caps then clears on release', () => {
+      const id = Math.floor(Math.random() * 1_000_000);
+      expect(canUseTokens('groq', 'tok-race', id, 5000, { tpm: 8000, tpd: null })).toBe(true);
+      const r = reserveRequest('groq', 'tok-race', id, 5000);
+      // 5000 reserved + 5000 estimate would exceed 8000.
+      expect(canUseTokens('groq', 'tok-race', id, 5000, { tpm: 8000, tpd: null })).toBe(false);
+      releaseReservation(r);
+      expect(canUseTokens('groq', 'tok-race', id, 5000, { tpm: 8000, tpd: null })).toBe(true);
     });
   });
 

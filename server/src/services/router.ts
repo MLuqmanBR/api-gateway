@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
-import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider, canUseProviderMinute } from './ratelimit.js';
+import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider, canUseProviderMinute, reserveRequest, releaseReservation } from './ratelimit.js';
 import { getExhaustedKeysForModel } from './key-exhaustion.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
@@ -729,11 +729,17 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         continue;
       }
 
+      // Reserve a provisional rate-limit slot at selection time so a
+      // concurrent routeRequest for the same (platform,model,key) sees this
+      // in-flight request before recordRequest persists it (#42 race). Rolled
+      // back — or superseded by the persisted row — when release() runs.
+      const rlReservation = reserveRequest(entry.platform, entry.model_id, key.id, estimatedTokens);
+
       // Build the release function so callers can decrement the slot.
       // Idempotent — safe to call multiple times (e.g., from both a
       // per-iteration and outer finally).
       let released = false;
-      const release = () => { if (released) return; released = true; releaseSlot(entry.platform); };
+      const release = () => { if (released) return; released = true; releaseSlot(entry.platform); releaseReservation(rlReservation); };
 
       return {
         provider: provider,
@@ -781,8 +787,9 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
           releaseSlot(entry.platform);
           continue;
         }
+        const rlReservation = reserveRequest(entry.platform, entry.model_id, key.id, estimatedTokens);
         let released = false;
-        const release = () => { if (released) return; released = true; releaseSlot(entry.platform); };
+        const release = () => { if (released) return; released = true; releaseSlot(entry.platform); releaseReservation(rlReservation); };
         return {
           provider: provider,
           modelId: entry.model_id,

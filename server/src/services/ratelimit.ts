@@ -15,6 +15,89 @@ const windows = new Map<string, Window>();
 type RateLimitDb = ReturnType<typeof getDb>;
 type UsageKind = 'request' | 'tokens';
 
+// ── Optimistic in-flight reservations (#42, check-then-act race) ──
+// routeRequest is synchronous, but the persisted counter is only written by
+// recordRequest AFTER the awaited upstream dispatch. So two concurrent requests
+// for the same (platform,model,key) can both pass the pre-check before either
+// records, briefly overshooting rpm/tpm and the provider-minute cap. To close
+// that window, routeRequest reserves a provisional entry here at selection time
+// (synchronously, so the next routeRequest sees it); the gating counters below
+// add these provisional reservations on top of the persisted/memory base. The
+// reservation is released on every route exit — success (recordRequest has by
+// then written the persisted row that supersedes it) or abandon/error (rolled
+// back) — via the route's release() closure, so persisted counters stay the
+// source of truth.
+interface Reservation {
+  platform: string;
+  modelId: string;
+  keyId: number;
+  ts: number;
+  tokens: number;
+}
+const reservations = new Map<number, Reservation>();
+let reservationSeq = 0;
+
+/** Reserve a provisional request + token slot for a just-selected route.
+ *  Returns an opaque handle to release exactly once via releaseReservation(). */
+export function reserveRequest(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  estimatedTokens: number,
+): number {
+  const id = ++reservationSeq;
+  const tokens = Number.isFinite(estimatedTokens) && estimatedTokens > 0 ? estimatedTokens : 0;
+  reservations.set(id, { platform, modelId, keyId, ts: Date.now(), tokens });
+  return id;
+}
+
+/** Release a reservation. Idempotent — a missing id is a no-op. */
+export function releaseReservation(id: number): void {
+  reservations.delete(id);
+}
+
+function provisionalRequestCount(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  cutoff: number,
+): number {
+  let n = 0;
+  for (const r of reservations.values()) {
+    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform && r.modelId === modelId) n++;
+  }
+  return n;
+}
+
+function provisionalTokenCount(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  cutoff: number,
+): number {
+  let sum = 0;
+  for (const r of reservations.values()) {
+    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform && r.modelId === modelId) sum += r.tokens;
+  }
+  return sum;
+}
+
+function provisionalProviderRequestCount(platform: string, keyId: number, cutoff: number): number {
+  let n = 0;
+  for (const r of reservations.values()) {
+    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform) n++;
+  }
+  return n;
+}
+
+function provisionalProviderTokenCount(platform: string, keyId: number, cutoff: number): number {
+  let sum = 0;
+  for (const r of reservations.values()) {
+    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform) sum += r.tokens;
+  }
+  return sum;
+}
+
 function getWindow(key: string): Window {
   let w = windows.get(key);
   if (!w) {
@@ -119,10 +202,11 @@ function requestCount(
   windowMs: number,
   now: number,
 ): number {
+  const provisional = provisionalRequestCount(platform, modelId, keyId, now - windowMs);
   const persisted = countPersistedRequests(platform, modelId, keyId, windowMs, now);
-  if (persisted !== undefined) return persisted;
+  if (persisted !== undefined) return persisted + provisional;
   const type = windowMs === MINUTE ? 'rpm' : 'rpd';
-  return memoryRequestCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now);
+  return memoryRequestCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now) + provisional;
 }
 
 function tokenCount(
@@ -132,10 +216,11 @@ function tokenCount(
   windowMs: number,
   now: number,
 ): number {
+  const provisional = provisionalTokenCount(platform, modelId, keyId, now - windowMs);
   const persisted = sumPersistedTokens(platform, modelId, keyId, windowMs, now);
-  if (persisted !== undefined) return persisted;
+  if (persisted !== undefined) return persisted + provisional;
   const type = windowMs === MINUTE ? 'tpm' : 'tpd';
-  return memoryTokenCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now);
+  return memoryTokenCount(`${platform}:${modelId}:${keyId}:${type}`, windowMs, now) + provisional;
 }
 
 export function canMakeRequest(
@@ -208,6 +293,7 @@ export function getProviderDailyRequestCap(platform: string): number | null {
 // rather than a sliding 24h window that benches providers past their true reset time.
 export function providerDailyRequestCount(platform: string, keyId: number, now = Date.now()): number {
   const dayStartMs = new Date(now).setUTCHours(0, 0, 0, 0);
+  const provisional = provisionalProviderRequestCount(platform, keyId, dayStartMs);
   const persisted = withDb(db => {
     const row = db.prepare(`
       SELECT COUNT(*) AS used
@@ -219,7 +305,7 @@ export function providerDailyRequestCount(platform: string, keyId: number, now =
     `).get(platform, keyId, dayStartMs) as { used: number };
     return row.used;
   });
-  if (persisted !== undefined) return persisted;
+  if (persisted !== undefined) return persisted + provisional;
   // DB-unavailable fallback: sum the per-model rpd windows for this platform+key.
   // Window key format is "platform:modelId:keyId:rpd" (modelId may contain ':').
   let total = 0;
@@ -228,7 +314,7 @@ export function providerDailyRequestCount(platform: string, keyId: number, now =
       total += w.timestamps.filter(ts => ts > dayStartMs).length;
     }
   }
-  return total;
+  return total + provisional;
 }
 
 // False when this provider account+key has hit its shared daily request cap, so
@@ -335,8 +421,9 @@ function sumPersistedProviderMinuteTokens(
 // Total requests in the last minute for a provider account+key, summed across
 // every model — the account-shared per-minute usage the upstream actually sees.
 export function providerMinuteRequestCount(platform: string, keyId: number, now = Date.now()): number {
+  const provisional = provisionalProviderRequestCount(platform, keyId, now - MINUTE);
   const persisted = countPersistedProviderMinuteRequests(platform, keyId, now);
-  if (persisted !== undefined) return persisted;
+  if (persisted !== undefined) return persisted + provisional;
   // DB-unavailable fallback: sum the per-model rpm windows for this platform+key.
   let total = 0;
   for (const [key, w] of windows) {
@@ -344,14 +431,15 @@ export function providerMinuteRequestCount(platform: string, keyId: number, now 
       total += pruneTimestamps(w.timestamps, MINUTE, now).length;
     }
   }
-  return total;
+  return total + provisional;
 }
 
 // Total tokens in the last minute for a provider account+key, summed across
 // every model.
 export function providerMinuteTokenCount(platform: string, keyId: number, now = Date.now()): number {
+  const provisional = provisionalProviderTokenCount(platform, keyId, now - MINUTE);
   const persisted = sumPersistedProviderMinuteTokens(platform, keyId, now);
-  if (persisted !== undefined) return persisted;
+  if (persisted !== undefined) return persisted + provisional;
   let total = 0;
   for (const [key, w] of windows) {
     if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:tpm`)) {
@@ -360,7 +448,7 @@ export function providerMinuteTokenCount(platform: string, keyId: number, now = 
       }
     }
   }
-  return total;
+  return total + provisional;
 }
 
 // False when this provider account+key has hit its shared per-minute request OR
@@ -602,6 +690,9 @@ export function clearPlatformCaches(platform: string): void {
   }
   for (const key of windows.keys()) {
     if (key.startsWith(prefix)) windows.delete(key);
+  }
+  for (const [id, r] of reservations) {
+    if (r.platform === platform) reservations.delete(id);
   }
   clearProviderConfigCache(platform);
 }
