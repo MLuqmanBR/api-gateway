@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
-import { checkKeyHealth, checkAllKeys } from '../services/health.js';
+import { checkKeyHealth, runCheckAllGuarded } from '../services/health.js';
 import { hasProvider } from '../providers/index.js';
 
 export const healthRouter = Router();
@@ -68,6 +68,12 @@ healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
 
 // Check all keys
 healthRouter.post('/check-all', async (_req: Request, res: Response) => {
-  await checkAllKeys();
+  // Shares the scheduled sweep's in-flight flag so a manual trigger can't
+  // overlap a running sweep (#40).
+  const ran = await runCheckAllGuarded();
+  if (!ran) {
+    res.status(409).json({ error: { message: 'A health check sweep is already running' } });
+    return;
+  }
   res.json({ success: true });
 });

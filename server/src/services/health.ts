@@ -185,6 +185,23 @@ export function resetErrorStatuses(): void {
 }
 
 let checkRunning = false;
+
+/**
+ * Run checkAllKeys unless a sweep is already in flight. Returns false when
+ * skipped-because-running. Both the scheduled interval and the manual
+ * /check-all route go through this so they share the same in-flight flag.
+ */
+export async function runCheckAllGuarded(): Promise<boolean> {
+  if (checkRunning) return false;
+  checkRunning = true;
+  try {
+    await checkAllKeys();
+  } finally {
+    checkRunning = false;
+  }
+  return true;
+}
+
 export function startHealthChecker(): void {
   if (intervalId) return;
   // Clear any transport-error residue before the first check. Without this,
@@ -195,11 +212,8 @@ export function startHealthChecker(): void {
   resetErrorStatuses();
   console.log(`[Health] Starting health checker (every ${CHECK_INTERVAL_MS / 1000}s, concurrency ${CHECK_CONCURRENCY})`);
   intervalId = setInterval(() => {
-    if (checkRunning) return;
-    checkRunning = true;
-    checkAllKeys()
-      .catch(err => console.error('[Health] Check failed:', err))
-      .finally(() => { checkRunning = false; });
+    runCheckAllGuarded()
+      .catch(err => console.error('[Health] Check failed:', err));
   }, CHECK_INTERVAL_MS);
 }
 
