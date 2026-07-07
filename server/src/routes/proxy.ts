@@ -17,6 +17,7 @@ import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandof
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
 import { resolvePinnedModel } from '../lib/pinned-model.js';
+import { isReasoningModelId } from '../lib/reasoning-model.js';
 
 export const proxyRouter = Router();
 
@@ -175,22 +176,7 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
 //                              claim reasoning capability on bare base
 //                              models. Heuristic, not a probe.
 function buildModelCapabilities(modelId: string, maxOutputTokens: number | null, supportsVision: boolean, supportsTools: boolean) {
-  const ml = modelId.toLowerCase();
-  const reasoningFamily =
-       ml.includes('-thinking')                       // k2-thinking, glm-thinking, etc.
-    || ml.includes('-think')                          // gpt-oss "think" tier variants
-    || ml.includes('reasoning')                       // nemotron-reasoning, command-a-reasoning
-    || ml.includes('deepseek-r1')                     // R1 family
-    || ml.includes('deepseek-v4')                     // V4 = V3.2 + reasoning
-    || ml.includes('qwq')                             // QwQ preview
-    || ml.includes('magistral')                       // Mistral Magi*
-    || ml.includes('o3-') || ml.includes('o4-')       // OpenAI o-series
-    || ml.includes('gpt-oss')                         // openai/gpt-oss-* = chain-of-thought tier
-    || ml.includes('minimax-m3')                       // MiniMax M3 = thinking tier
-    || ml.includes('minimax-m2')                       // MiniMax M2.x (m2.5/m2.7) = thinking tier (#292)
-    || ml.includes('minimaxai/minimax-m')             // NVIDIA-style id `minimaxai/minimax-mN` — catch M2.x/M3 family (#292)
-    || ml.includes('glm-5.2')                          // GLM 5.2 — reasoning tier on every host (incl. aggregatord coding-glm-5.2-free) (#292)
-    || ml.includes('mimo-v');                            // Xiaomi MiMo family — reasoning-capable
+  const reasoningFamily = isReasoningModelId(modelId);
 
   const modalities: { input: string[]; output: string[] } = {
     input: supportsVision ? ['text', 'image'] : ['text'],
@@ -1003,25 +989,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // inline in `content` wrapped in `` tags instead of using a separate
     // `reasoning_content` field. The api-gateway splits that into the
     // `reasoning_content` transport field so clients see a clean answer. The
-    // gate mirrors `buildModelCapabilities` (deepseek-r1, kimi-k2-thinking,
-    // etc. match the same pattern; if any of them ever emits the same tag
-    // the proxy handles it the same way).
-    const routeModelIdLower = route.modelId.toLowerCase();
-    const isReasoningModel =
-         routeModelIdLower.includes('-thinking')
-      || routeModelIdLower.includes('-think')
-      || routeModelIdLower.includes('reasoning')
-      || routeModelIdLower.includes('deepseek-r1')
-      || routeModelIdLower.includes('deepseek-v4')
-      || routeModelIdLower.includes('qwq')
-      || routeModelIdLower.includes('magistral')
-      || routeModelIdLower.includes('o3-') || routeModelIdLower.includes('o4-')
-      || routeModelIdLower.includes('gpt-oss')
-      || routeModelIdLower.includes('minimax-m3')
-      || routeModelIdLower.includes('minimax-m2')
-      || routeModelIdLower.includes('minimaxai/minimax-m')
-      || routeModelIdLower.includes('glm-5.2')
-      || routeModelIdLower.includes('mimo-v');
+    // gate shares the family detector with `buildModelCapabilities`
+    // (deepseek-r1, kimi-k2-thinking, etc. match the same pattern; if any of
+    // them ever emits the same tag the proxy handles it the same way).
+    const isReasoningModel = isReasoningModelId(route.modelId);
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
     let keySucceeded = false;
