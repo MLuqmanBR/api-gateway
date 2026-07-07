@@ -187,10 +187,13 @@ export function LiveEvents() {
       } catch { /* malformed event — skip */ }
     };
 
-    // EventSource can't send an Authorization header, so a remote (non-LAN)
-    // operator first mints a short-lived single-use ticket and passes it in the
-    // query string (#43). A LAN-trusted caller doesn't need one — mint failure
-    // falls back to the bare stream, which still authenticates by source IP.
+    // EventSource can't send an Authorization header, but it DOES send the
+    // HttpOnly session cookie automatically, which /api/events now accepts
+    // directly (Improvement 1). The short-lived single-use ticket (#43) is kept
+    // as a fallback for bearer-only sessions — and the cookie authenticates the
+    // ticket fetch itself, so this flow works with either credential. A
+    // LAN-trusted caller needs neither; mint failure falls back to the bare
+    // stream, which still authenticates by source IP (or the cookie).
     (async () => {
       let url = '/api/events';
       try {

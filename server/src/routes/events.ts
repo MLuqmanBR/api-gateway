@@ -3,6 +3,8 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { subscribeSse } from '../services/events.js';
 import { isTrustedRequest } from '../lib/ip-trust.js';
+import { validateSession } from '../services/auth.js';
+import { readSessionCookie } from '../lib/session-cookie.js';
 
 export const eventsRouter = Router();
 
@@ -58,14 +60,16 @@ eventsRouter.get('/ticket', (_req: Request, res: Response) => {
  * the proxy is doing: key exhaustions, retries, model switches, 1 RPM recovery
  * cycles, request successes/failures.
  *
- * Auth: a LAN-trusted caller streams directly (unchanged). A remote caller must
- * present a valid `?ticket=` minted from /api/events/ticket, which this handler
- * validates and consumes. Mounted ABOVE the /api requireAuth blanket in app.ts
- * so the ticket path — not a session header EventSource can't send — is the gate.
+ * Auth: a LAN-trusted caller streams directly (unchanged). A remote caller
+ * authenticates with the HttpOnly session cookie (Improvement 1 — EventSource
+ * sends cookies automatically), or, failing that, a valid `?ticket=` minted
+ * from /api/events/ticket, which this handler validates and consumes (#43,
+ * kept as fallback). Mounted ABOVE the /api requireAuth blanket in app.ts so
+ * these two paths — not a session header EventSource can't send — are the gate.
  * Up to 8 concurrent subscribers; oldest is evicted when the limit is hit.
  */
 export function eventsStreamHandler(req: Request, res: Response): void {
-  if (!isTrustedRequest(req)) {
+  if (!isTrustedRequest(req) && !validateSession(readSessionCookie(req))) {
     const ticket = typeof req.query.ticket === 'string' ? req.query.ticket : undefined;
     if (!consumeTicket(ticket)) {
       res.status(401).json({ error: { message: 'Authentication required', type: 'authentication_error' } });

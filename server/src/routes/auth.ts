@@ -10,6 +10,7 @@ import {
   deleteSession,
 } from '../services/auth.js';
 import { isTrustedRequest } from '../lib/ip-trust.js';
+import { setSessionCookie, clearSessionCookie, readSessionCookie } from '../lib/session-cookie.js';
 
 export const authRouter = Router();
 
@@ -63,9 +64,12 @@ function clearFailures(email: string): void {
   attempts.delete(email.toLowerCase());
 }
 
+// Session token from the request: bearer header, x-dashboard-token header, or
+// the HttpOnly session cookie (Improvement 1) — same precedence as requireAuth.
 function bearer(req: Request): string | undefined {
   return req.headers.authorization?.replace(/^Bearer\s+/i, '')
-    ?? (req.headers['x-dashboard-token'] as string | undefined);
+    ?? (req.headers['x-dashboard-token'] as string | undefined)
+    ?? readSessionCookie(req);
 }
 
 // Has the dashboard been set up yet, and is this caller authenticated?
@@ -97,6 +101,9 @@ authRouter.post('/setup', (req: Request, res: Response) => {
   }
   const user = createUser(parsed.data.email, parsed.data.password);
   const token = createSession(user.userId);
+  // HttpOnly session cookie alongside the JSON token (Improvement 1). The
+  // token stays in the body for backward compatibility with bearer clients.
+  setSessionCookie(req, res, token);
   res.status(201).json({ token, email: user.email });
 });
 
@@ -123,11 +130,15 @@ authRouter.post('/login', (req: Request, res: Response) => {
 
   clearFailures(email);
   const token = createSession(user.userId);
+  // HttpOnly session cookie alongside the JSON token (Improvement 1). The
+  // token stays in the body for backward compatibility with bearer clients.
+  setSessionCookie(req, res, token);
   res.json({ token, email: user.email });
 });
 
 authRouter.post('/logout', (req: Request, res: Response) => {
   deleteSession(bearer(req));
+  clearSessionCookie(res);
   res.json({ success: true });
 });
 

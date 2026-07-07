@@ -6,7 +6,9 @@ import { hashPassword, verifyPassword } from '../lib/password.js';
 // tokens. Distinct from the unified API key, which authenticates the /v1 proxy
 // for apps — this gates the /api/* admin surface for the human operator (#35).
 
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+// Exported so the session cookie's Max-Age (lib/session-cookie.ts) stays in
+// lock-step with the DB-side session expiry.
+export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 export interface SessionUser {
   userId: number;

@@ -1002,10 +1002,13 @@ export default function KeysPage() {
       } catch { /* ignore malformed events */ }
     }
 
-    // EventSource can't send an Authorization header, so a remote (non-LAN)
-    // operator first mints a short-lived single-use ticket and passes it in the
-    // query string (#43). LAN-trusted callers don't need one; mint failure
-    // falls back to the bare stream (still authenticated by source IP).
+    // EventSource can't send an Authorization header, but it DOES send the
+    // HttpOnly session cookie automatically, which /api/events now accepts
+    // directly (Improvement 1). The short-lived single-use ticket (#43) is
+    // kept as a fallback for bearer-only sessions — the cookie authenticates
+    // the ticket fetch itself, so this flow works with either credential.
+    // LAN-trusted callers need neither; mint failure falls back to the bare
+    // stream (still authenticated by source IP, or the cookie).
     ;(async () => {
       let url = '/api/events'
       try {

@@ -123,3 +123,117 @@ describe('Dashboard auth (#35)', () => {
     expect((await call(app, 'POST', '/api/auth/login', creds)).status).toBe(429);
   });
 });
+
+// ── HttpOnly session cookie (Improvement 1) ────────────────────────────────
+// setup/login also set an HttpOnly session cookie alongside the JSON token;
+// requireAuth accepts it as an alternative to the bearer header; logout clears
+// it. Same remote-caller simulation as above so the LAN auto-grant never fires.
+describe('Session cookie (Improvement 1)', () => {
+  let app: Express;
+
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    process.env.TRUST_PROXY = '1';
+    initDb(':memory:'); // fresh DB — this describe re-runs the setup flow.
+    app = createApp();
+  });
+
+  afterAll(() => {
+    if (ORIGINAL_TRUST_PROXY === undefined) delete process.env.TRUST_PROXY;
+    else process.env.TRUST_PROXY = ORIGINAL_TRUST_PROXY;
+  });
+
+  // Like `call` above, but exposes response headers (Set-Cookie) and lets the
+  // caller attach arbitrary request headers (Cookie) instead of a bearer.
+  async function callRaw(
+    method: string,
+    path: string,
+    body?: unknown,
+    headers: Record<string, string> = {},
+  ) {
+    const server = app.listen(0);
+    const addr = server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
+      method,
+      headers: {
+        ...(body ? { 'Content-Type': 'application/json' } : {}),
+        'X-Forwarded-For': REMOTE_IP,
+        ...headers,
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await res.json().catch(() => null);
+    server.close();
+    return { status: res.status, body: data, setCookie: res.headers.get('set-cookie') };
+  }
+
+  let cookiePair = ''; // "api-gateway_session=<token>" captured from login
+
+  it('setup and login both set an HttpOnly SameSite=Lax Path=/api cookie carrying the token', async () => {
+    const setup = await callRaw('POST', '/api/auth/setup', { email: 'admin@example.com', password: 'supersecret' });
+    expect(setup.status).toBe(201);
+    expect(setup.setCookie).toBeTruthy();
+
+    const login = await callRaw('POST', '/api/auth/login', { email: 'admin@example.com', password: 'supersecret' });
+    expect(login.status).toBe(200);
+
+    for (const sc of [setup.setCookie!, login.setCookie!]) {
+      expect(sc).toMatch(/^api-gateway_session=[0-9a-f]{64};/);
+      expect(sc).toMatch(/HttpOnly/i);
+      expect(sc).toMatch(/SameSite=Lax/i);
+      expect(sc).toMatch(/Path=\/api/i);
+      expect(sc).toMatch(/Max-Age=2592000/i); // 30 days — matches SESSION_TTL_MS
+      // Plain-HTTP request → no Secure attribute, or the browser would drop
+      // the cookie on the normal LAN deployment.
+      expect(sc).not.toMatch(/Secure/i);
+    }
+    // Cookie value is the same session token returned in the JSON body.
+    expect(login.setCookie).toContain(`api-gateway_session=${login.body.token};`);
+    cookiePair = `api-gateway_session=${login.body.token}`;
+  });
+
+  it('grants a protected /api route with ONLY the cookie (no Authorization header)', async () => {
+    const { status } = await callRaw('GET', '/api/keys', undefined, { Cookie: cookiePair });
+    expect(status).toBe(200);
+  });
+
+  it('still 401s with no credentials, and rejects a garbage cookie', async () => {
+    expect((await callRaw('GET', '/api/keys')).status).toBe(401);
+    expect((await callRaw('GET', '/api/keys', undefined, { Cookie: 'api-gateway_session=deadbeef' })).status).toBe(401);
+  });
+
+  it('authenticates the /api/events SSE stream with the cookie alone', async () => {
+    const server = app.listen(0);
+    const addr = server.address() as { port: number };
+    const controller = new AbortController();
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/events`, {
+      headers: { 'X-Forwarded-For': REMOTE_IP, Cookie: cookiePair },
+      signal: controller.signal,
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/event-stream');
+    controller.abort(); // don't wait on the endless stream
+    server.close();
+
+    // …and still 401s without any credential (ticket path unaffected).
+    const denied = await callRaw('GET', '/api/events');
+    expect(denied.status).toBe(401);
+  });
+
+  it('clears the cookie on logout and invalidates the session it carried', async () => {
+    const login = await callRaw('POST', '/api/auth/login', { email: 'admin@example.com', password: 'supersecret' });
+    const pair = `api-gateway_session=${login.body.token}`;
+    expect((await callRaw('GET', '/api/keys', undefined, { Cookie: pair })).status).toBe(200);
+
+    // Logout authenticated by the cookie itself — no bearer.
+    const out = await callRaw('POST', '/api/auth/logout', {}, { Cookie: pair });
+    expect(out.status).toBe(200);
+    // Clearing Set-Cookie: empty value + Path=/api + an epoch expiry.
+    expect(out.setCookie).toMatch(/^api-gateway_session=;/);
+    expect(out.setCookie).toMatch(/Path=\/api/i);
+    expect(out.setCookie).toMatch(/Expires=Thu, 01 Jan 1970/i);
+
+    // The session is gone server-side, so replaying the old cookie fails.
+    expect((await callRaw('GET', '/api/keys', undefined, { Cookie: pair })).status).toBe(401);
+  });
+});
