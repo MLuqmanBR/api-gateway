@@ -135,6 +135,22 @@ describe('openAiCompatThinkingPolicy', () => {
     // GLM 5.1 on NVIDIA is unchanged — still the narrow-enum path.
     expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.1')).toBe('glm_mapped');
   });
+
+  it('returns "glm52_synthetic" for GLM 5.2 on gatewaysynth (synthesizes thinking to surface reasoning_content)', () => {
+    expect(openAiCompatThinkingPolicy('gatewaysynth', 'glm-5.2')).toBe('glm52_synthetic');
+    expect(openAiCompatThinkingPolicy('gatewaysynth', 'z-ai/glm-5.2')).toBe('glm52_synthetic');
+  });
+
+  it('keeps gatewaysynth non-GLM-5.2 models on the default policy (no gatewaysynth-wide exception)', () => {
+    expect(openAiCompatThinkingPolicy('gatewaysynth', 'DeepSeek-V4-Pro')).toBe('reasoning_effort_only');
+    expect(openAiCompatThinkingPolicy('gatewaysynth', 'MiniMax-M3')).toBe('reasoning_effort_only');
+  });
+
+  it('keeps GLM 5.2 on non-gatewaysynth hosts unchanged (the gatewaysynth quirk is host-specific)', () => {
+    expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.2')).toBe('glm_nvidia');
+    expect(openAiCompatThinkingPolicy('openrouter', 'z-ai/glm-5.2')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('zhipu', 'glm-5.2')).toBe('glm_mapped');
+  });
 });
 
 describe('isGlmNvidiaThinkingModel', () => {
@@ -255,5 +271,33 @@ describe('openaiCompatThinkingBody', () => {
       expect(openaiCompatThinkingBody('glm_nvidia', undefined)).toEqual({});
       expect(openaiCompatThinkingBody('glm_nvidia', {})).toEqual({});
     });
+  });
+});
+
+describe('openaiCompatThinkingBody — glm52_synthetic (synthesizes thinking to surface reasoning_content)', () => {
+  it('synthesizes thinking={type:enabled} when only reasoning_effort is sent (the common OpenAI-SDK case)', () => {
+    expect(openaiCompatThinkingBody('glm52_synthetic', { reasoning_effort: 'high' }))
+      .toEqual({ thinking: { type: 'enabled' }, reasoning_effort: 'high' });
+  });
+
+  it('forwards the full effort enum verbatim — no glm_mapped clamping', () => {
+    expect(openaiCompatThinkingBody('glm52_synthetic', { reasoning_effort: 'max' }).reasoning_effort).toBe('max');
+    expect(openaiCompatThinkingBody('glm52_synthetic', { reasoning_effort: 'xhigh' }).reasoning_effort).toBe('xhigh');
+    expect(openaiCompatThinkingBody('glm52_synthetic', { reasoning_effort: 'minimal' }).reasoning_effort).toBe('minimal');
+  });
+
+  it('forwards an explicit thinking object verbatim and extracts its effort', () => {
+    const out = openaiCompatThinkingBody('glm52_synthetic', { thinking: { type: 'enabled', effort: 'max' } });
+    expect(out.thinking).toEqual({ type: 'enabled', effort: 'max' });
+    expect(out.reasoning_effort).toBe('max');
+  });
+
+  it('honors an explicit disable (early return, no effort forwarded)', () => {
+    expect(openaiCompatThinkingBody('glm52_synthetic', { thinking: { type: 'disabled' } }))
+      .toEqual({ thinking: { type: 'disabled' } });
+  });
+
+  it('emits nothing when neither knob is set', () => {
+    expect(openaiCompatThinkingBody('glm52_synthetic', undefined)).toEqual({});
   });
 });

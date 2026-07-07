@@ -217,6 +217,7 @@ export type OpenAiCompatThinkingPolicy =
   | 'reasoning_effort_only'   // default — emit reasoning_effort verbatim
   | 'glm_mapped'              // GLM — map effort to GLM's narrow enum, drop the rich object
   | 'glm_nvidia'              // GLM on NVIDIA NIM — needs chat_template_kwargs.enable_thinking; accepts full effort range
+  | 'glm52_synthetic'             // gatewaysynth × glm-5.2 — synthesize thinking={type:enabled} so reasoning_content surfaces; forward effort verbatim across the full 7-value enum
   | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only);
 
 // Legacy alias kept for clarity in comments; 'none' is now 'glm_mapped' because
@@ -264,6 +265,23 @@ export function isGlmNvidiaThinkingModel(platform: string, modelId?: string): bo
   return /(^|\/)glm[-_.]?5[-_.]?2([-_.]|$)/.test(modelId.toLowerCase());
 }
 
+/** True for GLM 5.2 served on the gatewaysynth New-API gateway (`gatewaysynth` + `glm-5.2`).
+ *  Unlike GLM's own OpenAI-compat wrapper (handled by `glm_mapped`), gatewaysynth's
+ *  gateway accepts the rich `thinking` object AND the full `reasoning_effort`
+ *  enum (none|minimal|low|medium|high|xhigh|max). Critically, `reasoning_effort`
+ *  alone does NOT surface `reasoning_content` — the `thinking={"type":"enabled"}`
+ *  switch is required to make the trace visible, so the body builder synthesizes
+ *  it when the caller asks for thinking via `reasoning_effort` alone. Confirmed
+ *  live against `glm-5.2` at `https://api.gatewaysynth.example/v1`. Scoped to 5.2 on the
+ *  gatewaysynth slug only; gatewaysynth's other models (DeepSeek-V4-Pro, MiniMax-M3) keep the
+ *  default. */
+export function isSyntheticGlm52ThinkingModel(platform: string, modelId?: string): boolean {
+  if (platform !== 'gatewaysynth' || !modelId) return false;
+  // Match `glm-5.2` (any separator / org prefix / case), e.g. `glm-5.2`,
+  // `z-ai/glm-5.2`. Same regex shape as isGlmNvidiaThinkingModel.
+  return /(^|\/)glm[-_.]?5[-_.]?2([-_.]|$)/.test(modelId.toLowerCase());
+}
+
 /** Resolve the thinking-field policy for an OpenAI-compat host. `platform`
  *  is the provider slug; `modelId` is the model being called. GLM 5.2 on
  *  NVIDIA NIM gets `'glm_nvidia'` (needs `chat_template_kwargs.enable_thinking`
@@ -275,6 +293,7 @@ export function isGlmNvidiaThinkingModel(platform: string, modelId?: string): bo
  *  rich `thinking` object. Promote a host to `'both'` only after live
  *  confirmation. */
 export function openAiCompatThinkingPolicy(platform: string, modelId?: string): OpenAiCompatThinkingPolicy {
+  if (isSyntheticGlm52ThinkingModel(platform, modelId)) return 'glm52_synthetic';
   if (isGlmNvidiaThinkingModel(platform, modelId)) return 'glm_nvidia';
   if (GLM_HOST_PLATFORMS.has(platform)) return 'glm_mapped';
   if (modelId && isGlmModel(modelId)) return 'glm_mapped';
@@ -355,6 +374,34 @@ export function openaiCompatThinkingBody(
     const requested = effort !== undefined || original?.thinking !== undefined;
     if (!requested) return out;
     out.chat_template_kwargs = { enable_thinking: true, clear_thinking: false };
+    if (effort) out.reasoning_effort = effort;
+    return out;
+  }
+
+  if (policy === 'glm52_synthetic') {
+    // gatewaysynth accepts reasoning_effort as a string across the full enum
+    // (none|minimal|low|medium|high|xhigh|max) and accepts `thinking` as a
+    // boolean or {type} object. But reasoning_effort ALONE does not surface
+    // reasoning_content — the thinking={type:enabled} switch is required.
+    // So when the caller asks for thinking by any means, ensure the thinking
+    // object reaches gatewaysynth. Confirmed live (Turn 1).
+    const effort = original?.reasoning_effort ?? original?.thinking?.effort;
+
+    // Honor an explicit disable: forward verbatim, send no effort.
+    if (original?.thinking?.type === 'disabled') {
+      return { thinking: { type: 'disabled' } };
+    }
+
+    // Nothing requested — send nothing; gatewaysynth defaults to no trace.
+    const requested = effort !== undefined || original?.thinking !== undefined;
+    if (!requested) return out;
+
+    // Forward the caller's thinking object verbatim when present (gatewaysynth accepts
+    // boolean, {type:enabled}, {type:adaptive}); otherwise synthesize the
+    // {type:enabled} switch that surfaces the trace.
+    out.thinking = original?.thinking ?? { type: 'enabled' };
+    // Forward effort verbatim (no clamping — gatewaysynth accepts the full 7-value
+    // enum, unlike glm_mapped's low|medium|high).
     if (effort) out.reasoning_effort = effort;
     return out;
   }

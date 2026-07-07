@@ -181,6 +181,63 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
+  describe('GLM 5.2 on gatewaysynth thinking wiring (reasoning_content surfacing)', () => {
+    const ihc = () => new OpenAICompatProvider({
+      platform: 'gatewaysynth',
+      name: 'gatewaysynth',
+      baseUrl: 'https://api.gatewaysynth.example/v1',
+    });
+    const okResponse = {
+      ok: true,
+      json: () => Promise.resolve({
+        id: 'x', object: 'chat.completion', created: 1, model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      }),
+    } as unknown as Response; // minimal Response stub for the fetch spy
+
+    const captureBody = async (model: string, opts: Record<string, unknown>): Promise<Record<string, unknown>> => {
+      let body: Record<string, unknown> = {};
+      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
+        const text = typeof init?.body === 'string' ? init.body : '{}';
+        body = JSON.parse(text) as Record<string, unknown>;
+        return okResponse;
+      });
+      await ihc().chatCompletion('k', [{ role: 'user', content: 'hi' }], model, opts);
+      return body;
+    };
+
+    it('synthesizes thinking={type:enabled} when only reasoning_effort is sent (OMP/OpenAI-SDK pattern)', async () => {
+      const body = await captureBody('glm-5.2', { reasoning_effort: 'high' });
+      expect(body.thinking).toEqual({ type: 'enabled' });
+      expect(body.reasoning_effort).toBe('high');
+    });
+
+    it('forwards reasoning_effort verbatim across the full enum (no glm_mapped clamping)', async () => {
+      const body = await captureBody('glm-5.2', { reasoning_effort: 'max' });
+      expect(body.reasoning_effort).toBe('max');
+      expect(body.thinking).toEqual({ type: 'enabled' });
+    });
+
+    it('forwards an explicit thinking object verbatim alongside extracted effort', async () => {
+      const body = await captureBody('glm-5.2', { reasoning_effort: 'max', thinking: { type: 'enabled' } });
+      expect(body.thinking).toEqual({ type: 'enabled' });
+      expect(body.reasoning_effort).toBe('max');
+    });
+
+    it('omits thinking fields entirely when no effort/thinking is requested', async () => {
+      const body = await captureBody('glm-5.2', {});
+      expect(body.thinking).toBeUndefined();
+      expect(body.reasoning_effort).toBeUndefined();
+    });
+
+    it('leaves gatewaysynth non-GLM-5.2 models on the default path (no thinking synthesized)', async () => {
+      const body = await captureBody('DeepSeek-V4-Pro', { reasoning_effort: 'high' });
+      expect(body.reasoning_effort).toBe('high');
+      expect(body.thinking).toBeUndefined();
+    });
+  });
+
   it('should throw on error response', async () => {
     vi.spyOn(global, 'fetch').mockResolvedValueOnce({
       ok: false,
