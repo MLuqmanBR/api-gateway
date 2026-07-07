@@ -15,6 +15,16 @@ export class CloudflareProvider extends BaseProvider {
   readonly platform = 'cloudflare' as const;
   readonly name = 'Cloudflare Workers AI';
 
+  // The ONLY place a Cloudflare account_id is derived. Given an apiKey it
+  // returns the account_id that must be used for THAT key — never a cached or
+  // borrowed account. Every outgoing request rebuilds the URL from the exact
+  // key it was given, so a key rotation always carries its own account_id.
+  static accountIdOf(apiKey: string): string {
+    const sep = apiKey.indexOf(':');
+    if (sep === -1) throw new Error('Cloudflare key must be in format "account_id:api_token"');
+    return apiKey.slice(0, sep);
+  }
+
   private parseKey(apiKey: string): { accountId: string; token: string } {
     const sep = apiKey.indexOf(':');
     if (sep === -1) throw new Error('Cloudflare key must be in format "account_id:api_token"');
