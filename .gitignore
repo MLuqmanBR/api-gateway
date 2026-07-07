@@ -30,3 +30,4 @@ omp-session-*
 AUDIT*.md
 PRIVACY-LAYER-FABLE.md
 UPGRADE-PROGRESS.md
+.upgrade-findings/
