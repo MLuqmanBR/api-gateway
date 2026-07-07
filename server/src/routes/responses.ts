@@ -12,6 +12,8 @@ import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, 
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
+import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
+import { isReasoningModelId } from '../lib/reasoning-model.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
@@ -431,6 +433,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     }
 
         let attemptEmitted = false; // per-attempt: true when real output emitted beyond the skeleton
+    // CoT families (MiniMax M2.x/M3, DeepSeek-R1, QwQ, …) return reasoning
+    // inline in `content` wrapped in `<think>` tags, or in a dedicated
+    // `reasoning_content` delta field. Same family gate as routes/proxy.ts —
+    // shared detector, see lib/reasoning-model.ts. Reasoning must never reach
+    // Codex's visible output_text; the Responses shim has no reasoning side
+    // channel, so extracted reasoning is dropped deliberately (the proxy maps
+    // it to `reasoning_content`, which has no equivalent here).
+    const isReasoningModel = isReasoningModelId(route.modelId);
     try {
       if (stream) {
         let outputIndex = 0;
