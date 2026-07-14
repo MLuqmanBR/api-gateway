@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import Database from 'better-sqlite3';
 import { initDb } from '../../db/index.js';
 
 /**

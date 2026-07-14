@@ -3,14 +3,13 @@
  * One-shot script to delete stale Cloudflare keys and insert 10 distinct
  * Cloudflare account keys. Run AFTER Step 4a (cooldowns + old keys deleted).
  *
- * Usage: ENCRYPTION_KEY=95fdfba8381c3406a3a4c043317a2ae80c16051d2f52b846ec75a15ecc2b08b0 \
- *        node server/scripts/encrypt-cloudflare-keys.ts
+ *        npx tsx server/scripts/encrypt-cloudflare-keys.ts
  *
  * Or load from the project's .env file.
  */
 
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import { createDatabase } from '../src/db/backend.js';
 import { readFileSync, existsSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -86,7 +85,7 @@ if (KEY_SETS.length === 0) {
   process.exit(1);
 }
 
-const db = new Database(DB_PATH);
+const db = createDatabase(DB_PATH);
 db.pragma('journal_mode = WAL');
 
 const insert = db.prepare(`

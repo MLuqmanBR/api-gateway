@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import Database from 'better-sqlite3';
+import type { DatabasePort } from '../../db/types.js';
+import { createDatabase } from '../../db/backend.js';
 import { initEncryptionKey, encrypt, decrypt } from '../../lib/crypto.js';
 
-function freshDb(): Database.Database {
-  const db = new Database(':memory:');
+function freshDb(): DatabasePort {
+  const db = createDatabase(':memory:');
   db.exec(`CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
   return db;
 }

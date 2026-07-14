@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { DatabasePort } from '../db/types.js';
 
 /** Discriminated result of resolving a client-pinned `model` field to a
  *  concrete `models.id`. The chat (`/v1/chat/completions`) and responses
@@ -26,10 +26,10 @@ const EXTENSION_PREFIX = 'api-gateway/';
 /** Resolve a client-pinned `model` to a `models.id`, or to an explicit
  *  not-found / disabled / ambiguous verdict the caller can surface as 400.
  *
- *  `db` is the gateway's better-sqlite3 handle (the caller already has it via
+ *  `db` is the gateway's database handle (the caller already has it via
  *  `getDb()`). `requestedModel` is the raw `model` field as the client sent it
  *  (still carrying the optional `api-gateway/` prefix). */
-export function resolvePinnedModel(db: Database.Database, requestedModel: string): PinnedModelResolution {
+export function resolvePinnedModel(db: DatabasePort, requestedModel: string): PinnedModelResolution {
   let workingModel = requestedModel;
   if (workingModel.startsWith(EXTENSION_PREFIX)) {
     workingModel = workingModel.slice(EXTENSION_PREFIX.length);

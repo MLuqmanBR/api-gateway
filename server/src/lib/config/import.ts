@@ -15,7 +15,7 @@
 //
 // `dryRun` runs the same logic but rolls back at the end via a savepoint
 // returning the diff without committing.
-import type Database from 'better-sqlite3';
+import type { DatabasePort } from '../../db/types.js';
 import { getDb, setSetting, getSetting } from '../../db/index.js';
 import { encrypt, decrypt } from '../crypto.js';
 import type { Platform } from '@api-gateway/shared';
@@ -124,7 +124,7 @@ function asPlatform(slug: string): Platform {
   return slug as unknown as Platform;
 }
 
-function uniqueSlug(db: Database.Database, base: string): string {
+function uniqueSlug(db: DatabasePort, base: string): string {
   let candidate = base;
   let n = 2;
   while (db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(candidate)) {
@@ -138,7 +138,7 @@ function uniqueSlug(db: Database.Database, base: string): string {
 
 // ── Settings ──────────────────────────────────────────────────────────────
 
-function applySettings(db: Database.Database, settings: ConfigSettings, diff: SectionDiff): void {
+function applySettings(db: DatabasePort, settings: ConfigSettings, diff: SectionDiff): void {
   // For each present key, only increment `updated` when the value would
   // actually change. An idempotent re-import of an unchanged config must
   // report zero changes for the settings section.
@@ -187,7 +187,7 @@ function applySettings(db: Database.Database, settings: ConfigSettings, diff: Se
 // ── Custom providers ──────────────────────────────────────────────────────
 
 function applyCustomProviders(
-  db: Database.Database,
+  db: DatabasePort,
   list: ConfigCustomProvider[],
   mode: ConfigImportOptions['mode'],
   summary: Record<string, SectionDiff>,
@@ -306,7 +306,7 @@ function modelKey(k: ModelKey): string {
   return `${k.platform}\u0000${k.modelId}`;
 }
 function applyModels(
-  db: Database.Database,
+  db: DatabasePort,
   list: ConfigModel[],
   mode: ConfigImportOptions['mode'],
   summary: Record<string, SectionDiff>,
@@ -445,7 +445,7 @@ function applyModels(
 // ── API keys ──────────────────────────────────────────────────────────────
 
 function applyApiKeys(
-  db: Database.Database,
+  db: DatabasePort,
   list: ConfigApiKey[],
   keysByPlatform: Map<string, string> | null,
   mode: ConfigImportOptions['mode'],
@@ -556,7 +556,7 @@ function applyApiKeys(
 // ── Fallback chain ────────────────────────────────────────────────────────
 
 function applyFallbackChain(
-  db: Database.Database,
+  db: DatabasePort,
   list: Array<{ platform: string; modelId: string; priority?: number; enabled: boolean }>,
   okModels: Map<string, number>,
   mode: ConfigImportOptions['mode'],
@@ -615,7 +615,7 @@ function applyFallbackChain(
 // ── Embeddings ────────────────────────────────────────────────────────────
 
 function applyEmbeddings(
-  db: Database.Database,
+  db: DatabasePort,
   families: ConfigEmbeddingFamily[],
   defaultFamily: string | undefined,
   mode: ConfigImportOptions['mode'],
@@ -696,7 +696,7 @@ function applyEmbeddings(
 // ── Quirks ────────────────────────────────────────────────────────────────
 
 function applyQuirks(
-  db: Database.Database,
+  db: DatabasePort,
   list: ConfigQuirk[],
   mode: ConfigImportOptions['mode'],
   summary: Record<string, SectionDiff>,
@@ -898,7 +898,7 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
   });
 
   if (eff.dryRun) {
-    // Run inside a savepoint so the work rolls back. better-sqlite3
+    // Run inside a savepoint so the work rolls back. The database port
     // does not expose SAVEPOINT as a method, so we drive it via raw SQL.
     const spName = `import_dryrun_${Date.now()}`;
     db.exec(`SAVEPOINT ${spName}`);

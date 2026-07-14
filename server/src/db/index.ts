@@ -1,5 +1,6 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import type { DatabasePort } from './types.js';
+import { createDatabase, backendName } from './backend.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -8,18 +9,18 @@ import { migrateDbSchema } from './migrations.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.resolve(__dirname, '../../data/api-gateway.db');
 
-let db: Database.Database;
+let db: DatabasePort;
 let _initialized = false;
 
 
-export function getDb(): Database.Database {
+export function getDb(): DatabasePort {
   if (!db) {
     throw new Error('Database not initialized. Call initDb() first.');
   }
   return db;
 }
 
-export function initDb(dbPath?: string): Database.Database {
+export function initDb(dbPath?: string): DatabasePort {
   // Guard only the singleton (no-arg) path so accidental double-init in
   // production never opens a second WAL connection on the same file.
   // Explicit paths (tests, import scripts) always create a fresh connection.
@@ -35,13 +36,13 @@ export function initDb(dbPath?: string): Database.Database {
     }
   }
 
-  db = new Database(resolvedPath);
+  db = createDatabase(resolvedPath);
   if (!isMemory) db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
 
   migrateDbSchema(db);
 
-  console.log(`Database initialized at ${resolvedPath}`);
+  console.log(`Database initialized at ${resolvedPath} (${backendName})`);
   return db;
 }
 

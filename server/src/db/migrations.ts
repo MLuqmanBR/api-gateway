@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import Database from 'better-sqlite3';
+import type { DatabasePort } from './types.js';
 import { initEncryptionKey } from '../lib/crypto.js';
 import { applyModelPricing } from './model-pricing.js';
 
@@ -9,7 +9,7 @@ import { applyModelPricing } from './model-pricing.js';
 // migration is genuinely needed, adopt monotonic step-wise migrations instead.
 const CURRENT_DATA_VERSION = 1;
 
-export function migrateDbSchema(db: Database.Database) {
+export function migrateDbSchema(db: DatabasePort) {
   // Schema-level changes run every boot — they're idempotent (IF NOT EXISTS).
   createTables(db);
   initEncryptionKey(db);
@@ -69,7 +69,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateSchemaV36KeyFormat(db);
 }
 
-function createTables(db: Database.Database) {
+function createTables(db: DatabasePort) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -211,7 +211,7 @@ function createTables(db: Database.Database) {
 // NULL when the request was auto-routed ('auto' or omitted model field).
 // requested_model = model_id means the pin was honored; a different model_id
 // means rate limits or failures forced a failover to another model.
-function ensureRequestRequestedModelColumn(db: Database.Database) {
+function ensureRequestRequestedModelColumn(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'requested_model')) {
     db.prepare('ALTER TABLE requests ADD COLUMN requested_model TEXT').run();
@@ -221,7 +221,7 @@ function ensureRequestRequestedModelColumn(db: Database.Database) {
 // `last_used` tracks the most recent session validation timestamp so stale
 // sessions can be pruned on a rolling basis rather than only at expiry.
 // NULL for sessions created before this migration — treated as active.
-function ensureSessionsLastUsedColumn(db: Database.Database) {
+function ensureSessionsLastUsedColumn(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(sessions)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'last_used')) {
     db.prepare('ALTER TABLE sessions ADD COLUMN last_used INTEGER').run();
@@ -231,14 +231,14 @@ function ensureSessionsLastUsedColumn(db: Database.Database) {
 // `ttfb_ms` is the time-to-first-byte for streaming responses (ms from dispatch
 // to the first chunk). NULL for non-streaming or pre-existing rows. Feeds the
 // bandit router's latency axis (server/src/services/scoring.ts).
-function ensureRequestTtfbColumn(db: Database.Database) {
+function ensureRequestTtfbColumn(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'ttfb_ms')) {
     db.prepare('ALTER TABLE requests ADD COLUMN ttfb_ms INTEGER').run();
   }
 }
 
-function ensureRequestKeyIdColumn(db: Database.Database) {
+function ensureRequestKeyIdColumn(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'key_id')) {
     db.prepare('ALTER TABLE requests ADD COLUMN key_id INTEGER').run();
@@ -248,7 +248,7 @@ function ensureRequestKeyIdColumn(db: Database.Database) {
 
 // `base_url` is the upstream endpoint for the user-configured 'custom' provider
 // (#117). NULL for every built-in platform — they use their hardcoded base URL.
-function ensureApiKeysBaseUrlColumn(db: Database.Database) {
+function ensureApiKeysBaseUrlColumn(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(api_keys)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'base_url')) {
     db.prepare('ALTER TABLE api_keys ADD COLUMN base_url TEXT').run();
@@ -258,7 +258,7 @@ function ensureApiKeysBaseUrlColumn(db: Database.Database) {
 // `key_id` binds a custom model to the api_keys row that carries ITS endpoint,
 // so several custom providers can coexist (#212). NULL for built-in platforms
 // (any key of the platform serves any of its models).
-function ensureModelsKeyIdColumn(db: Database.Database) {
+function ensureModelsKeyIdColumn(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'key_id')) {
     db.prepare('ALTER TABLE models ADD COLUMN key_id INTEGER').run();
@@ -272,7 +272,7 @@ function ensureModelsKeyIdColumn(db: Database.Database) {
   }
 }
 
-function ensureCustomProvidersMaxParallelColumn(db: Database.Database) {
+function ensureCustomProvidersMaxParallelColumn(db: DatabasePort) {
   const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
   if (!cols.some(c => c.name === 'max_parallel_requests')) {
     db.prepare('ALTER TABLE custom_providers ADD COLUMN max_parallel_requests INTEGER').run();
@@ -282,7 +282,7 @@ function ensureCustomProvidersMaxParallelColumn(db: Database.Database) {
 // `sticky_sessions_enabled` forces all requests in the same session to use
 // the same API key, maximizing upstream KV-cache hit rate for cache-heavy
 // providers like LongCAT. Off by default; gated behind the Advanced toggle.
-function ensureCustomProvidersStickySessionsColumn(db: Database.Database) {
+function ensureCustomProvidersStickySessionsColumn(db: DatabasePort) {
   const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
   if (!cols.some(c => c.name === 'sticky_sessions_enabled')) {
     db.prepare('ALTER TABLE custom_providers ADD COLUMN sticky_sessions_enabled INTEGER NOT NULL DEFAULT 0').run();
@@ -303,13 +303,13 @@ const BUILT_IN_PLATFORMS = [
   'pollinations', 'llm7', 'huggingface', 'opencode', 'ovh', 'commandcode',
 ];
 
-function seedBuiltInProviderSettings(db: Database.Database) {
+function seedBuiltInProviderSettings(db: DatabasePort) {
   const insert = db.prepare(
     `INSERT OR IGNORE INTO built_in_provider_settings (platform) VALUES (?)`,
   );
   for (const slug of BUILT_IN_PLATFORMS) insert.run(slug);
 }
-function seedModels(db: Database.Database) {
+function seedModels(db: DatabasePort) {
   const count = db.prepare('SELECT COUNT(*) as cnt FROM models').get() as { cnt: number };
   if (count.cnt > 0) return;
 
@@ -384,7 +384,7 @@ function seedModels(db: Database.Database) {
  * corrects stale rate-limits / monthly budgets, adds new smarter models
  * and three new providers (Zhipu, Moonshot, MiniMax).
  */
-function migrateModels(db: Database.Database) {
+function migrateModels(db: DatabasePort) {
   // 1) Replace outdated models in-place (preserves fallback_config & any references)
   const renames: Array<[string, string, string, string, number, string, number | null, number | null, number]> = [
     // platform, oldModelId, newModelId, newDisplayName, intelligenceRank, monthlyBudget, rpdLimit, contextWindow, sizeLabelPriority(unused)
@@ -463,7 +463,7 @@ function migrateModels(db: Database.Database) {
  * the current free tier, and adds real :free OpenRouter models found in the
  * live catalog (April 2026).
  */
-function migrateModelsV2(db: Database.Database) {
+function migrateModelsV2(db: DatabasePort) {
   // Helper: delete a model and its fallback_config entry (FK is RESTRICT-by-default)
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
@@ -539,7 +539,7 @@ function migrateModelsV2(db: Database.Database) {
  * SWE-bench Verified, Terminal-Bench 2, TAU-Bench, Aider Polyglot.
  * Higher rank = weaker. Ties are allowed (same weights across providers).
  */
-function migrateModelsV3Ranks(db: Database.Database) {
+function migrateModelsV3Ranks(db: DatabasePort) {
   const setRank = db.prepare(`UPDATE models SET intelligence_rank = ? WHERE platform = ? AND model_id = ?`);
   const ranks: Array<[number, string, string]> = [
     // #1-10 frontier coders / agents
@@ -594,7 +594,7 @@ function migrateModelsV3Ranks(db: Database.Database) {
  * (no structured tools), OR/gemma-4 (weak at tools). Renames CF llama-3.1 → 3.3
  * fp8-fast. Corrects stale limits.
  */
-function migrateModelsV4(db: Database.Database) {
+function migrateModelsV4(db: DatabasePort) {
   // 1) Remove entries that are unavailable or fail agentic tool use
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
@@ -748,7 +748,7 @@ function migrateModelsV4(db: Database.Database) {
  * free tier but throttled to 10 RPM / 100 RPD due to high demand; context capped
  * at 8192 on free tier).
  */
-function migrateModelsV5(db: Database.Database) {
+function migrateModelsV5(db: DatabasePort) {
   db.prepare(`UPDATE models SET enabled = 0 WHERE platform = 'google' AND model_id = 'gemini-2.5-pro'`).run();
 
   const insert = db.prepare(`
@@ -789,7 +789,7 @@ function migrateModelsV5(db: Database.Database) {
  *     against the same 20 RPD pool, confirming free-tier eligibility)
  *   - 2 OpenRouter :free models with no expiration_date
  */
-function migrateModelsV6(db: Database.Database) {
+function migrateModelsV6(db: DatabasePort) {
   // 1) Remove confirmed-dead OR route
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
@@ -867,7 +867,7 @@ function migrateModelsV6(db: Database.Database) {
  *   api.z.ai and open.bigmodel.cn keys.
  * HF and NVIDIA left as-is: HF still serves chat with current key; NVIDIA already disabled.
  */
-function migrateModelsV7(db: Database.Database) {
+function migrateModelsV7(db: DatabasePort) {
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
     DELETE FROM fallback_config WHERE model_db_id IN (
@@ -926,7 +926,7 @@ function migrateModelsV7(db: Database.Database) {
  * "Couldn't find valid service tier", so the 200s on these rows confirm free-tier
  * access. Cloudflare's @cf/* models share the 10K Neurons/day free pool.
  */
-function migrateModelsV8(db: Database.Database) {
+function migrateModelsV8(db: DatabasePort) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -963,7 +963,7 @@ function migrateModelsV8(db: Database.Database) {
  * zai-glm-4.7 due to high demand. Row kept (not deleted) so it can be
  * re-enabled later without losing fallback_config history.
  */
-function migrateModelsV9(db: Database.Database) {
+function migrateModelsV9(db: DatabasePort) {
   db.prepare(
     "UPDATE models SET enabled = 0 WHERE platform = 'cerebras' AND model_id = 'zai-glm-4.7'"
   ).run();
@@ -983,7 +983,7 @@ function migrateModelsV9(db: Database.Database) {
  * Quota shape: GPU-time, not tokens. monthly_token_budget reflects rough
  * Free-tier "session" capacity rather than a hard token cap.
  */
-function migrateModelsV10(db: Database.Database) {
+function migrateModelsV10(db: DatabasePort) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1040,7 +1040,7 @@ function migrateModelsV10(db: Database.Database) {
  *    please pay with fiat or send tao". The "free" tier requires a paid
  *    balance, which conflicts with the no-card criterion.
  */
-function migrateModelsV11(db: Database.Database) {
+function migrateModelsV11(db: DatabasePort) {
   // 1) Rename cerebras qwen3-235b → qwen-3-235b-a22b-instruct-2507 if the
   //    old id still exists on this DB. Safe to re-run because of the WHERE.
   db.prepare(`
@@ -1152,7 +1152,7 @@ function migrateModelsV11(db: Database.Database) {
  *   - nvidia/nemotron-3-super-120b-a12b:free  262144 → 1000000
  *   - qwen/qwen3-coder:free                   262144 → 1048576
  */
-function migrateModelsV12(db: Database.Database) {
+function migrateModelsV12(db: DatabasePort) {
   const deleteModel = db.prepare(`DELETE FROM models WHERE platform = ? AND model_id = ?`);
   const deleteFallback = db.prepare(`
     DELETE FROM fallback_config WHERE model_db_id IN (
@@ -1286,7 +1286,7 @@ function migrateModelsV12(db: Database.Database) {
  *   - github: gpt-5 family + xai/grok-3 both 400 "unavailable_model" on free
  *     tier — keep gpt-4o (V2 verdict still holds).
  */
-function migrateModelsV13(db: Database.Database) {
+function migrateModelsV13(db: DatabasePort) {
   // 1) Disables (row kept; can be re-enabled without losing fallback history).
   const disable = db.prepare(`UPDATE models SET enabled = 0 WHERE platform = ? AND model_id = ?`);
   const disables: Array<[string, string]> = [
@@ -1411,7 +1411,7 @@ function migrateModelsV13(db: Database.Database) {
  * Cerebras `gpt-oss-120b` is NOT in the deprecation list and stays enabled
  * as the sole free-tier Cerebras route.
  */
-function migrateModelsV14(db: Database.Database) {
+function migrateModelsV14(db: DatabasePort) {
   db.prepare(`
     UPDATE models SET enabled = 0
      WHERE platform = 'cerebras'
@@ -1431,7 +1431,7 @@ function migrateModelsV14(db: Database.Database) {
  * as Chutes — so the provider was reverted. This removes any orphaned row from
  * a DB that already ran the original V15. No-op on DBs that never had it.
  */
-function migrateModelsV15(db: Database.Database) {
+function migrateModelsV15(db: DatabasePort) {
   db.prepare(`
     DELETE FROM fallback_config WHERE model_db_id IN (
       SELECT id FROM models WHERE platform = 'siliconflow'
@@ -1452,7 +1452,7 @@ function migrateModelsV15(db: Database.Database) {
 // Conservative on purpose: with hard-fail routing a false negative is just a
 // clear "no vision model" error, while a false positive routes an image to a
 // model that chokes. Idempotent — safe on fresh seeds and upgrades alike.
-function migrateModelsV16Vision(db: Database.Database) {
+function migrateModelsV16Vision(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'supports_vision')) {
     db.prepare('ALTER TABLE models ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 0').run();
@@ -1506,7 +1506,7 @@ function migrateModelsV16Vision(db: Database.Database) {
 // Baidu CoBuddy, Groq Compound, GLM-4.6V Flash, GLM-4.5 Flash, Mistral Small 4,
 // Devstral). intelligence_rank (the within-tier tiebreak, low impact) is left
 // untouched. Idempotent — every statement is an absolute SET, safe to re-run.
-function migrateModelsV17IntelligenceTiers(db: Database.Database) {
+function migrateModelsV17IntelligenceTiers(db: DatabasePort) {
   const apply = db.transaction(() => {
     // Frontier (AA ≥ 45): genuine frontier-class. Promotes Gemini 3.5 Flash (55)
     // and Gemini 3 Flash Preview (46) up from Large.
@@ -1610,7 +1610,7 @@ function migrateModelsV17IntelligenceTiers(db: Database.Database) {
 // models (NVIDIA logs Nemotron traffic). Conservative shared 20 RPM / 200 RPD,
 // matching the OpenRouter :free pool pattern. Idempotent (INSERT OR IGNORE +
 // fallback_config backfill), safe to re-run.
-function migrateModelsV18OpenCodeZen(db: Database.Database) {
+function migrateModelsV18OpenCodeZen(db: DatabasePort) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1647,7 +1647,7 @@ function migrateModelsV18OpenCodeZen(db: Database.Database) {
  * Dec 2025, so rpd/tpm are conservative. Idempotent (INSERT OR IGNORE + fallback
  * backfill), safe to re-run.
  */
-function migrateModelsV19Gemma4(db: Database.Database) {
+function migrateModelsV19Gemma4(db: DatabasePort) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1676,7 +1676,7 @@ function migrateModelsV19Gemma4(db: Database.Database) {
  * 'kilo' api_keys sentinel row, added via the keyless Keys-page flow. Idempotent
  * (INSERT OR IGNORE + fallback backfill), safe to re-run.
  */
-function migrateModelsV20KiloFree(db: Database.Database) {
+function migrateModelsV20KiloFree(db: DatabasePort) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1713,7 +1713,7 @@ function migrateModelsV20KiloFree(db: Database.Database) {
  * These ids are re-inserted by their original migrations on each boot, so this
  * later DELETE is what keeps them out. Idempotent, safe to re-run.
  */
-function migrateModelsV21PruneDead(db: Database.Database) {
+function migrateModelsV21PruneDead(db: DatabasePort) {
   const dead: Array<[string, string]> = [
     ['llm7', 'gpt-oss-20b'],
     ['llm7', 'meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo'],
@@ -1768,7 +1768,7 @@ function migrateModelsV21PruneDead(db: Database.Database) {
 // tail (granite, lfm, stepfun, big-pickle, mimo, owl-alpha, cogito,
 // pollinations). Idempotent — reset-then-set, safe on fresh seeds and
 // upgrades alike.
-function migrateModelsV22Tools(db: Database.Database) {
+function migrateModelsV22Tools(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'supports_tools')) {
     db.prepare('ALTER TABLE models ADD COLUMN supports_tools INTEGER NOT NULL DEFAULT 0').run();
@@ -1859,7 +1859,7 @@ function migrateModelsV22Tools(db: Database.Database) {
  * vision/tools seeds match the V16/V22 rules (which re-assert next boot);
  * tiers match V17's bands.
  */
-function migrateModelsV23FreeTierAudit(db: Database.Database) {
+function migrateModelsV23FreeTierAudit(db: DatabasePort) {
   const apply = db.transaction(() => {
     for (const platform of ['sambanova', 'chutes']) {
       db.prepare(`
@@ -1919,7 +1919,7 @@ function migrateModelsV23FreeTierAudit(db: Database.Database) {
  *
  * Idempotent: INSERT OR IGNORE + always-run UPDATEs, safe to re-run.
  */
-function migrateModelsV24ZenRefresh(db: Database.Database) {
+function migrateModelsV24ZenRefresh(db: DatabasePort) {
   const apply = db.transaction(() => {
     const insert = db.prepare(`
       INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
@@ -1956,7 +1956,7 @@ function migrateModelsV24ZenRefresh(db: Database.Database) {
  * promo can re-enable). Idempotent: re-asserted each boot like the V13/V24
  * disables.
  */
-function migrateModelsV25ZenDeadPromos(db: Database.Database) {
+function migrateModelsV25ZenDeadPromos(db: DatabasePort) {
   const disable = db.prepare(`UPDATE models SET enabled = 0 WHERE platform = ? AND model_id = ?`);
   const disables: Array<[string, string]> = [
     ['opencode', 'nemotron-3-super-free'],
@@ -1970,7 +1970,7 @@ function migrateModelsV25ZenDeadPromos(db: Database.Database) {
 
 // V26: max_output_tokens for models so users can set the default max_tokens
 // the proxy sends upstream for each model. NULL means no default cap.
-function migrateModelsV26MaxOutputTokens(db: Database.Database) {
+function migrateModelsV26MaxOutputTokens(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'max_output_tokens')) {
     db.prepare('ALTER TABLE models ADD COLUMN max_output_tokens INTEGER').run();
@@ -1981,7 +1981,7 @@ function migrateModelsV26MaxOutputTokens(db: Database.Database) {
 // GlmAggregatorB, DeepSeek). Each is an OpenAI-compatible endpoint with
 // free-tier API keys. Models are registered and added to the fallback
 // chain at lowest priority so they don't displace existing models.
-function migrateCustomProvidersV27UserProviders(db: Database.Database) {
+function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
   type ProviderDef = { slug: string; name: string; url: string };
   type ModelDef = {
     provider: string; id: string; name: string;
@@ -2086,7 +2086,7 @@ function migrateCustomProvidersV27UserProviders(db: Database.Database) {
 // incompatible spaces, so /v1/embeddings only ever fails over WITHIN a family
 // (same model served by another provider), never across families.
 // Every entry was live-verified against the provider on 2026-06-04.
-function migrateEmbeddingsV1(db: Database.Database) {
+function migrateEmbeddingsV1(db: DatabasePort) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS embedding_models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2150,7 +2150,7 @@ function migrateEmbeddingsV1(db: Database.Database) {
 // hardcoded base URLs in providers/index.ts.
 //
 // Idempotent: a re-run sees no 'custom' rows and exits quietly.
-function migrateCustomProvidersV24(db: Database.Database) {
+function migrateCustomProvidersV24(db: DatabasePort) {
   const legacy = db.prepare(
     "SELECT id, base_url FROM api_keys WHERE platform = 'custom' ORDER BY id LIMIT 1"
   ).get() as { id: number; base_url: string | null } | undefined;
@@ -2176,7 +2176,7 @@ function migrateCustomProvidersV24(db: Database.Database) {
   tx();
 }
 
-function migrateQuirksV1(db: Database.Database) {
+function migrateQuirksV1(db: DatabasePort) {
   db.exec(`
     CREATE TABLE IF NOT EXISTS quirks (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2319,7 +2319,7 @@ function migrateQuirksV1(db: Database.Database) {
 
 /** Append any models not yet in the fallback chain, lowest priority, ordered by
  * intelligence_rank. Shared by the recent model migrations (V18–V20). */
-function backfillFallback(db: Database.Database) {
+function backfillFallback(db: DatabasePort) {
   const missing = db.prepare(`
     SELECT m.id FROM models m
     LEFT JOIN fallback_config f ON m.id = f.model_db_id
@@ -2332,7 +2332,7 @@ function backfillFallback(db: Database.Database) {
   }
 }
 
-function ensureUnifiedKey(db: Database.Database) {
+function ensureUnifiedKey(db: DatabasePort) {
   const existing = db.prepare("SELECT value FROM settings WHERE key = 'unified_api_key'").get() as { value: string } | undefined;
   if (!existing) {
     const key = `api-gateway-${crypto.randomBytes(24).toString('hex')}`;
@@ -2349,7 +2349,7 @@ function ensureUnifiedKey(db: Database.Database) {
 //   3. FK trigger: models.key_id → api_keys(id) ON DELETE SET NULL. SQLite
 //      won't ALTER TABLE to add a foreign key, so a trigger keeps the ref
 //      clean when an api_key row is deleted.
-function migrateSchemaV28IndexesAndFK(db: Database.Database) {
+function migrateSchemaV28IndexesAndFK(db: DatabasePort) {
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_requests_platform_model ON requests(platform, model_id)`).run();
   db.prepare(`CREATE INDEX IF NOT EXISTS idx_fallback_config_priority ON fallback_config(priority)`).run();
   db.prepare(`
@@ -2365,7 +2365,7 @@ function migrateSchemaV28IndexesAndFK(db: Database.Database) {
 // ── V29: archive support for custom providers (2026-06) ──
 // Adds an `archived` column so deleting a custom provider is a soft-delete:
 // models and keys are disabled, the provider row stays for analytics.
-function migrateSchemaV29ArchiveProviders(db: Database.Database) {
+function migrateSchemaV29ArchiveProviders(db: DatabasePort) {
   const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
   if (!cols.some(c => c.name === 'archived')) {
     db.prepare('ALTER TABLE custom_providers ADD COLUMN archived INTEGER DEFAULT 0').run();
@@ -2376,7 +2376,7 @@ function migrateSchemaV29ArchiveProviders(db: Database.Database) {
 // Lets operators register custom providers that don't need an API key
 // (e.g. a local Ollama instance, anonymous gateway). Keyless providers
 // auto-create a sentinel key row so routing treats them as configured.
-function migrateSchemaV30KeylessProviders(db: Database.Database) {
+function migrateSchemaV30KeylessProviders(db: DatabasePort) {
   const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
   if (!cols.some(c => c.name === 'keyless')) {
     db.prepare('ALTER TABLE custom_providers ADD COLUMN keyless INTEGER DEFAULT 0').run();
@@ -2387,7 +2387,7 @@ function migrateSchemaV30KeylessProviders(db: Database.Database) {
 // Lets operators specify whether a custom provider uses OpenAI-compatible
 // ('openai') or Anthropic-compatible ('anthropic') API format. Default is
 // 'openai' (backward-compatible with all existing providers).
-function migrateSchemaV31ApiFormat(db: Database.Database) {
+function migrateSchemaV31ApiFormat(db: DatabasePort) {
   const cols = db.prepare("PRAGMA table_info('custom_providers')").all() as Array<{ name: string }>;
   if (!cols.some(c => c.name === 'api_format')) {
     db.prepare("ALTER TABLE custom_providers ADD COLUMN api_format TEXT DEFAULT 'openai'").run();
@@ -2405,7 +2405,7 @@ function migrateSchemaV31ApiFormat(db: Database.Database) {
 // Removal: delete this function + its call in migrateDbSchema, remove
 // commandcode from platform.ts and keys.ts, and drop the one DB table row
 // via a one-line migration.
-function migrateModelsV32CommandCode(db: Database.Database) {
+function migrateModelsV32CommandCode(db: DatabasePort) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -2451,7 +2451,7 @@ function migrateModelsV32CommandCode(db: Database.Database) {
 // dashboard. Seed it here so every install gets it automatically. Mirrors the
 // M2.7 row's limits (40 RPM, shared credit budget, 196608 context). Runs every
 // boot via INSERT OR IGNORE; the fallback_config backfill mirrors V32. (#292)
-function migrateModelsV33NvidiaMinimaxM3(db: Database.Database) {
+function migrateModelsV33NvidiaMinimaxM3(db: DatabasePort) {
   const insert = db.prepare(`
     INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2498,7 +2498,7 @@ function migrateModelsV33NvidiaMinimaxM3(db: Database.Database) {
 //
 // One-shot sentinel gates the backfill so an operator who intentionally clears
 // the nvidia rpm limit isn't silently reverted on restart.
-function migrateModelsV34NvidiaSharedQuota(db: Database.Database) {
+function migrateModelsV34NvidiaSharedQuota(db: DatabasePort) {
   const sentinel = db.prepare("SELECT value FROM settings WHERE key = 'migrated_v34_nvidia'").get() as { value: string } | undefined;
   if (sentinel) return;
   db.prepare(
@@ -2516,7 +2516,7 @@ function migrateModelsV34NvidiaSharedQuota(db: Database.Database) {
 // The per-insert prune DELETE … WHERE created_at_ms <= ? does a full
 // table scan without an index on created_at_ms.  Add one so the hot-path
 // prune is O(log n) instead of O(n).  Idempotent — IF NOT EXISTS.
-function migrateSchemaV35RateLimitIndex(db: Database.Database) {
+function migrateSchemaV35RateLimitIndex(db: DatabasePort) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_created ON rate_limit_usage(created_at_ms)');
 }
 
@@ -2525,7 +2525,7 @@ function migrateSchemaV35RateLimitIndex(db: Database.Database) {
 // When key_format = 'colon', the provider splits the key at the first ':',
 // substitutes {account_id} in base_url, and sends only the token portion
 // as Authorization: Bearer.  Idempotent — pragma check before ALTER.
-function migrateSchemaV36KeyFormat(db: Database.Database) {
+function migrateSchemaV36KeyFormat(db: DatabasePort) {
   const col = db.prepare("PRAGMA table_info('custom_providers')").all() as { name: string }[];
   if (!col.some(c => c.name === 'key_format')) {
     db.exec("ALTER TABLE custom_providers ADD COLUMN key_format TEXT NOT NULL DEFAULT 'simple' CHECK(key_format IN ('simple','colon'))");

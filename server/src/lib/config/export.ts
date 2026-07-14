@@ -8,7 +8,7 @@
 // self-describing cipher blob. Without a passphrase the api_keys section
 // is included in plaintext — fine for offline backups, but the UI nudges
 // the user toward providing one.
-import type Database from 'better-sqlite3';
+import type { DatabasePort } from '../../db/types.js';
 import { getDb } from '../../db/index.js';
 import { decrypt } from '../crypto.js';
 import {
@@ -54,7 +54,7 @@ export class ConfigExportError extends Error {
   }
 }
 
-function readSection(db: Database.Database, sections: Record<ConfigSection, true>): ConfigEnvelope['sections'] {
+function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): ConfigEnvelope['sections'] {
   const out: ConfigEnvelope['sections'] = {};
   const tx = db.transaction(() => {
     if (sections.models) {

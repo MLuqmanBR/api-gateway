@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import { initDb } from '../../db/index.js';
-import type Database from 'better-sqlite3';
+import type { DatabasePort } from '../../db/types.js';
 import { resolvePinnedModel } from '../../lib/pinned-model.js';
 
-let db: Database.Database;
+let db: DatabasePort;
 
 beforeAll(() => {
   process.env.ENCRYPTION_KEY = '0'.repeat(64);

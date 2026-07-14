@@ -5,7 +5,7 @@
 **One endpoint. Every model. Free tiers or paid SOTA — routing that learns.**
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Node.js >=20](https://img.shields.io/badge/node.js-%3E%3D20-brightgreen.svg)](#quick-start)
+[![Node.js >=18](https://img.shields.io/badge/node.js-%3E%3D18-brightgreen.svg)](#quick-start)
 
 [Quick Start](#quick-start) · [Features](#features) · [Using the API](#using-the-api) · [How It Works](#how-it-works) · [Bring Your Own Provider](#bring-your-own-provider)
 
@@ -69,7 +69,7 @@ PRs welcome. See [Contributing](#contributing).
 
 ## Quick start
 
-**Prerequisites:** Node.js 20+, npm.
+**Prerequisites:** Node.js 18+, npm.
 
 ```bash
 git clone https://github.com/MLuqmanBR/api-gateway.git
@@ -342,7 +342,6 @@ flowchart LR
 **Skip it if you:**
 
 - Need a managed cloud service — it's self-hosted only
-- Can't run Node.js 20+ on your host
 - Need an admin dashboard for multiple operators — the gateway has one admin; multiple apps and clients can connect through it, but there's no multi-operator RBAC
 
 ## Contributing

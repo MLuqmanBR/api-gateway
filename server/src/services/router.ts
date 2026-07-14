@@ -12,7 +12,7 @@ import {
 } from './scoring.js';
 import { parseBudget } from '../lib/budget.js';
 import type { BaseProvider } from '../providers/base.js';
-import type { Database } from 'better-sqlite3';
+import type { DatabasePort } from '../db/types.js';
 
 interface KeyRow {
   id: number;
@@ -292,7 +292,7 @@ let providerConfigCacheTime = 0;
 
 /** Fetch platform-level config once per TTL window. Aggregates what were
  *  4-6 separate db.prepare().get() calls per chain entry into one lookup. */
-function getProviderConfig(db: Database, platform: string): ProviderConfig {
+function getProviderConfig(db: DatabasePort, platform: string): ProviderConfig {
   if (!providerConfigCache || Date.now() - providerConfigCacheTime >= PROVIDER_CONFIG_TTL_MS) {
     providerConfigCache = new Map();
     providerConfigCacheTime = Date.now();
@@ -346,7 +346,7 @@ function decayWeight(ageDays: number): number {
   return Math.pow(0.5, Math.max(0, ageDays) / HALF_LIFE_DAYS);
 }
 
-export function refreshStatsCache(db: Database, force = false): void {
+export function refreshStatsCache(db: DatabasePort, force = false): void {
   if (!force && statsCache && Date.now() - statsCacheTime < CACHE_TTL_MS) return;
 
   const since = new Date(Date.now() - WINDOW_MS).toISOString();
