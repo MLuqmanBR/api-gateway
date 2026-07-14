@@ -52,6 +52,7 @@ export interface CustomProvider {
   apiFormat: 'openai' | 'anthropic';
   stickySessionsEnabled: boolean;
   archived: boolean;
+  keyFormat: 'simple' | 'colon';
 }
 export interface CustomProviderCreate {
   slug: string;
@@ -65,6 +66,7 @@ export interface CustomProviderCreate {
   keyless?: boolean;
   apiFormat?: 'openai' | 'anthropic';
   stickySessionsEnabled?: boolean;
+  keyFormat?: 'simple' | 'colon';
 }
 
 export interface CustomProviderUpdate {
@@ -74,10 +76,10 @@ export interface CustomProviderUpdate {
   rpdLimit?: number | null;
   tpmLimit?: number | null;
   tpdLimit?: number | null;
-  maxParallelRequests?: number | null;
   keyless?: boolean;
   apiFormat?: 'openai' | 'anthropic';
   stickySessionsEnabled?: boolean;
+  keyFormat?: 'simple' | 'colon';
 }
 
 export interface CustomModelCreate {

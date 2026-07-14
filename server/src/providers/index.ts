@@ -221,7 +221,7 @@ export function buildProviderFor(platformSlug: string): BaseProvider | undefined
   // across requests — OpenAICompatProvider holds no per-instance state worth
   // reusing, and the DB hit is one indexed lookup.
   const db = getDb();
-  const row = db.prepare('SELECT base_url, keyless, api_format FROM custom_providers WHERE slug = ?').get(platformSlug) as { base_url: string; keyless: number; api_format: string } | undefined;
+  const row = db.prepare('SELECT base_url, keyless, api_format, key_format FROM custom_providers WHERE slug = ?').get(platformSlug) as { base_url: string; keyless: number; api_format: string; key_format: string } | undefined;
   if (!row?.base_url) return undefined;
   const keyless = row.keyless === 1;
   if (row.api_format === 'anthropic') {
@@ -231,6 +231,7 @@ export function buildProviderFor(platformSlug: string): BaseProvider | undefined
       baseUrl: row.base_url,
       timeoutMs: CUSTOM_PROVIDER_TIMEOUT_MS,
       keyless,
+      keyFormat: row.key_format,
     });
   }
   return new OpenAICompatProvider({
@@ -239,6 +240,7 @@ export function buildProviderFor(platformSlug: string): BaseProvider | undefined
     baseUrl: row.base_url,
     timeoutMs: CUSTOM_PROVIDER_TIMEOUT_MS,
     keyless,
+    keyFormat: row.key_format,
   });
 }
 

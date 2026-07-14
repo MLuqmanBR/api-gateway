@@ -32,6 +32,7 @@ const createProviderSchema = z.object({
   maxParallelRequests: z.number().int().min(1).nullable().optional(),
   keyless: z.boolean().optional(),
   apiFormat: z.enum(['openai', 'anthropic']).optional(),
+  keyFormat: z.enum(['simple', 'colon']).optional(),
   stickySessionsEnabled: z.boolean().optional(),
 });
 
@@ -46,12 +47,13 @@ const updateProviderSchema = z.object({
   maxParallelRequests: z.number().int().min(1).nullable().optional(),
   keyless: z.boolean().optional(),
   apiFormat: z.enum(['openai', 'anthropic']).optional(),
+  keyFormat: z.enum(['simple', 'colon']).optional(),
   stickySessionsEnabled: z.boolean().optional(),
 }).refine(d => d.displayName !== undefined || d.baseUrl !== undefined
   || d.slug !== undefined || d.tpmLimit !== undefined || d.tpdLimit !== undefined
   || d.rpmLimit !== undefined || d.rpdLimit !== undefined
   || d.maxParallelRequests !== undefined || d.keyless !== undefined || d.apiFormat !== undefined
-  || d.stickySessionsEnabled !== undefined, {
+  || d.keyFormat !== undefined || d.stickySessionsEnabled !== undefined, {
     message: `At least one of displayName, slug, baseUrl, stickySessionsEnabled, or limit must be provided`,
   });
 // tools by default (the most common case for OpenAI-compatible endpoints).
@@ -239,8 +241,6 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
 
 // ── Providers ──────────────────────────────────────────────────────────
 
-// List all custom providers with per-provider model + enabled-key counts so
-// the UI doesn't have to cross-reference.
 customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
   const db = getDb();
   const rows = db.prepare('SELECT * FROM custom_providers ORDER BY created_at ASC').all() as Array<{
@@ -251,6 +251,7 @@ customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
     created_at: string;
     keyless: number;
     api_format: string;
+    key_format: string;
     sticky_sessions_enabled: number;
     archived: number;
   }>;
@@ -274,6 +275,7 @@ customRouter.get('/api/custom-providers', (_req: Request, res: Response) => {
     maxParallelRequests: r.max_parallel_requests,
     keyless: r.keyless === 1,
     apiFormat: r.api_format as 'openai' | 'anthropic',
+    keyFormat: r.key_format as 'simple' | 'colon',
     stickySessionsEnabled: r.sticky_sessions_enabled === 1,
     archived: r.archived === 1,
     createdAt: r.created_at,
@@ -289,13 +291,18 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
     return;
   }
-  const { slug, displayName, rpmLimit, rpdLimit, tpmLimit, tpdLimit, maxParallelRequests, keyless, apiFormat = 'openai', stickySessionsEnabled } = parsed.data;
+  const { slug, displayName, rpmLimit, rpdLimit, tpmLimit, tpdLimit, maxParallelRequests, keyless, apiFormat = 'openai', keyFormat = 'simple', stickySessionsEnabled } = parsed.data;
   const baseUrl = parsed.data.apiFormat === 'anthropic'
     ? parsed.data.baseUrl.trim().replace(/\/+$/, '')
     : normalizeOpenAiBaseUrl(parsed.data.baseUrl);
 
   if (BUILTIN_SLUGS.has(slug)) {
     res.status(400).json({ error: { message: `slug '${slug}' is reserved by a built-in platform` } });
+    return;
+  }
+
+  if (keyFormat === 'colon' && !baseUrl.includes('{account_id}')) {
+    res.status(400).json({ error: { message: 'baseUrl must contain {account_id} when keyFormat is "colon"' } });
     return;
   }
 
@@ -329,8 +336,8 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
     } else {
       // Same slug, same base_url — revive from archive.
       const tx = db.transaction(() => {
-        db.prepare('UPDATE custom_providers SET archived = 0, display_name = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?, max_parallel_requests = ?, keyless = ?, api_format = ?, sticky_sessions_enabled = ? WHERE slug = ?')
-          .run(displayName.trim(), rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, apiFormat, stickySessionsEnabled ? 1 : 0, slug);
+        db.prepare('UPDATE custom_providers SET archived = 0, display_name = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?, max_parallel_requests = ?, keyless = ?, api_format = ?, key_format = ?, sticky_sessions_enabled = ? WHERE slug = ?')
+          .run(displayName.trim(), rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, apiFormat, keyFormat, stickySessionsEnabled ? 1 : 0, slug);
         db.prepare('UPDATE api_keys SET enabled = 1 WHERE platform = ?').run(slug);
         db.prepare('UPDATE models SET enabled = 1 WHERE platform = ?').run(slug);
       });
@@ -345,17 +352,17 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
         maxParallelRequests: maxParallelRequests ?? null,
         keyless: !!keyless,
         apiFormat,
+        keyFormat,
         stickySessionsEnabled: !!stickySessionsEnabled,
-        modelCount: sync.fetched, revived: true,
       });
       return;
     }
   }
 
   const result = db.prepare(`
-    INSERT INTO custom_providers (slug, display_name, base_url, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_parallel_requests, keyless, api_format, sticky_sessions_enabled)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(slug, displayName.trim(), baseUrl, rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, apiFormat, stickySessionsEnabled ? 1 : 0);
+    INSERT INTO custom_providers (slug, display_name, base_url, rpm_limit, rpd_limit, tpm_limit, tpd_limit, max_parallel_requests, keyless, api_format, key_format, sticky_sessions_enabled)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(slug, displayName.trim(), baseUrl, rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, apiFormat, keyFormat, stickySessionsEnabled ? 1 : 0);
 
   // Auto-discover models from the provider's /models endpoint.
   const sync = await syncModelsFromProvider(baseUrl, slug);
@@ -372,8 +379,8 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
     maxParallelRequests: maxParallelRequests ?? null,
     keyless: !!keyless,
     apiFormat,
+    keyFormat,
     stickySessionsEnabled: !!stickySessionsEnabled,
-    modelCount: sync.fetched,
   });
 });
 
@@ -444,6 +451,19 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
   if (parsed.data.apiFormat !== undefined) {
     updates.push('api_format = ?');
     values.push(parsed.data.apiFormat);
+  }
+  if (parsed.data.keyFormat !== undefined) {
+    // If changing to 'colon', validate baseUrl contains {account_id}.
+    if (parsed.data.keyFormat === 'colon') {
+      const existingRow = db.prepare('SELECT base_url, key_format FROM custom_providers WHERE slug = ?').get(oldSlug) as { base_url: string; key_format: string } | undefined;
+      const effectiveBaseUrl = parsed.data.baseUrl ?? existingRow?.base_url ?? '';
+      if (!effectiveBaseUrl.includes('{account_id}')) {
+        res.status(400).json({ error: { message: 'baseUrl must contain {account_id} when keyFormat is "colon"' } });
+        return;
+      }
+    }
+    updates.push('key_format = ?');
+    values.push(parsed.data.keyFormat);
   }
   if (parsed.data.stickySessionsEnabled !== undefined) {
     updates.push('sticky_sessions_enabled = ?');

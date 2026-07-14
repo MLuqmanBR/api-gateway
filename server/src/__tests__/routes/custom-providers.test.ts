@@ -412,4 +412,34 @@ describe('Custom providers (#230)', () => {
   it('buildProviderFor returns undefined for a slug that has no row', () => {
     expect(buildProviderFor('nonexistent-slug')).toBeUndefined();
   });
+
+  // ── keyFormat ─────────────────────────────────────────────────────
+
+  it('creates provider with keyFormat colon and baseUrl containing {account_id}', async () => {
+    const { status, body } = await request(app, 'POST', '/api/custom-providers', {
+      slug: 'databricks',
+      displayName: 'Databricks AI Gateway',
+      baseUrl: 'https://{account_id}.cloud.databricks.com/ai-gateway/mlflow/v1',
+      keyFormat: 'colon',
+    });
+    expect(status).toBe(201);
+    expect(body.keyFormat).toBe('colon');
+    expect(body.baseUrl).toBe('https://{account_id}.cloud.databricks.com/ai-gateway/mlflow/v1');
+
+    const db = getDb();
+    const row = db.prepare('SELECT key_format FROM custom_providers WHERE slug = ?').get('databricks') as { key_format: string };
+    expect(row.key_format).toBe('colon');
+  });
+
+  it('rejects keyFormat colon when baseUrl is missing {account_id}', async () => {
+    const { status, body } = await request(app, 'POST', '/api/custom-providers', {
+      slug: 'bad-colon',
+      displayName: 'Bad',
+      baseUrl: 'https://api.example.com/v1',
+      keyFormat: 'colon',
+    });
+    expect(status).toBe(400);
+    expect(body?.error?.message).toMatch(/account_id/);
+  });
+
 });

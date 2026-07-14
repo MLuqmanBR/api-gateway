@@ -197,6 +197,7 @@ function AddPlatformModal({
   const [stickySessionsEnabled, setStickySessionsEnabled] = useState(false)
   const [keyless, setKeyless] = useState(false)
   const [apiFormat, setApiFormat] = useState<'openai' | 'anthropic'>('openai')
+  const [keyFormat, setKeyFormat] = useState<'simple' | 'colon'>('simple')
 
   const create = useMutation<{ slug: string }, Error, Record<string, unknown>>({
     mutationFn: (body) => apiFetch('/api/custom-providers', { method: 'POST', body: JSON.stringify(body) }) as Promise<{ slug: string }>,
@@ -215,6 +216,7 @@ function AddPlatformModal({
       setParallelEnabled(false)
       setStickySessionsEnabled(false)
       setKeyless(false)
+      setKeyFormat('simple')
       setApiFormat('openai')
     },
   })
@@ -244,7 +246,7 @@ function AddPlatformModal({
         <form
           onSubmit={e => {
             e.preventDefault()
-            const body: Record<string, unknown> = { slug: slug.trim(), displayName: displayName.trim(), baseUrl: baseUrl.trim(), keyless, apiFormat }
+            const body: Record<string, unknown> = { slug: slug.trim(), displayName: displayName.trim(), baseUrl: baseUrl.trim(), keyless, apiFormat, keyFormat }
             if (showAdvanced) {
               if (rpmLimit) body.rpmLimit = parseInt(rpmLimit, 10)
               if (rpdLimit) body.rpdLimit = parseInt(rpdLimit, 10)
@@ -287,6 +289,13 @@ function AddPlatformModal({
               className="font-mono text-xs"
             />
 </div>
+{keyFormat === 'colon' && (
+  <p className="text-[11px] text-muted-foreground mt-1">
+    Use {'{account_id}'} as a placeholder — it will be replaced with each key's
+    account ID at request time. Example:{' '}
+    <code className="text-xs">https://{'{account_id}'}.cloud.databricks.com/ai-gateway/mlflow/v1</code>
+  </p>
+)}
           <button
             type="button"
             onClick={() => setShowAdvanced(s => !s)}
@@ -345,6 +354,20 @@ function AddPlatformModal({
                 <span className={apiFormat === 'openai' ? '' : 'text-muted-foreground'}>OpenAI</span>
                 <Switch checked={apiFormat === 'anthropic'} onCheckedChange={c => setApiFormat(c ? 'anthropic' : 'openai')} />
                 <span className={apiFormat === 'anthropic' ? '' : 'text-muted-foreground'}>Anthropic</span>
+              </label>
+            </div>
+            <div className="border-t pt-3 mt-1">
+              <Label className="text-xs">Credential format</Label>
+              <p className="text-[10px] text-muted-foreground mb-1">
+                How the API key is structured. "Bearer token" sends the whole key as-is.
+                "Account ID + API key" splits the key at the first colon — the left part
+                becomes the account_id (substituted into {'{account_id}'} in the base URL),
+                and the right part is the bearer token.
+              </p>
+              <label className="flex items-center gap-2 cursor-pointer text-xs">
+                <span className={keyFormat === 'simple' ? '' : 'text-muted-foreground'}>Bearer token</span>
+                <Switch checked={keyFormat === 'colon'} onCheckedChange={c => setKeyFormat(c ? 'colon' : 'simple')} />
+                <span className={keyFormat === 'colon' ? '' : 'text-muted-foreground'}>Account ID + API key</span>
               </label>
             </div>
             <div className="border-t pt-3 mt-1">
@@ -437,6 +460,9 @@ function EditPlatformModal({
   const [apiFormat, setApiFormat] = useState<'openai' | 'anthropic'>(
     isCustom ? (provider.apiFormat ?? 'openai') : 'openai',
   )
+  const [keyFormat, setKeyFormat] = useState<'simple' | 'colon'>(
+    isCustom ? ((provider.keyFormat ?? 'simple') as 'simple' | 'colon') : 'simple',
+  )
   const [showAdvanced, setShowAdvanced] = useState(false)
 
   const save = useMutation({
@@ -485,6 +511,7 @@ function EditPlatformModal({
               if (newMax !== provider.maxParallelRequests) body.maxParallelRequests = newMax;
               if (keyless !== provider.keyless) body.keyless = keyless;
               if (apiFormat !== (provider.apiFormat ?? 'openai')) body.apiFormat = apiFormat;
+              if (keyFormat !== ((provider.keyFormat ?? 'simple') as string)) body.keyFormat = keyFormat;
             }
             // Common fields: limits + sticky toggle.
             const oldRpm = initRpm ?? null;
@@ -519,6 +546,13 @@ function EditPlatformModal({
                 <Label className="text-xs">Base URL</Label>
                 <Input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} className="font-mono text-xs" />
               </div>
+{keyFormat === 'colon' && (
+  <p className="text-[11px] text-muted-foreground mt-1">
+    Use {'{account_id}'} as a placeholder — it will be replaced with each key's
+    account ID at request time. Example:{' '}
+    <code className="text-xs">https://{'{account_id}'}.cloud.databricks.com/ai-gateway/mlflow/v1</code>
+  </p>
+)}
             </>
           )}
           <button type="button" onClick={() => setShowAdvanced(s => !s)} className="text-xs text-muted-foreground hover:text-foreground">
@@ -550,6 +584,20 @@ function EditPlatformModal({
                       <span className={apiFormat === 'openai' ? '' : 'text-muted-foreground'}>OpenAI</span>
                       <Switch checked={apiFormat === 'anthropic'} onCheckedChange={c => setApiFormat(c ? 'anthropic' : 'openai')} />
                       <span className={apiFormat === 'anthropic' ? '' : 'text-muted-foreground'}>Anthropic</span>
+                    </label>
+                  </div>
+                  <div className="border-t pt-3 mt-1">
+                    <Label className="text-xs">Credential format</Label>
+                    <p className="text-[10px] text-muted-foreground mb-1">
+                      How the API key is structured. "Bearer token" sends the whole key as-is.
+                      "Account ID + API key" splits the key at the first colon — the left part
+                      becomes the account_id (substituted into {'{account_id}'} in the base URL),
+                      and the right part is the bearer token.
+                    </p>
+                    <label className="flex items-center gap-2 cursor-pointer text-xs">
+                      <span className={keyFormat === 'simple' ? '' : 'text-muted-foreground'}>Bearer token</span>
+                      <Switch checked={keyFormat === 'colon'} onCheckedChange={c => setKeyFormat(c ? 'colon' : 'simple')} />
+                      <span className={keyFormat === 'colon' ? '' : 'text-muted-foreground'}>Account ID + API key</span>
                     </label>
                   </div>
                   <div className="flex items-center gap-2 pt-1">
@@ -1076,12 +1124,12 @@ export default function KeysPage() {
 
   // Build a unified platform list for the add-key form. Built-ins come
   // first; active user-added custom providers appear at the end.
-  const allPlatforms: { value: string; label: string; url: string; keyless?: boolean }[] = [
+  const allPlatforms: { value: string; label: string; url: string; keyless?: boolean; keyFormat?: string }[] = [
     ...PLATFORMS,
-    ...activeCustom.map(cp => ({ value: cp.slug, label: `${cp.displayName} (custom)`, url: '', keyless: cp.keyless })),
+    ...activeCustom.map(cp => ({ value: cp.slug, label: `${cp.displayName} (custom)`, url: '', keyless: cp.keyless, keyFormat: cp.keyFormat })),
   ]
   const selectedPlatform = allPlatforms.find(p => p.value === platform)
-  const needsAccountId = platform === 'cloudflare'
+  const needsAccountId = platform === 'cloudflare' || selectedPlatform?.keyFormat === 'colon'
   const isKeyless = selectedPlatform?.keyless === true
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()

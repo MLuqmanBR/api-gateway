@@ -66,6 +66,7 @@ export function migrateDbSchema(db: Database.Database) {
   migrateModelsV33NvidiaMinimaxM3(db);
   migrateModelsV34NvidiaSharedQuota(db);
   migrateSchemaV35RateLimitIndex(db);
+  migrateSchemaV36KeyFormat(db);
 }
 
 function createTables(db: Database.Database) {
@@ -2517,4 +2518,16 @@ function migrateModelsV34NvidiaSharedQuota(db: Database.Database) {
 // prune is O(log n) instead of O(n).  Idempotent — IF NOT EXISTS.
 function migrateSchemaV35RateLimitIndex(db: Database.Database) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_rate_limit_usage_created ON rate_limit_usage(created_at_ms)');
+}
+
+// ── V36: key_format column on custom_providers (2026-07) ──
+// Lets a custom provider declare composite keys ("account_id:api_key").
+// When key_format = 'colon', the provider splits the key at the first ':',
+// substitutes {account_id} in base_url, and sends only the token portion
+// as Authorization: Bearer.  Idempotent — pragma check before ALTER.
+function migrateSchemaV36KeyFormat(db: Database.Database) {
+  const col = db.prepare("PRAGMA table_info('custom_providers')").all() as { name: string }[];
+  if (!col.some(c => c.name === 'key_format')) {
+    db.exec("ALTER TABLE custom_providers ADD COLUMN key_format TEXT NOT NULL DEFAULT 'simple' CHECK(key_format IN ('simple','colon'))");
+  }
 }

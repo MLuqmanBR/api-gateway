@@ -396,6 +396,112 @@ describe('OpenAICompatProvider', () => {
   });
 });
 
+describe('OpenAICompatProvider - keyFormat', () => {
+  it('simple format (default) sends full key as Bearer token', async () => {
+    const p = new OpenAICompatProvider({
+      platform: 'groq',
+      name: 'Test',
+      baseUrl: 'https://api.test.com/v1',
+    });
+
+    let authHeader = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      const headers = (init as { headers?: Record<string, string> })?.headers ?? {};
+      authHeader = headers['Authorization'] ?? '';
+      return { ok: true, json: () => Promise.resolve({ id: 'id', object: 'chat.completion', created: 1, model: 'm', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }) } as unknown as Response;
+    });
+
+    await p.chatCompletion('my-full-key', [{ role: 'user', content: 'hi' }], 'm');
+    expect(authHeader).toBe('Bearer my-full-key');
+  });
+
+  it('colon format sends only token portion as Bearer token', async () => {
+    const p = new OpenAICompatProvider({
+      platform: 'groq',
+      name: 'Test',
+      baseUrl: 'https://{account_id}.test.com/v1',
+      keyFormat: 'colon',
+    });
+
+    let authHeader = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      const headers = (init as { headers?: Record<string, string> })?.headers ?? {};
+      authHeader = headers['Authorization'] ?? '';
+      return { ok: true, json: () => Promise.resolve({ id: 'id', object: 'chat.completion', created: 1, model: 'm', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }) } as unknown as Response;
+    });
+
+    await p.chatCompletion('acct123:secret-token', [{ role: 'user', content: 'hi' }], 'm');
+    expect(authHeader).toBe('Bearer secret-token');
+  });
+
+  it('colon format substitutes {account_id} in URL', async () => {
+    const p = new OpenAICompatProvider({
+      platform: 'groq',
+      name: 'Test',
+      baseUrl: 'https://{account_id}.test.com/v1',
+      keyFormat: 'colon',
+    });
+
+    let capturedUrl = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      capturedUrl = url as string;
+      return { ok: true, json: () => Promise.resolve({ id: 'id', object: 'chat.completion', created: 1, model: 'm', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }) } as unknown as Response;
+    });
+
+    await p.chatCompletion('acct123:secret-token', [{ role: 'user', content: 'hi' }], 'm');
+    expect(capturedUrl).toBe('https://acct123.test.com/v1/chat/completions');
+  });
+
+  it('colon format with url containing no {account_id} still works (replaces nothing)', async () => {
+    const p = new OpenAICompatProvider({
+      platform: 'groq',
+      name: 'Test',
+      baseUrl: 'https://api.test.com/v1',
+      keyFormat: 'colon',
+    });
+
+    let capturedUrl = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      capturedUrl = url as string;
+      return { ok: true, json: () => Promise.resolve({ id: 'id', object: 'chat.completion', created: 1, model: 'm', choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 } }) } as unknown as Response;
+    });
+
+    await p.chatCompletion('acct123:secret-token', [{ role: 'user', content: 'hi' }], 'm');
+    expect(capturedUrl).toBe('https://api.test.com/v1/chat/completions');
+  });
+
+  it('colon format accountId throws on malformed key (no colon)', async () => {
+    const p = new OpenAICompatProvider({
+      platform: 'groq',
+      name: 'Test',
+      baseUrl: 'https://{account_id}.test.com/v1',
+      keyFormat: 'colon',
+    });
+
+    await expect(
+      p.chatCompletion('no-colon-here', [{ role: 'user', content: 'hi' }], 'm'),
+    ).rejects.toThrow('key must be in format "account_id:api_key"');
+  });
+
+  it('colon format validateKey probes substituted URL', async () => {
+    const p = new OpenAICompatProvider({
+      platform: 'groq',
+      name: 'Test',
+      baseUrl: 'https://{account_id}.test.com/v1',
+      keyFormat: 'colon',
+    });
+
+    let capturedUrl = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (url) => {
+      capturedUrl = url as string;
+      return { ok: true, status: 200, json: () => Promise.resolve({}) } as unknown as Response;
+    });
+
+    await p.validateKey('acct123:secret-token');
+    expect(capturedUrl).toBe('https://acct123.test.com/v1/models');
+  });
+});
+
 describe('OpenAICompatProvider - platform instances', () => {
   // Mirrors the actual registrations in server/src/providers/index.ts.
   // Update both when adding/removing a platform.

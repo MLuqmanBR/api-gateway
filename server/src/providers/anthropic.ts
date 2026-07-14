@@ -135,6 +135,7 @@ export class AnthropicCompatProvider extends BaseProvider {
     baseUrl: string;
     timeoutMs?: number;
     keyless?: boolean;
+    keyFormat?: string;
   }) {
     super();
     this.platform = opts.platform;

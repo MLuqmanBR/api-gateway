@@ -28,6 +28,10 @@ export class OpenAICompatProvider extends BaseProvider {
    * `400 This model only supports single tool-calls at once!`. When set, pin
    * parallel_tool_calls to false whenever tools are in play. See issue #255. */
   private readonly forceSingleToolCall: boolean;
+  /** 'colon' → key is "account_id:api_key", split at first ':',
+   *   {account_id} in baseUrl substituted at request time.
+   *   'simple' (default) → full string is the bearer token, no substitution. */
+  private readonly keyFormat: string;
 
   constructor(opts: {
     platform: Platform;
@@ -38,6 +42,7 @@ export class OpenAICompatProvider extends BaseProvider {
     timeoutMs?: number;
     keyless?: boolean;
     forceSingleToolCall?: boolean;
+    keyFormat?: string;
   }) {
     super();
     this.platform = opts.platform;
@@ -48,6 +53,7 @@ export class OpenAICompatProvider extends BaseProvider {
     this.timeoutMs = opts.timeoutMs ?? 60000;
     this.keyless = opts.keyless ?? false;
     this.forceSingleToolCall = opts.forceSingleToolCall ?? false;
+    this.keyFormat = opts.keyFormat ?? 'simple';
   }
 
   /** Resolve the per-call thinking policy: the host's base policy, tightened
@@ -74,11 +80,38 @@ export class OpenAICompatProvider extends BaseProvider {
     return options?.parallel_tool_calls;
   }
 
+  /** Extract the token portion from a colon-separated composite key.
+   *  For 'simple' keys the full string is the token. */
+  private bearerToken(apiKey: string): string {
+    if (this.keyFormat !== 'colon') return apiKey;
+    const sep = apiKey.indexOf(':');
+    return sep === -1 ? apiKey : apiKey.slice(sep + 1);
+  }
+
+  /** Extract the account_id from a composite key. Throws on 'colon'
+   *  format if no colon present. */
+  private accountId(apiKey: string): string {
+    const sep = apiKey.indexOf(':');
+    if (sep === -1) throw new Error(`${this.name} key must be in format "account_id:api_key"`);
+    return apiKey.slice(0, sep);
+  }
+
+  /** Build the effective base URL, substituting {account_id} when key_format
+   *  is 'colon'. Returns `${this.baseUrl}${path}` unchanged for 'simple'. */
+  private resolveUrl(apiKey: string, path: string): string {
+    if (this.keyFormat !== 'colon') return `${this.baseUrl}${path}`;
+    const id = this.accountId(apiKey);
+    const base = (this.baseUrl ?? '').replace(/\{account_id\}/g, id);
+    return `${base}${path}`;
+  }
+
   /** Keyless providers (Kilo's anonymous free tier) must send NO Authorization
    * header — a stored sentinel like `Bearer no-key` could be treated as an
    * invalid key. Everyone else sends the bearer as usual. */
   private authHeader(apiKey: string): Record<string, string> {
-    return this.keyless ? {} : { 'Authorization': `Bearer ${apiKey}` };
+    if (this.keyless) return {};
+    const token = this.bearerToken(apiKey);
+    return { 'Authorization': `Bearer ${token}` };
   }
 
   async chatCompletion(
@@ -107,7 +140,7 @@ export class OpenAICompatProvider extends BaseProvider {
     // from #290.)
     Object.assign(body, this.buildThinkingFields(modelId, options));
 
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
+    const res = await this.fetchWithTimeout(this.resolveUrl(apiKey, '/chat/completions'), {
       method: 'POST',
       headers: {
         ...this.authHeader(apiKey),
@@ -167,7 +200,7 @@ export class OpenAICompatProvider extends BaseProvider {
     // Same host/model-aware thinking-knob handling as the non-streaming path. (#292)
     Object.assign(body, this.buildThinkingFields(modelId, options));
 
-    const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
+    const res = await this.fetchWithTimeout(this.resolveUrl(apiKey, '/chat/completions'), {
       method: 'POST',
       headers: {
         ...this.authHeader(apiKey),
@@ -191,7 +224,7 @@ export class OpenAICompatProvider extends BaseProvider {
     // Note: transport errors (DNS / timeout / TLS) propagate to the caller.
     // health.ts catches them and marks status='error' WITHOUT incrementing
     // the consecutive-failure counter — only confirmed 401/403 disables a key.
-    const url = this.validateUrl ?? `${this.baseUrl}/models`;
+    const url = this.validateUrl ?? (this.keyFormat === 'colon' ? this.resolveUrl(apiKey, '/models') : `${this.baseUrl}/models`);
     // 30s (not 10s): some upstreams return a large /v1/models catalog that
     // takes >10s from high-latency regions (e.g. NVIDIA NIM measured ~11.2s
     // from India). A 10s cap aborted those calls and health.ts marked a
