@@ -277,5 +277,26 @@ describe('Routing Key Exhaustion', () => {
       expect(() => routeRequest(100, undefined, proId, false, false, undefined, { pinMode: true }))
         .toThrow(/Pinned model exhausted/);
     });
+
+    it('throws PINNED_MODEL_EXHAUSTED when the pinned model has keys but all are in skipKeys (the /v1/responses silent-fallthrough bug)', () => {
+      const db = getDb();
+      const proId = db.prepare("SELECT id FROM models WHERE model_id = 'gemini-1.5-pro'").get().id;
+      const proKeys = db.prepare("SELECT id FROM api_keys WHERE platform = 'google'").all() as Array<{ id: number }>;
+
+      vi.mocked(ratelimit.canMakeRequest).mockReturnValue(true);
+      vi.mocked(ratelimit.canUseTokens).mockReturnValue(true);
+
+      // Put ALL of Pro's keys into skipKeys — simulating the state after all
+      // keys failed on the pinned model during a single request sweep.
+      // Without pinMode, routeRequest silently falls through to Flash.
+      // With pinMode, it throws PINNED_MODEL_EXHAUSTED.
+      const skipKeys = new Set<string>();
+      for (const k of proKeys) {
+        skipKeys.add(`google:gemini-1.5-pro:${k.id}`);
+      }
+
+      expect(() => routeRequest(100, skipKeys, proId, false, false, undefined, { pinMode: true }))
+        .toThrow(/Pinned model exhausted/);
+    });
   });
 });
