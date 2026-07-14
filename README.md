@@ -341,9 +341,9 @@ flowchart LR
 
 **Skip it if you:**
 
-- Need multi-tenant auth or per-user billing — it's single-user by design
 - Need a managed cloud service — it's self-hosted only
 - Can't run Node.js 20+ on your host
+- Need an admin dashboard for multiple operators — the gateway has one admin; multiple apps and clients can connect through it, but there's no multi-operator RBAC
 
 ## Contributing
 
