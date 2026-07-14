@@ -10,7 +10,9 @@ interface StreamEvent { type: string; [key: string]: unknown }
  */
 export function useEventStream(onEvent: (event: StreamEvent) => void, enabled = true): void {
   const cbRef = useRef(onEvent)
-  cbRef.current = onEvent
+  useEffect(() => {
+    cbRef.current = onEvent
+  })
   useEffect(() => {
     if (!enabled) return
     const onMessage = (msg: MessageEvent) => {
