@@ -9,8 +9,6 @@ Route across every free-tier provider and any custom endpoint through a single O
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node.js >=20](https://img.shields.io/badge/node.js-%3E%3D20-brightgreen.svg)](#quick-start)
 
-![API-Gateway dashboard](repo-assets/desktop.png)
-
 </div>
 
 ---
@@ -25,7 +23,6 @@ Route across every free-tier provider and any custom endpoint through a single O
 - [Bring your own provider](#bring-your-own-provider)
 - [Settings & backup](#settings--backup)
 - [How it works](#how-it-works)
-- [Dashboard](#dashboard)
 - [What's not supported yet](#whats-not-supported-yet)
 - [Limitations](#limitations)
 - [Contributing](#contributing)
@@ -375,20 +372,6 @@ flowchart LR
 - **Encryption** — `server/src/lib/crypto.ts` (AES-256-GCM), `server/src/lib/error-redaction.ts` (provider error sanitization).
 - **Dashboard** — `client/` (React + Vite + shadcn/ui).
 - **Storage** — SQLite (`better-sqlite3`) with AES-256-GCM key encryption.
-
-## Dashboard
-
-![Keys](repo-assets/keys.png)
-
-Manage provider credentials, add custom providers, and grab the unified API key your apps connect with. Each key shows a live status dot and when it was last health-checked.
-
-![Playground](repo-assets/playground.png)
-
-Send a chat completion through the router and see which provider served it, with the model ID and latency printed right on the message.
-
-![Analytics](repo-assets/analytics.png)
-
-Request volume, success rate, tokens in and out, average latency, and per-provider breakdowns over 24h, 7d, and 30d windows.
 
 ## What's not supported yet
 
