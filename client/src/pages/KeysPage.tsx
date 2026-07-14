@@ -294,7 +294,7 @@ function AddPlatformModal({
   <p className="text-[11px] text-muted-foreground mt-1">
     Use {'{account_id}'} as a placeholder — it will be replaced with each key's
     account ID at request time. Example:{' '}
-    <code className="text-xs">https://{'{account_id}'}.cloud.databricks.com/ai-gateway/mlflow/v1</code>
+    <code className="text-xs">https://{'{account_id}'}.api.example.com/v1</code>
   </p>
 )}
           <button
@@ -551,7 +551,7 @@ function EditPlatformModal({
   <p className="text-[11px] text-muted-foreground mt-1">
     Use {'{account_id}'} as a placeholder — it will be replaced with each key's
     account ID at request time. Example:{' '}
-    <code className="text-xs">https://{'{account_id}'}.cloud.databricks.com/ai-gateway/mlflow/v1</code>
+    <code className="text-xs">https://{'{account_id}'}.api.example.com/v1</code>
   </p>
 )}
             </>

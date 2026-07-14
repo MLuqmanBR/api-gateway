@@ -417,17 +417,17 @@ describe('Custom providers (#230)', () => {
 
   it('creates provider with keyFormat colon and baseUrl containing {account_id}', async () => {
     const { status, body } = await request(app, 'POST', '/api/custom-providers', {
-      slug: 'databricks',
-      displayName: 'Databricks AI Gateway',
-      baseUrl: 'https://{account_id}.cloud.databricks.com/ai-gateway/mlflow/v1',
+      slug: 'colon-example',
+      displayName: 'Example AI Gateway',
+      baseUrl: 'https://{account_id}.api.example.com/v1',
       keyFormat: 'colon',
     });
     expect(status).toBe(201);
     expect(body.keyFormat).toBe('colon');
-    expect(body.baseUrl).toBe('https://{account_id}.cloud.databricks.com/ai-gateway/mlflow/v1');
+    expect(body.baseUrl).toBe('https://{account_id}.api.example.com/v1');
 
     const db = getDb();
-    const row = db.prepare('SELECT key_format FROM custom_providers WHERE slug = ?').get('databricks') as { key_format: string };
+    const row = db.prepare('SELECT key_format FROM custom_providers WHERE slug = ?').get('colon-example') as { key_format: string };
     expect(row.key_format).toBe('colon');
   });
 
