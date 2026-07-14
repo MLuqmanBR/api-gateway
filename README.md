@@ -2,7 +2,7 @@
 
 # API-Gateway
 
-**One endpoint. Every model. Routing that learns.**
+**One endpoint. Every model. Free tiers or paid SOTA — routing that learns.**
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 [![Node.js >=20](https://img.shields.io/badge/node.js-%3E%3D20-brightgreen.svg)](#quick-start)
@@ -15,7 +15,7 @@
 
 ## Why
 
-Every AI lab offers a free tier. Each alone is a toy. Stacked together — **~1.7 billion tokens per month across 100+ models**.
+Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per month across 100+ models) or routing paid premium models through a single intelligent endpoint — API-Gateway handles it the same way. Free or paid, one endpoint or twenty, the routing engine doesn't care. It learns which models deliver and routes accordingly.
 
 **The problem:**
 
@@ -23,13 +23,15 @@ Every AI lab offers a free tier. Each alone is a toy. Stacked together — **~1.
 - One provider flakes and your app breaks
 - Blow through a daily cap at 9 AM and discover it at noon
 - Every key exhausted? Most gateways just give up and return an error
+- No visibility into which model actually performed best for your workload
 
 **API-Gateway solves this:**
 
-- One OpenAI-compatible endpoint routes across every provider you configure
+- One OpenAI-compatible endpoint routes across every provider you configure — free tiers, paid APIs, or both mixed together
 - An adaptive engine learns which models deliver and routes accordingly
 - Per-key budget tracking *before* the request goes out — never blow through a cap again
 - When every key is exhausted, it drops to recovery mode and self-heals — your app never sees an error
+- A dashboard to manage keys, reorder your cascade, edit any model, and watch analytics in real time
 
 ## Features
 
@@ -260,7 +262,7 @@ The default family, per-provider toggles, and priorities live on the dashboard's
 
 ## Bring your own provider
 
-Any OpenAI-compatible or Anthropic-compatible HTTP endpoint becomes a provider — a cloud service, a local model server on your LAN, a paid API you have credits for. From the dashboard's **Keys** page:
+Add any OpenAI-compatible or Anthropic-compatible HTTP endpoint as a provider — a paid SOTA API (frontier models from any lab), a local model server on your LAN, a free-tier cloud service, or anything in between. It gets the same adaptive routing, the same cascade behavior, the same per-key budget tracking as every built-in. From the dashboard's **Keys** page:
 
 - **Add Provider** — slug, display name, base URL, API format (OpenAI or Anthropic), optional rate limits and concurrency caps.
 - **Auto-discovery** — models are pulled from `/v1/models` on creation. Re-run anytime. Or register models manually.
@@ -331,18 +333,17 @@ flowchart LR
 
 ## When to use · When to skip
 
-**Use it if you:**
-
-- Want to aggregate free-tier capacity across many providers behind one endpoint
+- Want to aggregate capacity across many providers behind one endpoint — free tiers, paid APIs, or both
 - Are building an app and don't want to hardcode a single provider
 - Want routing that adapts to real-world performance, not a static priority list
 - Need your app to keep working when providers fail or rate-limit
+- Want to mix free and paid models in one cascade (free for drafts, paid for hard problems)
 
 **Skip it if you:**
 
-- Need frontier-class reasoning (GPT-5, Claude Opus) — the free catalog tops out around Llama 3.3 70B, GLM-4.5, Qwen 3 Coder, and Gemini 2.5 Pro
-- Need a production SLA — free tiers change without notice and there's no uptime guarantee
 - Need multi-tenant auth or per-user billing — it's single-user by design
+- Need a managed cloud service — it's self-hosted only
+- Can't run Node.js 20+ on your host
 
 ## Contributing
 
