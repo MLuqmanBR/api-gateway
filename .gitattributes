@@ -1,0 +1,9 @@
+# Force GitHub Linguist to classify all .ts/.tsx files as TypeScript,
+# even when they contain no TypeScript-specific syntax (e.g. pure-JS
+# config/tooling scripts with a .ts extension). Without this, Linguist's
+# content heuristics reclassify such files as JavaScript.
+*.ts linguist-language=TypeScript
+*.tsx linguist-language=TypeScript
+
+# package-lock.json is auto-generated — exclude it from language stats.
+package-lock.json linguist-generated
