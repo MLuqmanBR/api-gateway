@@ -4,7 +4,7 @@
  * Cloudflare account keys. Run AFTER Step 4a (cooldowns + old keys deleted).
  *
  * Usage: ENCRYPTION_KEY=95fdfba8381c3406a3a4c043317a2ae80c16051d2f52b846ec75a15ecc2b08b0 \
- *        node server/scripts/encrypt-cloudflare-keys.mjs
+ *        node server/scripts/encrypt-cloudflare-keys.ts
  *
  * Or load from the project's .env file.
  */
@@ -82,7 +82,7 @@ try {
 if (KEY_SETS.length === 0) {
   console.error('FATAL: Provide Cloudflare key data via KEY_SETS_JSON env var.');
   console.error('  KEY_SETS_JSON=\'[{"label":"user@example.com","raw":"ACCOUNT_ID:API_TOKEN"}]\' \\');
-  console.error('  node server/scripts/encrypt-cloudflare-keys.mjs');
+  console.error('  node server/scripts/encrypt-cloudflare-keys.ts');
   process.exit(1);
 }
 

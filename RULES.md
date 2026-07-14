@@ -608,7 +608,7 @@ git push origin main
 
 ### 8.1 CLI Management Tool
 
-The project ships a CLI tool (`scripts/cli.mjs`) installed via `npm link`.
+The project ships a CLI tool (`scripts/cli.ts`) installed via `npm link`.
 Commands:
 
 ```
@@ -653,7 +653,7 @@ See `.env.example` for the full commented template.
 
 ### 8.4 Adding CLI Commands
 
-New CLI commands follow the pattern in `scripts/cli.mjs`:
+New CLI commands follow the pattern in `scripts/cli.ts`:
 1. Add a handler function (e.g., `function doThing() { ... }`)
 2. Add a branch in `main()` that matches the subcommand
 3. Use `parseFlags()` for any `--option` flags

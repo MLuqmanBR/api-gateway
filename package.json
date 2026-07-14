@@ -1,9 +1,10 @@
 {
   "name": "api-gateway",
   "bin": {
-    "api": "./scripts/cli.mjs"
+    "api": "./scripts/cli.ts"
   },
   "private": true,
+  "type": "module",
   "workspaces": [
     "shared",
     "server",
