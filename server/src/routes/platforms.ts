@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { clearProviderConfigCache } from '../services/router.js';
 
 export const platformsRouter = Router();
 
@@ -89,6 +90,7 @@ platformsRouter.patch('/:platform/settings', (req: Request, res: Response) => {
   db.prepare(
     `UPDATE built_in_provider_settings SET ${updates.join(', ')} WHERE platform = ?`,
   ).run(...values);
+  clearProviderConfigCache(platform);
   const row = db.prepare(
     `SELECT rpm_limit, rpd_limit, tpm_limit, tpd_limit, sticky_sessions_enabled
        FROM built_in_provider_settings WHERE platform = ?`,

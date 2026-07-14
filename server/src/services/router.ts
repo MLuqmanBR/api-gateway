@@ -325,6 +325,12 @@ export function clearProviderConfigCache(platform: string): void {
   providerConfigCache?.delete(platform);
 }
 
+/** Clear the entire provider config cache (called after config import, which
+ *  can change any provider's settings). Forces a full rebuild on next access. */
+export function clearAllProviderConfigCache(): void {
+  providerConfigCache = null;
+}
+
 interface ModelStats {
   successes: number;   // decay-weighted pseudo-count
   failures: number;    // decay-weighted pseudo-count

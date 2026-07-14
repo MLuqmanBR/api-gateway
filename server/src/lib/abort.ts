@@ -74,6 +74,33 @@ export function attachClientAbort(
   return { controller, detach };
 }
 
+
+/** Create a race promise that rejects with `RequestAbortError` when `signal`
+ *  aborts, plus an `isAborted()` check and a `cleanup()` to remove the
+ *  listener. Pre-attaches a no-op catch so an abort that fires while no
+ *  `Promise.race` is pending doesn't become an unhandled rejection.
+ *  Returns `undefined` promise + no-op fns when signal is absent. (#292) */
+export function createAbortRace(signal?: AbortSignal): {
+  abortPromise: Promise<never> | undefined;
+  isAborted: () => boolean;
+  cleanup: () => void;
+} {
+  if (!signal) return { abortPromise: undefined, isAborted: () => false, cleanup: () => {} };
+  let aborted = false;
+  let rejectAbort: ((e: Error) => void) | undefined;
+  const abortPromise = new Promise<never>((_, rej) => { rejectAbort = rej; });
+  abortPromise.catch(() => {});
+  const onAbort = () => {
+    aborted = true;
+    rejectAbort?.(new RequestAbortError());
+  };
+  signal.addEventListener('abort', onAbort, { once: true });
+  return {
+    abortPromise,
+    isAborted: () => aborted,
+    cleanup: () => signal.removeEventListener('abort', onAbort),
+  };
+}
 /** True if `err` is any shape of abort — our `RequestAbortError` or a native
  *  fetch `AbortError`. Re-exported here so routes can import everything
  *  abort-related from one place. (#292) */

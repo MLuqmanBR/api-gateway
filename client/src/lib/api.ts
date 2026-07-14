@@ -1,36 +1,22 @@
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
-const TOKEN_KEY = 'api-gateway_dashboard_token';
-
-// Dashboard session token (#35). Stored in localStorage; sent as a Bearer on
-// every /api request and cleared on a 401.
-export function getToken(): string | null {
-  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
-}
-export function setToken(token: string): void {
-  try { localStorage.setItem(TOKEN_KEY, token); } catch { /* ignore */ }
-}
-export function clearToken(): void {
-  try { localStorage.removeItem(TOKEN_KEY); } catch { /* ignore */ }
-}
 
 export const UNAUTHORIZED_EVENT = 'api-gateway:unauthorized';
 
 export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const token = getToken();
   const res = await fetch(`${BASE}${path}`, {
     // `...options` first so an explicit method/body/signal applies, but headers
     // are merged last — otherwise an options.headers would clobber the
-    // Content-Type and Authorization we set here.
+    // Content-Type we set here. The HttpOnly session cookie (#35) is sent
+    // automatically for same-origin requests.
     ...options,
+    credentials: 'same-origin',
     headers: {
       'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...options?.headers,
     },
   });
   if (res.status === 401) {
-    // Session missing/expired — drop the token and let the AuthGate re-render.
-    clearToken();
+    // Session missing/expired — let the AuthGate re-render.
     window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
   }
   if (!res.ok) {

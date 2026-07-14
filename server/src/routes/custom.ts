@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { clearRateLimitPenalty } from '../services/router.js';
+import { clearRateLimitPenalty, clearProviderConfigCache } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
@@ -344,6 +344,7 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
       tx();
 
       clearPlatformCaches(slug);
+      clearProviderConfigCache(slug);
       const sync = await syncModelsFromProvider(baseUrl, slug);
       res.json({
         id: existing.id, slug, displayName: displayName.trim(), baseUrl,
@@ -510,6 +511,7 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     db.prepare(`UPDATE custom_providers SET ${updates.join(', ')} WHERE slug = ?`).run(...values);
   });
   tx();
+  clearProviderConfigCache(slugChanged ? newSlug! : oldSlug);
 
   res.json({ success: true, slug: slugChanged ? newSlug : oldSlug });
 });
@@ -544,6 +546,7 @@ customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response)
   tx();
 
   clearPlatformCaches(slug);
+  clearProviderConfigCache(slug);
   res.json({ success: true, archived: true });
 });
 

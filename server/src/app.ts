@@ -89,22 +89,21 @@ export function createApp() {
   // requireAuth args stay as harmless redundancy.
   app.use('/api', requireAuth);
 
-  // API routes — all admin endpoints sit behind requireAuth.
-  app.use('/api/keys', requireAuth, keysRouter);
-  app.use('/api/platforms', requireAuth, platformsRouter);
-  app.use('/api/models', requireAuth, modelsRouter);
-  app.use('/api/fallback', requireAuth, fallbackRouter);
-  app.use('/api/embeddings', requireAuth, embeddingsRouter);
-  app.use('/api/events', requireAuth, eventsRouter);
-  app.use('/api/analytics', requireAuth, analyticsRouter);
-  app.use('/api/health', requireAuth, healthRouter);
-  app.use('/api/settings', requireAuth, settingsRouter);
+  // API routes — all admin endpoints sit behind the blanket /api requireAuth
+  // above; no per-router mount is needed.
+  app.use('/api/keys', keysRouter);
+  app.use('/api/platforms', platformsRouter);
+  app.use('/api/models', modelsRouter);
+  app.use('/api/fallback', fallbackRouter);
+  app.use('/api/embeddings', embeddingsRouter);
+  app.use('/api/events', eventsRouter);
+  app.use('/api/analytics', analyticsRouter);
+  app.use('/api/health', healthRouter);
+  app.use('/api/settings', settingsRouter);
   // Configuration export/import (versioned JSON envelope). Dashboard-
   // only — there's no operational reason a /v1 caller needs this.
-  app.use('/api/config', requireAuth, configRouter);
+  app.use('/api/config', configRouter);
   // Custom providers + their models — gated by the /api blanket above.
-  app.use('/api/custom-providers', requireAuth);
-  app.use('/api/custom-models', requireAuth);
   app.use(customRouter);
   app.use('/v1', createProxyRateLimiter());
   app.use('/v1', proxyRouter);

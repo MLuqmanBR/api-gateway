@@ -2,6 +2,7 @@ import { addToast } from '@/lib/toast'
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
+import { useEventStream } from '@/lib/use-event-stream'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -1020,56 +1021,17 @@ export default function KeysPage() {
   // update a progress counter as each key resolves. The operator sees
   // a live bar fill up + a per-key status flash as it happens.
   const [checkProgress, setCheckProgress] = useState<{ completed: number; total: number } | null>(null)
-  useEffect(() => {
-    if (!checkAll.isPending) {
-      // Clean up the progress bar after a short delay so the user can
-      // see the final state (e.g. "12/89 healthy") before it disappears.
-      // The cleanup itself runs when the next effect fires or on unmount.
-      return
+  useEventStream((e) => {
+    if (e?.type === 'health.check.start') {
+      setCheckProgress({ completed: 0, total: e.total as number })
+    } else if (e?.type === 'health.check.progress') {
+      setCheckProgress({ completed: e.completed as number, total: e.total as number })
+      queryClient.invalidateQueries({ queryKey: ['health'] })
+    } else if (e?.type === 'health.check.done') {
+      queryClient.invalidateQueries({ queryKey: ['health'] })
+      window.setTimeout(() => setCheckProgress(null), 1500)
     }
-    let es: EventSource | undefined
-    let cancelled = false
-
-    const onMessage = (msg: MessageEvent) => {
-      try {
-        const e = JSON.parse(msg.data)
-        if (e?.type === 'health.check.start') {
-          setCheckProgress({ completed: 0, total: e.total })
-        } else if (e?.type === 'health.check.progress') {
-          setCheckProgress({ completed: e.completed, total: e.total })
-          // Invalidate the health query at the end of every progress event
-          // so the per-key status badges in the table update live. This
-          // is cheap because the data is small and the query is cached.
-          queryClient.invalidateQueries({ queryKey: ['health'] })
-        } else if (e?.type === 'health.check.done') {
-          // One last invalidation + a brief hold so the final 89/89
-          // count is visible before the bar clears.
-          queryClient.invalidateQueries({ queryKey: ['health'] })
-          window.setTimeout(() => setCheckProgress(null), 1500)
-        }
-      } catch { /* ignore malformed events */ }
-    }
-
-    // EventSource can't send an Authorization header, but it DOES send the
-    // HttpOnly session cookie automatically, which /api/events now accepts
-    // directly (Improvement 1). The short-lived single-use ticket (#43) is
-    // kept as a fallback for bearer-only sessions — the cookie authenticates
-    // the ticket fetch itself, so this flow works with either credential.
-    // LAN-trusted callers need neither; mint failure falls back to the bare
-    // stream (still authenticated by source IP, or the cookie).
-    ;(async () => {
-      let url = '/api/events'
-      try {
-        const { ticket } = await apiFetch<{ ticket: string }>('/api/events/ticket')
-        url = `/api/events?ticket=${encodeURIComponent(ticket)}`
-      } catch { /* fall back to bare stream (LAN trust path) */ }
-      if (cancelled) return
-      es = new EventSource(url)
-      es.onmessage = onMessage
-    })()
-
-    return () => { cancelled = true; es?.close() }
-  }, [checkAll.isPending, queryClient])
+  }, checkAll.isPending)
   const checkKey = useMutation({
     mutationFn: (keyId: number) => apiFetch(`/api/health/check/${keyId}`, { method: 'POST' }),
     onSuccess: () => {

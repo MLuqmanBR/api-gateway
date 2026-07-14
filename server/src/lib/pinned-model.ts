@@ -83,3 +83,17 @@ export function resolvePinnedModel(db: Database.Database, requestedModel: string
   ).get(workingModel) as { id: number } | undefined;
   return disabledRow ? { kind: 'disabled' } : { kind: 'not_found' };
 }
+
+/** Format a non-resolved `PinnedModelResolution` as the reason string for a
+ *  400 `model_not_found` response. Shared by `/chat/completions` and
+ *  `/v1/responses` so the wording stays identical. */
+export function formatPinnedModelRejection(
+  resolution: Exclude<PinnedModelResolution, { kind: 'resolved' }>,
+): string {
+  if (resolution.kind === 'ambiguous') {
+    const plats = resolution.platforms.slice().sort();
+    return `is served by multiple providers (${plats.join(', ')}). Pin it with a 'platform/model_id' prefix (e.g. '${plats[0]}/<model_id>') to disambiguate`;
+  }
+  if (resolution.kind === 'disabled') return 'is disabled';
+  return 'is not in the catalog';
+}

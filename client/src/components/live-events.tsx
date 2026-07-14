@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ChevronDown, ChevronUp } from 'lucide-react';
-import { apiFetch } from '@/lib/api';
+import { useEventStream } from '@/lib/use-event-stream';
 
 // Mirrors server/src/services/events.ts LiveEvent union. Both ends drift
 // occasionally (the proxy added `request.aborted` for client-disconnect
@@ -157,59 +157,23 @@ export function LiveEvents() {
     });
   }, []);
 
-  useEffect(() => {
-    let es: EventSource | undefined;
-    let cancelled = false;
+  useEventStream((parsed) => {
+    const entry = formatEvent(parsed as unknown as LiveEvent);
 
-    const onMessage = (msg: MessageEvent) => {
-      try {
-        // Runtime guard (cheap): reject anything that doesn't even look like
-        // a LiveEvent before handing it to `formatEvent`. A peer connecting
-        // to /api/events with a non-JSON payload (or a tampered proxy) could
-        // otherwise push junk into the renderer and crash it.
-        const parsed = JSON.parse(msg.data);
-        if (!parsed || typeof parsed !== 'object' || typeof parsed.type !== 'string') return;
-        const entry = formatEvent(parsed as LiveEvent);
+    if (parsed.type === 'request.start') {
+      activeRef.current.add(parsed.id as string);
+      setActiveCount(activeRef.current.size);
+    } else if (parsed.type === 'request.done' || parsed.type === 'request.error' || parsed.type === 'request.aborted') {
+      // request.aborted also clears the in-flight counter — a request
+      // that completes via abort has no separate 'done' frame and would
+      // otherwise leak its 'start' id forever, leaving the pulsing dot
+      // stuck on screen.
+      activeRef.current.delete(parsed.id as string);
+      setActiveCount(activeRef.current.size);
+    }
 
-        if (parsed.type === 'request.start') {
-          activeRef.current.add(parsed.id);
-          setActiveCount(activeRef.current.size);
-        } else if (parsed.type === 'request.done' || parsed.type === 'request.error' || parsed.type === 'request.aborted') {
-          // request.aborted also clears the in-flight counter — a request
-          // that completes via abort has no separate 'done' frame and would
-          // otherwise leak its 'start' id forever, leaving the pulsing dot
-          // stuck on screen.
-          activeRef.current.delete(parsed.id);
-          setActiveCount(activeRef.current.size);
-        }
-
-        addLine(entry);
-      } catch { /* malformed event — skip */ }
-    };
-
-    // EventSource can't send an Authorization header, but it DOES send the
-    // HttpOnly session cookie automatically, which /api/events now accepts
-    // directly (Improvement 1). The short-lived single-use ticket (#43) is kept
-    // as a fallback for bearer-only sessions — and the cookie authenticates the
-    // ticket fetch itself, so this flow works with either credential. A
-    // LAN-trusted caller needs neither; mint failure falls back to the bare
-    // stream, which still authenticates by source IP (or the cookie).
-    (async () => {
-      let url = '/api/events';
-      try {
-        const { ticket } = await apiFetch<{ ticket: string }>('/api/events/ticket');
-        url = `/api/events?ticket=${encodeURIComponent(ticket)}`;
-      } catch { /* fall back to bare stream (LAN trust path) */ }
-      if (cancelled) return;
-      es = new EventSource(url);
-      es.onmessage = onMessage;
-      es.onerror = () => {
-        // EventSource auto-reconnects; just wait.
-      };
-    })();
-
-    return () => { cancelled = true; es?.close(); };
-  }, [addLine]);
+    addLine(entry);
+  });
 
   // Auto-scroll only the terminal container — never the page.
   // Double-fire: immediate set catches the common case; rAF catches

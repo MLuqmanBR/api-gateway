@@ -13,6 +13,7 @@ import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOpti
 import { contentToString } from '../lib/content.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 import { geminiThinkingConfig, normalizeThinking } from '../lib/thinking.js';
+import { createAbortRace } from '../lib/abort.js';
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 // Gemini 3 REQUIRES the `thoughtSignature` that accompanied a function call to
@@ -557,23 +558,11 @@ export class GoogleProvider extends BaseProvider {
     // immediately rather than waiting for the 300s inactivity timer. (#292)
     const abortSignal = options?.abortSignal;
     if (abortSignal?.aborted) throw new RequestAbortError();
-    let aborted = false;
-    let rejectAbort: ((e: Error) => void) | undefined;
-    const abortPromise: Promise<never> | undefined = abortSignal
-      ? new Promise<never>((_, rej) => { rejectAbort = rej; })
-      : undefined;
-    // Pre-attach a no-op catch so an abort that fires while no Promise.race
-    // is pending doesn't become an unhandled rejection.
-    abortPromise?.catch(() => {});
-    const onAbort = () => {
-      aborted = true;
-      rejectAbort?.(new RequestAbortError());
-    };
-    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+    const { abortPromise, isAborted, cleanup } = createAbortRace(abortSignal);
 
     try {
       while (true) {
-        if (aborted) throw new RequestAbortError();
+        if (isAborted()) throw new RequestAbortError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
           reader.read(),
@@ -689,7 +678,7 @@ export class GoogleProvider extends BaseProvider {
         };
       }
     } finally {
-      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+      cleanup();
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
   }

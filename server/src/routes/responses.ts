@@ -27,7 +27,7 @@ import {
 } from './proxy.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { attachClientAbort, isAbortError } from '../lib/abort.js';
-import { resolvePinnedModel } from '../lib/pinned-model.js';
+import { resolvePinnedModel, formatPinnedModelRejection } from '../lib/pinned-model.js';
 import { getGlobalRetryLimit } from '../services/router.js';
 import { publish } from '../services/events.js';
 
@@ -341,15 +341,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     if (resolution.kind === 'resolved') {
       preferredModel = resolution.modelDbId;
     } else {
-      let reason: string;
-      if (resolution.kind === 'ambiguous') {
-        const plats = resolution.platforms.slice().sort();
-        reason = `is served by multiple providers (${plats.join(', ')}). Pin it with a 'platform/model_id' prefix (e.g. '${plats[0]}/<model_id>') to disambiguate`;
-      } else if (resolution.kind === 'disabled') {
-        reason = 'is disabled';
-      } else {
-        reason = 'is not in the catalog';
-      }
+      const reason = formatPinnedModelRejection(resolution);
       res.status(400).json({
         error: {
           message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
@@ -360,6 +352,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       return;
     }
   }
+  const isPinned = !!(reqData.model && reqData.model !== 'auto');
   if (!preferredModel) {
     preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
   }
@@ -395,7 +388,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
-  let lastError: any = null;
+  let lastError: Error | null = null;
 
   // Stream bookkeeping (used only when stream === true).
   let seq = 0;
@@ -416,12 +409,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     if (upstreamAttempts >= attemptLimit) break;
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined);
-    } catch (err: any) {
-      const status = lastError ? 429 : (err.status ?? 503);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined, { pinMode: isPinned });
+    } catch (err: unknown) {
+      // routeRequest throws Error with { status?, code? } — see router.ts
+      const routingErr = err as Error & { status?: number };
+      const status = lastError ? 429 : (routingErr.status ?? 503);
       const message = lastError
         ? `All models rate-limited. Last error: ${sanitizeProviderErrorMessage(lastError.message)}`
-        : err.message;
+        : routingErr.message;
       const type = lastError ? 'rate_limit_error' : 'routing_error';
       if (streamStarted) {
         sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message, type } } });

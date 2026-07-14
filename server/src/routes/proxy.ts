@@ -16,7 +16,7 @@ import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
-import { resolvePinnedModel } from '../lib/pinned-model.js';
+import { resolvePinnedModel, formatPinnedModelRejection } from '../lib/pinned-model.js';
 import { isReasoningModelId } from '../lib/reasoning-model.js';
 
 export const proxyRouter = Router();
@@ -760,15 +760,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     if (resolution.kind === 'resolved') {
       preferredModel = resolution.modelDbId;
     } else {
-      let reason: string;
-      if (resolution.kind === 'ambiguous') {
-        const plats = resolution.platforms.slice().sort();
-        reason = `is served by multiple providers (${plats.join(', ')}). Pin it with a 'platform/model_id' prefix (e.g. '${plats[0]}/<model_id>') to disambiguate`;
-      } else if (resolution.kind === 'disabled') {
-        reason = 'is disabled';
-      } else {
-        reason = 'is not in the catalog';
-      }
+      const reason = formatPinnedModelRejection(resolution);
       res.status(400).json({
         error: {
           message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,

@@ -11,6 +11,7 @@ import type {
 import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
 import { contentToString, normalizeOutboundContent } from '../lib/content.js';
 import { anthropicThinking, normalizeThinking } from '../lib/thinking.js';
+import { createAbortRace } from '../lib/abort.js';
 
 // Anthropic Messages API. The 2023-06-01 revision is the current stable version
 // (Anthropic pins clients to a specific date and the server negotiates the wire
@@ -526,19 +527,7 @@ export class AnthropicCompatProvider extends BaseProvider {
     // Client disconnect must interrupt a stalled/slow Anthropic stream
     // immediately rather than waiting for the inactivity timer. (#292)
     if (abortSignal?.aborted) throw new RequestAbortError();
-    let aborted = false;
-    let rejectAbort: ((e: Error) => void) | undefined;
-    const abortPromise: Promise<never> | undefined = abortSignal
-      ? new Promise<never>((_, rej) => { rejectAbort = rej; })
-      : undefined;
-    // Pre-attach a no-op catch so an abort that fires while no Promise.race
-    // is pending doesn't become an unhandled rejection.
-    abortPromise?.catch(() => {});
-    const onAbort = () => {
-      aborted = true;
-      rejectAbort?.(new RequestAbortError());
-    };
-    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+    const { abortPromise, isAborted, cleanup } = createAbortRace(abortSignal);
 
     const decoder = new TextDecoder();
     let buffer = '';
@@ -576,7 +565,7 @@ export class AnthropicCompatProvider extends BaseProvider {
 
     try {
       while (true) {
-        if (aborted) throw new RequestAbortError();
+        if (isAborted()) throw new RequestAbortError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
           reader.read(),
@@ -771,7 +760,7 @@ export class AnthropicCompatProvider extends BaseProvider {
       const finish = yieldFinishIfNeeded();
       if (finish) yield finish;
     } finally {
-      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+      cleanup();
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
 

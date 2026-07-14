@@ -27,6 +27,7 @@ import {
   previewEnvelope,
   ConfigImportError,
 } from '../lib/config/import.js';
+import { clearAllProviderConfigCache } from '../services/router.js';
 
 export const configRouter = Router();
 
@@ -166,6 +167,7 @@ configRouter.post('/import', (req: Request, res: Response) => {
     }
     const { envelope, options } = (req.body ?? {}) as { envelope?: unknown; options?: unknown };
     const result = runImport({ envelope, options: options as Parameters<typeof runImport>[0]['options'] });
+    clearAllProviderConfigCache();
     res.json(result);
   } catch (err) {
     if (err instanceof ConfigImportError) {

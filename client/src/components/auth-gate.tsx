@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { apiFetch, setToken, UNAUTHORIZED_EVENT } from '@/lib/api'
+import { apiFetch, UNAUTHORIZED_EVENT } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -32,11 +32,10 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
     setBusy(true)
     setError('')
     try {
-      const res = await apiFetch<{ token: string }>(isSetup ? '/api/auth/setup' : '/api/auth/login', {
+      await apiFetch(isSetup ? '/api/auth/setup' : '/api/auth/login', {
         method: 'POST',
         body: JSON.stringify({ email, password }),
       })
-      setToken(res.token)
       onAuthed()
     } catch (err) {
       setError((err as Error).message)

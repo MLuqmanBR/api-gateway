@@ -2,7 +2,6 @@
 
 import { getDb } from '../db/index.js';
 import { markKeyHealthyFromRequest } from './health.js';
-import { clearProviderConfigCache } from './router.js';
 
 interface Window {
   timestamps: number[];
@@ -56,46 +55,23 @@ export function releaseReservation(id: number): void {
   reservations.delete(id);
 }
 
-function provisionalRequestCount(
+/** Summarize provisional reservations for a platform+key, optionally
+ *  filtered by modelId. Returns { count, tokens } in one pass. */
+function provisionalSummary(
   platform: string,
-  modelId: string,
   keyId: number,
   cutoff: number,
-): number {
-  let n = 0;
+  modelId?: string,
+): { count: number; tokens: number } {
+  let count = 0, tokens = 0;
   for (const r of reservations.values()) {
-    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform && r.modelId === modelId) n++;
+    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform &&
+        (modelId === undefined || r.modelId === modelId)) {
+      count++;
+      tokens += r.tokens;
+    }
   }
-  return n;
-}
-
-function provisionalTokenCount(
-  platform: string,
-  modelId: string,
-  keyId: number,
-  cutoff: number,
-): number {
-  let sum = 0;
-  for (const r of reservations.values()) {
-    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform && r.modelId === modelId) sum += r.tokens;
-  }
-  return sum;
-}
-
-function provisionalProviderRequestCount(platform: string, keyId: number, cutoff: number): number {
-  let n = 0;
-  for (const r of reservations.values()) {
-    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform) n++;
-  }
-  return n;
-}
-
-function provisionalProviderTokenCount(platform: string, keyId: number, cutoff: number): number {
-  let sum = 0;
-  for (const r of reservations.values()) {
-    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform) sum += r.tokens;
-  }
-  return sum;
+  return { count, tokens };
 }
 
 function getWindow(key: string): Window {
@@ -202,7 +178,7 @@ function requestCount(
   windowMs: number,
   now: number,
 ): number {
-  const provisional = provisionalRequestCount(platform, modelId, keyId, now - windowMs);
+  const provisional = provisionalSummary(platform, keyId, now - windowMs, modelId).count;
   const persisted = countPersistedRequests(platform, modelId, keyId, windowMs, now);
   if (persisted !== undefined) return persisted + provisional;
   const type = windowMs === MINUTE ? 'rpm' : 'rpd';
@@ -216,7 +192,7 @@ function tokenCount(
   windowMs: number,
   now: number,
 ): number {
-  const provisional = provisionalTokenCount(platform, modelId, keyId, now - windowMs);
+  const provisional = provisionalSummary(platform, keyId, now - windowMs, modelId).tokens;
   const persisted = sumPersistedTokens(platform, modelId, keyId, windowMs, now);
   if (persisted !== undefined) return persisted + provisional;
   const type = windowMs === MINUTE ? 'tpm' : 'tpd';
@@ -293,7 +269,7 @@ export function getProviderDailyRequestCap(platform: string): number | null {
 // rather than a sliding 24h window that benches providers past their true reset time.
 export function providerDailyRequestCount(platform: string, keyId: number, now = Date.now()): number {
   const dayStartMs = new Date(now).setUTCHours(0, 0, 0, 0);
-  const provisional = provisionalProviderRequestCount(platform, keyId, dayStartMs);
+  const provisional = provisionalSummary(platform, keyId, dayStartMs).count;
   const persisted = withDb(db => {
     const row = db.prepare(`
       SELECT COUNT(*) AS used
@@ -421,7 +397,7 @@ function sumPersistedProviderMinuteTokens(
 // Total requests in the last minute for a provider account+key, summed across
 // every model — the account-shared per-minute usage the upstream actually sees.
 export function providerMinuteRequestCount(platform: string, keyId: number, now = Date.now()): number {
-  const provisional = provisionalProviderRequestCount(platform, keyId, now - MINUTE);
+  const provisional = provisionalSummary(platform, keyId, now - MINUTE).count;
   const persisted = countPersistedProviderMinuteRequests(platform, keyId, now);
   if (persisted !== undefined) return persisted + provisional;
   // DB-unavailable fallback: sum the per-model rpm windows for this platform+key.
@@ -437,7 +413,7 @@ export function providerMinuteRequestCount(platform: string, keyId: number, now 
 // Total tokens in the last minute for a provider account+key, summed across
 // every model.
 export function providerMinuteTokenCount(platform: string, keyId: number, now = Date.now()): number {
-  const provisional = provisionalProviderTokenCount(platform, keyId, now - MINUTE);
+  const provisional = provisionalSummary(platform, keyId, now - MINUTE).tokens;
   const persisted = sumPersistedProviderMinuteTokens(platform, keyId, now);
   if (persisted !== undefined) return persisted + provisional;
   let total = 0;
@@ -694,5 +670,4 @@ export function clearPlatformCaches(platform: string): void {
   for (const [id, r] of reservations) {
     if (r.platform === platform) reservations.delete(id);
   }
-  clearProviderConfigCache(platform);
 }

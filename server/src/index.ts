@@ -13,7 +13,8 @@ const PORT = process.env.PORT ?? 3001;
 const HOST = process.env.HOST ?? '::';
 
 process.on('unhandledRejection', (reason: unknown) => {
-  console.error('[server] Unhandled rejection:', reason instanceof Error ? reason.stack : reason);
+  console.error('\n[server] Unhandled rejection:\n  ' + (reason instanceof Error ? reason.stack : reason) + '\n');
+  process.exit(1);
 });
 process.on('uncaughtException', (err: Error) => {
   console.error('\n[server] Uncaught exception:\n  ' + (err?.stack ?? err) + '\n');

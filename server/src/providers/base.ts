@@ -7,6 +7,8 @@ import type {
   Platform,
 } from '@api-gateway/shared/types.js';
 
+import { createAbortRace } from '../lib/abort.js';
+
 /** A provider HTTP error carrying the upstream status and, when the response
  *  included a Retry-After header, the parsed delay so the router can bench the
  *  key for at least that long. */
@@ -231,23 +233,11 @@ export abstract class BaseProvider {
     // 300s) or the provider's own EOF. We attach once and reject the pending
     // read via the race below. (#292)
     if (abortSignal?.aborted) throw new RequestAbortError();
-    let aborted = false;
-    let rejectAbort: ((e: Error) => void) | undefined;
-    const abortPromise: Promise<never> | undefined = abortSignal
-      ? new Promise<never>((_, rej) => { rejectAbort = rej; })
-      : undefined;
-    // Pre-attach a no-op catch so an abort that fires while no Promise.race
-    // is pending doesn't become an unhandled rejection.
-    abortPromise?.catch(() => {});
-    const onAbort = () => {
-      aborted = true;
-      rejectAbort?.(new RequestAbortError());
-    };
-    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+    const { abortPromise, isAborted, cleanup } = createAbortRace(abortSignal);
 
     try {
       while (true) {
-        if (aborted) throw new RequestAbortError();
+        if (isAborted()) throw new RequestAbortError();
         let timer: ReturnType<typeof setTimeout> | undefined;
         const result = await Promise.race([
           reader.read(),
@@ -301,7 +291,7 @@ export abstract class BaseProvider {
         }
       }
     } finally {
-      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+      cleanup();
       reader.cancel().catch(() => { /* upstream already gone */ });
     }
 
