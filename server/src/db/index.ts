@@ -39,6 +39,7 @@ export function initDb(dbPath?: string): DatabasePort {
   db = createDatabase(resolvedPath);
   if (!isMemory) db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  db.pragma('busy_timeout = 5000');
 
   migrateDbSchema(db);
 
