@@ -67,6 +67,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateModelsV34NvidiaSharedQuota(db);
   migrateSchemaV35RateLimitIndex(db);
   migrateSchemaV36KeyFormat(db);
+  migrateSchemaV37SessionsLastUsedIndex(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2530,4 +2531,12 @@ function migrateSchemaV36KeyFormat(db: DatabasePort) {
   if (!col.some(c => c.name === 'key_format')) {
     db.exec("ALTER TABLE custom_providers ADD COLUMN key_format TEXT NOT NULL DEFAULT 'simple' CHECK(key_format IN ('simple','colon'))");
   }
+}
+
+// ── V37: sessions last_used index (2026-07) ──
+// pruneSessions runs DELETE … WHERE last_used < ? but sessions is indexed
+// only on user_id, so each prune scans the table. Add an index on last_used
+// so the hourly prune is O(log n). Idempotent — IF NOT EXISTS.
+function migrateSchemaV37SessionsLastUsedIndex(db: DatabasePort) {
+  db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used)');
 }
