@@ -335,8 +335,7 @@ function mapGlmEffort(effort: ThinkingEffort): 'low' | 'medium' | 'high' {
  *    the full range. The rich `thinking` object is not forwarded (unverified on
  *    this host); its effort is extracted.
  *
- *  (#292 — previously the live path forwarded both verbatim unconditionally;
- *  this helper was defined but never imported, i.e. dead code.) */
+ *  (#292.) */
 export function openaiCompatThinkingBody(
   policy: OpenAiCompatThinkingPolicy,
   original: {
