@@ -200,6 +200,13 @@ register(new OpenAICompatProvider({
 // custom providers get the same extended timeout as Ollama Cloud.
 const CUSTOM_PROVIDER_TIMEOUT_MS = 120000;
 
+// Derived from the providers Map after all register() calls above.
+// Re-exported so routes/keys.ts, routes/platforms.ts, and routes/custom.ts
+// share one source of truth instead of hand-copying the slug list.
+export const BUILTIN_PLATFORM_SLUGS: readonly string[] = Object.freeze(
+  Array.from(providers.keys())
+) as readonly string[];
+
 export function getProvider(platform: Platform): BaseProvider | undefined {
   return providers.get(platform);
 }

@@ -2,24 +2,17 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { getProvider, buildProviderFor } from '../providers/index.js';
+import { getProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 
 export const keysRouter = Router();
 
-// Active built-in providers — must match providers/index.ts registrations +
-// shared/types.ts Platform. Custom providers are NOT in this list: they are
-// created via POST /api/custom-providers and have their own base URL, and their
-// keys (if any) are added by hitting POST /api/keys with the custom slug.
-// Moonshot and MiniMax direct integrations were dropped in V4. HuggingFace
-// was dropped in V4 and re-added in V13 via the router.huggingface.co route.
-// SambaNova was dropped in V23 (free tier permanently retired).
-const PLATFORMS = [
-  'google', 'groq', 'cerebras', 'nvidia', 'mistral',
-  'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu',
-  'ollama', 'kilo', 'pollinations', 'llm7', 'huggingface',
-  'opencode', 'ovh', 'commandcode',
-] as const;
+// Active built-in providers — derived from the providers registry Map
+// (providers/index.ts) so every new provider registration is automatically
+// included here. Custom providers are NOT in this list: they are created via
+// POST /api/custom-providers and have their own base URL, and their keys (if
+// any) are added by hitting POST /api/keys with the custom slug.
+const PLATFORMS = BUILTIN_PLATFORM_SLUGS;
 
 // `key` is optional so keyless providers (Kilo's anonymous gateway) can be added
 // without one; the handler enforces a non-empty key for everyone else.

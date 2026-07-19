@@ -2,19 +2,15 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
+import { BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { clearProviderConfigCache } from '../services/router.js';
 
 export const platformsRouter = Router();
 
-// Active built-in providers — must match providers/index.ts registrations +
-// shared/types.ts Platform. Custom providers are NOT in this list: they are
+// Active built-in providers — derived from the providers registry Map
+// (providers/index.ts). Custom providers are NOT in this list: they are
 // created via POST /api/custom-providers and have their own base URL.
-const PLATFORMS = [
-  'google', 'groq', 'cerebras', 'nvidia', 'mistral',
-  'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu',
-  'ollama', 'kilo', 'pollinations', 'llm7', 'huggingface',
-  'opencode', 'ovh', 'commandcode',
-] as const;
+const PLATFORMS = BUILTIN_PLATFORM_SLUGS;
 
 // Per-platform settings for built-in providers. Slimmer than the
 // custom_providers update schema — built-ins have immutable slug / base_url /

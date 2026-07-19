@@ -4,19 +4,15 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { clearRateLimitPenalty, clearProviderConfigCache } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
-import { hasProvider, buildProviderFor } from '../providers/index.js';
+import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 
 export const customRouter = Router();
 
 // Built-in platform slugs are off-limits as custom slugs — the catalog
 // already binds those names. Reject early to avoid silent shadowing.
-const BUILTIN_SLUGS = new Set([
-  'google', 'groq', 'cerebras', 'nvidia', 'mistral',
-  'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
-  'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode',
-  'ovh', 'commandcode',
-]);
+// Derived from the providers registry Map (BUILTIN_PLATFORM_SLUGS) so it
+// stays in sync automatically — no hand-copied list to maintain.
 
 // Slug format: lowercase letters, digits, dashes. 2-32 chars. Cannot start or
 // end with a dash.
@@ -296,7 +292,7 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
     ? parsed.data.baseUrl.trim().replace(/\/+$/, '')
     : normalizeOpenAiBaseUrl(parsed.data.baseUrl);
 
-  if (BUILTIN_SLUGS.has(slug)) {
+  if (BUILTIN_PLATFORM_SLUGS.includes(slug)) {
     res.status(400).json({ error: { message: `slug '${slug}' is reserved by a built-in platform` } });
     return;
   }
