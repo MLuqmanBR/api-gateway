@@ -291,7 +291,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const reqData = parsed.data;
 
   // Vision isn't carried through the Responses translation yet — fail clearly
-  // instead of answering blind to a dropped image (#118, #125).
   if (responsesInputHasImage(reqData)) {
     res.status(422).json({
       error: {
@@ -302,7 +301,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     });
     return;
   }
-
+  const responseId = newId('resp');
+  publish({ type: 'request.start', id: responseId, model: reqData.model ?? null, stream: !!reqData.stream, at: Date.now() });
   const stream = reqData.stream ?? false;
   const messages = toChatMessages(reqData);
   const tools = toChatTools(reqData.tools);
@@ -373,7 +373,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     return;
   }
 
-  const responseId = newId('resp');
   // Client-disconnect abort wiring — mirrors /chat/completions. A Stop /
   // session-close cancels the in-flight upstream call and breaks out of the
   // retry loop instead of running all MAX_RETRIES. (#292)
@@ -729,6 +728,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           id: responseId, model: route.modelId, text, toolCalls,
           promptTokens, completionTokens,
         }));
+        publish({ type: 'request.done', id: responseId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: promptTokens, out: completionTokens }, at: Date.now() });
 
         logRequest(route.platform, route.modelId, route.keyId, 'success',
           promptTokens, completionTokens, Date.now() - start, null);
@@ -771,6 +771,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
 
       res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type: 'provider_error' } });
+      publish({ type: 'request.error', id: responseId, error: safeError.slice(0, 300), at: Date.now() });
       return;
     } finally {
       route.release();
@@ -784,12 +785,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const exhaustedMsg = `All models rate-limited after ${upstreamAttempts} attempt(s). Last: ${lastError ? sanitizeProviderErrorMessage(lastError.message) : 'unknown'}`;
   if (streamStarted) {
     sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: exhaustedMsg, type: 'rate_limit_error' } } });
+    publish({ type: 'request.error', id: responseId, error: exhaustedMsg, at: Date.now() });
     res.end();
     return;
   }
   res.status(429).json({
     error: { message: exhaustedMsg, type: 'rate_limit_error' },
   });
+  publish({ type: 'request.error', id: responseId, error: exhaustedMsg, at: Date.now() });
   } catch (err: any) {
     // A RequestAbortError from an outer-loop abortableSleep (or any abort that
     // escaped the inner catch) ends the response silently on client disconnect.
