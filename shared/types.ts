@@ -312,7 +312,7 @@ export interface ChatCompletionResponse {
   choices: ChatCompletionChoice[];
   usage: TokenUsage;
   _routed_via?: {
-    platform: Platform;
+    platform: string;
     model: string;
   };
 }
@@ -359,7 +359,7 @@ export interface AnalyticsSummary {
 }
 
 export interface PlatformStats {
-  platform: Platform;
+  platform: string;
   requests: number;
   successRate: number;
   avgLatencyMs: number;
@@ -421,7 +421,7 @@ export interface ErrorDistribution {
 
 export interface RequestLog {
   id: number;
-  platform: Platform;
+  platform: string;
   modelId: string;
   status: 'success' | 'error';
   inputTokens: number;

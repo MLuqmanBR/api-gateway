@@ -4,7 +4,6 @@ import type {
   ChatCompletionChunk,
   ChatToolDefinition,
   ChatToolChoice,
-  Platform,
 } from '@api-gateway/shared/types.js';
 
 import { createAbortRace } from '../lib/abort.js';
@@ -138,7 +137,7 @@ function linkAbortAndTimeout(
 }
 
 export abstract class BaseProvider {
-  abstract readonly platform: Platform;
+  abstract readonly platform: string;
   abstract readonly name: string;
   /** Providers whose free tier needs no API key (e.g. Kilo's anonymous gateway).
    * When true, the gateway stores a sentinel key row so routing still considers

@@ -1,4 +1,3 @@
-import type { Platform } from '@api-gateway/shared/types.js';
 import { getDb } from '../db/index.js';
 import { OpenAICompatProvider } from './openai-compat.js';
 import { BaseProvider } from './base.js';
@@ -9,7 +8,7 @@ import { AnthropicCompatProvider } from './anthropic.js';
 import { CommandCodeProvider } from './commandcode.js';
 
 
-const providers = new Map<Platform, BaseProvider>();
+const providers = new Map<string, BaseProvider>();
 
 function register(provider: BaseProvider) {
   providers.set(provider.platform, provider);
@@ -207,7 +206,7 @@ export const BUILTIN_PLATFORM_SLUGS: readonly string[] = Object.freeze(
   Array.from(providers.keys())
 ) as readonly string[];
 
-export function getProvider(platform: Platform): BaseProvider | undefined {
+export function getProvider(platform: string): BaseProvider | undefined {
   return providers.get(platform);
 }
 
@@ -222,7 +221,7 @@ export function getProvider(platform: Platform): BaseProvider | undefined {
  * it).
  */
 export function buildProviderFor(platformSlug: string): BaseProvider | undefined {
-  const builtin = getProvider(platformSlug as Platform);
+  const builtin = getProvider(platformSlug);
   if (builtin) return builtin;
   // Custom slug: look up its base URL and keyless flag. We don't memoize
   // across requests — OpenAICompatProvider holds no per-instance state worth
@@ -233,7 +232,7 @@ export function buildProviderFor(platformSlug: string): BaseProvider | undefined
   const keyless = row.keyless === 1;
   if (row.api_format === 'anthropic') {
     return new AnthropicCompatProvider({
-      platform: platformSlug as Platform,
+      platform: platformSlug,
       name: platformSlug,
       baseUrl: row.base_url,
       timeoutMs: CUSTOM_PROVIDER_TIMEOUT_MS,
@@ -242,7 +241,7 @@ export function buildProviderFor(platformSlug: string): BaseProvider | undefined
     });
   }
   return new OpenAICompatProvider({
-    platform: platformSlug as Platform,
+    platform: platformSlug,
     name: platformSlug,
     baseUrl: row.base_url,
     timeoutMs: CUSTOM_PROVIDER_TIMEOUT_MS,
@@ -255,7 +254,7 @@ export function getAllProviders(): BaseProvider[] {
   return Array.from(providers.values());
 }
 
-export function hasProvider(platform: Platform): boolean {
+export function hasProvider(platform: string): boolean {
   if (providers.has(platform)) return true;
   const db = getDb();
   return !!db.prepare('SELECT 1 FROM custom_providers WHERE slug = ?').get(platform);
