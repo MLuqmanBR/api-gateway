@@ -79,22 +79,27 @@ modelsRouter.post('/sync-all', async (_req: Request, res: Response) => {
     targets.push({ slug: r.slug, baseUrl: r.base_url });
   }
 
+
+  const results = await Promise.allSettled(
+    targets.map(t => syncModelsFromProvider(t.baseUrl, t.slug))
+  );
   let totalFetched = 0;
   const errors: { slug: string; error: string }[] = [];
-  // model_ids newly added per provider — surfaces as a toast on the client
-  // (manual click + auto-sync every 5min) so the user knows models appeared.
   const added_by_provider: Record<string, string[]> = {};
-
-  for (const t of targets) {
-    const result = await syncModelsFromProvider(t.baseUrl, t.slug);
-    totalFetched += result.fetched;
-    if (result.error) {
-      errors.push({ slug: t.slug, error: result.error });
+  results.forEach((result, i) => {
+    const slug = targets[i].slug;
+    if (result.status === 'fulfilled') {
+      totalFetched += result.value.fetched;
+      if (result.value.error) {
+        errors.push({ slug, error: result.value.error });
+      }
+      if (result.value.added.length > 0) {
+        added_by_provider[slug] = result.value.added;
+      }
+    } else {
+      errors.push({ slug: targets[i].slug, error: result.reason?.message ?? String(result.reason) });
     }
-    if (result.added.length > 0) {
-      added_by_provider[t.slug] = result.added;
-    }
-  }
+  });
 
   res.json({
     success: true,
