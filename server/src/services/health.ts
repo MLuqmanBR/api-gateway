@@ -208,12 +208,15 @@ export function startHealthChecker(): void {
   // a key that was marked 'error' 4 minutes before restart would sit on
   // 'error' for another 5 minutes (until the next health check) — and
   // routeRequest excludes 'error' keys, so every request would route
-  // around it for no good reason.
-  resetErrorStatuses();
   console.log(`[Health] Starting health checker (every ${CHECK_INTERVAL_MS / 1000}s, concurrency ${CHECK_CONCURRENCY})`);
+  // Kick an immediate first sweep so freshly-booted keys reach a real status
+  // within seconds rather than waiting CHECK_INTERVAL_MS (default 5 min). The
+  // sweep is bounded-concurrency and idempotent, so duplicate-vs-interval is
+  // safe — runCheckAllGuarded() returns false on overlap rather than spawning
+  // a parallel sweep.
+  runCheckAllGuarded().catch(err => console.error('[Health] Initial check failed:', err));
   intervalId = setInterval(() => {
-    runCheckAllGuarded()
-      .catch(err => console.error('[Health] Check failed:', err));
+    runCheckAllGuarded().catch(err => console.error('[Health] Check failed:', err));
   }, CHECK_INTERVAL_MS);
 }
 
