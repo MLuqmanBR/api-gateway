@@ -425,6 +425,24 @@ const chatCompletionSchema = z.object({
   thinking: thinkingConfigSchema.nullable().optional(),
 });
 export function isRetryableError(err: any): boolean {
+  // First check structured status (set by providerHttpError in base.ts).
+  // If present, it's authoritative — matches the same categories as the
+  // message heuristics below, but without parsing ambiguity.
+  if (typeof err?.status === 'number') {
+    // Transient/retriable HTTP status codes (matching message heuristics).
+    // Transient/retriable HTTP status codes (matching message heuristics).
+    // 400 is included because providers often return 400 for bad API keys
+    // (per-key error) — the key rotation logic expects this to be retryable
+    // so it can cycle to the next key on the same model.
+    if (err.status === 400 || err.status === 429 || err.status === 408 || err.status === 425 ||
+        err.status === 500 || err.status === 502 || err.status === 503 || err.status === 504 ||
+        err.status === 403 || err.status === 404) {
+      return true;
+    }
+    // Non-retryable statuses: 400 (validation), 401 (auth), 402 (payment - handled by isPaymentRequiredError), etc.
+    return false;
+  }
+  // Fallback: message-based heuristics (legacy path, keeps existing behavior).
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
