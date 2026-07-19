@@ -18,6 +18,7 @@ import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
 import { resolvePinnedModel, formatPinnedModelRejection } from '../lib/pinned-model.js';
 import { isReasoningModelId } from '../lib/reasoning-model.js';
+import { logger } from '../lib/logger.js';
 
 export const proxyRouter = Router();
 
@@ -1070,7 +1071,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             if (anyChunk.error && !anyChunk.choices) {
               const msg = anyChunk.error.message ?? JSON.stringify(anyChunk.error).slice(0, 200);
               if (!headerSent) throw new Error(`in-band provider error from ${route.displayName}: ${msg}`);
-              console.error(`[Proxy] In-band error frame from ${route.displayName} mid-stream:`, msg);
+              logger.error(`[Proxy] In-band error frame from ${route.displayName} mid-stream`, { provider: route.platform, model: route.modelId, keyId: route.keyId, message: String(msg) });
               writeChunk({ error: { message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(String(msg))}`, type: 'stream_error' } });
               try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
               recordRateLimitHit(route.modelDbId);
@@ -1489,12 +1490,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             const sleepMs = err.retryAfterMs != null
               ? Math.min(err.retryAfterMs, 60_000)
               : 1000 * (keyAttempt + 1); // 1s then 2s
-            publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
-            console.log(`[Proxy] ${safeError.slice(0, 300)} from ${route.displayName}, rate-limited — backing off ${sleepMs}ms then retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
+            logger.info(`[Proxy] rate-limited — backing off ${sleepMs}ms then retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, sleepMs, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
             await abortableSleep(sleepMs, abortSignal);
           } else {
             publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
-            console.log(`[Proxy] ${safeError.slice(0, 300)} from ${route.displayName}, retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`);
+            logger.info(`[Proxy] retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
           }
           lastError = err;
           continue keyRetry;
