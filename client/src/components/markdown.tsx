@@ -3,6 +3,12 @@ import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { cn } from '@/lib/utils'
 
+// SECURITY: this component renders UNTRUSTED model output. The current
+// configuration (react-markdown + remarkGfm with NO rehype-raw and NO
+// dangerouslySetInnerHTML) is the XSS-safe posture — raw HTML in model text
+// is escaped. Do NOT add rehype-raw or dangerouslySetInnerHTML here without
+// a full re-review of the XSS surface.
+
 const components: Components = {
   p: ({ children }) => (
     <p className="my-2 first:mt-0 last:mb-0 whitespace-pre-wrap wrap-break-word">
