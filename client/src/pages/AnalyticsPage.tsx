@@ -55,7 +55,7 @@ const primaryFill = 'var(--foreground)'
 export default function AnalyticsPage() {
   const [range, setRange] = useState<TimeRange>('7d')
 
-  const { data: summary } = useQuery({
+  const { data: summary, isError: summaryError } = useQuery({
     queryKey: ['analytics', 'summary', range],
     queryFn: () => apiFetch<AnalyticsSummary>(`/api/analytics/summary?range=${range}`),
   })
@@ -158,6 +158,11 @@ export default function AnalyticsPage() {
             ))}
           </div>
         }
+      {summaryError && (
+        <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+          Can&apos;t reach the server — analytics are unavailable until the connection is restored.
+        </div>
+      )}
       />
       <div className="space-y-6">
         {/* Live routing feed — real-time visibility into proxy decisions */}
