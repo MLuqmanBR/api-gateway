@@ -2,7 +2,7 @@ import type { Request, Response, NextFunction } from 'express';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 
 export function errorHandler(err: Error, _req: Request, res: Response, next: NextFunction) {
-  console.error('[Error]', err.message);
+  console.error('[Error]', err.stack ?? err.message);
 
   if (res.headersSent) return next(err);
 
