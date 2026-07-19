@@ -686,6 +686,12 @@ export interface ConfigImportSummary {
      * message — never plaintext. */
     sampleFailure?: { platform: string; label: string; message: string };
   };
+
+  /** Non-fatal provenance notes the UI should surface to the operator.
+   * Currently populated when the envelope's `generator` differs from
+   * CONFIG_GENERATOR ('api-gateway') — a foreign file isn't rejected
+   * (forward-compat) but the operator should see what they're importing. */
+  warnings?: string[];
 }
 
 export interface ConfigExportRequest {
@@ -697,9 +703,6 @@ export interface ConfigExportRequest {
    * plaintext api_keys are included directly. */
   passphrase?: string;
   label?: string;
-}
-
-export interface RateLimitStatus {
   platform: Platform;
   modelId: string;
   rpm: { used: number; limit: number | null };
