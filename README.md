@@ -5,7 +5,7 @@
 **One endpoint. Every model. Free tiers or paid SOTA — routing that learns.**
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![Node.js >=18](https://img.shields.io/badge/node.js-%3E%3D18-brightgreen.svg)](#quick-start)
+[![Node.js >=20](https://img.shields.io/badge/node.js-%3E%3D20-brightgreen.svg)](#quick-start)
 
 [Quick Start](#quick-start) · [Features](#features) · [Using the API](#using-the-api) · [How It Works](#how-it-works) · [Bring Your Own Provider](#bring-your-own-provider)
 
@@ -69,7 +69,7 @@ PRs welcome. See [Contributing](#contributing).
 
 ## Quick start
 
-**Prerequisites:** Node.js 18+, npm.
+**Prerequisites:** Node.js 20+, npm.
 
 ```bash
 git clone https://github.com/MLuqmanBR/api-gateway.git
@@ -100,6 +100,7 @@ API-Gateway ships a CLI for managing the server as a background process:
 
 ```bash
 # Make the `api` command available in your shell:
+# (npm install must be run first — the CLI needs tsx in node_modules)
 npm link
 
 # Start/stop/restart the server in the background:

@@ -1,7 +1,24 @@
 {
   "name": "@api-gateway/shared",
-  "version": "0.1.0",
   "private": true,
-  "main": "./types.ts",
-  "types": "./types.ts"
+  "type": "module",
+  "main": "./dist/types.js",
+  "types": "./dist/types.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    },
+    "./types.js": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    },
+    "./types": {
+      "types": "./dist/types.d.ts",
+      "import": "./dist/types.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  }
 }

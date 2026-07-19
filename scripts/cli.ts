@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S npx tsx
 import { spawn } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -145,9 +145,9 @@ function build() {
 }
 
 function needsBuild() {
+  if (!existsSync(join(ROOT, 'shared', 'dist', 'types.js'))) return true;
   if (!existsSync(join(ROOT, 'server', 'dist', 'index.js'))) return true;
   if (!existsSync(join(ROOT, 'client', 'dist', 'index.html'))) return true;
-  return false;
 }
 
 async function ensureBuilt() {

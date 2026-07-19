@@ -5,17 +5,22 @@
   },
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "workspaces": [
     "shared",
     "server",
     "client"
   ],
   "scripts": {
+    "predev": "npm run build -w shared",
+    "predev:lan": "npm run build -w shared",
     "dev": "concurrently --kill-others-on-fail --names server,client \"npm run dev -w server\" \"npm run dev -w client\"",
     "dev:lan": "concurrently --kill-others-on-fail --names server,client \"npm run dev -w server\" \"npm run dev -w client -- --host\"",
     "test": "npm run test -w server && npm run typecheck -w client",
-    "build": "npm run build -w server && npm run build -w client",
-    "build:server": "npm run build -w server"
+    "build": "npm run build -w shared && npm run build -w server && npm run build -w client",
+    "build:server": "npm run build -w shared && npm run build -w server"
   },
   "devDependencies": {
     "concurrently": "^9.1.2"

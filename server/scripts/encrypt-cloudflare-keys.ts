@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env -S npx tsx
 /**
  * One-shot script to delete stale Cloudflare keys and insert 10 distinct
  * Cloudflare account keys. Run AFTER Step 4a (cooldowns + old keys deleted).
@@ -81,7 +81,7 @@ try {
 if (KEY_SETS.length === 0) {
   console.error('FATAL: Provide Cloudflare key data via KEY_SETS_JSON env var.');
   console.error('  KEY_SETS_JSON=\'[{"label":"user@example.com","raw":"ACCOUNT_ID:API_TOKEN"}]\' \\');
-  console.error('  node server/scripts/encrypt-cloudflare-keys.ts');
+  console.error('  npx tsx server/scripts/encrypt-cloudflare-keys.ts');
   process.exit(1);
 }
 
