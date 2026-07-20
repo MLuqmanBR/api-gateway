@@ -325,6 +325,15 @@ export function clearProviderConfigCache(platform: string): void {
   providerConfigCache?.delete(platform);
 }
 
+/** Clear round-robin index entries for a platform (called when a custom
+ *  provider is deleted so stale rrKey entries don't accumulate). */
+export function clearRoundRobinIndex(platform: string): void {
+  const prefix = `${platform}:`;
+  for (const key of roundRobinIndex.keys()) {
+    if (key.startsWith(prefix)) roundRobinIndex.delete(key);
+  }
+}
+
 /** Clear the entire provider config cache (called after config import, which
  *  can change any provider's settings). Forces a full rebuild on next access. */
 export function clearAllProviderConfigCache(): void {
@@ -718,7 +727,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
       // We found a working key for this model!
       if (!oneRPM && !(stickyEnabled && options?.stickySessionKey)) {
-        roundRobinIndex.set(rrKey, idx + attempt + 1);
+        roundRobinIndex.set(rrKey, (idx + attempt + 1) % keyOrder.length);
       }
 
       // ── Parallel request gating (provider-level) ──

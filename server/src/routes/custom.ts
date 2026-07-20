@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { clearRateLimitPenalty, clearProviderConfigCache } from '../services/router.js';
+import { clearRateLimitPenalty, clearProviderConfigCache, clearRoundRobinIndex } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
@@ -364,6 +364,7 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
       tx();
 
       clearPlatformCaches(slug);
+      clearRoundRobinIndex(slug);
       clearProviderConfigCache(slug);
       const sync = await syncModelsFromProvider(baseUrl, slug);
       res.json({
@@ -566,6 +567,7 @@ customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response)
   tx();
 
   clearPlatformCaches(slug);
+  clearRoundRobinIndex(slug);
   clearProviderConfigCache(slug);
   res.json({ success: true, archived: true });
 });
