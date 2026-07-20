@@ -8,33 +8,19 @@ import type {
 
 import { createAbortRace } from '../lib/abort.js';
 
-/** A provider HTTP error carrying the upstream status and, when the response
- *  included a Retry-After header, the parsed delay so the router can bench the
- *  key for at least that long. */
+/** A provider HTTP error carrying the upstream status. The router decides
+ *  cooldown duration independently (flat 90s via X1) — upstream Retry-After
+ *  is NOT parsed or honored for cooldown decisions (F13 reverse-remove). */
 export interface ProviderHttpError extends Error {
   status?: number;
-  retryAfterMs?: number;
 }
 
-/** Parse an HTTP `Retry-After` header (delta-seconds or an HTTP-date) into a
- *  millisecond delay. Returns undefined when absent or unparseable. */
-export function parseRetryAfterMs(value: string | null | undefined): number | undefined {
-  if (!value) return undefined;
-  const trimmed = value.trim();
-  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
-  const when = Date.parse(trimmed);
-  if (!Number.isNaN(when)) return Math.max(0, when - Date.now());
-  return undefined;
-}
-
-/** Build an error for a non-OK upstream response, capturing the status and any
- *  Retry-After hint. Used by every provider adapter so the proxy can honor a
- *  provider's explicit back-off when it sets the cooldown. */
+/** Build an error for a non-OK upstream response, capturing the status.
+ *  Used by every provider adapter. Upstream Retry-After is deliberately NOT
+ *  parsed — the gateway uses its own flat cooldown policy (F13/X1). */
 export function providerHttpError(res: Response, message: string): ProviderHttpError {
   const err = new Error(message) as ProviderHttpError;
   err.status = res.status;
-  const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after'));
-  if (retryAfterMs !== undefined) err.retryAfterMs = retryAfterMs;
   return err;
 }
 

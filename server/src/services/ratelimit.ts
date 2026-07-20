@@ -529,10 +529,9 @@ export function computeRetryCooldownMs(
   modelId: string,
   keyId: number,
   limits: { rpd: number | null; tpd: number | null },
-  retryAfterMs?: number | null,
 ): number {
   if (isPaymentRequired) return PAYMENT_REQUIRED_COOLDOWN_MS;
-  return getCooldownDurationForLimit(platform, modelId, keyId, limits, retryAfterMs);
+  return getCooldownDurationForLimit(platform, modelId, keyId, limits);
 }
 
 // Decide how long to bench a model+key after an upstream 429. Escalate to the
@@ -553,21 +552,15 @@ export function getCooldownDurationForLimit(
   modelId: string,
   keyId: number,
   limits: { rpd: number | null; tpd: number | null },
-  retryAfterMs?: number | null,
 ): number {
   const now = Date.now();
   const rpdExhausted =
     limits.rpd !== null && requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd;
   const tpdExhausted =
     limits.tpd !== null && tokenCount(platform, modelId, keyId, DAY, now) >= limits.tpd;
-  const base = (rpdExhausted || tpdExhausted)
+  return (rpdExhausted || tpdExhausted)
     ? getNextCooldownDuration(platform, modelId, keyId)
     : TRANSIENT_COOLDOWN_MS;
-  // Honor an upstream Retry-After as a floor: never bench shorter than our own
-  // heuristic, but extend (capped at a day) when the provider explicitly asks
-  // to wait longer than we otherwise would.
-  if (retryAfterMs != null && retryAfterMs > base) return Math.min(retryAfterMs, DAY);
-  return base;
 }
 
 function persistedCooldownExpiry(

@@ -142,17 +142,17 @@ describe('Proxy 429 short backoff (#295)', () => {
     }
   }, 10000);
 
-  it('honors an upstream Retry-After (longer than the heuristic)', async () => {
-    // 429 with Retry-After = 3s, capped at 60s by the proxy, so the first retry
-    // backs off ~3000ms — ~2s longer than the 1s heuristic would otherwise wait.
-    const four29WithRetry = Object.assign(
+  it('backs off with escalating sleep (1s then 2s, no upstream Retry-After)', async () => {
+    // F13: upstream Retry-After is no longer honored for cooldown/backoff.
+    // The proxy uses a fixed escalating sleep: 1s on first retry, 2s on second.
+    const four29 = Object.assign(
       new Error('fake API error 429: '),
-      { status: 429, retryAfterMs: 3000 },
+      { status: 429 },
     );
-    const callTimes = await postAndCapture(app, key, () => four29WithRetry, 2);
+    const callTimes = await postAndCapture(app, key, () => four29, 2);
 
     expect(callTimes.length).toBeGreaterThanOrEqual(2);
-    // The first gap honors the 3s Retry-After (allow jitter down to 2800ms).
-    expect(callTimes[1] - callTimes[0]).toBeGreaterThanOrEqual(2800);
+    // The first gap is ~1000ms (1s escalating backoff, allow jitter down to 800ms).
+    expect(callTimes[1] - callTimes[0]).toBeGreaterThanOrEqual(800);
   }, 10000);
 });

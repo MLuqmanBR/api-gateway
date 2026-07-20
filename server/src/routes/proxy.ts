@@ -1505,9 +1505,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             || msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
             || msg.includes('resource_exhausted');
           if (is429) {
-            const sleepMs = err.retryAfterMs != null
-              ? Math.min(err.retryAfterMs, 60_000)
-              : 1000 * (keyAttempt + 1); // 1s then 2s
+            const sleepMs = 1000 * (keyAttempt + 1); // 1s then 2s
             logger.info(`[Proxy] rate-limited — backing off ${sleepMs}ms then retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, sleepMs, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
             await abortableSleep(sleepMs, abortSignal);
           } else {
@@ -1551,7 +1549,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         isPaymentRequiredError(lastError),
         route.platform, route.modelId, route.keyId,
         { rpd: route.rpdLimit, tpd: route.tpdLimit },
-        lastError?.retryAfterMs,
       ),
     );
     recordRateLimitHit(route.modelDbId);
