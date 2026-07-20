@@ -498,11 +498,30 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy): ChainRow[] {
   const intelMin = composites.length ? Math.min(...composites) : 0;
   const intelMax = composites.length ? Math.max(...composites) : 0;
 
-  return chain
+  const scored = chain
     .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, true).score }))
     // Higher score first; manual priority breaks ties so the chain still matters.
-    .sort((a, b) => b.s - a.s || a.e.priority - b.e.priority)
-    .map(x => x.e);
+    .sort((a, b) => b.s - a.s || a.e.priority - b.e.priority);
+
+  // C2: anti-herd buffer-random tiebreak. When bandit_breaker='on', models
+  // whose scores are within 5% of the best are shuffled together so traffic
+  // spreads across near-equal candidates instead of herding onto one.
+  // Default OFF — tests stay deterministic.
+  if (getSetting('bandit_breaker') === 'on' && scored.length > 1) {
+    const buffer = 0.05; // 5%
+    const best = scored[0].s;
+    const herdEnd = scored.findIndex(x => x.s < best * (1 - buffer));
+    const herdSize = herdEnd === -1 ? scored.length : herdEnd;
+    if (herdSize > 1) {
+      // Fisher-Yates shuffle the top herd
+      for (let i = herdSize - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [scored[i], scored[j]] = [scored[j], scored[i]];
+      }
+    }
+  }
+
+  return scored.map(x => x.e);
 }
 
 /**

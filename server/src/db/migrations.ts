@@ -74,6 +74,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV40Budgets(db);
   migrateSchemaV41ResponseCache(db);
   migrateSchemaV42Webhooks(db);
+  migrateSchemaV43LatencyPerToken(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2638,4 +2639,11 @@ function migrateSchemaV42Webhooks(db: DatabasePort) {
       created_at INTEGER NOT NULL
     )
   `);
+}
+
+// C2: add latency_per_token_ms column to requests for per-token latency scoring.
+// Records latency_ms / output_tokens when outputTokens > 0; null otherwise.
+// Used by the anti-herd buffer-random tiebreak in the router.
+function migrateSchemaV43LatencyPerToken(db: DatabasePort) {
+  try { db.exec('ALTER TABLE requests ADD COLUMN latency_per_token_ms REAL'); } catch { /* duplicate column */ }
 }

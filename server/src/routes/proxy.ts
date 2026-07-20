@@ -1806,10 +1806,12 @@ export function logRequest(
 ) {
   try {
     const db = getDb();
+    // C2: compute per-token latency (null when no output tokens, e.g. errors).
+    const latencyPerTokenMs = outputTokens > 0 ? latencyMs / outputTokens : null;
     db.prepare(`
-      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel);
+      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, latency_per_token_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, latencyPerTokenMs);
   } catch (e) {
     console.error('Failed to log request:', e);
   }
