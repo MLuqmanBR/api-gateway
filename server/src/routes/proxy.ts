@@ -13,8 +13,15 @@ import { contentToString, messageHasImage, normalizeOutboundContent } from '../l
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
-import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
-import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
+import { ThinkTagStream } from '../lib/think-tags.js';
+import { getContextHandoffMode, recordIncomingMessages, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
+import { pipeline } from '../lib/hook-pipeline.js';
+import { registerBuiltInHooks } from '../lib/builtin-hooks.js';
+
+// F1: register the three built-in transforms (context-handoff, tool-rescue,
+// think-tags) on the process-wide HookPipeline singleton. Idempotent — safe
+// even if responses.ts also calls it. F7/F8 subscribe to this pipeline.
+registerBuiltInHooks();
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
 import { resolvePinnedModel, formatPinnedModelRejection } from '../lib/pinned-model.js';
@@ -1008,7 +1015,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // which already counts the injected message.
     let injectedHandoffTokens = 0;
     if (handoffMode !== 'off' && sessionKey) {
-      const handoff = maybeInjectContextHandoff({ mode: handoffMode, sessionKey, messages, selectedModelKey: modelKey });
+      // F1: context-handoff now runs through the HookPipeline so F7/F8 can
+      // observe the mutation. The pipeline runs the registered pre-call hooks
+      // in order (context-handoff is the only one today) and returns the
+      // mutated messages + injection metadata.
+      const handoff = pipeline.runPreCall({ mode: handoffMode, sessionKey, messages, selectedModelKey: modelKey });
       if (handoff.injected) console.log(`[Proxy] Context handoff injected (session ${sessionKey.slice(0, 8)}…, model switch detected)`);
       outboundMessages = handoff.messages;
       injectedHandoffTokens = handoff.injectedTokens;
@@ -1357,49 +1368,39 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           throw new Error(`empty completion from ${route.displayName}`);
         }
 
-        // Inline tool-call dialect rescue (#231 audit): a tool-bearing
-        // request answered with the call serialized as TEXT (a mid-
-        // conversation model switch makes the new model imitate the previous
-        // model's private syntax). Re-parse it into structured tool_calls so
-        // the client's agent loop keeps working; a detected-but-unparseable
-        // dialect is a dead turn and fails over like an empty completion.
-        if (wantsTools && respMsg && (respMsg.tool_calls?.length ?? 0) === 0 && respText) {
-          const rescue = rescueInlineToolCalls(respText, new Set((tools ?? []).map(t => t.function.name)));
-          if (rescue.detected) {
-            if (!rescue.calls) {
-              throw new Error(`unparseable inline tool-call dialect from ${route.displayName}: ${respText.slice(0, 120)}`);
-            }
+        // F1: post-call transforms (tool-rescue + think-tags) now run through
+        // the HookPipeline so F7/F8 can observe the mutations. The pipeline
+        // runs tool-rescue FIRST (so think-tags only sees visible text), then
+        // think-tags, threading the mutated content through both. The proxy
+        // applies the pipeline's result to respMsg here — the hooks themselves
+        // never touch the response object, keeping them pure-ish.
+        if (respMsg) {
+          const postResult = pipeline.runPostCallSuccess({
+            content: respText,
+            reasoning: respMsg.reasoning_content ?? '',
+            toolNames: new Set((tools ?? []).map(t => t.function.name)),
+            isReasoningModel,
+            wantsTools,
+            hasExistingToolCalls: (respMsg.tool_calls?.length ?? 0) > 0,
+          });
+          // Apply tool-rescue result (structured tool_calls).
+          if (postResult.toolCallsDetected && postResult.toolCalls) {
             const schemas = toolSchemaMap(tools);
-            respMsg.tool_calls = rescue.calls.map((c, i) => ({
+            respMsg.tool_calls = postResult.toolCalls.map((c, i) => ({
               id: `call_rescued_${i + 1}`,
               type: 'function' as const,
               function: { name: c.name, arguments: repairToolArguments(c.arguments, schemas.get(c.name)) },
             }));
-            respMsg.content = rescue.cleanText.length > 0 ? rescue.cleanText : null;
+            respMsg.content = postResult.content.length > 0 ? postResult.content : null;
             if (result.choices?.[0]) result.choices[0].finish_reason = 'tool_calls';
-            console.log(`[Proxy] Rescued ${rescue.calls.length} inline tool call(s) from ${route.displayName} into structured tool_calls`);
+            console.log(`[Proxy] Rescued ${postResult.toolCalls.length} inline tool call(s) from ${route.displayName} into structured tool_calls`);
+          } else if (postResult.content !== respText) {
+            // Think-tags modified the content (or tool-rescue cleanText).
+            respMsg.content = postResult.content.length > 0 ? postResult.content : null;
           }
-        }
-
-        // `` tag extraction (non-streaming path). Mirrors what the
-        // streaming path does on the complete response: move ``
-        // blocks from `content` to `reasoning_content` so clients see
-        // a clean answer and a separate reasoning trace. Skipped for
-        // non-reasoning models — the gate is the same model-id
-        // pattern used in the streaming path. Runs after the tool-
-        // call rescue so the dialect detector only ever saw visible
-        // text; the markers (`<|tool_call_begin|>` etc.) never appear
-        // inside a real think block, so the order is safe.
-        if (isReasoningModel && respMsg) {
-          const originalContent = contentToString(respMsg.content ?? '');
-          if (originalContent.length > 0) {
-            const think = extractThinkTags(originalContent);
-            if (think.extracted) {
-              respMsg.content = think.visible.length > 0 ? think.visible : null;
-              if (think.reasoning.length > 0) {
-                respMsg.reasoning_content = think.reasoning;
-              }
-            }
+          // Apply reasoning (only if think-tags extracted reasoning).
+          if (postResult.reasoning && postResult.reasoning !== (respMsg.reasoning_content ?? '')) {
+            respMsg.reasoning_content = postResult.reasoning;
           }
         }
 
