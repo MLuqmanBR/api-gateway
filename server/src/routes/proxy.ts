@@ -10,6 +10,7 @@ import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { isCacheEnabled, isCacheableTemp, isCacheBypassed, computeCacheKey, getCachedResponse, setCachedResponse, synthesizeSSE } from '../services/cache.js';
 import { recordMetricsRequest, recordMetricsTokens } from '../services/metrics.js';
+import { acquireSlot, isQueueEnabled, QueueTimeoutError } from '../services/queue.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { checkAndReserve, recordSpend, estimateCostCents } from '../services/budgets.js';
@@ -1151,6 +1152,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     let keySucceeded = false;
     keyRetry: for (let keyAttempt = 0; keyAttempt < PER_KEY_RETRIES; keyAttempt++) {
       try {
+      // F9: acquire per-provider concurrency slot before the upstream call.
+      let releaseSlot: (() => void) | null = null;
+      if (isQueueEnabled()) {
+        releaseSlot = await acquireSlot(route.platform);
+      }
+      try {
       if (stream) {
         // — Stream turn-integrity (#231 audit) —
         // The old loop forwarded upstream chunks verbatim and called any
@@ -1572,7 +1579,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         }
         return;
       }
+      } finally {
+        // F9: release the per-provider concurrency slot.
+        if (releaseSlot) releaseSlot();
+      }
     } catch (err: any) {
+      // F9: queue full or timeout — return 503 with Retry-After (D-FEATURES-6).
+      if (err instanceof QueueTimeoutError) {
+        const retryAfterSec = Math.ceil(err.timeoutMs / 1000);
+        if (!res.headersSent) {
+          res.setHeader('Retry-After', String(retryAfterSec));
+          res.status(503).json({
+            error: {
+              type: 'queue_full',
+              message: err.message,
+              queue_timeout_ms: err.timeoutMs,
+              platform: err.platform,
+            },
+          });
+        }
+        publish({ type: 'request.error', id: requestId, error: `Queue ${err.reason}: ${err.message}`, at: Date.now() });
+        return;
+      }
       // Client stopped the request (Stop button / closed session). This is NOT
       // a provider failure — don't log an error, don't retry, don't 502. Just
       // end the response silently. The abort signal already cancelled the

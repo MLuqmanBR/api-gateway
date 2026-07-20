@@ -8,6 +8,7 @@ import { budgetsRouter } from './routes/budgets.js';
 import { cacheRouter } from './routes/cache.js';
 import { metricsRouter } from './routes/metrics.js';
 import { webhooksRouter } from './routes/webhooks.js';
+import { queueRouter } from './routes/queue.js';
 import { platformsRouter } from './routes/platforms.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
@@ -104,6 +105,7 @@ export function createApp() {
   app.use('/api/budgets', budgetsRouter);
   app.use('/api/cache', cacheRouter);
   app.use('/api/webhooks', webhooksRouter);
+  app.use('/api/queue', queueRouter);
   app.use('/api/platforms', platformsRouter);
   app.use('/api/models', modelsRouter);
   app.use('/api/fallback', fallbackRouter);
