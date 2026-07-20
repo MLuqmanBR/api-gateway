@@ -12,6 +12,7 @@ import { isCacheEnabled, isCacheableTemp, isCacheBypassed, computeCacheKey, getC
 import { recordMetricsRequest, recordMetricsTokens } from '../services/metrics.js';
 import { acquireSlot, isQueueEnabled, QueueTimeoutError } from '../services/queue.js';
 import { isCircuitOpen, recordCircuitSuccess, recordCircuitFailure, shouldMarkExhausted } from '../services/circuit-breaker.js';
+import { setRetryAfter } from '../lib/http-headers.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { checkAndReserve, recordSpend, estimateCostCents } from '../services/budgets.js';
@@ -1600,7 +1601,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       if (err instanceof QueueTimeoutError) {
         const retryAfterSec = Math.ceil(err.timeoutMs / 1000);
         if (!res.headersSent) {
-          res.setHeader('Retry-After', String(retryAfterSec));
+          setRetryAfter(res, retryAfterSec);
           res.status(503).json({
             error: {
               type: 'queue_full',
