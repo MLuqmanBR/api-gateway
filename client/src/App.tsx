@@ -18,6 +18,7 @@ import { ErrorBoundary } from '@/components/error-boundary'
 
 
 const MiddlePage = lazy(() => import('@/pages/MiddlePage'))
+const KeysPage = lazy(() => import('@/pages/KeysPage'))
 const BudgetPage = lazy(() => import('@/pages/BudgetPage'))
 const PlaygroundPage = lazy(() => import('@/pages/PlaygroundPage'))
 const FallbackPage = lazy(() => import('@/pages/FallbackPage'))

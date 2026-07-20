@@ -60,13 +60,13 @@ export default function BudgetPage() {
       apiFetch('/api/budgets', { method: 'POST', body: JSON.stringify(data) }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['budgets'] })
-      addToast('Budget saved', 'success')
+      addToast({ kind: 'success', title: 'Budget saved', sticky: false })
       setDailyLimit('')
       setWeeklyLimit('')
       setMonthlyLimit('')
       setScopeId('')
     },
-    onError: (e: Error) => addToast(e.message, 'error'),
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
   const deleteMutation = useMutation({
@@ -74,9 +74,9 @@ export default function BudgetPage() {
       apiFetch(`/api/budgets?scope=${b.scope}${b.scope_id ? `&scope_id=${b.scope_id}` : ''}`, { method: 'DELETE' }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['budgets'] })
-      addToast('Budget deleted', 'success')
+      addToast({ kind: 'success', title: 'Budget deleted', sticky: false })
     },
-    onError: (e: Error) => addToast(e.message, 'error'),
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
   const resetMutation = useMutation({
@@ -84,9 +84,9 @@ export default function BudgetPage() {
       apiFetch(`/api/budgets/reset?scope=${b.scope}${b.scope_id ? `&scope_id=${b.scope_id}` : ''}`, { method: 'POST' }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['budgets'] })
-      addToast('Usage reset', 'success')
+      addToast({ kind: 'success', title: 'Usage reset', sticky: false })
     },
-    onError: (e: Error) => addToast(e.message, 'error'),
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
   function handleSubmit(e: React.FormEvent) {
@@ -109,7 +109,7 @@ export default function BudgetPage() {
         <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
           <div>
             <Label htmlFor="scope">Scope</Label>
-            <Select value={scope} onValueChange={(v: 'client_key' | 'global') => setScope(v)}>
+            <Select value={scope} onValueChange={v => setScope((v ?? 'global') as 'client_key' | 'global')}>
               <SelectTrigger id="scope"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="global">Global</SelectItem>

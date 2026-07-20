@@ -1,6 +1,7 @@
 // Middle Layer dashboard — Privacy layer config + known-secrets store.
 // Wired into the navbar at /middle.
 import { Shield, Plus, Trash2, Power, Loader2, Eye, EyeOff, Zap } from 'lucide-react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { addToast } from '@/lib/toast'
@@ -31,7 +32,7 @@ type MiddleStats = {
 export default function MiddlePage() {
   const queryClient = useQueryClient()
   const [showSecretValue, setShowSecretValue] = useState(false)
-  const [newSecret, setNewSecret] = useState({ value: '', kind: 'api_key', label: '' })
+  const [newSecret, setNewSecret] = useState<{ value: string; kind: string; label: string }>({ value: '', kind: 'api_key', label: '' })
 
   const config = useQuery<MiddleConfig>({
     queryKey: ['middle-config'],
@@ -53,9 +54,9 @@ export default function MiddlePage() {
       apiFetch('/api/middle/config', { method: 'PUT', body: JSON.stringify(data) }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['middle-config'] })
-      addToast('Configuration updated', { type: 'success' })
+      addToast({ kind: 'success', title: 'Configuration updated', sticky: false })
     },
-    onError: (e: Error) => addToast(e.message, { type: 'error' }),
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
   const addSecretMut = useMutation({
@@ -65,9 +66,9 @@ export default function MiddlePage() {
       queryClient.invalidateQueries({ queryKey: ['middle-secrets'] })
       queryClient.invalidateQueries({ queryKey: ['middle-stats'] })
       setNewSecret({ value: '', kind: 'api_key', label: '' })
-      addToast('Secret added', { type: 'success' })
+      addToast({ kind: 'success', title: 'Secret added', sticky: false })
     },
-    onError: (e: Error) => addToast(e.message, { type: 'error' }),
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
   const deleteSecret = useMutation({
@@ -76,9 +77,9 @@ export default function MiddlePage() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['middle-secrets'] })
       queryClient.invalidateQueries({ queryKey: ['middle-stats'] })
-      addToast('Secret removed', { type: 'success' })
+      addToast({ kind: 'success', title: 'Secret removed', sticky: false })
     },
-    onError: (e: Error) => addToast(e.message, { type: 'error' }),
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
   const toggleSecret = useMutation({
@@ -91,7 +92,7 @@ export default function MiddlePage() {
       queryClient.invalidateQueries({ queryKey: ['middle-secrets'] })
       queryClient.invalidateQueries({ queryKey: ['middle-stats'] })
     },
-    onError: (e: Error) => addToast(e.message, { type: 'error' }),
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
   const cfg = config.data ?? {}
@@ -326,7 +327,7 @@ export default function MiddlePage() {
                   onChange={(e) => setNewSecret(s => ({ ...s, value: e.target.value }))}
                   placeholder="sk-…"
                 />
-                <Button variant="outline" size="icon" onClick={() => setShowSecretValue(v => !v)}>
+                <Button variant="outline" size="icon" onClick={() => setShowSecretValue(!showSecretValue)}>
                   {showSecretValue ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </Button>
               </div>
