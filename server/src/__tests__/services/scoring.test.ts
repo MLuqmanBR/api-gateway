@@ -53,8 +53,10 @@ describe('scoring: intelligence axis', () => {
     expect(intelligenceScore(2500, 1000, 4000)).toBeCloseTo(0.5, 5);
   });
 
-  it('returns neutral-high when all models are equal', () => {
-    expect(intelligenceScore(5, 5, 5)).toBe(1);
+  it('returns neutral (0.5) when all models are equal', () => {
+    // When the chain is homogeneous, intelligence can't differentiate —
+    // return 0.5 so it doesn't inflate the base score.
+    expect(intelligenceScore(5, 5, 5)).toBe(0.5);
   });
 });
 

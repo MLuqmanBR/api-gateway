@@ -110,7 +110,7 @@ export function speedScore(tokPerSec: number, ttfbMs: number | null): number {
 // Caller supplies a composite (tier-first, rank-as-tiebreaker — see router) and
 // the min/max across the enabled chain. We min-max normalize to [0,1], 1 = best.
 export function intelligenceScore(composite: number, min: number, max: number): number {
-  if (max <= min) return 1; // single model or all equal → neutral-high
+  if (max <= min) return 0.5; // single model or all equal → neutral, not max
   return (composite - min) / (max - min);
 }
 
