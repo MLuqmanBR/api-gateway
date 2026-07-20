@@ -396,7 +396,10 @@ function extractToolCalls(parts: GeminiPart[] | undefined): ChatToolCall[] {
   for (const part of parts) {
     if (!part.functionCall?.name) continue;
 
-    const id = part.functionCall.id ?? `call_${Date.now()}_${fallbackIndex++}`;
+    // Use crypto.randomUUID() for the fallback id — Date.now()+idx can
+    // collide across concurrent requests, causing cross-request signature
+    // bleed in the thoughtSigCache (a wrong sig → 400 → failover).
+    const id = part.functionCall.id ?? `call_${crypto.randomUUID()}`;
     // Cache the signature keyed by the id we hand the client, so when the client
     // echoes this call back (without the signature, as OpenAI format requires)
     // we can re-attach it and Gemini accepts the history.
