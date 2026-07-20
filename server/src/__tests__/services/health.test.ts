@@ -7,6 +7,11 @@ import { initDb, getDb } from '../../db/index.js';
 const validateMock = vi.hoisted(() => ({
   returnValue: true as boolean,
   throwError: null as Error | null,
+  // Structural parallelism instrumentation (Imp 35): track concurrent
+  // in-flight validateKey calls. If processing is sequential, maxInFlight
+  // stays 1; if parallel, it exceeds 1.
+  inFlight: 0,
+  maxInFlight: 0,
 }));
 
 vi.mock('../../providers/index.js', () => ({
@@ -15,8 +20,13 @@ vi.mock('../../providers/index.js', () => ({
     name: 'NVIDIA NIM',
     baseUrl: 'https://integrate.api.nvidia.com/v1',
     validateKey: () => {
-      if (validateMock.throwError) return Promise.reject(validateMock.throwError);
-      return Promise.resolve(validateMock.returnValue);
+      validateMock.inFlight++;
+      validateMock.maxInFlight = Math.max(validateMock.maxInFlight, validateMock.inFlight);
+      if (validateMock.throwError) {
+        validateMock.inFlight--;
+        return Promise.reject(validateMock.throwError);
+      }
+      return Promise.resolve(validateMock.returnValue).finally(() => { validateMock.inFlight--; });
     },
   }),
   hasProvider: () => true,
@@ -204,14 +214,13 @@ describe('Health checker (#256)', () => {
       });
 
       try {
-        const t0 = Date.now();
+        validateMock.inFlight = 0;
+        validateMock.maxInFlight = 0;
         await checkAllKeys();
-        const elapsed = Date.now() - t0;
-        // Generous upper bound — if it ran sequentially, even with mocked
-        // providers, the loop overhead + promise scheduling would push
-        // past 2s easily on 5 keys. The whole batch should be
-        // near-instant here.
-        expect(elapsed).toBeLessThan(2000);
+        // Structural parallelism assertion (Imp 35): if keys were processed
+        // sequentially, maxInFlight would be 1. With parallel processing,
+        // at least 2 validateKey calls overlap at some point.
+        expect(validateMock.maxInFlight).toBeGreaterThan(1);
 
         // We expect exactly one 'start' event, one 'done' event, and one
         // 'progress' event per key.
