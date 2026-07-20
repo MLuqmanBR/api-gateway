@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { keysRouter } from './routes/keys.js';
 import { budgetsRouter } from './routes/budgets.js';
 import { cacheRouter } from './routes/cache.js';
+import { metricsRouter } from './routes/metrics.js';
 import { platformsRouter } from './routes/platforms.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
@@ -86,6 +87,10 @@ export function createApp() {
   // authed /api/events/ticket route below); the handler validates+consumes it
   // when the caller isn't LAN-trusted. LAN-trusted callers stream unchanged.
   app.get('/api/events', eventsStreamHandler);
+
+  // F7: Prometheus /metrics — mounted BEFORE the /api requireAuth blanket
+  // so Prometheus can scrape without dashboard auth. Gated by METRICS_AUTH_TOKEN.
+  app.use(metricsRouter);
 
   // Default-deny: every /api/* route is gated by requireAuth unless
   // deliberately mounted above this blanket.  Existing per-router

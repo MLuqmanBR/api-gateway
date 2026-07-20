@@ -9,6 +9,7 @@ import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { isCacheEnabled, isCacheableTemp, isCacheBypassed, computeCacheKey, getCachedResponse, setCachedResponse, synthesizeSSE } from '../services/cache.js';
+import { recordMetricsRequest, recordMetricsTokens } from '../services/metrics.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { checkAndReserve, recordSpend, estimateCostCents } from '../services/budgets.js';
@@ -1768,4 +1769,16 @@ export function logRequest(
   } catch (e) {
     console.error('Failed to log request:', e);
   }
+  // F7: record Prometheus metrics alongside the DB log.
+  try {
+    recordMetricsRequest({
+      platform, model: modelId,
+      status: status === 'success' ? 'success' : 'error',
+      stream: outputTokens > 0 && ttfbMs !== null,
+      latencyMs,
+    });
+    if (inputTokens > 0 || outputTokens > 0) {
+      recordMetricsTokens({ platform, model: modelId, inputTokens, outputTokens });
+    }
+  } catch { /* metrics are best-effort */ }
 }

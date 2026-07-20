@@ -5,6 +5,7 @@ import { pruneSessions } from './services/auth.js';
 import { startHealthChecker, stopHealthChecker } from './services/health.js';
 import { startRequestRetentionPruner, stopRequestRetentionPruner } from './services/request-retention.js';
 import { rebuildExhaustionFromDB } from './services/key-exhaustion.js';
+import { attachRealtimeServer } from './services/realtime.js';
 
 const PORT = process.env.PORT ?? 3001;
 // Dual-stack ('::') by default so the dashboard is reachable over both IPv4
@@ -37,6 +38,8 @@ async function main() {
   };
 
   let activeServer = app.listen(Number(PORT), HOST, onReady(HOST));
+  // F11: attach WebSocket Realtime API server (/v1/realtime)
+  attachRealtimeServer(activeServer);
   activeServer.on('error', (err: NodeJS.ErrnoException) => {
     // The default '::' bind fails where IPv6 is disabled (kernel
     // ipv6.disable=1 and the like) — retry IPv4-only rather than dying.
@@ -45,6 +48,7 @@ async function main() {
     if (!process.env.HOST && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL')) {
       console.warn('[server] IPv6 unavailable on this host — falling back to 0.0.0.0 (IPv4-only)');
       activeServer = app.listen(Number(PORT), '0.0.0.0', onReady('0.0.0.0'));
+      attachRealtimeServer(activeServer);
       activeServer.on('error', (err: NodeJS.ErrnoException) => {
         console.error('\n[server] IPv4 fallback failed to start:\n  ' + (err?.message ?? err) + '\n');
         process.exit(1);
