@@ -6,7 +6,6 @@ import type {
   ChatToolChoice,
   ChatToolDefinition,
   TokenUsage,
-  Platform,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
 import { contentToString, normalizeOutboundContent } from '../lib/content.js';
@@ -123,7 +122,7 @@ interface AnthropicStreamEvent {
  * `anthropic-beta` header enables newer tool-use features.
  */
 export class AnthropicCompatProvider extends BaseProvider {
-  readonly platform: Platform;
+  readonly platform: string;
   readonly name: string;
   // baseUrl is declared on BaseProvider as a public field; redeclared here so
   // callers can read it on the concrete class without a type-narrowing cast.
@@ -131,7 +130,7 @@ export class AnthropicCompatProvider extends BaseProvider {
   private readonly timeoutMs: number;
 
   constructor(opts: {
-    platform: Platform;
+    platform: string;
     name: string;
     baseUrl: string;
     timeoutMs?: number;

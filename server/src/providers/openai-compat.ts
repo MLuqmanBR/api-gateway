@@ -2,7 +2,6 @@ import type {
   ChatMessage,
   ChatCompletionResponse,
   ChatCompletionChunk,
-  Platform,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { extractErrorMessage } from '../lib/error-body.js';
@@ -16,7 +15,7 @@ import {
  * GitHub Models, Fireworks AI.
  */
 export class OpenAICompatProvider extends BaseProvider {
-  readonly platform: Platform;
+  readonly platform: string;
   readonly name: string;
   // baseUrl is inherited from BaseProvider (set in constructor below)
   private readonly extraHeaders: Record<string, string>;
@@ -34,7 +33,7 @@ export class OpenAICompatProvider extends BaseProvider {
   private readonly keyFormat: string;
 
   constructor(opts: {
-    platform: Platform;
+    platform: string;
     name: string;
     baseUrl: string;
     extraHeaders?: Record<string, string>;

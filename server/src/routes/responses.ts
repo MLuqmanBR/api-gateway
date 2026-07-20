@@ -302,7 +302,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     return;
   }
   const responseId = newId('resp');
-  publish({ type: 'request.start', id: responseId, model: reqData.model ?? null, stream: !!reqData.stream, at: Date.now() });
+  publish({ type: 'request.start', id: responseId, model: reqData.model, stream: !!reqData.stream, at: Date.now() });
   const stream = reqData.stream ?? false;
   const messages = toChatMessages(reqData);
   const tools = toChatTools(reqData.tools);

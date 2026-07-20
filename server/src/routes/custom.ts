@@ -6,6 +6,7 @@ import { clearRateLimitPenalty, clearProviderConfigCache } from '../services/rou
 import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
+import { decrypt } from '../lib/crypto.js';
 
 export const customRouter = Router();
 
@@ -124,13 +125,36 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
     return { fetched: 0, added: [], error: 'invalid base URL' };
   }
 
+  // Look up the newest enabled API key for this slug. Many providers require
+  // the API key on their /models endpoint too — pass it as a Bearer header
+  // when one exists, so auto-discovery works for gated catalogs.
+  let authHeader = '';
+  try {
+    const keyRow = getDb().prepare(`
+      SELECT encrypted_key, iv, auth_tag
+      FROM api_keys
+      WHERE slug = ? AND enabled = 1
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(slug) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+    if (keyRow) {
+      const key = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
+      authHeader = `Bearer ${key}`;
+    }
+  } catch {
+    // Decryption failed — proceed unauthenticated; /models may still be open.
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
     const res = await fetch(`${baseUrl}/models`, {
       signal: controller.signal,
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
     });
 
     if (!res.ok) {
