@@ -17,7 +17,7 @@ import { drainPersisted } from '@/lib/toast'
 import { ErrorBoundary } from '@/components/error-boundary'
 
 
-const KeysPage = lazy(() => import('@/pages/KeysPage'))
+const MiddlePage = lazy(() => import('@/pages/MiddlePage'))
 const BudgetPage = lazy(() => import('@/pages/BudgetPage'))
 const PlaygroundPage = lazy(() => import('@/pages/PlaygroundPage'))
 const FallbackPage = lazy(() => import('@/pages/FallbackPage'))
@@ -31,6 +31,7 @@ const navItems = [
   { to: '/keys', label: 'Keys' },
   { to: '/budgets', label: 'Budgets' },
   { to: '/analytics', label: 'Analytics' },
+  { to: '/middle', label: 'Middle' },
   { to: '/settings', label: 'Settings' },
 ]
 
@@ -232,6 +233,7 @@ function App() {
                     <Route path="/playground" element={<PlaygroundPage />} />
                     <Route path="/analytics" element={<AnalyticsPage />} />
                     <Route path="/keys" element={<KeysPage />} />
+                    <Route path="/middle" element={<MiddlePage />} />
                   <Route path="/budgets" element={<BudgetPage />} />
                     <Route path="/settings" element={<SettingsPage />} />
                     <Route path="/test" element={<Navigate to="/playground" replace />} />
