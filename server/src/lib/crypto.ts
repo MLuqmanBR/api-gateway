@@ -112,3 +112,45 @@ export function maskKey(key: string): string {
   if (key.length <= 8) return '****' + key.slice(-4);
   return key.slice(0, 4) + '...' + key.slice(-4);
 }
+
+// ---- F3: client key hashing (scrypt) ----
+// scrypt is Node's stdlib KDF — slower than plain SHA-256 but standard for
+// cross-tool interop. The secret format is <key_id>:<secret> so the auth
+// flow can do an O(1) PK lookup BEFORE the scrypt (avoids O(N) scrypt DoS
+// when multiple client keys exist). routiium S5 concept (Apache-2.0).
+
+const SCRYPT_N = 16384;
+const SCRYPT_R = 8;
+const SCRYPT_P = 1;
+const SCRYPT_KEYLEN = 32;
+
+/** Generate a 16-byte salt as hex. */
+export function generateSalt(): string {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/** Generate a client key id in the form ck_<uuid>. */
+export function generateClientKeyId(): string {
+  return 'ck_' + crypto.randomUUID().replace(/-/g, '');
+}
+
+/** Generate a 24-hex-char client secret. */
+export function generateClientSecret(): string {
+  return crypto.randomBytes(12).toString('hex');
+}
+
+/** Hash a client secret with its salt using scrypt. Returns hex hash. */
+export function hashClientSecret(secret: string, salt: string): string {
+  return crypto.scryptSync(secret, salt, SCRYPT_KEYLEN, {
+    N: SCRYPT_N, r: SCRYPT_R, p: SCRYPT_P,
+    maxmem: 128 * SCRYPT_N * SCRYPT_R * 2,
+  }).toString('hex');
+}
+
+/** Timing-safe comparison of two hex hash strings. */
+export function timingSafeHexEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'hex');
+  const bufB = Buffer.from(b, 'hex');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}

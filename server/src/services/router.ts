@@ -538,6 +538,13 @@ export interface RouteOptions {
   /** F2 (β): the model_db_id that triggered a content_policy_violation —
    *  used to skip the same model (try a different model, not just a different key). */
   failedModelDbId?: number;
+  /** F3: the authenticated client key id (null for the unified key). Used for
+   *  per-key model allowlist enforcement + budget tracking (F4). */
+  clientKeyId?: string | null;
+  /** F3: model allowlist for the authenticated client key (null = no restriction).
+   *  Each entry is a model_id string (e.g. 'gpt-4o'); the router skips models
+   *  whose model_id is NOT in this set. */
+  clientModelAllowlist?: string[] | null;
 }
 
 export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
@@ -610,6 +617,13 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     }
     if (options?.triggeringClass === 'content_policy_violation' && options.failedModelDbId != null) {
       if (entry.model_db_id === options.failedModelDbId) continue;
+    }
+
+    // F3: enforce the authenticated client key's model allowlist. Skip models
+    // whose model_id is NOT in the allowlist. An empty/null allowlist means
+    // no restriction (the unified key or a client key without an allowlist).
+    if (options?.clientModelAllowlist && options.clientModelAllowlist.length > 0) {
+      if (!options.clientModelAllowlist.includes(entry.model_id)) continue;
     }
 
     // Same guard for a model with a small per-minute token budget: a single

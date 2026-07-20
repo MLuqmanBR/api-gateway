@@ -9,6 +9,7 @@ import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -68,6 +69,30 @@ export function extractApiToken(req: Request): string | undefined {
   const xApiKey = Array.isArray(apiKeyHeader) ? apiKeyHeader[0] : apiKeyHeader;
   const trimmed = xApiKey?.trim();
   return trimmed || undefined;
+}
+
+// F3: authenticate a request token against the unified key (backward-compat)
+// OR a client key (scoped, hashed-at-rest). Returns the authenticated client
+// key info if the token is a client key; null for the unified key. The caller
+// uses the returned clientKey to enforce model allowlist + expiry inside
+// routeRequest. An empty client_keys table means only the unified key works.
+export interface AuthResult {
+  authenticated: boolean;
+  clientKey: AuthenticatedClientKey | null;
+}
+export function authenticateRequest(token: string | undefined): AuthResult {
+  if (!token) return { authenticated: false, clientKey: null };
+  const unifiedKey = getUnifiedApiKey();
+  // Unified key first (backward-compat — the bootstrap credential).
+  if (timingSafeStringEqual(token, unifiedKey)) {
+    return { authenticated: true, clientKey: null };
+  }
+  // Client key: <key_id>:<secret> format. O(1) PK lookup + one scrypt.
+  const clientKey = authenticateClientKey(token);
+  if (clientKey) {
+    return { authenticated: true, clientKey };
+  }
+  return { authenticated: false, clientKey: null };
 }
 
 // Sticky sessions: track which model served each "session"
@@ -211,8 +236,8 @@ function buildModelCapabilities(modelId: string, maxOutputTokens: number | null,
 // shows API models which is linked by the user.
 proxyRouter.get('/models', (req: Request, res: Response) => {
   const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  const auth = authenticateRequest(token);
+  if (!auth.authenticated) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
@@ -543,8 +568,8 @@ const EmbeddingsBody = z.object({
 
 proxyRouter.post('/embeddings', async (req: Request, res: Response) => {
   const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  const auth = authenticateRequest(token);
+  if (!auth.authenticated) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
@@ -577,8 +602,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // loopback callers. Browser pages can reach localhost, so socket locality is
   // not a reliable authorization boundary.
   const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  const auth = authenticateRequest(token);
+  if (!auth.authenticated) {
     res.status(401).json({
       error: { message: 'Invalid API key', type: 'authentication_error' },
     });
@@ -946,7 +971,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         hasImage,
         wantsTools,
         skipModels.size > 0 ? skipModels : undefined,
-        { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId },
+        { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId, clientKeyId: auth.clientKey?.id ?? null, clientModelAllowlist: auth.clientKey?.modelAllowlist ?? null },
       );
       attemptedModels.add(route.modelId);
     } catch (err: any) {

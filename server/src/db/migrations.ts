@@ -69,6 +69,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV36KeyFormat(db);
   migrateSchemaV37SessionsLastUsedIndex(db);
   migrateSchemaV38CooldownReason(db);
+  migrateSchemaV39ClientKeys(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2553,4 +2554,25 @@ function migrateSchemaV38CooldownReason(db: DatabasePort) {
   if (!names.has('reason')) db.exec('ALTER TABLE rate_limit_cooldowns ADD COLUMN reason TEXT');
   if (!names.has('status_code')) db.exec('ALTER TABLE rate_limit_cooldowns ADD COLUMN status_code INTEGER');
   if (!names.has('set_at_ms')) db.exec('ALTER TABLE rate_limit_cooldowns ADD COLUMN set_at_ms INTEGER');
+}
+
+// F3: client_keys table — per-deployment / per-script API keys with model
+// allowlists, expiry, and revocation. The unified key stays as the bootstrap
+// credential; an empty client_keys table means today's single-bearer behavior
+// is unchanged. Secret format is <key_id>:<secret> for O(1) PK lookup — the
+// auth flow parses the bearer, looks up by id, then scrypt-verifies the secret.
+function migrateSchemaV39ClientKeys(db: DatabasePort) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS client_keys (
+      id TEXT PRIMARY KEY,
+      secret_hash TEXT NOT NULL,
+      salt TEXT NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      expires_at_ms INTEGER,
+      model_allowlist TEXT,
+      rpm_override INTEGER,
+      created_at_ms INTEGER NOT NULL
+    )
+  `);
 }

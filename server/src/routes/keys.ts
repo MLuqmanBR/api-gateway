@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { getProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
+import { mintClientKey, listClientKeys, deleteClientKey, updateClientKey } from '../lib/client-keys.js';
 
 export const keysRouter = Router();
 
@@ -226,4 +227,71 @@ keysRouter.patch('/:id', (req: Request, res: Response) => {
   if (enabled !== undefined) response.enabled = enabled;
   if (label !== undefined) response.label = label;
   res.json(response);
+});
+
+// ---- F3: client keys (scoped, hashed-at-rest) ----
+// Mint, list, update, delete per-deployment API keys. Secret format
+// <key_id>:<secret> returned ONCE on mint. Empty table = today's behavior.
+
+const mintClientKeySchema = z.object({
+  label: z.string().min(1).max(200),
+});
+
+const updateClientKeySchema = z.object({
+  enabled: z.boolean().optional(),
+  label: z.string().min(1).max(200).optional(),
+  expires_at_ms: z.number().int().nullable().optional(),
+  model_allowlist: z.array(z.string()).nullable().optional(),
+  rpm_override: z.number().int().min(1).nullable().optional(),
+}).refine(data => Object.keys(data).length > 0, {
+  message: 'At least one field must be provided',
+});
+
+// Mint a new client key. Returns the full <key_id>:<secret> ONCE.
+keysRouter.post('/client', (req: Request, res: Response) => {
+  const parsed = mintClientKeySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.issues[0]?.message ?? 'Invalid input' } });
+    return;
+  }
+  try {
+    const minted = mintClientKey(getDb(), parsed.data.label);
+    res.status(201).json({ key: minted.key, id: minted.id, label: minted.label });
+  } catch (err: any) {
+    res.status(409).json({ error: { message: err.message } });
+  }
+});
+
+// List all client keys (masked — no secret).
+keysRouter.get('/client', (_req: Request, res: Response) => {
+  const keys = listClientKeys(getDb());
+  res.json(keys.map(k => ({
+    ...k,
+    model_allowlist: k.model_allowlist ? JSON.parse(k.model_allowlist) : null,
+  })));
+});
+
+// Update a client key (toggle, label, expiry, allowlist, rpm).
+keysRouter.patch('/client/:id', (req: Request, res: Response) => {
+  const parsed = updateClientKeySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.issues[0]?.message ?? 'Invalid input' } });
+    return;
+  }
+  const ok = updateClientKey(getDb(), req.params.id as string, parsed.data);
+  if (!ok) {
+    res.status(404).json({ error: { message: 'Client key not found' } });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+// Delete (revoke) a client key.
+keysRouter.delete('/client/:id', (req: Request, res: Response) => {
+  const ok = deleteClientKey(getDb(), req.params.id as string);
+  if (!ok) {
+    res.status(404).json({ error: { message: 'Client key not found' } });
+    return;
+  }
+  res.json({ ok: true });
 });

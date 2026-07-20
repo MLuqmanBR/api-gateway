@@ -170,7 +170,148 @@ function UnifiedKeySection() {
   )
 }
 
-// ── Add-platform modal ────────────────────────────────────────────────────
+// ── F3: Client keys section ──────────────────────────────────────────────
+// Per-deployment / per-script API keys with model allowlists + expiry. The
+// secret <key_id>:<secret> is shown ONCE on mint. Uses the same masked-display
+// pattern as UnifiedKeySection (apiKey.slice(0, 6) + '•'.repeat(32)).
+
+interface ClientKey {
+  id: string
+  label: string
+  enabled: number
+  expires_at_ms: number | null
+  model_allowlist: string[] | null
+  rpm_override: number | null
+  created_at_ms: number
+}
+
+function ClientKeysSection() {
+  const queryClient = useQueryClient()
+  const [newLabel, setNewLabel] = useState('')
+  const [mintedKey, setMintedKey] = useState<string | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const { data: keys = [] } = useQuery<ClientKey[]>({
+    queryKey: ['client-keys'],
+    queryFn: () => apiFetch('/api/keys/client'),
+  })
+
+  const mint = useMutation({
+    mutationFn: (label: string) =>
+      apiFetch<{ key: string; id: string; label: string }>('/api/keys/client', {
+        method: 'POST',
+        body: JSON.stringify({ label }),
+      }),
+    onSuccess: (data) => {
+      setMintedKey(data.key)
+      setNewLabel('')
+      queryClient.invalidateQueries({ queryKey: ['client-keys'] })
+    },
+  })
+
+  const remove = useMutation({
+    mutationFn: (id: string) => apiFetch(`/api/keys/client/${id}`, { method: 'DELETE' }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-keys'] }),
+  })
+
+  const toggle = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) =>
+      apiFetch(`/api/keys/client/${id}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled }),
+      }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-keys'] }),
+  })
+
+  function copyMinted() {
+    if (!mintedKey) return
+    navigator.clipboard.writeText(mintedKey)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1500)
+  }
+
+  return (
+    <section className="rounded-3xl border bg-card p-5">
+      <div className="flex items-start justify-between gap-4 mb-3">
+        <div>
+          <h2 className="text-sm font-medium">Client keys</h2>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Per-deployment credentials with scoped model access. Use these instead of the master key for scripts, CI, or teammates.
+          </p>
+        </div>
+      </div>
+
+      {mintedKey && (
+        <div className="mb-3 rounded-lg border border-green-500/40 bg-green-500/10 px-3 py-2.5">
+          <p className="text-xs font-medium text-green-600 dark:text-green-400 mb-1.5">
+            Copy this key now — the secret is shown only once:
+          </p>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 font-mono text-xs bg-muted px-3 py-2 rounded-lg select-all truncate">
+              {mintedKey}
+            </code>
+            <Button variant="outline" size="sm" onClick={copyMinted}>
+              {copied ? 'Copied' : 'Copy'}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setMintedKey(null)}>
+              Dismiss
+            </Button>
+          </div>
+        </div>
+      )}
+
+      <form
+        onSubmit={(e) => { e.preventDefault(); if (newLabel.trim()) mint.mutate(newLabel.trim()) }}
+        className="flex items-end gap-2 mb-4"
+      >
+        <div className="space-y-1.5 flex-1">
+          <Label className="text-xs">Label</Label>
+          <Input
+            value={newLabel}
+            onChange={(e) => setNewLabel(e.target.value)}
+            placeholder="e.g. CI pipeline, teammate script"
+            className="text-xs"
+          />
+        </div>
+        <Button type="submit" size="sm" disabled={mint.isPending || !newLabel.trim()}>
+          {mint.isPending ? 'Minting…' : 'Mint key'}
+        </Button>
+      </form>
+
+      {keys.length > 0 ? (
+        <div className="space-y-2">
+          {keys.map((k) => (
+            <div key={k.id} className="flex items-center gap-3 rounded-lg border px-3 py-2 text-xs">
+              <code className="font-mono text-muted-foreground truncate" style={{ maxWidth: 180 }}>{k.id}</code>
+              <span className="font-medium truncate flex-1">{k.label}</span>
+              {k.enabled ? (
+                <span className="text-green-600 dark:text-green-400">active</span>
+              ) : (
+                <span className="text-muted-foreground">disabled</span>
+              )}
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => toggle.mutate({ id: k.id, enabled: !k.enabled })}
+              >
+                {k.enabled ? 'Disable' : 'Enable'}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => remove.mutate(k.id)}
+              >
+                Revoke
+              </Button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="text-xs text-muted-foreground">No client keys yet. Mint one above.</p>
+      )}
+    </section>
+  )
+}
 // Modal shown by the "Add New Platform" tile in the Platforms section. Adds
 // the user's first custom OpenAI-compatible endpoint to the catalog. After
 // the row is created the same form lets them add models immediately.
@@ -1170,6 +1311,7 @@ export default function KeysPage() {
       />
       <div className="space-y-8">
         <UnifiedKeySection />
+        <ClientKeysSection />
         <section>
           <h2 className="text-sm font-medium mb-3">Add a provider key</h2>
           <form onSubmit={handleSubmit} className="flex flex-wrap gap-3 rounded-3xl border p-4 bg-card">
