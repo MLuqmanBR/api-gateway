@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import { publish, subscribe, type LiveEvent } from '../../services/events.js';
 
 describe('events service', () => {
@@ -19,6 +19,14 @@ describe('events service', () => {
   beforeEach(() => {
     collected.length = 0;
     unsubscribers.length = 0;
+  });
+
+  // Unsubscribe every listener after each test so the module-singleton
+  // subscriber Set doesn't leak across tests (Imp 28). Without this, a
+  // future test could cross MAX_SUBSCRIBERS=8 and evict a listener under
+  // assertion — brittle isolation.
+  afterEach(() => {
+    for (const off of unsubscribers) off();
   });
 
   it('delivers every published event to every active subscriber', () => {
