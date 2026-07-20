@@ -39,6 +39,32 @@ export class CloudflareProvider extends BaseProvider {
     return messages.map(m => ({ ...m, content: contentToString(m.content) }));
   }
 
+  /** Assemble the request body shared by both call paths. Thinking knobs
+   * are forwarded verbatim — Cloudflare silently drops fields it doesn't
+   * recognize, but newer reasoning models (DeepSeek R1 distill etc.) read
+   * `reasoning_effort` and pick the right depth. (#290) */
+  private buildBody(
+    messages: ChatMessage[],
+    modelId: string,
+    options: CompletionOptions | undefined,
+    stream = false,
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      model: modelId,
+      messages: this.normalizeMessages(messages),
+    };
+    if (options?.temperature !== undefined) body.temperature = options.temperature;
+    if (options?.max_tokens !== undefined) body.max_tokens = options.max_tokens;
+    if (options?.top_p !== undefined) body.top_p = options.top_p;
+    if (options?.tools) body.tools = options.tools;
+    if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
+    if (options?.parallel_tool_calls !== undefined) body.parallel_tool_calls = options.parallel_tool_calls;
+    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
+    if (options?.thinking) body.thinking = options.thinking;
+    if (stream) body.stream = true;
+    return body;
+  }
+
   async chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
@@ -54,22 +80,7 @@ export class CloudflareProvider extends BaseProvider {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages: this.normalizeMessages(messages),
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: options?.parallel_tool_calls,
-        // Forward thinking knobs verbatim — Cloudflare silently drops fields
-        // it doesn't recognize for now, but newer reasoning models (DeepSeek
-        // R1 distill etc.) read `reasoning_effort` and pick the right depth.
-        // (#290)
-        ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
-        ...(options?.thinking ? { thinking: options.thinking } : {}),
-      }),
+      body: JSON.stringify(this.buildBody(messages, modelId, options)),
     }, 120000, options?.abortSignal);
 
     if (!res.ok) {
@@ -97,20 +108,7 @@ export class CloudflareProvider extends BaseProvider {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages: this.normalizeMessages(messages),
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: options?.parallel_tool_calls,
-        stream: true,
-        // Thinking knobs — same rationale as the non-streaming path. (#290)
-        ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
-        ...(options?.thinking ? { thinking: options.thinking } : {}),
-      }),
+      body: JSON.stringify(this.buildBody(messages, modelId, options, true)),
     }, 120000, options?.abortSignal);
 
     if (!res.ok) {

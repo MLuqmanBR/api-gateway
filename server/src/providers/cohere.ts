@@ -13,27 +13,38 @@ export class CohereProvider extends BaseProvider {
   readonly name = 'Cohere';
   baseUrl = API_BASE;
 
+  /** Assemble the request body shared by both call paths. Cohere's Chat
+   * API ignores unknown fields, so `reasoning_effort` and the rich
+   * `thinking` object are forwarded verbatim — a future model/route that
+   * understands them decides; the rest is silently dropped upstream. (#290) */
+  private buildBody(
+    messages: ChatMessage[],
+    modelId: string,
+    options: CompletionOptions | undefined,
+    stream = false,
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = {
+      model: modelId,
+      messages: flattenMessageContent(messages),
+    };
+    if (options?.temperature !== undefined) body.temperature = options.temperature;
+    if (options?.max_tokens !== undefined) body.max_tokens = options.max_tokens;
+    if (options?.top_p !== undefined) body.top_p = options.top_p;
+    if (options?.tools) body.tools = options.tools;
+    if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
+    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
+    if (options?.thinking) body.thinking = options.thinking;
+    if (stream) body.stream = true;
+    return body;
+  }
+
   async chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
-    const body: Record<string, unknown> = {
-      model: modelId,
-      messages: flattenMessageContent(messages),
-      temperature: options?.temperature,
-      max_tokens: options?.max_tokens,
-      top_p: options?.top_p,
-      tools: options?.tools,
-      tool_choice: options?.tool_choice,
-    };
-    // Cohere's Chat API ignores unknown fields, so we forward both the
-    // `reasoning_effort` shorthand and the rich `thinking` object verbatim
-    // — a future model/route that understands them decides; the rest is
-    // silently dropped at the wrapper. (#290)
-    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
-    if (options?.thinking) body.thinking = options.thinking;
+    const body = this.buildBody(messages, modelId, options);
 
     const res = await this.fetchWithTimeout(`${API_BASE}/chat/completions`, {
       method: 'POST',
@@ -59,21 +70,7 @@ export class CohereProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const body: Record<string, unknown> = {
-      model: modelId,
-      messages: flattenMessageContent(messages),
-      temperature: options?.temperature,
-      max_tokens: options?.max_tokens,
-      top_p: options?.top_p,
-      tools: options?.tools,
-      tool_choice: options?.tool_choice,
-      stream: true,
-    };
-    // Same thinking-knob pass-through as the non-streaming path. The
-    // wrapper decides what to do with these; unknown fields are dropped
-    // upstream. (#290)
-    if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
-    if (options?.thinking) body.thinking = options.thinking;
+    const body = this.buildBody(messages, modelId, options, true);
 
     const res = await this.fetchWithTimeout(`${API_BASE}/chat/completions`, {
       method: 'POST',
