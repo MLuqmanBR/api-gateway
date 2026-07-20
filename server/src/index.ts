@@ -6,6 +6,7 @@ import { startHealthChecker, stopHealthChecker } from './services/health.js';
 import { startRequestRetentionPruner, stopRequestRetentionPruner } from './services/request-retention.js';
 import { rebuildExhaustionFromDB } from './services/key-exhaustion.js';
 import { attachRealtimeServer } from './services/realtime.js';
+import { initWebhooks } from './services/webhooks.js';
 
 const PORT = process.env.PORT ?? 3001;
 // Dual-stack ('::') by default so the dashboard is reachable over both IPv4
@@ -23,6 +24,7 @@ process.on('uncaughtException', (err: Error) => {
 });
 async function main() {
   initDb();
+  initWebhooks();
   pruneSessions();
   // Re-prune hourly so expired/stale sessions don't accumulate between boots.
   setInterval(() => pruneSessions(), 60 * 60 * 1000).unref();

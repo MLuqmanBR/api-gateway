@@ -73,6 +73,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV39ClientKeys(db);
   migrateSchemaV40Budgets(db);
   migrateSchemaV41ResponseCache(db);
+  migrateSchemaV42Webhooks(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2619,6 +2620,22 @@ function migrateSchemaV41ResponseCache(db: DatabasePort) {
       created_at_ms INTEGER NOT NULL,
       hits INTEGER DEFAULT 0,
       tokens_saved INTEGER DEFAULT 0
+    )
+  `);
+}
+
+// F8: webhooks table — signed async event delivery to external HTTP endpoints.
+// events_filter is a comma-sep list of event names OR trailing-wildcard
+// patterns (e.g. "routing.*,request.error"). HMAC-SHA256 signed with secret.
+function migrateSchemaV42Webhooks(db: DatabasePort) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS webhooks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      url TEXT NOT NULL,
+      secret TEXT NOT NULL,
+      events_filter TEXT NOT NULL DEFAULT '*',
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL
     )
   `);
 }
