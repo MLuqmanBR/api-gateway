@@ -54,6 +54,8 @@ interface ChainRow {
   // Custom models bind to the api_keys row carrying their endpoint (#212);
   // NULL for built-in platforms.
   key_id: number | null;
+  // C3: JSON string array of tags (default '[]') for tag-based filtering.
+  tags: string | null;
 }
 
 export interface RouteResult {
@@ -564,6 +566,10 @@ export interface RouteOptions {
    *  Each entry is a model_id string (e.g. 'gpt-4o'); the router skips models
    *  whose model_id is NOT in this set. */
   clientModelAllowlist?: string[] | null;
+  /** C3: request tags parsed from X-API-Gateway-Tags header. When set,
+   *  models whose tags don't intersect reqTags are skipped (unless the
+   *  model has the `default` tag). Empty/undefined = today's behavior. */
+  reqTags?: Set<string>;
 }
 
 export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
@@ -578,7 +584,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.max_output_tokens, m.key_id
+           m.supports_tools, m.context_window, m.max_output_tokens, m.key_id, m.tags
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     WHERE fc.enabled = 1
@@ -615,6 +621,22 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // nothing — worse than a failover. Applies to sticky models too, same
     // reasoning as vision above.
     if (requireTools && !entry.supports_tools) continue;
+
+    // C3: tag/metadata-based filtering. When reqTags is non-empty, skip
+    // models whose tags don't intersect — UNLESS the model has the 'default'
+    // tag (always eligible) or reqTags is undefined/empty (today's behavior).
+    if (options?.reqTags && options.reqTags.size > 0) {
+      let modelTags: Set<string> | null = null;
+      try { modelTags = new Set(JSON.parse(entry.tags ?? '[]') as string[]); } catch { modelTags = new Set(); }
+      const hasDefault = modelTags?.has('default');
+      if (!hasDefault) {
+        let intersects = false;
+        for (const tag of options.reqTags) {
+          if (modelTags?.has(tag)) { intersects = true; break; }
+        }
+        if (!intersects) continue;
+      }
+    }
 
     // Context-aware routing: skip a model whose context window can't hold the
     // request, so a large prompt never selects a small-context model and burns

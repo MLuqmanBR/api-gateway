@@ -75,6 +75,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV41ResponseCache(db);
   migrateSchemaV42Webhooks(db);
   migrateSchemaV43LatencyPerToken(db);
+  migrateSchemaV44ModelTags(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2646,4 +2647,11 @@ function migrateSchemaV42Webhooks(db: DatabasePort) {
 // Used by the anti-herd buffer-random tiebreak in the router.
 function migrateSchemaV43LatencyPerToken(db: DatabasePort) {
   try { db.exec('ALTER TABLE requests ADD COLUMN latency_per_token_ms REAL'); } catch { /* duplicate column */ }
+}
+
+// C3: add tags column to models for tag/metadata-based filtering.
+// JSON string array, default '[]'. Inbound X-API-Gateway-Tags header
+// filters the chain to models whose tags intersect the request tags.
+function migrateSchemaV44ModelTags(db: DatabasePort) {
+  try { db.exec("ALTER TABLE models ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'"); } catch { /* duplicate column */ }
 }

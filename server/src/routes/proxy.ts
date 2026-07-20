@@ -913,6 +913,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // in the request body or `X-API-Gateway-No-Cache` header.
   const cacheNoCacheHeader = req.get('X-API-Gateway-No-Cache');
   const cacheDirective = parsed.data.cache;
+  // C3: parse request tags from X-API-Gateway-Tags header for tag-based filtering.
+  const rawTagsHeader = req.headers['x-api-gateway-tags'] as string | string[] | undefined;
+  const tagsHeader = Array.isArray(rawTagsHeader) ? rawTagsHeader[0] : rawTagsHeader;
+  const reqTags = tagsHeader
+    ? new Set(tagsHeader.split(',').map(t => t.trim()).filter(Boolean))
+    : undefined;
   const cacheable = isCacheEnabled()
     && isCacheableTemp(temperature, top_p)
     && !isCacheBypassed(cacheDirective, cacheNoCacheHeader);
@@ -1024,7 +1030,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         hasImage,
         wantsTools,
         skipModels.size > 0 ? skipModels : undefined,
-        { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId, clientKeyId: auth.clientKey?.id ?? null, clientModelAllowlist: auth.clientKey?.modelAllowlist ?? null },
+        { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId, clientKeyId: auth.clientKey?.id ?? null, clientModelAllowlist: auth.clientKey?.modelAllowlist ?? null, reqTags },
       );
       attemptedModels.add(route.modelId);
       // F10: skip if circuit breaker is open for this (platform, model, keyId).
