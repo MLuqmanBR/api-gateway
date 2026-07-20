@@ -40,18 +40,31 @@ Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per m
 | **Adaptive routing engine** | Scores every model on reliability × speed × intelligence using Thompson sampling. Four presets: balanced, smartest, fastest, reliable. Or manual priority. | The router gets smarter the more you use it. No static list to maintain. |
 | **Per-key budget tracking** | Tracks RPM, RPD, TPM, TPD per `(provider, model, key)` *before* the request goes out. | You never blow through a daily cap. The router always picks a key with capacity. |
 | **Self-healing key rotation** | Three retries per key. When all keys are exhausted, drops to 1-RPM recovery mode — probing until one recovers. | Your app never sees an error, even when every key hits its daily limit. |
-| **Intelligent cascade** | On 429, 5xx, or timeout: short cooldown on the key, cascade to the next model. Cooldowns are per-key, not per-model. | One rate-limited key never benches the whole provider. Other keys stay available. |
+| **Intelligent cascade** | On 429, 5xx, or timeout: flat 90-second cooldown on the key, cascade to the next model. Cooldowns are per-key, not per-model. | One rate-limited key never benches the whole provider. Other keys stay available. |
+| **Typed fallback chains** | Define explicit fallback chains per request via the `fallback` field. Routes the primary model, cascades through your chain on failure. | Predictable routing for workflows that need a specific model with controlled fallback. |
 | **Context-aware selection** | Skips models with insufficient context window, no vision for images, or no tools for tool calls. | Your request never lands on a model that will mangle it. |
 | **Sticky sessions** | Multi-turn conversations stay on the same model for 30 minutes. | No hallucination spike from mid-conversation model switches. |
 | **Context handoff** | When a session must switch models, injects a compact system message so the new model knows it's continuing an existing task. | No "let me start over." Off by default; `API_GATEWAY_CONTEXT_HANDOFF=on_model_switch`. |
 | **Key health monitoring** | Periodic probes mark keys healthy, rate-limited, invalid, or error. Successful requests promote keys back to healthy. | Dead keys are skipped automatically. The system recovers from transport hiccups without intervention. |
 | **Concurrency gating** | Cap concurrent requests per provider. | A slow endpoint never starves faster ones of connection slots. |
 | **Encrypted key storage** | AES-256-GCM before touching the database. Decryption in-memory at request time only. | Your provider keys never sit in plaintext. |
-| **Error redaction** | Strips key fragments, account IDs, and internal URLs from provider error responses. | Sensitive data never leaks to your client. |
-| **Unified API key** | Apps authenticate with a single `api-gateway-...` bearer token. | Provider keys never touch your application code. |
+| **Error redaction** | Strips key fragments, account IDs, high-entropy tokens, and internal URLs from provider error responses. | Sensitive data never leaks to your client. |
+| **Per-client-key auth** | Issue multiple dashboard-level client keys, each with its own spend cap and label. Apps authenticate with an `api-gateway-...` bearer token. | Multi-app isolation without multi-tenant overhead. Each app gets its own key and budget. |
 | **Tool call repair** | Automatic correction for JSON Schema mismatches and rescue for inline tool-call dialects. | Fewer broken tool loops. |
 | **Embeddings with family routing** | `/v1/embeddings` routes by model family. Cascade only walks providers serving the same model. | Never silently corrupts your vector store by switching embedding models. |
 | **Full config export/import** | One JSON file: models, cascade, providers, keys (optionally passphrase-encrypted), routing strategy, embeddings. Dry-run preview, atomic import with rollback. | Move your entire setup between machines safely. |
+| **Response caching** | Exact-match cache for temp-0 requests. `X-API-Gateway-No-Cache` to bypass. | Zero-latency repeat responses, zero upstream spend on identical requests. |
+| **Anthropic-format inbound** | `/v1/messages` accepts Anthropic-format requests and translates to OpenAI internally. | Use the Anthropic SDK directly without switching your endpoint. |
+| **Prometheus metrics** | `/metrics` endpoint with request counts, latency histograms, routing stats. `METRICS_AUTH_TOKEN` for external scraping. | Drop-in for Grafana / alerting without a sidecar. |
+| **Signed async webhooks** | Register webhook receivers for routing events. HMAC-SHA256 signed payloads. | Build automations around key exhaustion, model switches, and routing decisions. |
+| **Request queueing** | Per-provider concurrency queue with fair scheduling. Configurable via `/api/queue`. | Burst traffic is queued, not dropped. Slow providers don't starve fast ones. |
+| **Circuit breaker** | Per-provider circuit breaker with configurable thresholds. Open/half-open/closed states via `/api/circuits`. | Failing providers are tripped automatically, reducing wasted upstream calls. |
+| **WebSocket Realtime API** | `/v1/realtime` WebSocket endpoint for OpenAI Realtime API sessions. | Audio and streaming conversations through one gateway endpoint. |
+| **Spend-cap budgets** | Set monthly spend limits per client key or per provider. `/api/budgets` for management. | Never exceed your budget. Alerts and auto-cutoff when the cap is reached. |
+| **Tag/metadata filtering** | `X-API-Gateway-Tags` header filters the routing chain to models with matching tags. | Route to specific model subsets (e.g. "coding only", "fast only") per request. |
+| **TTFT-per-token routing** | Scoring blends time-to-first-token and per-token latency, not just total time. Anti-herd randomization prevents all clients choosing the same model. | Better latency for streaming. Natural load distribution across providers. |
+| **Outbound Retry-After** | On 503, the gateway sends `Retry-After` to the client and cascades to the next model simultaneously. | Clients don't retry into the same failing provider. |
+| **Privacy Layer** | Outbound redaction (known secrets → placeholders), AI interceptor (detects new secrets), prompt compression (SmartCrusher + TOON). All default OFF, per-direction. | Secrets never reach upstream providers. Compression cuts tool-output tokens 50-80%. |
 
 <details>
 <summary><b>What's not supported yet</b></summary>
@@ -61,7 +74,7 @@ Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per m
 - Legacy completions (`/v1/completions`) — only chat is implemented
 - Moderation (`/v1/moderations`)
 - `n > 1` (multiple completions per request)
-- Per-user billing / multi-tenant auth — single-user by design
+- Multi-operator RBAC — the gateway has one admin with per-client-key auth; multiple apps and clients can connect through it, but there's no multi-operator role-based access control
 
 PRs welcome. See [Contributing](#contributing).
 
@@ -296,26 +309,26 @@ Merge modes:
 Every import supports `dryRun: true` — runs inside a `SAVEPOINT`, rolls back, returns a diff summary. Always dry-run first against a populated database.
 
 </details>
-
-## How it works
-
 ```mermaid
 flowchart LR
     Client["Your app<br/>OpenAI SDK / curl / any client"] -->|"Bearer api-gateway-…"| Gateway["Gateway :3001"]
     Gateway --> Router["Adaptive routing engine<br/>score · filter · pick best key"]
-    Router --> Providers["Provider connectors<br/>18 built-in + custom"]
-    Providers -->|"stream / JSON"| Gateway
+    Router --> Middle["Middle layer<br/>redact → compress (opt-in)"]
+    Middle --> Providers["Provider connectors<br/>18 built-in + custom"]
+    Providers -->|"stream / JSON"| Middle
+    Middle -->|"un-redact"| Gateway
     Providers -->|"429 / 5xx / timeout<br/>cascade to next"| Router
     Gateway -->|"response"| Client
 ```
 
 1. Your app sends a request with a single `api-gateway-...` bearer token.
 2. The routing engine scores every enabled model (Thompson-sampling Beta posterior for reliability, blended with speed and intelligence), filters out models that can't handle the request, and picks the best key with capacity.
-3. On 429, 5xx, or timeout: cooldown the key, cascade to the next model. On total exhaustion: drop to 1-RPM recovery mode until a key recovers.
-4. The response streams back with an `X-Routed-Via` header showing which provider served it.
-
+3. **Middle layer** (opt-in): known secrets are redacted to placeholders before the request leaves; tool outputs are compressed via SmartCrusher/TOON. After the response, placeholders are restored to real values.
+4. On 429, 5xx, or timeout: cooldown the key, cascade to the next model. On total exhaustion: drop to 1-RPM recovery mode until a key recovers.
+5. The response streams back with `X-Routed-Via` and `X-Attempted-Models` headers showing which providers served or were attempted.
 <details>
 <summary><b>Component map</b></summary>
+
 
 | Subsystem | Source | Role |
 | --- | --- | --- |
@@ -327,6 +340,15 @@ flowchart LR
 | Context handoff | `server/src/services/context-handoff.ts` | Session continuity on model switch, 3-hour TTL |
 | Embeddings | `server/src/services/embeddings.ts` | Family-routed, same-model cascade only |
 | Encryption | `server/src/lib/crypto.ts` + `error-redaction.ts` | AES-256-GCM key storage, provider error sanitization |
+| Middle layer | `server/src/middle/` | Redaction (store, spans, session, interceptor), compression (SmartCrusher, TOON, eligibility) |
+| Request queue | `server/src/services/queue.ts` | Per-provider concurrency queue with fair scheduling |
+| Circuit breaker | `server/src/services/circuit-breaker.ts` | Per-provider circuit with open/half-open/closed states |
+| Webhooks | `server/src/services/webhooks.ts` | HMAC-SHA256 signed async event delivery |
+| Metrics | `server/src/services/metrics.ts` | Prometheus `/metrics` endpoint |
+| Realtime | `server/src/services/realtime.ts` | WebSocket `/v1/realtime` API server |
+| Anthropic translate | `server/src/routes/anthropic.ts` + `server/src/lib/anthropic-translate.ts` | `/v1/messages` inbound translation |
+| Response cache | `server/src/services/cache.ts` | Exact-match cache for temp-0 requests |
+| Budgets | `server/src/services/budgets.ts` + `server/src/routes/budgets.ts` | Spend-cap budgets per client key |
 | Dashboard | `client/` | React + Vite + shadcn/ui |
 | Storage | SQLite (`better-sqlite3`) | AES-256-GCM key encryption |
 
