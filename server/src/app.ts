@@ -10,6 +10,7 @@ import { platformsRouter } from './routes/platforms.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
 import { responsesRouter } from './routes/responses.js';
+import { messagesRouter } from './routes/messages.js';
 import { fallbackRouter } from './routes/fallback.js';
 import { embeddingsRouter } from './routes/embeddings.js';
 import { analyticsRouter } from './routes/analytics.js';
@@ -113,6 +114,8 @@ export function createApp() {
   app.use('/v1', proxyRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
+  // F6: Anthropic-format inbound (POST /v1/messages — Claude Code / Anthropic CLI)
+  app.use('/v1', messagesRouter);
   // Error handler (for API routes)
   app.use(errorHandler);
 
