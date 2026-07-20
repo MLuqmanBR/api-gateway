@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import type { DatabasePort } from './types.js';
 import { initEncryptionKey } from '../lib/crypto.js';
-import { applyModelPricing } from './model-pricing.js';
+import { applyModelPricing, applyActualCostPricing } from './model-pricing.js';
 
 // FROZEN — do NOT bump. All new model-seed migrations MUST be idempotent and
 // unguarded (outside the `version < CURRENT_DATA_VERSION` transaction) so they
@@ -61,6 +61,7 @@ export function migrateDbSchema(db: DatabasePort) {
 
   // Non-destructive refreshes that should run every boot (updates, not resets).
   applyModelPricing(db);
+  applyActualCostPricing(db);
   migrateQuirksV1(db);
   migrateModelsV32CommandCode(db);
   migrateModelsV33NvidiaMinimaxM3(db);
@@ -70,6 +71,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV37SessionsLastUsedIndex(db);
   migrateSchemaV38CooldownReason(db);
   migrateSchemaV39ClientKeys(db);
+  migrateSchemaV40Budgets(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2573,6 +2575,32 @@ function migrateSchemaV39ClientKeys(db: DatabasePort) {
       model_allowlist TEXT,
       rpm_override INTEGER,
       created_at_ms INTEGER NOT NULL
+    )
+  `);
+}
+
+// F4: budgets table — $-spend caps with daily/weekly/monthly periods.
+// Amounts in CENTS (integers) to avoid floating-point rounding. Scopes:
+// 'client_key' (scope_id = the client key id) or 'global' (scope_id NULL).
+// Lazy reset on read — no scheduler needed (reset_at timestamps compared
+// against UTC midnight / Monday / first-of-month on each checkAndReserve).
+function migrateSchemaV40Budgets(db: DatabasePort) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS budgets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scope TEXT NOT NULL,
+      scope_id TEXT,
+      daily_limit_cents INTEGER,
+      weekly_limit_cents INTEGER,
+      monthly_limit_cents INTEGER,
+      weekly_reset_day INTEGER DEFAULT 1,
+      daily_used_cents INTEGER DEFAULT 0,
+      weekly_used_cents INTEGER DEFAULT 0,
+      monthly_used_cents INTEGER DEFAULT 0,
+      daily_reset_at TEXT,
+      weekly_reset_at TEXT,
+      monthly_reset_at TEXT,
+      UNIQUE(scope, scope_id)
     )
   `);
 }

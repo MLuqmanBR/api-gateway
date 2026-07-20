@@ -211,3 +211,24 @@ export function applyModelPricing(db: DatabasePort): void {
   });
   applyAll();
 }
+
+/**
+ * F4: add operator-populated actual-cost columns to the models table.
+ * Unlike applyModelPricing (which seeds paid-equivalent rates), this ONLY
+ * adds the columns — the operator opts in per paid-API-backed model via
+ * the dashboard. Free-tier-backed models stay NULL, so the spend math falls
+ * back to paid-equivalent (the analytics savings stat).
+ *
+ * recordSpend uses: actual_cost_input_per_m ?? paid_input_per_m ?? FALLBACK_INPUT_PER_M
+ * (same chain for output). This means F4 spend and analytics savings diverge
+ * ONLY for paid-API-backed models where the operator explicitly priced actual cost.
+ */
+export function applyActualCostPricing(db: DatabasePort): void {
+  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (!columns.some(c => c.name === 'actual_cost_input_per_m')) {
+    db.prepare('ALTER TABLE models ADD COLUMN actual_cost_input_per_m REAL').run();
+  }
+  if (!columns.some(c => c.name === 'actual_cost_output_per_m')) {
+    db.prepare('ALTER TABLE models ADD COLUMN actual_cost_output_per_m REAL').run();
+  }
+}

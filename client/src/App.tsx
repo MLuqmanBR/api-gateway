@@ -18,6 +18,7 @@ import { ErrorBoundary } from '@/components/error-boundary'
 
 
 const KeysPage = lazy(() => import('@/pages/KeysPage'))
+const BudgetPage = lazy(() => import('@/pages/BudgetPage'))
 const PlaygroundPage = lazy(() => import('@/pages/PlaygroundPage'))
 const FallbackPage = lazy(() => import('@/pages/FallbackPage'))
 const EmbeddingsPage = lazy(() => import('@/pages/EmbeddingsPage'))
@@ -28,6 +29,7 @@ const navItems = [
   { to: '/models', label: 'Models' },
   { to: '/playground', label: 'Playground' },
   { to: '/keys', label: 'Keys' },
+  { to: '/budgets', label: 'Budgets' },
   { to: '/analytics', label: 'Analytics' },
   { to: '/settings', label: 'Settings' },
 ]
@@ -230,6 +232,7 @@ function App() {
                     <Route path="/playground" element={<PlaygroundPage />} />
                     <Route path="/analytics" element={<AnalyticsPage />} />
                     <Route path="/keys" element={<KeysPage />} />
+                  <Route path="/budgets" element={<BudgetPage />} />
                     <Route path="/settings" element={<SettingsPage />} />
                     <Route path="/test" element={<Navigate to="/playground" replace />} />
                     <Route path="/health" element={<Navigate to="/keys" replace />} />

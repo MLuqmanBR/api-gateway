@@ -10,6 +10,7 @@ import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
+import { checkAndReserve, recordSpend, estimateCostCents } from '../services/budgets.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -960,6 +961,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
     // ---- Get route ----
     let route: RouteResult;
+    // F4: estimated cost in cents for budget tracking (0 when no client key
+    // or no budget row). Set by the budget check after route selection.
+    let budgetEstCostCents = 0;
+    let budgetPricing: { actual_cost_input_per_m: number | null; actual_cost_output_per_m: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null } | undefined;
     try {
       // When a handoff could fire this turn, pad the token estimate so the router's
       // context-window and TPM checks account for the extra system message overhead.
@@ -974,6 +979,36 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId, clientKeyId: auth.clientKey?.id ?? null, clientModelAllowlist: auth.clientKey?.modelAllowlist ?? null },
       );
       attemptedModels.add(route.modelId);
+
+      // F4: check the $-budget for the authenticated client key.
+      // Only enforced when a budget row exists for the scope — an empty
+      // budgets table means no enforcement (today's behavior). The estimate
+      // uses the selected model's pricing: actual_cost ?? paid ?? FALLBACK.
+      if (auth.clientKey) {
+        budgetPricing = getDb().prepare(
+          'SELECT actual_cost_input_per_m, actual_cost_output_per_m, paid_input_per_m, paid_output_per_m FROM models WHERE id = ?',
+        ).get(route.modelDbId) as { actual_cost_input_per_m: number | null; actual_cost_output_per_m: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null } | undefined;
+        const estOutputTokens = max_tokens ?? route.maxOutputTokens ?? 1000;
+        budgetEstCostCents = estimateCostCents(
+          estimatedInputTokens, estOutputTokens,
+          budgetPricing?.actual_cost_input_per_m ?? null, budgetPricing?.actual_cost_output_per_m ?? null,
+          budgetPricing?.paid_input_per_m ?? null, budgetPricing?.paid_output_per_m ?? null,
+        );
+        const budgetResult = checkAndReserve('client_key', auth.clientKey.id, budgetEstCostCents);
+        if (!budgetResult.allowed) {
+          route.release();
+          res.status(402).json({
+            error: {
+              type: 'budget_exhausted',
+              message: `Budget exhausted (${budgetResult.exhaustedPeriod} limit reached)`,
+              overage_cents: budgetResult.overageCents,
+              scope: budgetResult.scope,
+              period: budgetResult.exhaustedPeriod,
+            },
+          });
+          return;
+        }
+      }
     } catch (err: any) {
       // Pinned model has no more keys — enter 1 RPM mode.
       if (err.code === 'PINNED_MODEL_EXHAUSTED') {
@@ -1355,6 +1390,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: estimatedInputTokens + injectedHandoffTokens, out: totalOutputTokens }, at: Date.now() });
           clearExhausted(route.keyId, route.modelId);
           if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
+          // F4: reconcile the budget estimate with actual token usage.
+          if (auth.clientKey && budgetEstCostCents > 0) {
+            const actualCostCents = estimateCostCents(
+              estimatedInputTokens + injectedHandoffTokens, totalOutputTokens,
+              budgetPricing?.actual_cost_input_per_m ?? null, budgetPricing?.actual_cost_output_per_m ?? null,
+              budgetPricing?.paid_input_per_m ?? null, budgetPricing?.paid_output_per_m ?? null,
+            );
+            recordSpend('client_key', auth.clientKey.id, actualCostCents, budgetEstCostCents);
+          }
           return;
         } catch (streamErr: any) {
           if (isAbortError(streamErr) || abortSignal.aborted) throw streamErr;
@@ -1468,6 +1512,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: promptTokens, out: completionTokens }, at: Date.now() });
         clearExhausted(route.keyId, route.modelId);
         if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
+        // F4: reconcile the budget estimate with actual token usage.
+        if (auth.clientKey && budgetEstCostCents > 0) {
+          const actualCostCents = estimateCostCents(
+            promptTokens, completionTokens,
+            budgetPricing?.actual_cost_input_per_m ?? null, budgetPricing?.actual_cost_output_per_m ?? null,
+            budgetPricing?.paid_input_per_m ?? null, budgetPricing?.paid_output_per_m ?? null,
+          );
+          recordSpend('client_key', auth.clientKey.id, actualCostCents, budgetEstCostCents);
+        }
         return;
       }
     } catch (err: any) {
