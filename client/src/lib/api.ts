@@ -1,4 +1,5 @@
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
+export const UNAUTHORIZED_EVENT = 'api-gateway:unauthorized';
 
 export const TOKEN_KEY = 'api-gateway_dashboard_token';
 
