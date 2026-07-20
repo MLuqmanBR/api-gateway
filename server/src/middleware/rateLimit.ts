@@ -89,3 +89,46 @@ export function createProxyRateLimiter() {
     next();
   };
 }
+
+/** Per-IP fixed-window rate limiter for arbitrary routes (e.g. /api/auth/login).
+ *  Reuses the same window logic as the proxy limiter but with a smaller limit
+ *  and a JSON error shape that suits dashboard endpoints. */
+export function createPerIpLimiter(limit: number, _windowMs = 60_000) {
+  const windows = new Map<string, WindowState>();
+  return function perIpLimit(req: Request, res: Response, next: NextFunction): void {
+    if (limit <= 0) { next(); return; }
+    const now = Date.now();
+    const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+    let state = windows.get(ip);
+    if (!state || now >= state.resetAt) {
+      state = { count: 0, resetAt: now + _windowMs };
+      windows.set(ip, state);
+    }
+    state.count += 1;
+    if (windows.size > MAX_TRACKED_IPS) {
+      for (const [key, value] of windows) {
+        if (now >= value.resetAt) windows.delete(key);
+      }
+      if (windows.size > MAX_TRACKED_IPS) {
+        let oldestKey = '';
+        let oldestReset = Infinity;
+        for (const [k, v] of windows) {
+          if (v.resetAt < oldestReset) { oldestReset = v.resetAt; oldestKey = k; }
+        }
+        windows.delete(oldestKey);
+      }
+    }
+    if (state.count > limit) {
+      const retryAfter = Math.max(1, Math.ceil((state.resetAt - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfter));
+      res.status(429).json({
+        error: {
+          message: `Too many requests. Retry in ${retryAfter}s.`,
+          type: 'rate_limit_error',
+        },
+      });
+      return;
+    }
+    next();
+  };
+}

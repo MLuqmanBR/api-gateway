@@ -11,6 +11,7 @@ import {
 } from '../services/auth.js';
 import { isTrustedRequest } from '../lib/ip-trust.js';
 import { setSessionCookie, clearSessionCookie, readSessionCookie } from '../lib/session-cookie.js';
+import { createPerIpLimiter } from '../middleware/rateLimit.js';
 
 export const authRouter = Router();
 
@@ -107,7 +108,13 @@ authRouter.post('/setup', (req: Request, res: Response) => {
   res.status(201).json({ token, email: user.email });
 });
 
-authRouter.post('/login', (req: Request, res: Response) => {
+// Per-IP login throttle (Imp 11): closes the remaining online-guessing axis
+// on the only public credential endpoint. 20/min is generous for a legitimate
+// operator (loopback dashboard use never approaches this) but stops an
+// attacker who rotates source emails to bypass the per-email throttle.
+const loginLimiter = createPerIpLimiter(20);
+
+authRouter.post('/login', loginLimiter, (req: Request, res: Response) => {
   const parsed = credentialsSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
