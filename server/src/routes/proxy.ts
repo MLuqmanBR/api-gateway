@@ -3,6 +3,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
+import { classifyError, type ErrorClass } from '../lib/error-class.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
@@ -832,6 +833,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
   let lastError: any = null;
+  // F2 (β): typed fallback routing — tracks the error class from the last
+  // retryable failure so the next routeRequest skips models that would fail
+  // the same way (e.g. escalate to a bigger-context model on context overflow).
+  let triggeringClass: ErrorClass | undefined;
+  let failedContextWindow: number | null | undefined;
+  let failedModelDbId: number | undefined;
   const isPinned = !!(requestedModel && !isAutoModel(requestedModel));
   let prevModelKey: string | undefined;
   let prevKeyId: number | undefined;
@@ -930,7 +937,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         hasImage,
         wantsTools,
         skipModels.size > 0 ? skipModels : undefined,
-        { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined },
+        { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId },
       );
     } catch (err: any) {
       // Pinned model has no more keys — enter 1 RPM mode.
@@ -1571,6 +1578,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     lastRequestTime = Date.now();
     publish({ type: 'routing.key_exhausted', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, reason: sanitizeProviderErrorMessage(lastError?.message), at: Date.now() });
     console.log(`[Proxy] Key ${route.keyId} exhausted after ${PER_KEY_RETRIES} failures from ${route.displayName}`);
+
+    // F2 (β): classify the error for the next routeRequest call so the
+    // router skips models that would fail the same way.
+    triggeringClass = classifyError(lastError);
+    failedContextWindow = route.contextWindow;
+    failedModelDbId = route.modelDbId;
     // Continue outer loop → routeRequest picks next key.
     } finally {
       route.release();

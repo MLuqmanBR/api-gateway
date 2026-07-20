@@ -4,6 +4,7 @@ import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown, canUseProviderMinute, reserveRequest, releaseReservation } from './ratelimit.js';
 import { getExhaustedKeysForModel } from './key-exhaustion.js';
+import type { ErrorClass } from '../lib/error-class.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
   reliabilityPosterior, expectedReliability, sampleBeta,
@@ -71,6 +72,8 @@ export interface RouteResult {
    * proxy as a fallback `max_tokens` when the caller doesn't supply one
    * (NVIDIA NIM minimax-m3 returns empty 200s without an explicit limit). */
   maxOutputTokens: number | null;
+  /** F2 (β): the model's context window, for typed fallback routing. */
+  contextWindow: number | null;
   // Decrements the in-flight slot for the associated provider.
   // Callers MUST invoke this in a finally block after the request completes.
   release: () => void;
@@ -525,6 +528,16 @@ export interface RouteOptions {
   oneRPM?: boolean;
   /** Session key for sticky key selection — when set and the provider has sticky_sessions_enabled, key selection is deterministic. */
   stickySessionKey?: string;
+  /** F2 (β): typed fallback routing hint. When set, the router skips models
+   *  that would fail the same way (e.g. skip smaller-context models on
+   *  context_window_exceeded, skip the same model on content_policy_violation). */
+  triggeringClass?: ErrorClass;
+  /** F2 (β): the context_window of the model that triggered a
+   *  context_window_exceeded — used to skip models with <= this window. */
+  failedContextWindow?: number | null;
+  /** F2 (β): the model_db_id that triggered a content_policy_violation —
+   *  used to skip the same model (try a different model, not just a different key). */
+  failedModelDbId?: number;
 }
 
 export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
@@ -587,6 +600,17 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // guard. If every model is too small, the loop falls through and the caller
     // gets the normal "all models exhausted" error rather than a wasted sweep.
     if (entry.context_window != null && estimatedTokens > entry.context_window) continue;
+
+    // F2 (β): typed fallback routing — skip models that would fail the same way.
+    // On context_window_exceeded: skip models with <= the failed model's window
+    // (escalate to a bigger-context model). On content_policy_violation: skip the
+    // same model that failed (try a different model, not just a different key).
+    if (options?.triggeringClass === 'context_window_exceeded' && options.failedContextWindow != null) {
+      if (entry.context_window != null && entry.context_window <= options.failedContextWindow) continue;
+    }
+    if (options?.triggeringClass === 'content_policy_violation' && options.failedModelDbId != null) {
+      if (entry.model_db_id === options.failedModelDbId) continue;
+    }
 
     // Same guard for a model with a small per-minute token budget: a single
     // request that alone exceeds tpm_limit can never fit one minute of quota and
@@ -765,6 +789,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         rpdLimit: limits.rpd,
         tpdLimit: limits.tpd,
         maxOutputTokens: entry.max_output_tokens,
+        contextWindow: entry.context_window,
         release,
       };
     }
@@ -814,6 +839,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
           rpdLimit: limits.rpd,
           tpdLimit: limits.tpd,
           maxOutputTokens: entry.max_output_tokens,
+          contextWindow: entry.context_window,
           release,
         };
       }
