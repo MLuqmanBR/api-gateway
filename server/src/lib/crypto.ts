@@ -84,7 +84,7 @@ function getEncryptionKey(): Buffer {
 
 export function encrypt(text: string): { encrypted: string; iv: string; authTag: string } {
   const key = getEncryptionKey();
-  const iv = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12); // GCM standard nonce is 12 bytes
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
 
   let encrypted = cipher.update(text, 'utf8', 'hex');
