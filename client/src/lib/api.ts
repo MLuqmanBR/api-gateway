@@ -1,6 +1,13 @@
 const BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
 
-export const UNAUTHORIZED_EVENT = 'api-gateway:unauthorized';
+export const TOKEN_KEY = 'api-gateway_dashboard_token';
+
+/** Read the dashboard auth token from localStorage. Used by non-apiFetch
+ *  callers (SettingsPage export, Playground) that need to set Authorization
+ *  on a raw fetch. apiFetch itself relies on the HttpOnly session cookie. */
+export function getToken(): string | null {
+  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
+}
 
 export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {

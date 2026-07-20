@@ -23,7 +23,7 @@ import {
   Check,
   X,
 } from 'lucide-react'
-import { apiFetch } from '@/lib/api'
+import { apiFetch, getToken } from '@/lib/api'
 import { addToast } from '@/lib/toast'
 import { makeConfigBackupFilename, getLocalTimezoneName, downloadBlob } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -683,7 +683,7 @@ function buildUrl(path: string): string {
 function authHeaders(): Record<string, string> {
   // Reuse the same auth token the apiFetch helper uses — direct fetch
   // skips the helper so we don't have to type the response as JSON.
-  const token = localStorage.getItem('api-gateway_dashboard_token')
+  const token = getToken()
   return {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
