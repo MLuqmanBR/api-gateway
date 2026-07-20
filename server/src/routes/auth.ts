@@ -81,9 +81,16 @@ function bearer(req: Request): string | undefined {
 // any "signed in as X" UI.
 authRouter.get('/status', (req: Request, res: Response) => {
   const session = validateSession(bearer(req));
+  // Mirror requireAuth's DASHBOARD_REQUIRE_LOGIN gate (middleware/requireAuth.ts
+  // line 24): when that env is set, LAN auto-trust is off, so `authenticated`
+  // must not report true for a LAN caller with no session. `hasSession` tells
+  // the AuthGate whether the caller has a real login session independent of
+  // network trust, so it can force a login when a requireSession endpoint 401s.
+  const lanTrusted = !process.env.DASHBOARD_REQUIRE_LOGIN && isTrustedRequest(req);
   res.json({
     needsSetup: userCount() === 0,
-    authenticated: !!session || isTrustedRequest(req),
+    authenticated: !!session || lanTrusted,
+    hasSession: !!session,
     email: session?.email ?? null,
   });
 });

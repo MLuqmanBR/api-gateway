@@ -104,7 +104,22 @@ describe('Dashboard auth (#35)', () => {
 
   it('reports authenticated status with a valid token', async () => {
     const { body } = await call(app, 'GET', '/api/auth/status', undefined, token);
-    expect(body).toMatchObject({ needsSetup: false, authenticated: true, email: 'admin@example.com' });
+    expect(body).toMatchObject({ needsSetup: false, authenticated: true, hasSession: true, email: 'admin@example.com' });
+  });
+
+  it('reports authenticated=true but hasSession=false for a LAN-trusted caller with no session', async () => {
+    // The `call` helper always spoofs a remote IP via X-Forwarded-For, so hit
+    // the endpoint directly from loopback (127.0.0.1) — the trusted range — to
+    // reproduce the exact state a localhost dashboard operator lands in: the
+    // dashboard trusts them (authenticated=true) but they hold no real
+    // session (hasSession=false), which is what forces the AuthGate to show
+    // the login form when a requireSession endpoint 401s.
+    const server = app.listen(0);
+    const addr = server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${addr.port}/api/auth/status`);
+    const body = await res.json();
+    server.close();
+    expect(body).toMatchObject({ needsSetup: false, authenticated: true, hasSession: false, email: null });
   });
 
   it('invalidates the token on logout', async () => {

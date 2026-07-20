@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label'
 interface AuthStatus {
   needsSetup: boolean
   authenticated: boolean
+  hasSession: boolean
   email: string | null
 }
 
@@ -92,6 +93,7 @@ function AuthForm({ mode, onAuthed }: { mode: 'setup' | 'login'; onAuthed: () =>
 
 export function AuthGate({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient()
+  const [forceLogin, setForceLogin] = useState(false)
   const { data, isLoading, isError, refetch } = useQuery<AuthStatus>({
     queryKey: ['auth-status'],
     queryFn: () => apiFetch('/api/auth/status'),
@@ -99,13 +101,15 @@ export function AuthGate({ children }: { children: ReactNode }) {
   })
 
   useEffect(() => {
-    const handler = () => { refetch() }
+    const handler = () => { setForceLogin(true); refetch() }
     window.addEventListener(UNAUTHORIZED_EVENT, handler)
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, handler)
   }, [refetch])
 
   function onAuthed() {
-    // New session: drop any cached (unauthenticated) data and re-check status.
+    // New session: drop any cached (unauthenticated) data, clear any forced
+    // login (e.g. from a requireSession 401), and re-check status.
+    setForceLogin(false)
     queryClient.invalidateQueries()
     refetch()
   }
@@ -122,7 +126,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
   }
 
   if (data.needsSetup) return <AuthForm mode="setup" onAuthed={onAuthed} />
-  if (!data.authenticated) return <AuthForm mode="login" onAuthed={onAuthed} />
+  if (!data.authenticated || (forceLogin && !data.hasSession)) return <AuthForm mode="login" onAuthed={onAuthed} />
 
   return <>{children}</>
 }
