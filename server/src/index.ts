@@ -1,9 +1,9 @@
 import './env.js';
 import { createApp } from './app.js';
-import { initDb } from './db/index.js';
+import { initDb, getDb } from './db/index.js';
 import { pruneSessions } from './services/auth.js';
-import { startHealthChecker } from './services/health.js';
-import { startRequestRetentionPruner } from './services/request-retention.js';
+import { startHealthChecker, stopHealthChecker } from './services/health.js';
+import { startRequestRetentionPruner, stopRequestRetentionPruner } from './services/request-retention.js';
 import { rebuildExhaustionFromDB } from './services/key-exhaustion.js';
 
 const PORT = process.env.PORT ?? 3001;
@@ -54,16 +54,21 @@ async function main() {
     console.error('\n[server] Failed to start:\n  ' + (err?.message ?? err) + '\n');
     process.exit(1);
   });
-  process.on('SIGTERM', () => {
-    console.log('[server] SIGTERM received — shutting down gracefully');
-    activeServer.close(() => process.exit(0));
+  // Graceful shutdown (Imp 37): stop timers, close the HTTP listener, then
+  // close the DB handle (WAL checkpoint) before exiting. Calling stop
+  // functions is idempotent (they no-op if already stopped).
+  function shutdown() {
+    console.log('[server] Shutting down gracefully');
+    stopHealthChecker();
+    stopRequestRetentionPruner();
+    activeServer.close(() => {
+      try { getDb().close(); } catch { /* already closed */ }
+      process.exit(0);
+    });
     setTimeout(() => process.exit(0), 30_000).unref();
-  });
-  process.on('SIGINT', () => {
-    console.log('[server] SIGINT received — shutting down gracefully');
-    activeServer.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 30_000).unref();
-  });
+  }
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
 }
 
 main().catch((err) => {
