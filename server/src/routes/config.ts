@@ -28,6 +28,7 @@ import {
   ConfigImportError,
 } from '../lib/config/import.js';
 import { clearAllProviderConfigCache } from '../services/router.js';
+import { requireSession } from '../middleware/requireAuth.js';
 
 export const configRouter = Router();
 
@@ -52,7 +53,7 @@ const exportRequestSchema = z.object({
   download: z.boolean().optional(),
 });
 
-configRouter.post('/export', (req: Request, res: Response) => {
+configRouter.post('/export', requireSession, (req: Request, res: Response) => {
   const parsed = exportRequestSchema.safeParse(req.body ?? {});
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map((e) => e.message).join(', ') } });

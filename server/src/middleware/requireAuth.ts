@@ -18,10 +18,29 @@ import { readSessionCookie } from '../lib/session-cookie.js';
 // Remote callers still need a valid session token. See server/src/lib/ip-trust.ts
 // for the full policy and its limitations.
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  if (isTrustedRequest(req)) {
+  // DASHBOARD_REQUIRE_LOGIN=1 opts out of LAN auto-trust — on a shared or
+  // untrusted LAN, auto-trust grants full /api/* (including key exfiltration
+  // endpoints) to any loopback/RFC1918 source with no session.
+  if (!process.env.DASHBOARD_REQUIRE_LOGIN && isTrustedRequest(req)) {
     next();
     return;
   }
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '')
+    ?? (req.headers['x-dashboard-token'] as string | undefined)
+    ?? readSessionCookie(req);
+  const session = validateSession(token);
+  if (!session) {
+    res.status(401).json({ error: { message: 'Authentication required', type: 'authentication_error' } });
+    return;
+  }
+  (req as Request & { user?: typeof session }).user = session;
+  next();
+}
+
+/** Like requireAuth but never auto-trusts LAN — always requires a valid session.
+ *  Use on sensitive endpoints (config export, unified API key) so a trusted-LAN
+ *  caller still needs a login session (Imp 18). */
+export function requireSession(req: Request, res: Response, next: NextFunction): void {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '')
     ?? (req.headers['x-dashboard-token'] as string | undefined)
     ?? readSessionCookie(req);
