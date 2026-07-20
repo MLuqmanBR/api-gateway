@@ -31,6 +31,7 @@ import { attachClientAbort, isAbortError } from '../lib/abort.js';
 import { resolvePinnedModel, formatPinnedModelRejection } from '../lib/pinned-model.js';
 import { getGlobalRetryLimit } from '../services/router.js';
 import { publish } from '../services/events.js';
+import { applyOutbound, unredactResponseText, createStreamUnredactor, interceptInboundText, type MiddleSession } from '../middle/index.js';
 
 export const responsesRouter = Router();
 
@@ -305,7 +306,13 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const responseId = newId('resp');
   publish({ type: 'request.start', id: responseId, model: reqData.model, stream: !!reqData.stream, at: Date.now() });
   const stream = reqData.stream ?? false;
-  const messages = toChatMessages(reqData);
+  let messages = toChatMessages(reqData);
+  // B2-6 O2: apply middle-layer outbound transform (redact → compress).
+  // Memoized via middleSession so retries/fallbacks skip the interceptor.
+  let middleSession: MiddleSession | undefined;
+  const middle = await applyOutbound(messages, middleSession);
+  messages = middle.messages;
+  if (middle.session) middleSession = middle.session;
   const tools = toChatTools(reqData.tools);
   // name → parameter schema, for repairing double-encoded tool arguments on
   // the way back out (see lib/tool-args.ts).
@@ -450,6 +457,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // tool-call accumulator keyed by the provider's tool_call index
         const toolAcc = new Map<number, { outputIndex: number; itemId: string; callId: string; name: string; args: string }>();
         let totalOutputTokens = 0;
+        // B2-6 R4: streaming un-redactor for output_text deltas. Args are
+        // un-redacted at .done finalization (non-streaming unredactText)
+        // since they accumulate as JSON strings per tool call.
+        const textUnredactor = createStreamUnredactor(middleSession);
 
         // Inline-dialect hold window (#231): first text is held until it
         // either matches a tool-call dialect marker (held to the end and
@@ -472,8 +483,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             part: { type: 'output_text', text: '', annotations: [] },
           });
           if (text) {
-            sse('response.output_text.delta', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, delta: text });
-            msgText += text;
+            const safeText = textUnredactor ? textUnredactor.feed(text) : text;
+            if (safeText.length > 0) {
+              sse('response.output_text.delta', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, delta: safeText });
+              msgText += safeText;
+            }
           }
         };
 
@@ -525,10 +539,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             totalOutputTokens += Math.ceil(text.length / 4);
             if (dialectMode === 'passthrough') {
               if (msgItemId === null) openTextItem('');
-              sse('response.output_text.delta', {
-                item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, delta: text,
-              });
-              msgText += text;
+              // B2-6 R4: un-redact the text delta through the streaming
+              // un-redactor (placeholders → real values).
+              const safeText = textUnredactor ? textUnredactor.feed(text) : text;
+              if (safeText.length > 0) {
+                sse('response.output_text.delta', {
+                  item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, delta: safeText,
+                });
+                msgText += safeText;
+              }
             } else {
               heldText += text;
               if (dialectMode === 'undecided') {
@@ -616,6 +635,16 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           heldText = '';
         }
 
+        // B2-6 R4: flush the streaming text un-redactor — emit any held-back
+        // residual that was a potential partial-placeholder prefix.
+        if (textUnredactor) {
+          const textResidual = textUnredactor.flush();
+          if (textResidual.length > 0) {
+            if (msgItemId === null) openTextItem('');
+            sse('response.output_text.delta', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, delta: textResidual });
+            msgText += textResidual;
+          }
+        }
         // Finalize any open text item.
         if (msgItemId !== null) {
           sse('response.output_text.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, text: msgText });
@@ -636,7 +665,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // Codex hard-rejects those.
         const finalToolCalls: ChatToolCall[] = [];
         for (const acc of toolAcc.values()) {
-          const repairedArgs = repairToolArguments(acc.args || '{}', toolSchemas.get(acc.name));
+          const rawArgs = middleSession ? unredactResponseText(acc.args || '{}', middleSession) : (acc.args || '{}');
+          const repairedArgs = repairToolArguments(rawArgs, toolSchemas.get(acc.name));
           let validArgs = false;
           try { JSON.parse(repairedArgs); validArgs = true; } catch { /* not valid JSON — drop below */ }
           if (!(acc.name.length > 0 && validArgs)) continue;
@@ -725,6 +755,23 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
         if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+        // B2-6 R3: un-redact the non-streaming response (placeholders → real
+        // values). Then run the inbound interceptor (non-streaming only, D2)
+        // to catch new secrets the model emitted.
+        if (middleSession) {
+          if (text.length > 0) text = unredactResponseText(text, middleSession);
+          if (toolCalls.length > 0) {
+            for (const tc of toolCalls) {
+              if (tc?.function?.arguments) {
+                tc.function.arguments = unredactResponseText(tc.function.arguments, middleSession);
+              }
+            }
+          }
+          if (text.length > 0) {
+            const inbound = await interceptInboundText(text, middleSession);
+            if (inbound.newSecretsFound) text = inbound.text;
+          }
+        }
         res.json(buildResponseObject({
           id: responseId, model: route.modelId, text, toolCalls,
           promptTokens, completionTokens,

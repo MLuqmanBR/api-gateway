@@ -18,7 +18,7 @@ import { getDb, getSetting } from '../../db/index.js';
 import { decrypt } from '../../lib/crypto.js';
 import { buildProviderFor } from '../../providers/index.js';
 import { RedactionSession } from './session.js';
-import { addSecret } from './store.js';
+import { addSecret, getActiveSecretsForRedaction } from './store.js';
 
 // --- Scanned-LRU cache (module-level, per-boot) ---
 // Agentic clients resend the whole history every turn. With this cache, only
@@ -284,10 +284,14 @@ export async function interceptInbound(
       addSecret(value, kind, 'ai');
     }
     if (newSecrets.length > 0) {
-      // Re-redact the text with the updated store. Create a fresh session
-      // since this is a separate scan context (the inbound session may have
-      // different secrets than the outbound session).
-      const inboundSession = new RedactionSession();
+      // Re-redact ONLY the new secrets — outbound secrets were already
+      // un-redacted (R1/R3) and should reach the client as real values.
+      // Creating a session with all active secrets would re-redact the
+      // outbound ones too, hiding the client's own secrets behind
+      // placeholders they can't un-redact.
+      const newValues = new Set(newSecrets.map(s => s.value));
+      const newOnly = getActiveSecretsForRedaction().filter(s => newValues.has(s.value));
+      const inboundSession = new RedactionSession(newOnly);
       const redacted = inboundSession.redactOutbound([{ role: 'assistant', content: text }]);
       return { text: redacted[0].content as string, newSecretsFound: true };
     }

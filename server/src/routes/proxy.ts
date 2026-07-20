@@ -24,6 +24,7 @@ import { ThinkTagStream } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { pipeline } from '../lib/hook-pipeline.js';
 import { registerBuiltInHooks } from '../lib/builtin-hooks.js';
+import { applyOutbound, unredactResponseText, createStreamUnredactor, interceptInboundText, type MiddleSession } from '../middle/index.js';
 
 // F1: register the three built-in transforms (context-handoff, tool-rescue,
 // think-tags) on the process-wide HookPipeline singleton. Idempotent — safe
@@ -949,6 +950,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     res.setHeader('X-Cache', 'MISS');
   }
 
+  // B2-6: per-request middle-layer session. Created lazily by applyOutbound
+  // on the first enabled attempt; reused across retries/fallbacks so the
+  // AI interceptor (Stage-2) runs once per request, not per attempt.
+  let middleSession: MiddleSession | undefined;
 
   try {
   outerLoop: for (let totalAttempt = 0; ; totalAttempt++) {
@@ -1147,6 +1152,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       outboundMessages = handoff.messages;
       injectedHandoffTokens = handoff.injectedTokens;
     }
+    // B2-6 O1: apply middle-layer outbound transform (redact → compress).
+    // Memoized via middleSession so retries/fallbacks skip the interceptor
+    // (Stage-2) and re-run only the cheap Stage-1 programmatic redaction.
+    // The context-handoff summary (which contains prior user content) is
+    // also covered because this runs AFTER the handoff injection.
+    const middle = await applyOutbound(outboundMessages, middleSession);
+    outboundMessages = middle.messages;
+    if (middle.session) middleSession = middle.session;
 
     // Fallback for `max_tokens`: if the caller didn't supply a value
     // (some clients omit it entirely; OpenAI says "no limit" by default),
@@ -1206,6 +1219,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // detector only ever sees visible text (post-extraction).
         const thinkStream = new ThinkTagStream();
         let bufferedReasoning = '';
+        // B2-6 R2: streaming un-redactors. One for visible text, one for
+        // reasoning — both share the same map but have independent buffers
+        // so partial placeholder prefixes in one stream don't delay the
+        // other. Null when no redaction session exists (redact was off).
+        const visibleUnredactor = createStreamUnredactor(middleSession);
+        const reasoningUnredactor = createStreamUnredactor(middleSession);
         const preamble: unknown[] = []; // role-only chunks held until flush
         const toolCallAcc = new Map<number, { id?: string; name: string; args: string }>();
         let upstreamFinish: string | null = null;
@@ -1294,7 +1313,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             const reasoningText = typeof choice.delta?.reasoning_content === 'string' ? choice.delta.reasoning_content : '';
             if (reasoningText.length > 0) {
               flushHeaders();
-              writeChunk(mkChunk({ reasoning_content: reasoningText }, null));
+              // B2-6 R2: un-redact native reasoning_content through the
+              // streaming un-redactor (placeholders → real values).
+              const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(reasoningText) : reasoningText;
+              if (safeReasoning.length > 0) writeChunk(mkChunk({ reasoning_content: safeReasoning }, null));
             }
             if (text.length === 0) {
               // Role preamble / keep-alive: hold until first payload decides
@@ -1330,10 +1352,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               // think block that closes before the answer begins.
               if (isReasoningModel) {
                 const think = thinkStream.feed(text);
-                if (think.reasoning.length > 0) {
-                  writeChunk(mkChunk({ reasoning_content: think.reasoning }, null));
+                // B2-6 R2: un-redact visible and reasoning through separate
+                // streaming un-redactors (independent buffers).
+                const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(think.reasoning) : think.reasoning;
+                if (safeReasoning.length > 0) {
+                  writeChunk(mkChunk({ reasoning_content: safeReasoning }, null));
                 }
-                text = think.visible;
+                text = visibleUnredactor ? visibleUnredactor.feed(think.visible) : think.visible;
+                if (text.length === 0) continue;
+              }
+              // B2-6 R2: un-redact visible content for non-reasoning models
+              // (reasoning models already un-redacted inside the block above).
+              if (!isReasoningModel) {
+                text = visibleUnredactor ? visibleUnredactor.feed(text) : text;
                 if (text.length === 0) continue;
               }
               // reasoning_content is stripped here: any reasoning on this chunk
@@ -1350,10 +1381,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // the dialect detector entirely — nothing to feed.
             if (isReasoningModel) {
               const think = thinkStream.feed(text);
-              if (think.reasoning.length > 0) {
-                bufferedReasoning += think.reasoning;
+              // B2-6 R2: un-redact visible and reasoning (undecided/dialect).
+              const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(think.reasoning) : think.reasoning;
+              if (safeReasoning.length > 0) {
+                bufferedReasoning += safeReasoning;
               }
-              text = think.visible;
+              text = visibleUnredactor ? visibleUnredactor.feed(think.visible) : think.visible;
+              if (text.length === 0) continue;
+            }
+            // B2-6 R2: un-redact visible content for non-reasoning models.
+            if (!isReasoningModel) {
+              text = visibleUnredactor ? visibleUnredactor.feed(text) : text;
               if (text.length === 0) continue;
             }
             heldText += text;
@@ -1387,7 +1425,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             .map(([, acc]) => ({
               id: acc.id && acc.id.length > 0 ? acc.id : `call_stream_${++syntheticStreamIds}`,
               type: 'function' as const,
-              function: { name: acc.name, arguments: repairToolArguments(acc.args || '{}', schemas.get(acc.name)) },
+              function: { name: acc.name, arguments: repairToolArguments(middleSession ? unredactResponseText(acc.args || '{}', middleSession) : (acc.args || '{}'), schemas.get(acc.name)) },
             }))
             .filter(c => { try { JSON.parse(c.function.arguments); return c.function.name.length > 0; } catch { return false; } });
 
@@ -1401,7 +1439,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               if (!rescue.calls) throw new Error(`unparseable inline tool-call dialect from ${route.displayName}: ${heldText.slice(0, 120)}`);
               let rescuedIds = 0;
               for (const c of rescue.calls) {
-                completedCalls.push({ id: `call_rescued_${++rescuedIds}`, type: 'function', function: { name: c.name, arguments: repairToolArguments(c.arguments, schemas.get(c.name)) } });
+                completedCalls.push({ id: `call_rescued_${++rescuedIds}`, type: 'function', function: { name: c.name, arguments: repairToolArguments(middleSession ? unredactResponseText(c.arguments, middleSession) : c.arguments, schemas.get(c.name)) } });
               }
               heldText = rescue.cleanText;
               console.log(`[Proxy] Rescued ${rescuedIds} inline tool call(s) from ${route.displayName} into structured tool_calls`);
@@ -1419,6 +1457,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           if (thinkFinal.residual.length > 0) {
             heldText += thinkFinal.residual;
           }
+          // B2-6 R2: flush the streaming un-redactors — emit any held-back
+          // residual that was a potential partial-placeholder prefix.
+          const visibleResidual = visibleUnredactor ? visibleUnredactor.flush() : '';
+          const reasoningResidual = reasoningUnredactor ? reasoningUnredactor.flush() : '';
+          if (visibleResidual.length > 0) heldText += visibleResidual;
+          if (reasoningResidual.length > 0) bufferedReasoning += reasoningResidual;
 
           const hasText = headerSent || heldText.trim().length > 0 || bufferedReasoning.length > 0;
           if (!hasText && completedCalls.length === 0) {
@@ -1568,6 +1612,33 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             if (tc?.function?.arguments != null) {
               tc.function.arguments = repairToolArguments(tc.function.arguments, schemas.get(tc.function.name));
             }
+          }
+        }
+        // B2-6 R1: un-redact the non-streaming response (placeholders →
+        // real values). Runs AFTER post-call transforms and tool-arg repair
+        // so those see the placeholder text the model produced. Then run
+        // the inbound interceptor (non-streaming only, per D2) to catch
+        // new secrets the model emitted.
+        if (middleSession && respMsg) {
+          if (typeof respMsg.content === 'string') {
+            respMsg.content = unredactResponseText(respMsg.content, middleSession);
+          }
+          if (typeof respMsg.reasoning_content === 'string') {
+            respMsg.reasoning_content = unredactResponseText(respMsg.reasoning_content, middleSession);
+          }
+          if (respMsg.tool_calls?.length) {
+            for (const tc of respMsg.tool_calls) {
+              if (tc?.function?.arguments) {
+                tc.function.arguments = unredactResponseText(tc.function.arguments, middleSession);
+              }
+            }
+          }
+          // B2-4b: inbound interceptor — scan for new secrets the model
+          // emitted (non-streaming only). Re-redacts ONLY new secrets so
+          // outbound secrets reach the client as real values.
+          if (typeof respMsg.content === 'string' && respMsg.content.length > 0) {
+            const inbound = await interceptInboundText(respMsg.content, middleSession);
+            if (inbound.newSecretsFound) respMsg.content = inbound.text;
           }
         }
         // Normalize array-shaped message.content to a string on the way out (#166).
