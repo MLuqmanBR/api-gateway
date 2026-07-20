@@ -498,6 +498,21 @@ export function isPaymentRequiredError(err: any): boolean {
     || msg.includes('insufficient balance');
 }
 
+/** C1: classify the cooldown reason from the error for debug metadata.
+ *  Does NOT affect cooldown duration (flat 90s via X1). */
+export function classifyCooldownReason(err: any): { reason: string; statusCode?: number } {
+  if (!err) return { reason: 'unknown' };
+  const status = typeof err.status === 'number' ? err.status : undefined;
+  if (isPaymentRequiredError(err)) return { reason: 'payment_required', statusCode: status ?? 402 };
+  if (status === 429) return { reason: 'rate_limit', statusCode: 429 };
+  if (status && status >= 500) return { reason: 'server_error', statusCode: status };
+  if (status && status >= 400) return { reason: 'client_error', statusCode: status };
+  const msg = (err.message ?? '').toLowerCase();
+  if (msg.includes('timeout') || msg.includes('timed out')) return { reason: 'timeout' };
+  if (msg.includes('abort')) return { reason: 'aborted' };
+  return { reason: 'transport_error', statusCode: status };
+}
+
 // Pull the incremental text out of a streaming chunk for token counting.
 // Must tolerate chunks that carry no `choices` array at all: some providers
 // (e.g. Groq) emit usage/keepalive frames shaped like `{usage:{...}}` with no
@@ -1482,7 +1497,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
           // Non-pinned dead-turn: skip this model, try the next one in the
           // chain (the key works — a different model on it may succeed).
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false), 'dead_turn');
           recordRateLimitHit(route.modelDbId);
           skipModels.add(route.modelDbId);
           continue outerLoop;
@@ -1549,6 +1564,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       computeRetryCooldownMs(
         isPaymentRequiredError(lastError),
       ),
+      classifyCooldownReason(lastError).reason,
+      classifyCooldownReason(lastError).statusCode,
     );
     recordRateLimitHit(route.modelDbId);
     lastRequestTime = Date.now();

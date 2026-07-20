@@ -68,6 +68,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV35RateLimitIndex(db);
   migrateSchemaV36KeyFormat(db);
   migrateSchemaV37SessionsLastUsedIndex(db);
+  migrateSchemaV38CooldownReason(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2539,4 +2540,17 @@ function migrateSchemaV36KeyFormat(db: DatabasePort) {
 // so the hourly prune is O(log n). Idempotent — IF NOT EXISTS.
 function migrateSchemaV37SessionsLastUsedIndex(db: DatabasePort) {
   db.exec('CREATE INDEX IF NOT EXISTS idx_sessions_last_used ON sessions(last_used)');
+}
+
+// ── V38: cooldown reason columns (C1, 2026-07) ──
+// Adds nullable reason/status_code/set_at_ms to rate_limit_cooldowns so a
+// debug session can see WHICH error class benched a key. Metadata only —
+// does not decide duration (everything is flat 90s via X1). Idempotent —
+// pragma check before ALTER.
+function migrateSchemaV38CooldownReason(db: DatabasePort) {
+  const cols = db.prepare("PRAGMA table_info(rate_limit_cooldowns)").all() as Array<{ name: string }>;
+  const names = new Set(cols.map(c => c.name));
+  if (!names.has('reason')) db.exec('ALTER TABLE rate_limit_cooldowns ADD COLUMN reason TEXT');
+  if (!names.has('status_code')) db.exec('ALTER TABLE rate_limit_cooldowns ADD COLUMN status_code INTEGER');
+  if (!names.has('set_at_ms')) db.exec('ALTER TABLE rate_limit_cooldowns ADD COLUMN set_at_ms INTEGER');
 }
