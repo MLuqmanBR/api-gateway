@@ -79,11 +79,17 @@ describe('Proxy client-disconnect abort + attempt limit', () => {
     // Every upstream call returns a 429 (retryable) so the loop would keep
     // cycling. We abort the client after the first call lands; the loop must
     // stop immediately instead of burning more attempts.
+    // Signal handoff (Imp 36): instead of fixed setTimeout offsets, resolve
+    // a promise from inside the first chatCompletion mock so we know the
+    // upstream call is in-flight before aborting. Deterministic, no race.
     let calls = 0;
+    let firstCallStarted: () => void;
+    const firstCallStartedPromise = new Promise<void>(resolve => { firstCallStarted = resolve; });
     chatCompletion.mockImplementation(async () => {
       calls++;
-      // Stall briefly so the abort lands while the request is still in flight.
-      await new Promise(r => setTimeout(r, 50));
+      if (calls === 1) firstCallStarted();
+      // Stall until the abort lands and the loop unwinds.
+      await new Promise(r => setTimeout(r, 500));
       throw RATE_LIMIT_ERROR;
     });
 
@@ -92,8 +98,9 @@ describe('Proxy client-disconnect abort + attempt limit', () => {
       messages: [{ role: 'user', content: 'hi' }],
     }, key, { signal: controller.signal });
 
-    // Abort shortly after the first upstream call has started.
-    setTimeout(() => controller.abort(), 80);
+    // Wait for the first upstream call to actually start, then abort.
+    await firstCallStartedPromise;
+    controller.abort();
     // A client abort rejects the fetch; swallow it.
     await promise.catch(() => {});
 
