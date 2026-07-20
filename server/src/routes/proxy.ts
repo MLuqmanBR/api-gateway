@@ -839,6 +839,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let triggeringClass: ErrorClass | undefined;
   let failedContextWindow: number | null | undefined;
   let failedModelDbId: number | undefined;
+  // F12: track the unique model ids the router attempted for the response header.
+  const attemptedModels = new Set<string>();
   const isPinned = !!(requestedModel && !isAutoModel(requestedModel));
   let prevModelKey: string | undefined;
   let prevKeyId: number | undefined;
@@ -887,7 +889,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const msg = `Recovery limit reached after ${upstreamAttempts} upstream attempt(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
       publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
       if (!res.headersSent) {
-        res.setHeader('X-Routed-Via', 'none');
+        res.setHeader('X-Routed-Via', 'none'); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         res.setHeader('X-Upstream-Attempts', String(upstreamAttempts));
         res.status(429).json({
           error: {
@@ -902,7 +904,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const msg = `All models rate-limited after ${totalAttempt} recovery iteration(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
       publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
       if (!res.headersSent) {
-        res.setHeader('X-Routed-Via', 'none');
+        res.setHeader('X-Routed-Via', 'none'); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         res.setHeader('X-Recovery-Iterations', String(totalAttempt));
         res.status(429).json({
           error: {
@@ -939,6 +941,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         skipModels.size > 0 ? skipModels : undefined,
         { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId },
       );
+      attemptedModels.add(route.modelId);
     } catch (err: any) {
       // Pinned model has no more keys — enter 1 RPM mode.
       if (err.code === 'PINNED_MODEL_EXHAUSTED') {
@@ -1075,7 +1078,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
           if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
           headerSent = true;
           for (const p of preamble) res.write(`data: ${JSON.stringify(p)}\n\n`);
@@ -1412,7 +1415,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
         if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
         if (inOneRPMMode) res.setHeader('X-Recovery-Mode', '1rpm');
         // Repair double-encoded tool arguments against the request's tool
@@ -1497,7 +1500,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // the gateway must not pretend is a transient retryable condition.
             const errorMsg = `Provider error (${route.displayName}): ${safeError}`;
             publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
-            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
             if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
             res.status(502).json({ error: { message: errorMsg, type: 'provider_error' } });
             return;
@@ -1545,7 +1548,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Non-retryable error (auth, 4xx, etc.): don't retry.
         const errorMsg = `Provider error (${route.displayName}): ${safeError}`;
         publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
         res.status(502).json({
           error: {
