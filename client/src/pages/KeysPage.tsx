@@ -1021,14 +1021,23 @@ export default function KeysPage() {
   // update a progress counter as each key resolves. The operator sees
   // a live bar fill up + a per-key status flash as it happens.
   const [checkProgress, setCheckProgress] = useState<{ completed: number; total: number } | null>(null)
+  // Throttle health invalidation during check-all: at most once per second
+  // during progress events, plus once on done. Without this, a large fleet
+  // triggers ~N invalidations (one per key), causing a refetch storm.
+  const lastHealthInvalidate = useRef(0)
   useEventStream((e) => {
     if (e?.type === 'health.check.start') {
       setCheckProgress({ completed: 0, total: e.total as number })
     } else if (e?.type === 'health.check.progress') {
       setCheckProgress({ completed: e.completed as number, total: e.total as number })
-      queryClient.invalidateQueries({ queryKey: ['health'] })
+      const now = Date.now()
+      if (now - lastHealthInvalidate.current >= 1000) {
+        lastHealthInvalidate.current = now
+        queryClient.invalidateQueries({ queryKey: ['health'] })
+      }
     } else if (e?.type === 'health.check.done') {
       queryClient.invalidateQueries({ queryKey: ['health'] })
+      lastHealthInvalidate.current = Date.now()
       window.setTimeout(() => setCheckProgress(null), 1500)
     }
   }, checkAll.isPending)
