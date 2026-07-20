@@ -72,6 +72,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV38CooldownReason(db);
   migrateSchemaV39ClientKeys(db);
   migrateSchemaV40Budgets(db);
+  migrateSchemaV41ResponseCache(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2601,6 +2602,23 @@ function migrateSchemaV40Budgets(db: DatabasePort) {
       weekly_reset_at TEXT,
       monthly_reset_at TEXT,
       UNIQUE(scope, scope_id)
+    )
+  `);
+}
+
+// F5: response_cache table — exact-match, temp-0 response caching. Two-tier
+// L1 (in-memory LRU 2048) / L2 (SQLite) per OmniRoute's pattern. The cache key
+// is a SHA-256 hash of model+messages+tools+tool_choice+temperature+top_p+
+// penalties+reasoning_effort+thinking.budget+max_tokens. Only temperature===0
+// requests are cacheable. TTL is checked on read via created_at_ms.
+function migrateSchemaV41ResponseCache(db: DatabasePort) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS response_cache (
+      key TEXT PRIMARY KEY,
+      response_json TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL,
+      hits INTEGER DEFAULT 0,
+      tokens_saved INTEGER DEFAULT 0
     )
   `);
 }

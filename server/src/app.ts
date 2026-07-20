@@ -5,6 +5,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { keysRouter } from './routes/keys.js';
 import { budgetsRouter } from './routes/budgets.js';
+import { cacheRouter } from './routes/cache.js';
 import { platformsRouter } from './routes/platforms.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
@@ -94,6 +95,7 @@ export function createApp() {
   // above; no per-router mount is needed.
   app.use('/api/keys', keysRouter);
   app.use('/api/budgets', budgetsRouter);
+  app.use('/api/cache', cacheRouter);
   app.use('/api/platforms', platformsRouter);
   app.use('/api/models', modelsRouter);
   app.use('/api/fallback', fallbackRouter);

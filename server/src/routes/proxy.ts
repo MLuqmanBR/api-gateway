@@ -8,6 +8,7 @@ import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel,
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
+import { isCacheEnabled, isCacheableTemp, isCacheBypassed, computeCacheKey, getCachedResponse, setCachedResponse, synthesizeSSE } from '../services/cache.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { checkAndReserve, recordSpend, estimateCostCents } from '../services/budgets.js';
@@ -457,6 +458,12 @@ const chatCompletionSchema = z.object({
   // into the wire shape each upstream accepts. (#290)
   reasoning_effort: thinkingEffortSchema.nullable().optional(),
   thinking: thinkingConfigSchema.nullable().optional(),
+  // F5: per-request cache control. `cache: {no_cache: true}` bypasses the
+  // response cache for this single request (litellm's per-request pattern).
+  cache: z.object({
+    no_cache: z.boolean().optional(),
+    ttl: z.number().int().min(0).optional(),
+  }).nullable().optional(),
 });
 export function isRetryableError(err: any): boolean {
   // First check structured status (set by providerHttpError in base.ts).
@@ -896,6 +903,43 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // caught immediately and the loop exits. The watcher ignores the `close`
   // that fires after a normal `res.end()` so successful completions are
   // unaffected. (#292)
+  // F5: Response cache — check for a cache hit before entering the routing
+  // loop. Only temperature === 0 (deterministic) requests are cacheable, and
+  // only when cache_enabled is true (default). Bypass via `cache:{no_cache}`
+  // in the request body or `X-API-Gateway-No-Cache` header.
+  const cacheNoCacheHeader = req.get('X-API-Gateway-No-Cache');
+  const cacheDirective = parsed.data.cache;
+  const cacheable = isCacheEnabled()
+    && isCacheableTemp(temperature, top_p)
+    && !isCacheBypassed(cacheDirective, cacheNoCacheHeader);
+  let cacheKey: string | undefined;
+  if (cacheable) {
+    cacheKey = computeCacheKey({
+      model: requestedModel ?? 'auto', messages, tools, tool_choice,
+      temperature, top_p, max_tokens, reasoning_effort, thinking,
+    });
+    const cached = getCachedResponse(cacheKey);
+    if (cached) {
+      res.setHeader('X-Cache', 'HIT');
+      if (stream) {
+        // Synthesize SSE from the cached non-streaming JSON (OmniRoute pattern).
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.flushHeaders();
+        res.write(synthesizeSSE(cached));
+        res.end();
+      } else {
+        res.setHeader('Cache-Control', 'no-cache');
+        res.json(JSON.parse(cached));
+      }
+      publish({ type: 'request.done', id: requestId, model: requestedModel ?? 'auto', provider: 'cache', keyId: 0, latencyMs: Date.now() - start, tokens: { in: 0, out: 0 }, at: Date.now() });
+      return;
+    }
+    // Cacheable but no hit — mark MISS so the client can see the cache is active.
+    res.setHeader('X-Cache', 'MISS');
+  }
+
+
   try {
   outerLoop: for (let totalAttempt = 0; ; totalAttempt++) {
     // ---- Exit: client disconnected ----
@@ -1520,6 +1564,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             budgetPricing?.paid_input_per_m ?? null, budgetPricing?.paid_output_per_m ?? null,
           );
           recordSpend('client_key', auth.clientKey.id, actualCostCents, budgetEstCostCents);
+        }
+        // F5: store the response in the cache (only temp-0, non-streaming).
+        if (cacheKey && !stream) {
+          setCachedResponse(cacheKey, JSON.stringify(normalizeOutboundContent(result)));
         }
         return;
       }
