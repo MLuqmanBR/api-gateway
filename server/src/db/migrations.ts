@@ -76,6 +76,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV42Webhooks(db);
   migrateSchemaV43LatencyPerToken(db);
   migrateSchemaV44ModelTags(db);
+  migrateSchemaV45MiddleRedaction(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -2654,4 +2655,21 @@ function migrateSchemaV43LatencyPerToken(db: DatabasePort) {
 // filters the chain to models whose tags intersect the request tags.
 function migrateSchemaV44ModelTags(db: DatabasePort) {
   try { db.exec("ALTER TABLE models ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'"); } catch { /* duplicate column */ }
+}
+
+// B2-2: metadata table for the encrypted known-secrets store. The secret
+// VALUES live in an encrypted file (server/data/middle-secrets.enc, AES-256-GCM
+// via lib/crypto.ts), NOT in the DB — this table holds only metadata for
+// dashboard listing without decrypting on every render. masked_preview is
+// maskKey(value) from lib/crypto.ts (first/last chars only).
+function migrateSchemaV45MiddleRedaction(db: DatabasePort) {
+  db.exec(`CREATE TABLE IF NOT EXISTS middle_secret_meta (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    added_by TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    masked_preview TEXT NOT NULL DEFAULT ''
+  )`);
 }
