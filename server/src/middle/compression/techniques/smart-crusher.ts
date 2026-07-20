@@ -288,15 +288,22 @@ export function smartCrush(content: string, opts: SmartCrushOptions = {}): Smart
     return { output: content, sentinel: null, applied: false, originalCount, keptCount: arr.length, droppedCount: 0, shape };
   }
 
-  // Check off-limits spans in the compressed content — if a placeholder is inside
-  // a dropped row, abort (the placeholder would be lost).
-  const offLimits = detectOffLimits(content);
+  // Check each dropped row for off-limits content (fenced code, placeholders, etc.)
+  // by running detectOffLimits on the row's string representation directly.
+  // Also do a direct backtick/placeholder scan since JSON-escaped fences (\\n)
+  // don't match the line-anchored regex.
   for (const idx of [...arr.keys()]) {
     if (!indices.includes(idx)) {
-      // This row was dropped — check if it contained off-limits content
       const rowStr = JSON.stringify(arr[idx]);
-      const rowStart = content.indexOf(rowStr);
-      if (rowStart >= 0 && intersectsOffLimits(rowStart, rowStart + rowStr.length, offLimits)) {
+      // Direct check for triple-backtick fences (may be JSON-escaped as \\n)
+      const hasFence = rowStr.includes('```') || rowStr.includes('~~~');
+      // Direct check for redaction placeholders
+      const hasPlaceholder = /⟦R\d+:[0-9a-f]{6,12}⟧/.test(rowStr);
+      // Direct check for compression sentinels
+      const hasSentinel = /⟦C\d+:<<[^>]+>>⟧/.test(rowStr);
+      // detectOffLimits for other patterns
+      const rowOffLimits = detectOffLimits(rowStr);
+      if (hasFence || hasPlaceholder || hasSentinel || rowOffLimits.length > 0) {
         // Off-limits content in a dropped row — abort, return original
         return { output: content, sentinel: null, applied: false, originalCount, keptCount: arr.length, droppedCount: 0, shape };
       }
