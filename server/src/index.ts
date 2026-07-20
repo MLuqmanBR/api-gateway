@@ -6,6 +6,7 @@ import { startHealthChecker, stopHealthChecker } from './services/health.js';
 import { startRequestRetentionPruner, stopRequestRetentionPruner } from './services/request-retention.js';
 import { rebuildExhaustionFromDB } from './services/key-exhaustion.js';
 import { attachRealtimeServer } from './services/realtime.js';
+import { initSecretsStore } from './middle/redaction/store.js';
 import { initWebhooks } from './services/webhooks.js';
 
 const PORT = process.env.PORT ?? 3001;
@@ -24,6 +25,7 @@ process.on('uncaughtException', (err: Error) => {
 });
 async function main() {
   initDb();
+  initSecretsStore(); // B2-7: initialize encrypted known-secrets store
   initWebhooks();
   pruneSessions();
   // Re-prune hourly so expired/stale sessions don't accumulate between boots.

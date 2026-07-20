@@ -24,6 +24,7 @@ import { authRouter } from './routes/auth.js';
 import { eventsRouter, eventsStreamHandler } from './routes/events.js';
 import { customRouter } from './routes/custom.js';
 import { configRouter } from './routes/config.js';
+import { middleRouter } from './routes/middle.js';
 import { requireAuth } from './middleware/requireAuth.js';
 import { createProxyRateLimiter } from './middleware/rateLimit.js';
 import { errorHandler } from './middleware/errorHandler.js';
@@ -118,6 +119,7 @@ export function createApp() {
   app.use('/api/settings', settingsRouter);
   // Configuration export/import (versioned JSON envelope). Dashboard-
   // only — there's no operational reason a /v1 caller needs this.
+  app.use('/api/middle', middleRouter);
   app.use('/api/config', configRouter);
   // Custom providers + their models — gated by the /api blanket above.
   app.use(customRouter);
