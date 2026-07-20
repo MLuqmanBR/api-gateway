@@ -79,6 +79,30 @@ export class OpenAICompatProvider extends BaseProvider {
     return options?.parallel_tool_calls;
   }
 
+  /** Assemble the request body shared by chatCompletion and
+   * streamChatCompletion. Optional params are included only when explicitly
+   * set — some providers (NVIDIA NIM minimax) reject unknown or zero-valued
+   * params. Thinking/reasoning knobs are forwarded ONLY for fields this host
+   * (and this model) accept; see buildThinkingFields. */
+  private buildBody(
+    messages: ChatMessage[],
+    modelId: string,
+    options: CompletionOptions | undefined,
+    stream = false,
+  ): Record<string, unknown> {
+    const body: Record<string, unknown> = { model: modelId, messages };
+    if (options?.temperature !== undefined) body.temperature = options.temperature;
+    if (options?.max_tokens !== undefined && options.max_tokens > 0) body.max_tokens = options.max_tokens;
+    if (options?.top_p !== undefined) body.top_p = options.top_p;
+    if (options?.tools?.length) body.tools = options.tools;
+    if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
+    const parallel = this.resolveParallelToolCalls(options);
+    if (parallel !== undefined) body.parallel_tool_calls = parallel;
+    Object.assign(body, this.buildThinkingFields(modelId, options));
+    if (stream) body.stream = true;
+    return body;
+  }
+
   /** Extract the token portion from a colon-separated composite key.
    *  For 'simple' keys the full string is the token. */
   private bearerToken(apiKey: string): string {
@@ -119,25 +143,7 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
-    const body: Record<string, unknown> = { model: modelId, messages };
-    // Only include optional params when explicitly set — some providers
-    // (NVIDIA NIM minimax) reject unknown or zero-valued params.
-    if (options?.temperature !== undefined) body.temperature = options.temperature;
-    if (options?.max_tokens !== undefined && options.max_tokens > 0) body.max_tokens = options.max_tokens;
-    if (options?.top_p !== undefined) body.top_p = options.top_p;
-    if (options?.tools?.length) body.tools = options.tools;
-    if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
-    const parallel = this.resolveParallelToolCalls(options);
-    if (parallel !== undefined) body.parallel_tool_calls = parallel;
-    // Thinking/reasoning knobs: forward ONLY fields this host (and this model)
-    // accept. GLM hosts/models reject both `reasoning_effort` and the rich
-    // `thinking` object (pydantic literal_error on the latter), so we send
-    // nothing and let the model use its default. Unknown hosts get the safe
-    // `reasoning_effort`-only default. The rich `thinking` object is never
-    // forwarded unless the host is explicitly allowlisted — that's the field
-    // that killed GLM-5.1. (#292, replaces the verbatim "send both" behavior
-    // from #290.)
-    Object.assign(body, this.buildThinkingFields(modelId, options));
+    const body = this.buildBody(messages, modelId, options);
 
     const res = await this.fetchWithTimeout(this.resolveUrl(apiKey, '/chat/completions'), {
       method: 'POST',
@@ -186,18 +192,7 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const body: Record<string, unknown> = { model: modelId, messages, stream: true };
-    // Only include optional params when explicitly set — some providers
-    // (NVIDIA NIM minimax) reject unknown or zero-valued params.
-    if (options?.temperature !== undefined) body.temperature = options.temperature;
-    if (options?.max_tokens !== undefined && options.max_tokens > 0) body.max_tokens = options.max_tokens;
-    if (options?.top_p !== undefined) body.top_p = options.top_p;
-    if (options?.tools?.length) body.tools = options.tools;
-    if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
-    const parallel = this.resolveParallelToolCalls(options);
-    if (parallel !== undefined) body.parallel_tool_calls = parallel;
-    // Same host/model-aware thinking-knob handling as the non-streaming path. (#292)
-    Object.assign(body, this.buildThinkingFields(modelId, options));
+    const body = this.buildBody(messages, modelId, options, true);
 
     const res = await this.fetchWithTimeout(this.resolveUrl(apiKey, '/chat/completions'), {
       method: 'POST',
