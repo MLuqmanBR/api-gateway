@@ -13,7 +13,7 @@ import { getActiveSecretsForRedaction } from './store.js';
 
 export class RedactionSession {
   private readonly map = new Map<string, string>(); // placeholder → value
-  private readonly secrets: KnownSecret[];
+  private secrets: KnownSecret[];
 
   constructor(secrets?: KnownSecret[]) {
     this.secrets = secrets ?? getActiveSecretsForRedaction();
@@ -25,6 +25,12 @@ export class RedactionSession {
    * original string is used and a warning is logged once. */
   redactOutbound(messages: ChatMessage[]): ChatMessage[] {
     return messages.map(msg => this.redactMessage(msg));
+  }
+
+  /** Rebuild the secrets list from the store. Called after the interceptor
+   * adds new secrets (Row B2-4) so a re-run of redactOutbound picks them up. */
+  rebuildSecrets(): void {
+    this.secrets = getActiveSecretsForRedaction();
   }
 
   private redactMessage(msg: ChatMessage): ChatMessage {
