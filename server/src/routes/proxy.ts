@@ -11,6 +11,7 @@ import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { isCacheEnabled, isCacheableTemp, isCacheBypassed, computeCacheKey, getCachedResponse, setCachedResponse, synthesizeSSE } from '../services/cache.js';
 import { recordMetricsRequest, recordMetricsTokens } from '../services/metrics.js';
 import { acquireSlot, isQueueEnabled, QueueTimeoutError } from '../services/queue.js';
+import { isCircuitOpen, recordCircuitSuccess, recordCircuitFailure, shouldMarkExhausted } from '../services/circuit-breaker.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { checkAndReserve, recordSpend, estimateCostCents } from '../services/budgets.js';
@@ -1025,6 +1026,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId, clientKeyId: auth.clientKey?.id ?? null, clientModelAllowlist: auth.clientKey?.modelAllowlist ?? null },
       );
       attemptedModels.add(route.modelId);
+      // F10: skip if circuit breaker is open for this (platform, model, keyId).
+      if (isCircuitOpen(route.platform, route.modelId, route.keyId)) {
+        route.release();
+        skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+        if (shouldMarkExhausted(route.platform, route.modelId, route.keyId)) {
+          markExhausted(route.keyId, route.platform, route.modelId);
+        }
+        continue outerLoop;
+      }
 
       // F4: check the $-budget for the authenticated client key.
       // Only enforced when a budget row exists for the scope — an empty
@@ -1441,6 +1451,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
           publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: estimatedInputTokens + injectedHandoffTokens, out: totalOutputTokens }, at: Date.now() });
           clearExhausted(route.keyId, route.modelId);
+          recordCircuitSuccess(route.platform, route.modelId, route.keyId);
           if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
           // F4: reconcile the budget estimate with actual token usage.
           if (auth.clientKey && budgetEstCostCents > 0) {
@@ -1563,6 +1574,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         );
         publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: promptTokens, out: completionTokens }, at: Date.now() });
         clearExhausted(route.keyId, route.modelId);
+        recordCircuitSuccess(route.platform, route.modelId, route.keyId);
         if (inOneRPMMode) { inOneRPMMode = false; oneRPMCycles = 0; }
         // F4: reconcile the budget estimate with actual token usage.
         if (auth.clientKey && budgetEstCostCents > 0) {
@@ -1720,6 +1732,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // Key exhausted: all PER_KEY_RETRIES attempts failed.
     // Mark it so the router cycles to the next key (and in 1 RPM mode,
     // exhausted keys are re-tried in exhaustion order).
+    // F10: record circuit breaker failure for this (platform, model, keyId).
+    recordCircuitFailure(route.platform, route.modelId, route.keyId);
+
     markExhausted(route.keyId, route.platform, route.modelId);
     const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
     skipKeys.add(skipId);
