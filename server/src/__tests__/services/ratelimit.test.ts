@@ -6,9 +6,7 @@ import {
   recordRequest,
   recordTokens,
   getRateLimitStatus,
-  getNextCooldownDuration,
-  getCooldownDurationForLimit,
-  canUseProvider,
+  computeRetryCooldownMs,
   providerDailyRequestCount,
   getProviderDailyRequestCap,
   reserveRequest,
@@ -47,10 +45,10 @@ describe('Rate Limiter', () => {
       expect(canMakeRequest('groq', 'llama-70b', testId, limits)).toBe(false);
     });
 
-    it('should deny request when RPD limit reached', () => {
+    it('X1: per-DAY gate removed — RPD no longer blocks (always allows)', () => {
       const limits = { rpm: null, rpd: 1, tpm: null, tpd: null };
       recordRequest('google', 'gemini', testId);
-      expect(canMakeRequest('google', 'gemini', testId, limits)).toBe(false);
+      expect(canMakeRequest('google', 'gemini', testId, limits)).toBe(true);
     });
 
     it('should allow request when limits are null (unlimited)', () => {
@@ -123,64 +121,6 @@ describe('Rate Limiter', () => {
     });
   });
 
-  describe('escalating cooldown', () => {
-    it('escalates the 2nd/3rd/4th hit within 24h to 10m / 1h / 24h', () => {
-      const id = Math.floor(Math.random() * 1_000_000);
-      const args = ['cerebras', `escalating-model-${id}`, id] as const;
-      // 1st: 2 minutes
-      expect(getNextCooldownDuration(...args)).toBe(2 * 60 * 1000);
-      // 2nd: 10 minutes
-      expect(getNextCooldownDuration(...args)).toBe(10 * 60 * 1000);
-      // 3rd: 1 hour
-      expect(getNextCooldownDuration(...args)).toBe(60 * 60 * 1000);
-      // 4th: 24 hours
-      expect(getNextCooldownDuration(...args)).toBe(24 * 60 * 60 * 1000);
-      // 5th+ stays at 24h (quarantined until next quota window)
-      expect(getNextCooldownDuration(...args)).toBe(24 * 60 * 60 * 1000);
-    });
-
-    it('counts independently per (platform, model, key)', () => {
-      const id = Math.floor(Math.random() * 1_000_000);
-      // Different keys for the same model should each start at 2m, not share state.
-      expect(getNextCooldownDuration('groq', `m-${id}`, id)).toBe(2 * 60 * 1000);
-      expect(getNextCooldownDuration('groq', `m-${id}`, id + 1)).toBe(2 * 60 * 1000);
-      expect(getNextCooldownDuration('groq', `m-${id}-other`, id)).toBe(2 * 60 * 1000);
-    });
-  });
-
-  describe('getCooldownDurationForLimit (daily vs transient 429)', () => {
-    it('uses a short, non-escalating cooldown when the daily quota is NOT exhausted', () => {
-      const id = Math.floor(Math.random() * 1_000_000);
-      const args = ['groq', `transient-${id}`, id] as const;
-      // groq-like: large daily quota, no requests recorded yet → transient (TPM/RPM)
-      // 429s must stay at the short fixed cooldown and never escalate.
-      expect(getCooldownDurationForLimit(...args, { rpd: 1000, tpd: null })).toBe(90 * 1000);
-      expect(getCooldownDurationForLimit(...args, { rpd: 1000, tpd: null })).toBe(90 * 1000);
-      expect(getCooldownDurationForLimit(...args, { rpd: 1000, tpd: null })).toBe(90 * 1000);
-    });
-
-    it('treats a null daily limit as never-exhausted (always transient)', () => {
-      const id = Math.floor(Math.random() * 1_000_000);
-      for (let i = 0; i < 50; i++) recordRequest('mistral', `nolimit-${id}`, id);
-      expect(
-        getCooldownDurationForLimit('mistral', `nolimit-${id}`, id, { rpd: null, tpd: null }),
-      ).toBe(90 * 1000);
-    });
-
-    it('escalates only once the daily request limit is actually reached', () => {
-      const id = Math.floor(Math.random() * 1_000_000);
-      const platform = 'openrouter';
-      const model = `daily-${id}`;
-      // Below the daily limit → still transient.
-      recordRequest(platform, model, id);
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: 5, tpd: null })).toBe(90 * 1000);
-      // Reach the daily limit → now it escalates (2m, then 10m, ...).
-      for (let i = 0; i < 5; i++) recordRequest(platform, model, id);
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: 5, tpd: null })).toBe(2 * 60 * 1000);
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: 5, tpd: null })).toBe(10 * 60 * 1000);
-    });
-  });
-
   describe('persistent state', () => {
     it('preserves per-key usage and cooldowns after the limiter module reloads', async () => {
       process.env.ENCRYPTION_KEY = '0'.repeat(64);
@@ -206,10 +146,10 @@ describe('Rate Limiter', () => {
         const limiterAfterReload = await import('../../services/ratelimit.js');
 
         expect(limiterAfterReload.canMakeRequest('groq', 'persistent-model', keyId, {
-          rpm: null, rpd: 1, tpm: null, tpd: null,
+          rpm: 1, rpd: null, tpm: null, tpd: null,
         })).toBe(false);
         expect(limiterAfterReload.canUseTokens('groq', 'persistent-model', keyId, 100, {
-          tpm: null, tpd: 1000,
+          tpm: 1000, tpd: null,
         })).toBe(false);
         expect(limiterAfterReload.isOnCooldown('groq', 'persistent-model', keyId)).toBe(true);
       } finally {
@@ -247,24 +187,12 @@ describe('Rate Limiter', () => {
       recordRequest('groq', 'llama-70b', testId);
       expect(providerDailyRequestCount('openrouter', testId)).toBe(3);
     });
-
-    it('blocks the whole provider once the shared daily cap is hit', () => {
-      process.env[ENV] = '3';
-      recordRequest('openrouter', 'model-a', testId);
-      recordRequest('openrouter', 'model-b', testId);
-      expect(canUseProvider('openrouter', testId)).toBe(true); // 2 < 3
-      recordRequest('openrouter', 'model-c', testId);
-      expect(canUseProvider('openrouter', testId)).toBe(false); // 3 >= 3
-    });
   });
 });
 
-describe('Cooldown duration (F13: upstream Retry-After no longer honored)', () => {
-  const noLimits = { rpd: null, tpd: null };
-  let testId: number;
-  beforeEach(() => { testId = Math.floor(Math.random() * 1_000_000); });
-
-  it('uses the flat transient cooldown when no daily limit is exhausted', () => {
-    expect(getCooldownDurationForLimit('groq', 'm', testId, noLimits)).toBe(90_000);
+describe('Cooldown duration (X1: flat 90s after any error)', () => {
+  it('always returns 90s regardless of error class or limits', () => {
+    expect(computeRetryCooldownMs(false)).toBe(90_000);
+    expect(computeRetryCooldownMs(true)).toBe(90_000); // 402 also flat 90s now
   });
 });

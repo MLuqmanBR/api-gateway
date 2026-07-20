@@ -585,7 +585,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           if (rescue.detected && !rescue.calls) {
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, `unparseable inline tool-call dialect: ${heldText.slice(0, 120)}`);
             skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-            setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+            setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false));
             recordRateLimitHit(route.modelDbId);
             lastError = new Error(`unparseable inline tool-call dialect from ${route.displayName}`);
             continue;
@@ -658,7 +658,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         if (msgText.length === 0 && finalToolCalls.length === 0) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no valid tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
@@ -711,7 +711,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         if (!text && toolCalls.length === 0) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false));
           recordRateLimitHit(route.modelDbId);
           lastError = new Error(`empty completion from ${route.displayName}`);
           continue;
@@ -761,8 +761,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
         setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
           isPaymentRequiredError(err),
-          route.platform, route.modelId, route.keyId,
-          { rpd: route.rpdLimit, tpd: route.tpdLimit },
         ));
         recordRateLimitHit(route.modelDbId);
         lastError = err;

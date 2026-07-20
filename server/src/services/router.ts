@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
-import { canMakeRequest, canUseTokens, isOnCooldown, canUseProvider, canUseProviderMinute, reserveRequest, releaseReservation } from './ratelimit.js';
+import { canMakeRequest, canUseTokens, isOnCooldown, canUseProviderMinute, reserveRequest, releaseReservation } from './ratelimit.js';
 import { getExhaustedKeysForModel } from './key-exhaustion.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
@@ -702,10 +702,8 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         // Check cooldown (from previous 429s)
         if (isOnCooldown(entry.platform, entry.model_id, key.id)) continue;
 
-        // Provider-wide daily request cap (#162): providers like OpenRouter cap
-        // total requests/day across ALL their models for the account, not per
-        // model — skip every model on this provider once that key hits the cap.
-        if (!canUseProvider(entry.platform, key.id)) continue;
+        // X1: per-DAY provider-wide gate (canUseProvider) REMOVED — no long bench.
+        // Per-MINUTE provider-wide gate stays below.
 
         // Provider-wide per-minute cap (#295): same idea as the daily cap above,
         // but per-minute. Providers like NVIDIA NIM enforce ONE 40 RPM budget

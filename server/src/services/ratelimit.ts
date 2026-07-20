@@ -207,13 +207,13 @@ export function canMakeRequest(
 ): boolean {
   const now = Date.now();
 
+  // X1: per-MINUTE gate stays (naturally resets ~60s, no long bench).
   if (limits.rpm !== null) {
     if (requestCount(platform, modelId, keyId, MINUTE, now) >= limits.rpm) return false;
   }
 
-  if (limits.rpd !== null) {
-    if (requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd) return false;
-  }
+  // X1: per-DAY gate removed — no long bench from rpd. Daily-exhausted keys
+  // retry every ~90s until UTC midnight (user-accepted).
 
   return true;
 }
@@ -227,15 +227,13 @@ export function canUseTokens(
 ): boolean {
   const now = Date.now();
 
+  // X1: per-MINUTE gate stays (naturally resets ~60s, no long bench).
   if (limits.tpm !== null) {
     const used = tokenCount(platform, modelId, keyId, MINUTE, now);
     if (used + estimatedTokens > limits.tpm) return false;
   }
 
-  if (limits.tpd !== null) {
-    const used = tokenCount(platform, modelId, keyId, DAY, now);
-    if (used + estimatedTokens > limits.tpd) return false;
-  }
+  // X1: per-DAY gate removed — no long bench from tpd.
 
   return true;
 }
@@ -293,13 +291,10 @@ export function providerDailyRequestCount(platform: string, keyId: number, now =
   return total + provisional;
 }
 
-// False when this provider account+key has hit its shared daily request cap, so
-// the router skips every model on that provider for this key until UTC midnight reset.
-export function canUseProvider(platform: string, keyId: number, now = Date.now()): boolean {
-  const cap = getProviderDailyRequestCap(platform);
-  if (cap === null) return true;
-  return providerDailyRequestCount(platform, keyId, now) < cap;
-}
+// X1: canUseProvider (per-DAY provider-wide gate) REMOVED — no long bench.
+// The per-MINUTE provider-wide gate (canUseProviderMinute) STAYS.
+// getProviderDailyRequestCap / providerDailyRequestCount retained as vestigial
+// (analytics-only, no longer called from the routing path).
 // ── Provider-wide per-minute caps (#295) ──
 // Mirror of the provider-wide daily cap above, but per-minute. Some providers
 // enforce ONE per-minute request (and/or per-minute token) quota across the
@@ -485,82 +480,19 @@ export function recordTokens(
 // Cooldown: when a provider returns 429, block that model+key for a period
 const cooldowns = new Map<string, number>(); // key -> expiry timestamp
 
-// Escalating cooldown: track hits per key over a rolling 24h window so a
-// daily-quota exhaustion (OpenRouter free: 50/day, Cohere free: 33/day, etc.)
-// quarantines the key for the rest of the day instead of looping through
-// the 2-minute cooldown 20 times per request and consuming every fallback slot.
-// In-memory only — state resets on restart, which is fine (a clean restart
-// will re-escalate on the next 429 if the quota is genuinely exhausted).
-const cooldownHits = new Map<string, number[]>(); // key -> timestamps of recent cooldown set events
-const HOUR = 60 * MINUTE;
-const COOLDOWN_DURATIONS = [
-  2 * MINUTE,   // 1st hit in 24h
-  10 * MINUTE,  // 2nd
-  HOUR,         // 3rd
-  DAY,          // 4th and beyond
-];
-
-export function getNextCooldownDuration(platform: string, modelId: string, keyId: number): number {
-  const key = `${platform}:${modelId}:${keyId}`;
-  const now = Date.now();
-  const hits = (cooldownHits.get(key) ?? []).filter(t => t > now - DAY);
-  hits.push(now);
-  cooldownHits.set(key, hits);
-  const idx = Math.min(hits.length - 1, COOLDOWN_DURATIONS.length - 1);
-  return COOLDOWN_DURATIONS[idx]!;
-}
-
-// Short cooldown for a transient (per-minute) 429 — recovers within ~one window.
+// X1: every cooldown after ANY upstream error is flat 90s. No escalation
+// ladder, no payment-required 1-day branch, no daily-quota quarantine, no
+// upstream-header-derived duration. Per-MINUTE pre-call gates stay (rpm/tpm/
+// canUseProviderMinute — ~60s natural reset). Per-DAY gates removed.
 const TRANSIENT_COOLDOWN_MS = 90 * 1000;
 
-// Long cooldown for a 402 Payment Required (provider/key out of credits). Unlike
-// a 429, this won't clear on the next minute/day window — it needs a top-up or
-// billing reset. Bench the model+key for a full day so the router fails over to
-// other providers instead of re-hammering a dead key every retry. Re-escalates
-// on the next 402 after expiry if still unpaid; a restart re-benches on first hit.
-export const PAYMENT_REQUIRED_COOLDOWN_MS = DAY;
-
-/** Compute the cooldown duration for a retryable error. Encapsulates the
- *  payment-required vs transient decision so both the proxy and responses
- *  routers apply the same policy. */
+/** Compute the cooldown duration for a retryable error. X1: always returns
+ *  the flat transient cooldown. The isPaymentRequired param is retained for
+ *  C1 (cooldown-reason recording) but does not affect duration. */
 export function computeRetryCooldownMs(
-  isPaymentRequired: boolean,
-  platform: string,
-  modelId: string,
-  keyId: number,
-  limits: { rpd: number | null; tpd: number | null },
+  _isPaymentRequired: boolean,
 ): number {
-  if (isPaymentRequired) return PAYMENT_REQUIRED_COOLDOWN_MS;
-  return getCooldownDurationForLimit(platform, modelId, keyId, limits);
-}
-
-// Decide how long to bench a model+key after an upstream 429. Escalate to the
-// long quarantine (getNextCooldownDuration, up to 24h) ONLY when the model is
-// genuinely at its DAILY limit (RPD or TPD) — that won't recover until the
-// provider's daily reset, so a long bench avoids hammering a truly-dead key.
-//
-// A transient RPM/TPM 429 gets a short fixed cooldown and does NOT count toward
-// escalation. This is the common case for providers with a tight per-minute
-// token budget but a large daily quota — e.g. groq gpt-oss-120b has rpd=1000
-// yet tpm=8000, so a single burst of large prompts 429s on TPM while the daily
-// quota is barely touched. Without this split, those transient bursts escalated
-// (2m → 10m → 1h → 24h) and quarantined a perfectly healthy provider for the
-// rest of the day. Daily counters are persisted (countPersistedRequests /
-// sumPersistedTokens), so this verdict is stable across restarts.
-export function getCooldownDurationForLimit(
-  platform: string,
-  modelId: string,
-  keyId: number,
-  limits: { rpd: number | null; tpd: number | null },
-): number {
-  const now = Date.now();
-  const rpdExhausted =
-    limits.rpd !== null && requestCount(platform, modelId, keyId, DAY, now) >= limits.rpd;
-  const tpdExhausted =
-    limits.tpd !== null && tokenCount(platform, modelId, keyId, DAY, now) >= limits.tpd;
-  return (rpdExhausted || tpdExhausted)
-    ? getNextCooldownDuration(platform, modelId, keyId)
-    : TRANSIENT_COOLDOWN_MS;
+  return TRANSIENT_COOLDOWN_MS;
 }
 
 function persistedCooldownExpiry(
@@ -653,9 +585,6 @@ export function clearPlatformCaches(platform: string): void {
   const prefix = `${platform}:`;
   for (const key of cooldowns.keys()) {
     if (key.startsWith(prefix)) cooldowns.delete(key);
-  }
-  for (const key of cooldownHits.keys()) {
-    if (key.startsWith(prefix)) cooldownHits.delete(key);
   }
   for (const key of windows.keys()) {
     if (key.startsWith(prefix)) windows.delete(key);

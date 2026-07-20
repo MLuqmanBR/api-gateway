@@ -488,8 +488,9 @@ export function isRetryableError(err: any): boolean {
 }
 
 // A 402 Payment Required / out-of-credits error. Distinct from a transient 429:
-// it won't recover on the next window, so the caller benches the model+key with
-// PAYMENT_REQUIRED_COOLDOWN_MS (a full day) rather than the 90s transient cooldown.
+// it won't recover on the next window. X1: cooldown is flat 90s like every
+// other error — the predicate STAYS for routing (a 402 falls over to the next
+// model via isRetryableError) and for C1 cooldown-reason recording.
 export function isPaymentRequiredError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
   return msg.includes('402') || msg.includes('payment required')
@@ -1481,7 +1482,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
           // Non-pinned dead-turn: skip this model, try the next one in the
           // chain (the key works — a different model on it may succeed).
-          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false, route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
+          setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false));
           recordRateLimitHit(route.modelDbId);
           skipModels.add(route.modelDbId);
           continue outerLoop;
@@ -1547,8 +1548,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       route.keyId,
       computeRetryCooldownMs(
         isPaymentRequiredError(lastError),
-        route.platform, route.modelId, route.keyId,
-        { rpd: route.rpdLimit, tpd: route.tpdLimit },
       ),
     );
     recordRateLimitHit(route.modelDbId);
