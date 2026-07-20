@@ -17,14 +17,14 @@
  * context-handoff message varies per routed model so Stage-1 must re-run, but
  * the interceptor never re-runs.
  */
-
 import type { ChatMessage } from '@api-gateway/shared';
 import { getSetting } from '../db/index.js';
 import { RedactionSession } from './redaction/session.js';
 import { getActiveSecretsForRedaction } from './redaction/store.js';
 import { interceptOutbound, interceptInbound } from './redaction/interceptor.js';
 import { StreamUnredactor } from './redaction/stream-unredact.js';
-
+import { getCompressionConfig, compressMessages } from './compression/index.js';
+import { smartCrush } from './compression/techniques/smart-crusher.js';
 // ── Per-request session ────────────────────────────────────────────────────
 
 export interface MiddleSession {
@@ -89,30 +89,81 @@ export async function applyOutbound(
     return { messages };
   }
 
+  let workingMessages = messages;
+  let resultSession = session;
+
+  // ── Stage 1+2: Redaction (redact → AI intercept) ────────────────────────
   if (cfg.redactionEnabled) {
     // Existing session (retry/fallback) → Stage-1 only, reuse the session.
     if (session?.redaction) {
-      const redacted = session.redaction.redactOutbound(messages);
-      return { messages: redacted, session };
-    }
-
-    // First attempt → Stage-1 programmatic + Stage-2 AI interceptor.
-    const secrets = getActiveSecretsForRedaction();
-    const redactionSession = new RedactionSession(secrets);
-    const redacted = redactionSession.redactOutbound(messages);
-    const intercepted = await interceptOutbound(redacted, redactionSession);
-    return {
-      messages: intercepted.messages,
-      session: {
+      workingMessages = session.redaction.redactOutbound(messages);
+    } else {
+      // First attempt → Stage-1 programmatic + Stage-2 AI interceptor.
+      const secrets = getActiveSecretsForRedaction();
+      const redactionSession = new RedactionSession(secrets);
+      workingMessages = redactionSession.redactOutbound(messages);
+      const intercepted = await interceptOutbound(workingMessages, redactionSession);
+      workingMessages = intercepted.messages;
+      resultSession = {
         redaction: redactionSession,
         interceptorRan: true,
         metrics: { tokensBefore: 0, tokensAfter: 0, tokensSaved: 0 },
-      },
-    };
+      };
+    }
   }
 
-  // Compression only (B1, not yet implemented — pass through unchanged).
-  return { messages };
+  // ── Stage 3: Compression (runs AFTER redact per §0 invariant #2) ──────────
+  if (cfg.compressionEnabled) {
+    workingMessages = compressToolMessages(workingMessages);
+  }
+
+  return { messages: workingMessages, session: resultSession };
+}
+
+/**
+ * Compress role:"tool" JSON-array messages using SmartCrusher.
+ * Inserts sentinel system messages after compressed tool outputs.
+ * Non-mutating — returns a new array. Skips the last `protectRecent` messages.
+ */
+function compressToolMessages(messages: ChatMessage[]): ChatMessage[] {
+  const compCfg = getCompressionConfig();
+  if (!compCfg.enabled || !compCfg.smartCrusher) return messages;
+
+  const protectRecent = compCfg.protectRecent;
+  const skipCount = Math.min(protectRecent, messages.length);
+  const cutoff = messages.length - skipCount;
+
+  const result: ChatMessage[] = [];
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    // Skip messages in the protect_recent window
+    if (i >= cutoff) {
+      result.push(msg);
+      continue;
+    }
+    // Only compress role:"tool" with string content
+    if (msg.role !== 'tool' || typeof msg.content !== 'string') {
+      result.push(msg);
+      continue;
+    }
+    // Try SmartCrusher
+    const crushResult = smartCrush(msg.content, {
+      losslessOnly: compCfg.smartCrusherLosslessOnly,
+      emitSentinel: compCfg.emitSentinel,
+      minSavingsRatio: compCfg.minSavingsRatio,
+    });
+    if (!crushResult.applied) {
+      result.push(msg);
+      continue;
+    }
+    // Replace content with compressed form
+    result.push({ ...msg, content: crushResult.output });
+    // Insert sentinel system message after the tool message
+    if (crushResult.sentinel) {
+      result.push({ role: 'system', content: crushResult.sentinel });
+    }
+  }
+  return result;
 }
 
 // ── Response-side helpers (R1–R4) ──────────────────────────────────────────
