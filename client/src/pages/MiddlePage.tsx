@@ -1,8 +1,7 @@
 // Middle Layer dashboard — Privacy layer config + known-secrets store.
 // Wired into the navbar at /middle.
-import { useState } from 'react'
+import { Shield, Plus, Trash2, Power, Loader2, Eye, EyeOff, Zap } from 'lucide-react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { Shield, Plus, Trash2, Power, Loader2, Eye, EyeOff } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { addToast } from '@/lib/toast'
 import { Button } from '@/components/ui/button'
@@ -171,6 +170,121 @@ export default function MiddlePage() {
               onCheckedChange={(v) => toggleConfig('middle_interceptor_inbound_enabled', v ? '1' : '0')}
             />
           </div>
+        </CardContent>
+      </Card>
+
+      {/* Prompt Compression */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2"><Zap className="h-5 w-5" /> Prompt Compression</CardTitle>
+          <CardDescription>Compress tool outputs before sending to the model. Runs after redaction.</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <Label>Compression</Label>
+              <p className="text-sm text-muted-foreground">Master toggle for the compression pipeline.</p>
+            </div>
+            <Switch
+              checked={cfg.middle_compression_enabled === '1'}
+              onCheckedChange={(v) => toggleConfig('middle_compression_enabled', v ? '1' : '0')}
+            />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <Label>SmartCrusher</Label>
+              <p className="text-sm text-muted-foreground">Drop low-value rows from JSON-array tool outputs.</p>
+            </div>
+            <Switch
+              checked={cfg.middle_compression_smart_crusher === '1'}
+              onCheckedChange={(v) => toggleConfig('middle_compression_smart_crusher', v ? '1' : '0')}
+            />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <Label>TOON lossless re-render</Label>
+              <p className="text-sm text-muted-foreground">Render JSON arrays as CSV-schema (no rows dropped).</p>
+            </div>
+            <Switch
+              checked={cfg.middle_compression_toon === '1'}
+              onCheckedChange={(v) => toggleConfig('middle_compression_toon', v ? '1' : '0')}
+            />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <Label>Emit sentinel</Label>
+              <p className="text-sm text-muted-foreground">Insert a note when rows are dropped (recommended).</p>
+            </div>
+            <Switch
+              checked={cfg.middle_compression_emit_sentinel !== '0'}
+              onCheckedChange={(v) => toggleConfig('middle_compression_emit_sentinel', v ? '1' : '0')}
+            />
+          </div>
+
+          <div className="flex items-center justify-between">
+            <div>
+              <Label>SmartCrusher lossless-only</Label>
+              <p className="text-sm text-muted-foreground">Only re-render with TOON, never drop rows.</p>
+            </div>
+            <Switch
+              checked={cfg.middle_compression_smart_crusher_lossless_only !== '0'}
+              onCheckedChange={(v) => toggleConfig('middle_compression_smart_crusher_lossless_only', v ? '1' : '0')}
+            />
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
+            <div className="space-y-1">
+              <Label htmlFor="min-tokens">Min tokens</Label>
+              <Input
+                id="min-tokens"
+                type="number"
+                min={50}
+                max={2000}
+                value={cfg.middle_compression_min_tokens ?? '250'}
+                onChange={(e) => toggleConfig('middle_compression_min_tokens', e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="protect-recent">Protect recent</Label>
+              <Input
+                id="protect-recent"
+                type="number"
+                min={0}
+                max={12}
+                value={cfg.middle_compression_protect_recent ?? '4'}
+                onChange={(e) => toggleConfig('middle_compression_protect_recent', e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="min-savings-ratio">Min savings ratio</Label>
+              <Input
+                id="min-savings-ratio"
+                type="number"
+                step={0.05}
+                min={0.05}
+                max={0.5}
+                value={cfg.middle_compression_min_savings_ratio ?? '0.15'}
+                onChange={(e) => toggleConfig('middle_compression_min_savings_ratio', e.target.value)}
+              />
+            </div>
+          </div>
+
+          <details className="text-sm">
+            <summary className="cursor-pointer text-muted-foreground hover:text-foreground">
+              Off-limits rules (what compression never touches)
+            </summary>
+            <ul className="mt-2 ml-4 space-y-1 text-muted-foreground">
+              <li>Fenced code blocks (``` and ~~~)</li>
+              <li>Inline backtick code spans</li>
+              <li>Redaction placeholders (⟦R1:abc123⟧)</li>
+              <li>role:"tool" messages (lossless by default)</li>
+              <li>Compression sentinels (⟦C7:&lt;&lt;...&gt;&gt;⟧)</li>
+              <li>JSON tool schemas and system messages</li>
+            </ul>
+          </details>
         </CardContent>
       </Card>
 
