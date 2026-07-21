@@ -11,6 +11,7 @@ import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { PageHeader } from '@/components/page-header'
+import { FloatingBar } from '@/components/floating-bar'
 
 type MiddleConfig = Record<string, string>
 
@@ -33,6 +34,7 @@ export default function MiddlePage() {
   const queryClient = useQueryClient()
   const [showSecretValue, setShowSecretValue] = useState(false)
   const [newSecret, setNewSecret] = useState<{ value: string; kind: string; label: string }>({ value: '', kind: 'api_key', label: '' })
+  const [localCfg, setLocalCfg] = useState<Record<string, string>>({})
 
   const config = useQuery<MiddleConfig>({
     queryKey: ['middle-config'],
@@ -54,6 +56,7 @@ export default function MiddlePage() {
       apiFetch('/api/middle/config', { method: 'PUT', body: JSON.stringify(data) }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['middle-config'] })
+      setLocalCfg({})
       addToast({ kind: 'success', title: 'Configuration updated', sticky: false })
     },
     onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
@@ -98,9 +101,22 @@ export default function MiddlePage() {
   const cfg = config.data ?? {}
   const isLoading = config.isLoading || secrets.isLoading
 
-  function toggleConfig(key: string, value: string) {
-    updateConfig.mutate({ [key]: value })
+  function configValue(key: string, fallback: string = ''): string {
+    return localCfg[key] ?? cfg[key] ?? fallback
   }
+  function setConfig(key: string, value: string) {
+    setLocalCfg(prev => {
+      const next = { ...prev }
+      if (value === (cfg[key] ?? '')) {
+        delete next[key]
+      } else {
+        next[key] = value
+      }
+      return next
+    })
+  }
+  const hasChanges = Object.entries(localCfg).some(([k, v]) => v !== (cfg[k] ?? ''))
+
 
   return (
     <div className="space-y-6">
@@ -125,8 +141,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Replace known secrets with placeholders before sending to the model.</p>
             </div>
             <Switch
-              checked={cfg.middle_redaction_enabled === '1'}
-              onCheckedChange={(v) => toggleConfig('middle_redaction_enabled', v ? '1' : '0')}
+              checked={configValue('middle_redaction_enabled') === '1'}
+              onCheckedChange={(v) => setConfig('middle_redaction_enabled', v ? '1' : '0')}
             />
           </div>
 
@@ -136,8 +152,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Compress tool outputs before sending (coming soon).</p>
             </div>
             <Switch
-              checked={cfg.middle_compression_enabled === '1'}
-              onCheckedChange={(v) => toggleConfig('middle_compression_enabled', v ? '1' : '0')}
+              checked={configValue('middle_compression_enabled') === '1'}
+              onCheckedChange={(v) => setConfig('middle_compression_enabled', v ? '1' : '0')}
             />
           </div>
 
@@ -145,9 +161,9 @@ export default function MiddlePage() {
             <Label htmlFor="interceptor-model">Interceptor model ID</Label>
             <Input
               id="interceptor-model"
-              value={cfg.middle_interceptor_model ?? ''}
+              value={configValue('middle_interceptor_model')}
               placeholder="e.g. 42 (models.id)"
-              onChange={(e) => toggleConfig('middle_interceptor_model', e.target.value)}
+              onChange={(e) => setConfig('middle_interceptor_model', e.target.value)}
             />
             <p className="text-sm text-muted-foreground">The model used for AI-based secret detection. Leave empty to disable.</p>
           </div>
@@ -156,8 +172,8 @@ export default function MiddlePage() {
             <Label htmlFor="interceptor-timeout">Interceptor timeout (ms)</Label>
             <Input
               id="interceptor-timeout"
-              value={cfg.middle_interceptor_timeout_ms ?? '4000'}
-              onChange={(e) => toggleConfig('middle_interceptor_timeout_ms', e.target.value)}
+              value={configValue('middle_interceptor_timeout_ms', '4000')}
+              onChange={(e) => setConfig('middle_interceptor_timeout_ms', e.target.value)}
             />
           </div>
 
@@ -167,8 +183,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Scan model responses for new secrets (non-streaming only).</p>
             </div>
             <Switch
-              checked={cfg.middle_interceptor_inbound_enabled === '1'}
-              onCheckedChange={(v) => toggleConfig('middle_interceptor_inbound_enabled', v ? '1' : '0')}
+              checked={configValue('middle_interceptor_inbound_enabled') === '1'}
+              onCheckedChange={(v) => setConfig('middle_interceptor_inbound_enabled', v ? '1' : '0')}
             />
           </div>
         </CardContent>
@@ -187,8 +203,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Master toggle for the compression pipeline.</p>
             </div>
             <Switch
-              checked={cfg.middle_compression_enabled === '1'}
-              onCheckedChange={(v) => toggleConfig('middle_compression_enabled', v ? '1' : '0')}
+              checked={configValue('middle_compression_enabled') === '1'}
+              onCheckedChange={(v) => setConfig('middle_compression_enabled', v ? '1' : '0')}
             />
           </div>
 
@@ -198,8 +214,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Drop low-value rows from JSON-array tool outputs.</p>
             </div>
             <Switch
-              checked={cfg.middle_compression_smart_crusher === '1'}
-              onCheckedChange={(v) => toggleConfig('middle_compression_smart_crusher', v ? '1' : '0')}
+              checked={configValue('middle_compression_smart_crusher') === '1'}
+              onCheckedChange={(v) => setConfig('middle_compression_smart_crusher', v ? '1' : '0')}
             />
           </div>
 
@@ -209,8 +225,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Render JSON arrays as CSV-schema (no rows dropped).</p>
             </div>
             <Switch
-              checked={cfg.middle_compression_toon === '1'}
-              onCheckedChange={(v) => toggleConfig('middle_compression_toon', v ? '1' : '0')}
+              checked={configValue('middle_compression_toon') === '1'}
+              onCheckedChange={(v) => setConfig('middle_compression_toon', v ? '1' : '0')}
             />
           </div>
 
@@ -220,8 +236,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Insert a note when rows are dropped (recommended).</p>
             </div>
             <Switch
-              checked={cfg.middle_compression_emit_sentinel !== '0'}
-              onCheckedChange={(v) => toggleConfig('middle_compression_emit_sentinel', v ? '1' : '0')}
+              checked={configValue('middle_compression_emit_sentinel', '1') !== '0'}
+              onCheckedChange={(v) => setConfig('middle_compression_emit_sentinel', v ? '1' : '0')}
             />
           </div>
 
@@ -231,8 +247,8 @@ export default function MiddlePage() {
               <p className="text-sm text-muted-foreground">Only re-render with TOON, never drop rows.</p>
             </div>
             <Switch
-              checked={cfg.middle_compression_smart_crusher_lossless_only !== '0'}
-              onCheckedChange={(v) => toggleConfig('middle_compression_smart_crusher_lossless_only', v ? '1' : '0')}
+              checked={configValue('middle_compression_smart_crusher_lossless_only', '1') !== '0'}
+              onCheckedChange={(v) => setConfig('middle_compression_smart_crusher_lossless_only', v ? '1' : '0')}
             />
           </div>
 
@@ -244,8 +260,8 @@ export default function MiddlePage() {
                 type="number"
                 min={50}
                 max={2000}
-                value={cfg.middle_compression_min_tokens ?? '250'}
-                onChange={(e) => toggleConfig('middle_compression_min_tokens', e.target.value)}
+                value={configValue('middle_compression_min_tokens', '250')}
+                onChange={(e) => setConfig('middle_compression_min_tokens', e.target.value)}
               />
             </div>
             <div className="space-y-1">
@@ -255,8 +271,8 @@ export default function MiddlePage() {
                 type="number"
                 min={0}
                 max={12}
-                value={cfg.middle_compression_protect_recent ?? '4'}
-                onChange={(e) => toggleConfig('middle_compression_protect_recent', e.target.value)}
+                value={configValue('middle_compression_protect_recent', '4')}
+                onChange={(e) => setConfig('middle_compression_protect_recent', e.target.value)}
               />
             </div>
             <div className="space-y-1">
@@ -267,8 +283,8 @@ export default function MiddlePage() {
                 step={0.05}
                 min={0.05}
                 max={0.5}
-                value={cfg.middle_compression_min_savings_ratio ?? '0.15'}
-                onChange={(e) => toggleConfig('middle_compression_min_savings_ratio', e.target.value)}
+                value={configValue('middle_compression_min_savings_ratio', '0.15')}
+                onChange={(e) => setConfig('middle_compression_min_savings_ratio', e.target.value)}
               />
             </div>
           </div>
@@ -400,6 +416,13 @@ export default function MiddlePage() {
           )}
         </CardContent>
       </Card>
+      <FloatingBar show={hasChanges}>
+        <span className="text-xs text-muted-foreground">Unsaved changes</span>
+        <Button variant="outline" size="sm" onClick={() => setLocalCfg({})}>Discard</Button>
+        <Button size="sm" onClick={() => updateConfig.mutate(localCfg)} disabled={updateConfig.isPending}>
+          {updateConfig.isPending ? 'Saving…' : 'Save changes'}
+        </Button>
+      </FloatingBar>
     </div>
   )
 }

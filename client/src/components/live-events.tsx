@@ -45,11 +45,20 @@ interface HealthCheckStartEvent extends LiveEventBase { type: 'health.check.star
 interface HealthCheckProgressEvent extends LiveEventBase { type: 'health.check.progress'; keyId: number; platform: string; status: string; completed: number; total: number; }
 interface HealthCheckDoneEvent extends LiveEventBase { type: 'health.check.done'; total: number; }
 
+// Middle-layer interceptor events. The interceptor makes its own AI call to
+// scan messages for new secrets — these events make that call visible in the
+// live feed so the operator can see when the interceptor fires and whether it
+// succeeded or timed out. (#B2-4)
+interface InterceptorStartEvent extends LiveEventBase { type: 'interceptor.start'; model: string; provider: string; }
+interface InterceptorDoneEvent extends LiveEventBase { type: 'interceptor.done'; model: string; provider: string; keyId: number; latencyMs: number; secretsFound: number; }
+interface InterceptorErrorEvent extends LiveEventBase { type: 'interceptor.error'; model: string; provider: string; error: string; }
+
 type LiveEvent =
   | RequestStartEvent | RequestDoneEvent | RequestErrorEvent | RequestAbortedEvent
   | StreamChunkEvent
   | KeyExhaustedEvent | KeyRetryEvent | KeySwitchEvent | ModelSwitchEvent | RecoveryEvent
-  | HealthCheckStartEvent | HealthCheckProgressEvent | HealthCheckDoneEvent;
+  | HealthCheckStartEvent | HealthCheckProgressEvent | HealthCheckDoneEvent
+  | InterceptorStartEvent | InterceptorDoneEvent | InterceptorErrorEvent;
 
 interface LogEntry {
   id: string;
@@ -78,6 +87,12 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
       return { id: e.id, ts, kind: 'done', text: `✓ [${rId}] ${e.provider}/${e.model} key#${e.keyId} — ${e.latencyMs}ms${e.tokens ? `, ${e.tokens.in}↓/${e.tokens.out}↑ tokens` : ''}` };
     case 'request.error':
       return { id: e.id, ts, kind: 'error', text: `✗ [${rId}] ${e.error}` };
+    case 'interceptor.start':
+      return { id: e.id, ts, kind: 'info', text: `🛡 [${rId}] Interceptor scanning via ${e.provider}/${e.model}` };
+    case 'interceptor.done':
+      return { id: e.id, ts, kind: 'info', text: `🛡 [${rId}] Interceptor done: ${e.provider}/${e.model} key#${e.keyId} — ${e.latencyMs}ms, ${e.secretsFound} secret(s) found` };
+    case 'interceptor.error':
+      return { id: e.id, ts, kind: 'error', text: `🛡 [${rId}] Interceptor error on ${e.provider}/${e.model}: ${e.error.slice(0, 80)}` };
     case 'request.aborted':
       // Client disconnection (Stop button, socket close, session reset).
       // Before this case landed, an aborted-then-completed switch would

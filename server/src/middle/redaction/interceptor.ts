@@ -17,9 +17,9 @@ import type { ChatMessage } from '@api-gateway/shared/types.js';
 import { getDb, getSetting } from '../../db/index.js';
 import { decrypt } from '../../lib/crypto.js';
 import { buildProviderFor } from '../../providers/index.js';
+import { publish } from '../../services/events.js';
 import { RedactionSession } from './session.js';
 import { addSecret, getActiveSecretsForRedaction } from './store.js';
-
 // --- Scanned-LRU cache (module-level, per-boot) ---
 // Agentic clients resend the whole history every turn. With this cache, only
 // the NEW tail messages get scanned — identical history messages are skipped.
@@ -91,6 +91,27 @@ interface InterceptorSpan {
   kind: string;
 }
 
+/** Log an interceptor call to the requests table with request_type='interceptor'
+ *  so it shows in the analytics dashboard alongside chat and embedding traffic.
+ *  Mirrors how the embeddings service logs its calls (direct INSERT, not via
+ *  logRequest, because the interceptor bypasses the proxy routing pipeline). */
+function logInterceptorCall(
+  platform: string,
+  modelId: string,
+  keyId: number,
+  status: 'success' | 'error',
+  latencyMs: number,
+  error: string | null,
+): void {
+  try {
+    getDb().prepare(`
+      INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type)
+      VALUES (?, ?, ?, ?, 0, 0, ?, ?, 'interceptor')
+    `).run(platform, modelId, keyId, status, latencyMs, error);
+  } catch (e) {
+    console.error('[Middle] Failed to log interceptor call:', e);
+  }
+}
 // --- Core dispatch ---
 
 async function dispatchInterceptor(
@@ -115,35 +136,57 @@ async function dispatchInterceptor(
 
   const apiKey = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
 
+  const eventId = crypto.randomUUID();
+  publish({ type: 'interceptor.start', id: eventId, model: modelRow.model_id, provider: modelRow.platform, at: Date.now() });
+
   const messages: ChatMessage[] = [
     { role: 'system', content: buildSystemPrompt(detectionTargets) },
     { role: 'user', content: text },
   ];
 
-  const response = await provider.chatCompletion(apiKey, messages, modelRow.model_id, {
-    temperature: 0,
-    max_tokens: 1024,
-    abortSignal: AbortSignal.timeout(timeoutMs),
-  });
-
-  const content = response.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || content.trim().length === 0) return [];
-
-  // Parse + validate the JSON array. Never trust model output shape.
-  let parsed: unknown;
+  const start = Date.now();
   try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw new Error('Interceptor returned non-JSON');
+    const response = await provider.chatCompletion(apiKey, messages, modelRow.model_id, {
+      temperature: 0,
+      max_tokens: 1024,
+      abortSignal: AbortSignal.timeout(timeoutMs),
+    });
+
+    const content = response.choices?.[0]?.message?.content;
+    if (typeof content !== 'string' || content.trim().length === 0) {
+      const latency = Date.now() - start;
+      logInterceptorCall(modelRow.platform, modelRow.model_id, keyRow.id, 'success', latency, null);
+      publish({ type: 'interceptor.done', id: eventId, model: modelRow.model_id, provider: modelRow.platform, keyId: keyRow.id, latencyMs: latency, secretsFound: 0, at: Date.now() });
+      return [];
+    }
+
+    // Parse + validate the JSON array. Never trust model output shape.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      throw new Error('Interceptor returned non-JSON');
+    }
+    if (!Array.isArray(parsed)) throw new Error('Interceptor returned non-array');
+    const spans = parsed.filter(
+      (item): item is InterceptorSpan =>
+        item !== null &&
+        typeof item === 'object' &&
+        typeof (item as Record<string, unknown>).exact === 'string' &&
+        typeof (item as Record<string, unknown>).kind === 'string',
+    );
+
+    const latency = Date.now() - start;
+    logInterceptorCall(modelRow.platform, modelRow.model_id, keyRow.id, 'success', latency, null);
+    publish({ type: 'interceptor.done', id: eventId, model: modelRow.model_id, provider: modelRow.platform, keyId: keyRow.id, latencyMs: latency, secretsFound: spans.length, at: Date.now() });
+    return spans;
+  } catch (err) {
+    const latency = Date.now() - start;
+    const msg = err instanceof Error ? err.message : String(err);
+    logInterceptorCall(modelRow.platform, modelRow.model_id, keyRow.id, 'error', latency, msg);
+    publish({ type: 'interceptor.error', id: eventId, model: modelRow.model_id, provider: modelRow.platform, error: msg, at: Date.now() });
+    throw err;
   }
-  if (!Array.isArray(parsed)) throw new Error('Interceptor returned non-array');
-  return parsed.filter(
-    (item): item is InterceptorSpan =>
-      item !== null &&
-      typeof item === 'object' &&
-      typeof (item as Record<string, unknown>).exact === 'string' &&
-      typeof (item as Record<string, unknown>).kind === 'string',
-  );
 }
 
 /** Find all verbatim occurrences of `exact` in `text` via indexOf scanning.

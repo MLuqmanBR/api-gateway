@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader } from '@/components/page-header'
+import { FloatingBar } from '@/components/floating-bar'
 import { Trash2, RotateCcw, DollarSign } from 'lucide-react'
 
 interface Budget {
@@ -91,6 +92,26 @@ export default function BudgetPage() {
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
+    createMutation.mutate({
+      scope,
+      scope_id: scope === 'client_key' ? scopeId : null,
+      daily_limit_cents: dailyLimit ? Math.round(parseFloat(dailyLimit) * 100) : null,
+      weekly_limit_cents: weeklyLimit ? Math.round(parseFloat(weeklyLimit) * 100) : null,
+      monthly_limit_cents: monthlyLimit ? Math.round(parseFloat(monthlyLimit) * 100) : null,
+    })
+  }
+
+  const hasChanges = (scope === 'client_key' ? !!scopeId : false) || !!(dailyLimit || weeklyLimit || monthlyLimit)
+
+  function handleDiscard() {
+    setScope('global')
+    setScopeId('')
+    setDailyLimit('')
+    setWeeklyLimit('')
+    setMonthlyLimit('')
+  }
+
+  function handleSaveClick() {
     createMutation.mutate({
       scope,
       scope_id: scope === 'client_key' ? scopeId : null,
@@ -189,6 +210,13 @@ export default function BudgetPage() {
           </table>
         </div>
       )}
+      <FloatingBar show={hasChanges}>
+        <span className="text-xs text-muted-foreground">Unsaved changes</span>
+        <Button variant="outline" size="sm" onClick={handleDiscard}>Discard</Button>
+        <Button size="sm" onClick={handleSaveClick} disabled={createMutation.isPending}>
+          {createMutation.isPending ? 'Saving…' : 'Save changes'}
+        </Button>
+      </FloatingBar>
     </div>
   )
 }

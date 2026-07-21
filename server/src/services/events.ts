@@ -25,6 +25,13 @@ export type LiveEvent =
   | { type: 'routing.model_switch'; id: string; from: string; to: string; reason: string; at: number }
   | { type: 'routing.recovery'; id: string; cycle: number; max: number | null; reason: string; at: number }
   | { type: 'stream.chunk'; id: string; text: string; at: number }
+  // Middle-layer interceptor (privacy layer B2-4). The interceptor makes
+  // its own AI call to scan messages for new secrets — these events make
+  // that call visible in the live feed and the analytics dashboard, the
+  // same way chat/embedding requests are. (#B2-4)
+  | { type: 'interceptor.start'; id: string; model: string; provider: string; at: number }
+  | { type: 'interceptor.done'; id: string; model: string; provider: string; keyId: number; latencyMs: number; secretsFound: number; at: number }
+  | { type: 'interceptor.error'; id: string; model: string; provider: string; error: string; at: number }
   // Health-check progress. The KeysPage subscribes to these so the "Check
   // all" button can show live per-key results instead of a frozen
   // "Checking…" spinner that gave the operator zero feedback for 15+
