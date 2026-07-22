@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 import { useEventStream } from '@/lib/use-event-stream';
@@ -67,7 +67,8 @@ interface LogEntry {
   kind: 'start' | 'done' | 'error' | 'info';
 }
 
-const MAX_LOG_LINES = 200;
+const MAX_LOG_LINES = 10000;
+const RENDER_SLICE = 100;
 
 function formatEvent(evt: LiveEvent): LogEntry | undefined {
   // Defensive: a malformed or under-specified event (missing id/at fields
@@ -92,7 +93,7 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
     case 'interceptor.done':
       return { id: e.id, ts, kind: 'info', text: `🛡 [${rId}] Interceptor done: ${e.provider}/${e.model} key#${e.keyId} — ${e.latencyMs}ms, ${e.secretsFound} secret(s) found` };
     case 'interceptor.error':
-      return { id: e.id, ts, kind: 'error', text: `🛡 [${rId}] Interceptor error on ${e.provider}/${e.model}: ${e.error.slice(0, 80)}` };
+      return { id: e.id, ts, kind: 'error', text: `🛡 [${rId}] Interceptor error on ${e.provider}/${e.model}: ${e.error}` };
     case 'request.aborted':
       // Client disconnection (Stop button, socket close, session reset).
       // Before this case landed, an aborted-then-completed switch would
@@ -102,7 +103,7 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
     case 'stream.chunk':
       // Reserved for future per-token live delta; render as info so a
       // producer can be enabled without further client changes.
-      return { id: e.id, ts, kind: 'info', text: `${e.text.length > 80 ? e.text.slice(0, 80) + '\u2026' : e.text}` };
+      return { id: e.id, ts, kind: 'info', text: e.text };
     case 'health.check.start':
     case 'health.check.progress':
     case 'health.check.done':
@@ -112,7 +113,7 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
       // spam the operator with no useful information. Drop them here. (#256)
       return undefined;
     case 'routing.key_exhausted':
-      return { id: e.id, ts, kind: 'info', text: `⚠ [${rId}] Key #${e.keyId} exhausted on ${e.provider}/${e.model}: ${e.reason.slice(0, 80)}` };
+      return { id: e.id, ts, kind: 'info', text: `⚠ [${rId}] Key #${e.keyId} exhausted on ${e.provider}/${e.model}: ${e.reason}` };
     case 'routing.key_retry':
       return { id: e.id, ts, kind: 'info', text: `↻ [${rId}] Retrying ${e.provider}/${e.model} key#${e.keyId} (${e.attempt}/${e.max})` };
     case 'routing.key_switch':
@@ -159,6 +160,18 @@ export function LiveEvents() {
   const [activeCount, setActiveCount] = useState(0);
   const logContainerRef = useRef<HTMLDivElement>(null);
   const activeRef = useRef(new Set<string>());
+  const autoScrollRef = useRef(true);
+
+  // Keep the ref in sync with state so the onScroll handler (which is not
+  // a React effect and doesn't get fresh state) always reads the current value.
+  useEffect(() => { autoScrollRef.current = autoScroll; }, [autoScroll]);
+
+  const scrollToBottom = useCallback(() => {
+    const el = logContainerRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, []);
+
   // `addLine` accepts undefined and drops it; the render loop reads `l.ts`/
   // `l.text` on every entry, so any nullish line is a renderer-crash hazard.
   // `formatEvent` already filters unknown/malformed events by returning
@@ -190,17 +203,37 @@ export function LiveEvents() {
     addLine(entry);
   });
 
-  // Auto-scroll only the terminal container — never the page.
-  // Double-fire: immediate set catches the common case; rAF catches
-  // late layout when content height is still settling after React commit.
-  useEffect(() => {
-    if (!autoScroll || !logContainerRef.current) return;
+  // Scroll to bottom on new lines when autoScroll is on.
+  // useLayoutEffect fires synchronously after DOM mutation, before paint —
+  // eliminates the race where the browser paints stale scroll position.
+  // All scroll operations target only the log container, never the page.
+  useLayoutEffect(() => {
+    if (autoScroll) scrollToBottom();
+  }, [lines.length, autoScroll, scrollToBottom, expanded]);
+
+  // Detect manual scroll-up and auto-pause auto-scroll.
+  // When the user scrolls away from the bottom, turn off auto-scroll so
+  // new events don't yank the view back down.
+  const onScroll = useCallback(() => {
+    if (!autoScrollRef.current) return;
     const el = logContainerRef.current;
-    el.scrollTop = el.scrollHeight;
-    requestAnimationFrame(() => {
-      el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom > 30) {
+      setAutoScroll(false);
+    }
+  }, []);
+
+  const toggleAutoScroll = useCallback(() => {
+    setAutoScroll(prev => {
+      const next = !prev;
+      if (next) {
+        // Re-enabling: immediately scroll to bottom so the user sees the latest
+        requestAnimationFrame(() => scrollToBottom());
+      }
+      return next;
     });
-  }, [lines.length, autoScroll]);
+  }, [scrollToBottom]);
 
   const clearLogs = () => setLines([]);
 
@@ -229,7 +262,7 @@ export function LiveEvents() {
           <Button
             variant={autoScroll ? 'secondary' : 'ghost'}
             size="xs"
-            onClick={() => setAutoScroll(v => !v)}
+            onClick={toggleAutoScroll}
             title={autoScroll ? 'Auto-scroll ON — click to pause' : 'Auto-scroll OFF — click to resume'}
             className="gap-1.5"
           >
@@ -250,6 +283,7 @@ export function LiveEvents() {
       {/* Log area */}
       <div
         ref={logContainerRef}
+        onScroll={onScroll}
         className={`overflow-y-auto font-mono text-[11px] leading-relaxed bg-muted text-muted-foreground rounded-b-3xl transition-all duration-200 ${
           expanded ? 'max-h-[480px]' : 'max-h-[144px]'
         }`}
@@ -260,7 +294,7 @@ export function LiveEvents() {
           </div>
         ) : (
           <div className="py-1.5">
-            {lines.map((l, i) => (
+            {lines.slice(-RENDER_SLICE).map((l, i) => (
               <div
                 key={`${l.id}-${i}`}
                 className={`px-4 py-0.5 whitespace-pre-wrap break-all ${
