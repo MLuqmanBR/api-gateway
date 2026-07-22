@@ -38,7 +38,6 @@ export default function MiddlePage() {
   const [localCfg, setLocalCfg] = useState<Record<string, string>>({})
   const [bulkMode, setBulkMode] = useState(false)
   const [bulkText, setBulkText] = useState('')
-  const [bulkKind, setBulkKind] = useState('api_key')
   const [selected, setSelected] = useState<Set<string>>(new Set())
 
   const config = useQuery<MiddleConfig>({
@@ -104,7 +103,7 @@ export default function MiddlePage() {
   })
 
   const bulkAddMut = useMutation({
-    mutationFn: (data: { secrets: Array<{ value: string; kind: string }> }) =>
+    mutationFn: (data: { secrets: Array<{ value: string; kind: string; label?: string }> }) =>
       apiFetch<{ added: number; results: Array<{ id: string; existed: boolean }> }>('/api/middle/secrets/bulk', {
         method: 'POST', body: JSON.stringify(data),
       }),
@@ -156,7 +155,16 @@ export default function MiddlePage() {
   function handleBulkAdd() {
     const lines = bulkText.split('\n').map(l => l.trim()).filter(Boolean)
     if (lines.length === 0) return
-    bulkAddMut.mutate({ secrets: lines.map(v => ({ value: v, kind: bulkKind })) })
+    const secrets = lines.map(line => {
+      const parts = line.split(/\s*,\s*/)
+      return {
+        value: parts[0] ?? '',
+        kind: parts[1] ?? 'api_key',
+        label: parts[2] ?? '',
+      }
+    }).filter(s => s.value)
+    if (secrets.length === 0) return
+    bulkAddMut.mutate({ secrets })
   }
 
   function toggleSelected(id: string) {
@@ -431,33 +439,23 @@ export default function MiddlePage() {
             </div>
           ) : (
             <div className="space-y-2">
-              <div className="flex gap-2 items-end">
-                <div className="flex-1 space-y-1">
-                  <Label htmlFor="bulk-textarea">Paste secrets (one per line)</Label>
-                  <Textarea
-                    id="bulk-textarea"
-                    value={bulkText}
-                    onChange={(e) => setBulkText(e.target.value)}
-                    placeholder={'sk-abc123...\nnvapi-def456...\ngithub_token_ghi789...'}
-                    className="font-mono text-sm min-h-[120px]"
-                  />
-                </div>
-                <div className="w-32 space-y-1">
-                  <Label htmlFor="bulk-kind">Kind</Label>
-                  <Input
-                    id="bulk-kind"
-                    value={bulkKind}
-                    onChange={(e) => setBulkKind(e.target.value)}
-                  />
-                </div>
-                <Button
-                  onClick={handleBulkAdd}
-                  disabled={!bulkText.trim() || bulkAddMut.isPending}
-                >
-                  {bulkAddMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-                  Add {bulkText.split('\n').filter(l => l.trim()).length || ''} secret{bulkText.split('\n').filter(l => l.trim()).length !== 1 ? 's' : ''}
-                </Button>
+              <div className="space-y-1">
+                <Label htmlFor="bulk-textarea">Paste secrets (one per line: value , kind , label)</Label>
+                <Textarea
+                  id="bulk-textarea"
+                  value={bulkText}
+                  onChange={(e) => setBulkText(e.target.value)}
+                  placeholder={'sk-or-f83oirhdjfhdkjasd , api_key , account1\nnvapi-eowenyr834bfhjdsba , api_key , account1\ncfai-294831232434 , apiKey , lazy account'}
+                  className="font-mono text-sm min-h-[120px]"
+                />
               </div>
+              <Button
+                onClick={handleBulkAdd}
+                disabled={!bulkText.trim() || bulkAddMut.isPending}
+              >
+                {bulkAddMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                Add {bulkText.split('\n').map(l => l.trim()).filter(Boolean).length || ''} secret{bulkText.split('\n').map(l => l.trim()).filter(Boolean).length !== 1 ? 's' : ''}
+              </Button>
             </div>
           )}
 
