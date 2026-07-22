@@ -155,22 +155,30 @@ function rebuildSortedSecrets(): void {
 
 // --- Public API ---
 
-/** List secret metadata for the dashboard. Never returns plaintext values. */
+/** List secret metadata for the dashboard. Never returns plaintext values.
+ *  The maskedPreview is re-derived from the in-memory cache so it always
+ *  reflects the current maskKey format, even for secrets added before a
+ *  maskKey change. Falls back to the stored DB value only if the entry
+ *  isn't in the cache (shouldn't happen — cache and DB stay in sync). */
 export function listSecrets(): SecretMeta[] {
   const db = getDb();
   const rows = db.prepare('SELECT * FROM middle_secret_meta ORDER BY created_at_ms DESC').all() as Array<{
     id: string; kind: string; label: string; added_by: string;
     created_at_ms: number; enabled: number; masked_preview: string;
   }>;
-  return rows.map(r => ({
-    id: r.id,
-    kind: r.kind,
-    label: r.label,
-    addedBy: r.added_by,
-    createdAtMs: r.created_at_ms,
-    enabled: r.enabled === 1,
-    maskedPreview: r.masked_preview,
-  }));
+  const entries = ensureCache();
+  return rows.map(r => {
+    const entry = entries.get(r.id);
+    return {
+      id: r.id,
+      kind: r.kind,
+      label: r.label,
+      addedBy: r.added_by,
+      createdAtMs: r.created_at_ms,
+      enabled: r.enabled === 1,
+      maskedPreview: entry ? maskKey(entry.value) : r.masked_preview,
+    };
+  });
 }
 
 /** Add a secret. Deduplicates by value hash — returns existing id if the
@@ -204,6 +212,45 @@ export function addSecret(value: string, kind: string, addedBy: 'manual' | 'ai',
 
   rebuildSortedSecrets();
   return id;
+}
+
+/** Add multiple secrets in a single disk write. Deduplicates by value hash
+ *  — duplicates within the batch return the existing id with existed=true.
+ *  Re-enables disabled secrets that match. */
+export function addSecretsBulk(
+  items: Array<{ value: string; kind: string; label?: string }>,
+  addedBy: 'manual' | 'ai' = 'manual',
+): Array<{ id: string; value: string; kind: string; existed: boolean }> {
+  const db = getDb();
+  const entries = ensureCache();
+  const insertStmt = db.prepare(`
+    INSERT INTO middle_secret_meta (id, kind, label, added_by, created_at_ms, enabled, masked_preview)
+    VALUES (?, ?, ?, ?, ?, 1, ?)
+    ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, label = excluded.label, enabled = 1
+  `);
+  const now = Date.now();
+  const results: Array<{ id: string; value: string; kind: string; existed: boolean }> = [];
+
+  for (const item of items) {
+    const hexTag = hexTagFor(item.value);
+    const id = `s_${hexTag}`;
+    const existed = entries.has(id);
+    if (!existed) {
+      const entry: SecretEntry = {
+        id, value: item.value, kind: item.kind,
+        label: item.label ?? '', addedBy, createdAtMs: now, enabled: true,
+      };
+      entries.set(id, entry);
+      insertStmt.run(id, item.kind, item.label ?? '', addedBy, entry.createdAtMs, maskKey(item.value));
+    } else {
+      insertStmt.run(id, item.kind, item.label ?? '', addedBy, now, maskKey(item.value));
+    }
+    results.push({ id, value: item.value, kind: item.kind, existed });
+  }
+
+  saveToDisk(entries);
+  rebuildSortedSecrets();
+  return results;
 }
 
 /** Remove a secret by id. */

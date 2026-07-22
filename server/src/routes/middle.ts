@@ -14,7 +14,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getSetting, setSetting } from '../db/index.js';
 import { clearMiddleConfigCache, type MiddleConfig } from '../middle/index.js';
-import { listSecrets, addSecret, removeSecret, setEnabled } from '../middle/redaction/store.js';
+import { listSecrets, addSecret, addSecretsBulk, removeSecret, setEnabled } from '../middle/redaction/store.js';
 import { getInterceptorFailures } from '../middle/redaction/interceptor.js';
 
 export const middleRouter = Router();
@@ -116,6 +116,27 @@ middleRouter.post('/secrets', (req: Request, res: Response) => {
   res.json({ id, ok: true });
 });
 
+const bulkAddSchema = z.object({
+  secrets: z.array(z.object({
+    value: z.string().min(1, 'value is required'),
+    kind: z.string().min(1, 'kind is required'),
+    label: z.string().optional(),
+  })).min(1, 'At least one secret is required'),
+});
+
+middleRouter.post('/secrets/bulk', (req: Request, res: Response) => {
+  const parsed = bulkAddSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.issues[0]?.message ?? 'Invalid bulk request', type: 'invalid_request_error' } });
+    return;
+  }
+  const results = addSecretsBulk(
+    parsed.data.secrets.map(s => ({ value: s.value, kind: s.kind, label: s.label })),
+    'manual',
+  );
+  res.json({ added: results.length, results });
+});
+
 middleRouter.delete('/secrets', (req: Request, res: Response) => {
   const id = req.query.id as string | undefined;
   if (!id) {
@@ -124,6 +145,18 @@ middleRouter.delete('/secrets', (req: Request, res: Response) => {
   }
   removeSecret(id);
   res.json({ ok: true });
+});
+
+middleRouter.delete('/secrets/bulk', (req: Request, res: Response) => {
+  const ids = req.query.ids as string | undefined;
+  if (!ids) {
+    res.status(400).json({ error: { message: 'ids query parameter is required (comma-separated)', type: 'invalid_request_error' } });
+    return;
+  }
+  const idList = ids.split(',').map(s => s.trim()).filter(Boolean);
+  let removed = 0;
+  for (const id of idList) { removeSecret(id); removed++; }
+  res.json({ removed });
 });
 
 const patchSecretSchema = z.object({

@@ -1,7 +1,7 @@
 // Middle Layer dashboard — Privacy layer config + known-secrets store.
 // Wired into the navbar at /middle.
 import { Shield, Plus, Trash2, Power, Loader2, Eye, EyeOff, Zap } from 'lucide-react'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { addToast } from '@/lib/toast'
@@ -12,6 +12,7 @@ import { Switch } from '@/components/ui/switch'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
+import { Textarea } from '@/components/ui/textarea'
 
 type MiddleConfig = Record<string, string>
 
@@ -35,6 +36,10 @@ export default function MiddlePage() {
   const [showSecretValue, setShowSecretValue] = useState(false)
   const [newSecret, setNewSecret] = useState<{ value: string; kind: string; label: string }>({ value: '', kind: 'api_key', label: '' })
   const [localCfg, setLocalCfg] = useState<Record<string, string>>({})
+  const [bulkMode, setBulkMode] = useState(false)
+  const [bulkText, setBulkText] = useState('')
+  const [bulkKind, setBulkKind] = useState('api_key')
+  const [selected, setSelected] = useState<Set<string>>(new Set())
 
   const config = useQuery<MiddleConfig>({
     queryKey: ['middle-config'],
@@ -98,6 +103,37 @@ export default function MiddlePage() {
     onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
+  const bulkAddMut = useMutation({
+    mutationFn: (data: { secrets: Array<{ value: string; kind: string }> }) =>
+      apiFetch<{ added: number; results: Array<{ id: string; existed: boolean }> }>('/api/middle/secrets/bulk', {
+        method: 'POST', body: JSON.stringify(data),
+      }),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['middle-secrets'] })
+      queryClient.invalidateQueries({ queryKey: ['middle-stats'] })
+      const existed = data.results.filter(r => r.existed).length
+      setBulkText('')
+      addToast({ kind: 'success', title: `Added ${data.added - existed} new secret(s)${existed ? ` (${existed} already existed)` : ''}`, sticky: false })
+    },
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
+  })
+
+  const bulkDeleteMut = useMutation({
+    mutationFn: (ids: string[]) =>
+      apiFetch<{ removed: number }>(`/api/middle/secrets/bulk?ids=${ids.map(encodeURIComponent).join(',')}`, { method: 'DELETE' }),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ['middle-secrets'] })
+      queryClient.invalidateQueries({ queryKey: ['middle-stats'] })
+      setSelected(new Set())
+      addToast({ kind: 'success', title: `Removed ${data.removed} secret(s)`, sticky: false })
+    },
+    onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
+  })
+
+  useEffect(() => {
+    setSelected(new Set())
+  }, [secrets.data])
+
   const cfg = config.data ?? {}
   const isLoading = config.isLoading || secrets.isLoading
 
@@ -116,6 +152,21 @@ export default function MiddlePage() {
     })
   }
   const hasChanges = Object.entries(localCfg).some(([k, v]) => v !== (cfg[k] ?? ''))
+
+  function handleBulkAdd() {
+    const lines = bulkText.split('\n').map(l => l.trim()).filter(Boolean)
+    if (lines.length === 0) return
+    bulkAddMut.mutate({ secrets: lines.map(v => ({ value: v, kind: bulkKind })) })
+  }
+
+  function toggleSelected(id: string) {
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
 
 
   return (
@@ -331,61 +382,135 @@ export default function MiddlePage() {
           <CardDescription>Secrets that are automatically replaced with placeholders in outbound requests.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
-          {/* Add secret */}
-          <div className="flex gap-2 items-end">
-            <div className="flex-1 space-y-1">
-              <Label htmlFor="secret-value">Value</Label>
-              <div className="flex gap-1">
+          {/* Add secret — Single / Bulk toggle */}
+          <div className="flex gap-2">
+            <Button variant={!bulkMode ? 'default' : 'outline'} size="sm" onClick={() => setBulkMode(false)}>Single</Button>
+            <Button variant={bulkMode ? 'default' : 'outline'} size="sm" onClick={() => setBulkMode(true)}>Bulk</Button>
+          </div>
+
+          {!bulkMode ? (
+            <div className="flex gap-2 items-end">
+              <div className="flex-1 space-y-1">
+                <Label htmlFor="secret-value">Value</Label>
+                <div className="flex gap-1">
+                  <Input
+                    id="secret-value"
+                    type={showSecretValue ? 'text' : 'password'}
+                    value={newSecret.value}
+                    onChange={(e) => setNewSecret(s => ({ ...s, value: e.target.value }))}
+                    placeholder="sk-…"
+                  />
+                  <Button variant="outline" size="icon" onClick={() => setShowSecretValue(!showSecretValue)}>
+                    {showSecretValue ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </Button>
+                </div>
+              </div>
+              <div className="w-32 space-y-1">
+                <Label htmlFor="secret-kind">Kind</Label>
                 <Input
-                  id="secret-value"
-                  type={showSecretValue ? 'text' : 'password'}
-                  value={newSecret.value}
-                  onChange={(e) => setNewSecret(s => ({ ...s, value: e.target.value }))}
-                  placeholder="sk-…"
+                  id="secret-kind"
+                  value={newSecret.kind}
+                  onChange={(e) => setNewSecret(s => ({ ...s, kind: e.target.value }))}
                 />
-                <Button variant="outline" size="icon" onClick={() => setShowSecretValue(!showSecretValue)}>
-                  {showSecretValue ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </div>
+              <div className="w-32 space-y-1">
+                <Label htmlFor="secret-label">Label</Label>
+                <Input
+                  id="secret-label"
+                  value={newSecret.label}
+                  onChange={(e) => setNewSecret(s => ({ ...s, label: e.target.value }))}
+                />
+              </div>
+              <Button
+                onClick={() => addSecretMut.mutate(newSecret)}
+                disabled={!newSecret.value || addSecretMut.isPending}
+              >
+                {addSecretMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                Add
+              </Button>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              <div className="flex gap-2 items-end">
+                <div className="flex-1 space-y-1">
+                  <Label htmlFor="bulk-textarea">Paste secrets (one per line)</Label>
+                  <Textarea
+                    id="bulk-textarea"
+                    value={bulkText}
+                    onChange={(e) => setBulkText(e.target.value)}
+                    placeholder={'sk-abc123...\nnvapi-def456...\ngithub_token_ghi789...'}
+                    className="font-mono text-sm min-h-[120px]"
+                  />
+                </div>
+                <div className="w-32 space-y-1">
+                  <Label htmlFor="bulk-kind">Kind</Label>
+                  <Input
+                    id="bulk-kind"
+                    value={bulkKind}
+                    onChange={(e) => setBulkKind(e.target.value)}
+                  />
+                </div>
+                <Button
+                  onClick={handleBulkAdd}
+                  disabled={!bulkText.trim() || bulkAddMut.isPending}
+                >
+                  {bulkAddMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                  Add {bulkText.split('\n').filter(l => l.trim()).length || ''} secret{bulkText.split('\n').filter(l => l.trim()).length !== 1 ? 's' : ''}
                 </Button>
               </div>
             </div>
-            <div className="w-32 space-y-1">
-              <Label htmlFor="secret-kind">Kind</Label>
-              <Input
-                id="secret-kind"
-                value={newSecret.kind}
-                onChange={(e) => setNewSecret(s => ({ ...s, kind: e.target.value }))}
-              />
-            </div>
-            <div className="w-32 space-y-1">
-              <Label htmlFor="secret-label">Label</Label>
-              <Input
-                id="secret-label"
-                value={newSecret.label}
-                onChange={(e) => setNewSecret(s => ({ ...s, label: e.target.value }))}
-              />
-            </div>
-            <Button
-              onClick={() => addSecretMut.mutate(newSecret)}
-              disabled={!newSecret.value || addSecretMut.isPending}
-            >
-              {addSecretMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-              Add
-            </Button>
-          </div>
+          )}
 
           {/* Secrets list */}
           {secrets.data && secrets.data.length > 0 && (
             <div className="space-y-2">
+              {selected.size > 0 && (
+                <div className="flex items-center justify-between rounded-md border border-destructive/30 bg-destructive/5 p-2">
+                  <span className="text-sm text-muted-foreground">{selected.size} selected</span>
+                  <div className="flex gap-2">
+                    <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>Clear</Button>
+                    <Button
+                      variant="destructive"
+                      size="sm"
+                      onClick={() => bulkDeleteMut.mutate([...selected])}
+                      disabled={bulkDeleteMut.isPending}
+                    >
+                      {bulkDeleteMut.isPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                      Delete selected ({selected.size})
+                    </Button>
+                  </div>
+                </div>
+              )}
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded border-input"
+                  checked={secrets.data.length > 0 && selected.size === secrets.data.length}
+                  onChange={(e) => {
+                    if (e.target.checked) setSelected(new Set(secrets.data.map(s => s.id)))
+                    else setSelected(new Set())
+                  }}
+                />
+                Select all
+              </div>
               {secrets.data.map(s => (
                 <div key={s.id} className="flex items-center justify-between rounded-md border p-3">
-                  <div className="space-y-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-sm">{s.maskedPreview}</span>
-                      <span className="text-xs text-muted-foreground">{s.kind}</span>
-                      {s.label && <span className="text-xs text-muted-foreground">· {s.label}</span>}
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      Added by {s.addedBy} · {new Date(s.createdAtMs).toLocaleString()}
+                  <div className="flex items-center gap-3">
+                    <input
+                      type="checkbox"
+                      className="h-4 w-4 rounded border-input"
+                      checked={selected.has(s.id)}
+                      onChange={() => toggleSelected(s.id)}
+                    />
+                    <div className="space-y-1">
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono text-sm">{s.maskedPreview}</span>
+                        <span className="text-xs text-muted-foreground">{s.kind}</span>
+                        {s.label && <span className="text-xs text-muted-foreground">· {s.label}</span>}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Added by {s.addedBy} · {new Date(s.createdAtMs).toLocaleString()}
+                      </div>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
