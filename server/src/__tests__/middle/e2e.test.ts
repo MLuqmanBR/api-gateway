@@ -146,7 +146,8 @@ describe('B2-8: interceptor-failure floor', () => {
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
         return { choices: [{ message: { role: 'assistant', content: `Echo: ${placeholder}` }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } };
       },
       async *streamChatCompletion() { throw new Error('should not be called'); },
@@ -165,9 +166,11 @@ describe('B2-8: interceptor-failure floor', () => {
       model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
+    expect(status).toBe(200);
     // Stage-1 still applied: provider saw placeholder, not secret
-    expect(capturedMessages![0].content).not.toContain(SECRET);
-    expect(capturedMessages![0].content).toMatch(/⟦R\d+:[0-9a-f]+⟧/);
+    const userOutboundE2e = capturedMessages!.find((m: any) => m.role !== 'system');
+    expect(userOutboundE2e?.content).not.toContain(SECRET);
+    expect(userOutboundE2e?.content).toMatch(/⟦R\d+:[0-9a-f]+⟧/);
     // Client got real value back
     expect((body as any).choices[0].message.content).toContain(SECRET);
   });
@@ -252,7 +255,8 @@ describe('B2-8: fenced code + JSON tool args byte-exact', () => {
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
         return { choices: [{ message: { role: 'assistant', content: `Echo back:\n\`\`\`bash\nexport API_KEY=${placeholder}\n\`\`\`` }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } };
       },
       async *streamChatCompletion() { throw new Error('should not be called'); },
@@ -278,7 +282,8 @@ describe('B2-8: fenced code + JSON tool args byte-exact', () => {
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
         const args = JSON.stringify({ nested: { key: placeholder, arr: [placeholder, 'other'] } });
         return { choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'save', arguments: args } }] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 5, completion_tokens: 5 } };
       },
@@ -338,7 +343,8 @@ describe('B2-8: fuzz ≥500 cases (seeded PRNG)', () => {
       // Mock echoes the (redacted) user content back verbatim
       mockRouteRequest.mockReturnValue(fakeRoute({
         async chatCompletion(_k: string, messages: any[]) {
-          const text = messages[0].content as string;
+          const userMsg = messages.find((m: any) => m.role !== 'system');
+          const text = userMsg?.content as string;
           return { choices: [{ message: { role: 'assistant', content: text }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } };
         },
         async *streamChatCompletion() { throw new Error('should not be called'); },
@@ -380,7 +386,8 @@ describe('B2-8: fuzz ≥500 cases (seeded PRNG)', () => {
         async chatCompletion() { throw new Error('should not be called'); },
         async *streamChatCompletion(_k: string, messages: any[]) {
           capturedMessages = messages;
-          const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+          const userMsg = messages.find((m: any) => m.role !== 'system');
+          const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
           // Stream the placeholder split at a random position, interleaved with prefix/suffix
           const content = prefix + placeholder + suffix;
           // Split into 2-4 chunks at random positions

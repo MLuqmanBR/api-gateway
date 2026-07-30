@@ -111,7 +111,8 @@ describe('B2-6: disabled-path byte-identity', () => {
     expect((body as any).choices[0].message.content).toBe(responseText);
     // Redaction was off → provider received the original (un-redacted) text
     expect(capturedMessages).toBeTruthy();
-    expect(capturedMessages![0].content).toContain(SECRET);
+    const userOutboundOff = capturedMessages!.find((m: any) => m.role !== 'system');
+    expect(userOutboundOff?.content).toContain(SECRET);
   });
 });
 
@@ -122,8 +123,9 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        // Echo the placeholder back in the response
-        const text = messages[0].content as string;
+        // Echo the placeholder back in the response — find first non-system message (redaction instruction may be at [0])
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const text = userMsg?.content as string;
         return { choices: [{ message: { role: 'assistant', content: `I see your key: ${text.match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? text}` }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } };
       },
       async *streamChatCompletion() { throw new Error('should not be called'); },
@@ -139,8 +141,9 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
     expect(status).toBe(200);
     // Provider received the placeholder, NOT the real secret
     expect(capturedMessages).toBeTruthy();
-    expect(capturedMessages![0].content).not.toContain(SECRET);
-    expect(capturedMessages![0].content).toMatch(/⟦R\d+:[0-9a-f]+⟧/);
+    const userOutbound = capturedMessages!.find((m: any) => m.role !== 'system');
+    expect(userOutbound?.content).not.toContain(SECRET);
+    expect(userOutbound?.content).toMatch(/⟦R\d+:[0-9a-f]+⟧/);
     // Client received the real value (un-redacted)
     const responseContent = (body as any).choices[0].message.content;
     expect(responseContent).toContain(SECRET);
@@ -152,7 +155,8 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
       async chatCompletion() { throw new Error('should not be called'); },
       async *streamChatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
         // Stream the placeholder split across two chunks
         const mid = Math.floor(placeholder.length / 2);
         yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta: { content: `Key: ${placeholder.slice(0, mid)}` }, finish_reason: null }] };
@@ -170,8 +174,9 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
     }, key);
     expect(status).toBe(200);
     // Provider received the placeholder
-    expect(capturedMessages![0].content).not.toContain(SECRET);
-    expect(capturedMessages![0].content).toMatch(/⟦R\d+:[0-9a-f]+⟧/);
+    const userOutboundStream = capturedMessages!.find((m: any) => m.role !== 'system');
+    expect(userOutboundStream?.content).not.toContain(SECRET);
+    expect(userOutboundStream?.content).toMatch(/⟦R\d+:[0-9a-f]+⟧/);
     // Client received the real value (un-redacted from split chunks)
     const allFrames = frames(text);
     const contentChunks = allFrames
@@ -186,7 +191,8 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
         return { choices: [{ message: { role: 'assistant', content: null, tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'save_key', arguments: JSON.stringify({ key: placeholder }) } }] }, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 5, completion_tokens: 5 } };
       },
       async *streamChatCompletion() { throw new Error('should not be called'); },
@@ -213,7 +219,8 @@ describe('B2-6: enabled round-trip /v1/responses', () => {
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
         return { choices: [{ message: { role: 'assistant', content: `Key: ${placeholder}` }, finish_reason: 'stop' }], usage: { prompt_tokens: 5, completion_tokens: 5 } };
       },
       async *streamChatCompletion() { throw new Error('should not be called'); },
@@ -227,7 +234,8 @@ describe('B2-6: enabled round-trip /v1/responses', () => {
       input: `My key is ${SECRET}`, stream: false,
     }, key);
     expect(status).toBe(200);
-    expect(capturedMessages![0].content).not.toContain(SECRET);
+    const userOutboundResp = capturedMessages!.find((m: any) => m.role !== 'system');
+    expect(userOutboundResp?.content).not.toContain(SECRET);
     expect((body as any).output_text).toContain(SECRET);
   });
 
@@ -236,7 +244,8 @@ describe('B2-6: enabled round-trip /v1/responses', () => {
       async chatCompletion() { throw new Error('should not be called'); },
       async *streamChatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
-        const placeholder = (messages[0].content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
+        const userMsg = messages.find((m: any) => m.role !== 'system');
+        const placeholder = (userMsg?.content as string).match(/⟦R\d+:[0-9a-f]+⟧/)?.[0] ?? 'unknown';
         const mid = Math.floor(placeholder.length / 2);
         yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta: { content: `Key: ${placeholder.slice(0, mid)}` }, finish_reason: null }] };
         yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'fake-model', choices: [{ index: 0, delta: { content: `${placeholder.slice(mid)} end` }, finish_reason: null }] };
@@ -252,7 +261,8 @@ describe('B2-6: enabled round-trip /v1/responses', () => {
       input: `My key is ${SECRET}`, stream: true,
     }, key);
     expect(status).toBe(200);
-    expect(capturedMessages![0].content).not.toContain(SECRET);
+    const userOutboundRespStream = capturedMessages!.find((m: any) => m.role !== 'system');
+    expect(userOutboundRespStream?.content).not.toContain(SECRET);
     // The SSE stream should contain the real value (un-redacted)
     expect(text).toContain(SECRET);
     // And NOT contain the placeholder

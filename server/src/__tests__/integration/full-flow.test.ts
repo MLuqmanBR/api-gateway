@@ -83,7 +83,7 @@ describe('Full Integration Flow', () => {
     });
     expect(status).toBe(201);
     expect(body.platform).toBe('groq');
-    expect(body.maskedKey).toContain('...');
+    expect(body.maskedKey).toMatch(/^\\*\\*\\*\\*.+$/);
   });
 
   it('Step 5: Proxy routes to Groq and handles provider error gracefully', async () => {

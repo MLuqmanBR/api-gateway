@@ -128,7 +128,7 @@ describe('SecretsStore — listSecrets (metadata only)', () => {
     expect(metas[0].enabled).toBe(true);
     // masked_preview should NOT contain the full secret
     expect(metas[0].maskedPreview).not.toContain('super-secret-key');
-    expect(metas[0].maskedPreview).toContain('...');
+    expect(metas[0].maskedPreview).toMatch(/^\*\*\*\*.+$/);
   });
 
   it('removes metadata from DB on removeSecret', () => {

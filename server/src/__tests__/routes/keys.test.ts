@@ -56,7 +56,7 @@ describe('Keys API', () => {
     expect(status).toBe(201);
     expect(body.platform).toBe('groq');
     expect(body.label).toBe('My Groq Key');
-    expect(body.maskedKey).toContain('...');
+    expect(body.maskedKey).toBe('****789');
   });
 
   it('GET /api/keys returns the created key', async () => {

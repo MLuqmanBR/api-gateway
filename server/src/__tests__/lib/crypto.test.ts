@@ -30,11 +30,11 @@ describe('Crypto', () => {
 
   describe('maskKey', () => {
     it('should mask long keys', () => {
-      expect(maskKey('gsk_test1234567890abcdef')).toBe('gsk_...cdef');
+      expect(maskKey('gsk_test1234567890abcdef')).toBe('****def');
     });
 
     it('should mask short keys', () => {
-      expect(maskKey('abcd')).toBe('****abcd');
+      expect(maskKey('abcd')).toBe('****bcd');
     });
   });
 });
