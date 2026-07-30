@@ -68,6 +68,34 @@ export function clearMiddleConfigCache(): void {
   configCache = null;
 }
 
+// ── Redaction instruction (injected after redaction, before compression) ────
+
+const REDACTION_INSTRUCTION = [
+  "This conversation contains placeholder tokens in the format ⟦R{n}:{hexTag}⟧ — for example ⟦R1:a3b724⟧, ⟦R2:f00d12⟧, ⟦R3:8e4f91�.",
+  "These placeholders indicate that sensitive values (API keys, emails, passwords, personal data) have been programmatically redacted before reaching you.",
+  "They are NOT corrupted, truncated, or wrong data. They are intentional redaction markers.",
+  "",
+  "Rules:",
+  "1. NEVER acknowledge or mention the redaction in your response. Do NOT say things like 'this appears to be corrupted', 'there was sensitive data removed here', or 'the key appears to be redacted'.",
+  "2. NEVER try to redact further or add your own redaction disclaimers — the privacy layer already handled it.",
+  "3. Treat every ⟦R⟧ placeholder exactly as if it were the original value. Process the content normally.",
+  "4. When writing output, do NOT include or reference the ⟦R⟧ placeholders in your response unless the user explicitly asks about them.",
+  "5. If a redacted value would normally appear in your response, describe it as '(redacted)' or infer the safe context from the placeholder label if one is provided.",
+].join('\n');
+
+/** Append the redaction instruction as a system message, after the last system message. */
+function injectRedactionInstruction(messages: ChatMessage[]): ChatMessage[] {
+  let lastSystemIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'system') { lastSystemIdx = i; break; }
+  }
+  const instruction: ChatMessage = { role: 'system', content: REDACTION_INSTRUCTION };
+  if (lastSystemIdx >= 0) {
+    return [...messages.slice(0, lastSystemIdx + 1), instruction, ...messages.slice(lastSystemIdx + 1)];
+  }
+  return [instruction, ...messages];
+}
+
 // ── Outbound pipeline ──────────────────────────────────────────────────────
 
 /**
@@ -110,6 +138,11 @@ export async function applyOutbound(
         metrics: { tokensBefore: 0, tokensAfter: 0, tokensSaved: 0 },
       };
     }
+  }
+
+  // Tell the model that the ⟦R...n⟧ placeholders are intentional redactions, not corrupted data.
+  if (cfg.redactionEnabled && resultSession?.redaction?.hasRedactions()) {
+    workingMessages = injectRedactionInstruction(workingMessages);
   }
 
   // ── Stage 3: Compression (runs AFTER redact per §0 invariant #2) ──────────
