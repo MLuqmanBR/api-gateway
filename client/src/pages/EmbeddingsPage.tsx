@@ -74,7 +74,7 @@ export default function EmbeddingsPage() {
     onError: (e: Error) => addToast({ kind: 'warning', title: 'Save failed', description: e.message }),
   })
 
-  const families = localFamilies ?? data?.families ?? []
+  const families = useMemo(() => localFamilies ?? data?.families ?? [], [localFamilies, data?.families])
   // Live filter across family name, provider slug, and modelId. Cheap
   // enough to run on every keystroke; no debounce.
   const [query, setQuery] = useState('')

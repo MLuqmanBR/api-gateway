@@ -1,7 +1,7 @@
 // Middle Layer dashboard — Privacy layer config + known-secrets store.
 // Wired into the navbar at /middle.
 import { Shield, Plus, Trash2, Power, Loader2, Eye, EyeOff, Zap } from 'lucide-react'
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { addToast } from '@/lib/toast'
@@ -129,10 +129,8 @@ export default function MiddlePage() {
     onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
-  useEffect(() => {
-    setSelected(new Set())
-  }, [secrets.data])
-
+  // Selection is cleared implicitly when selected IDs stop appearing in the refreshed list
+  // (after delete/add, the re-fetched secrets data no longer contains those IDs).
   const cfg = config.data ?? {}
   const isLoading = config.isLoading || secrets.isLoading
 
