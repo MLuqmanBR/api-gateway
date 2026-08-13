@@ -1,0 +1,17 @@
+[Unit]
+Description=API Gateway (api-gateway server)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_ROOT__
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env node server/dist/index.js
+Restart=on-failure
+RestartSec=2
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=default.target

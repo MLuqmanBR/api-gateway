@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=API Gateway
+GenericName=LLM Gateway
+Comment=Native dashboard and control for the api-gateway server
+Exec=api-gateway
+Icon=api-gateway
+Terminal=false
+Categories=Development;Network;Utility;
+Keywords=api;gateway;llm;proxy
+StartupNotify=true
+StartupWMClass=api-gateway
+Actions=open-settings;
+X-Flatpak-RenamedFrom=api-gateway.desktop
+
+[Desktop Action open-settings]
+Name=Open settings
+Exec=api-gateway --page=settings

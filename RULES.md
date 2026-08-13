@@ -14,6 +14,7 @@
 |---|---|
 | **Your fork** (origin) | `https://github.com/MLuqmanBR/api-gateway.git` |
 | **Upstream** (original) | `https://github.com/tashfeenahmed/freellmapi.git` |
+| **Native desktop app** | PyQt6 client lives under `src/api_gateway_app/` (see README-app.md); follows the same branch rules as everything else |
 
 ```
 upstream/main  ←  the canonical upstream. Never commit here directly.

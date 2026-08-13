@@ -33,3 +33,11 @@ UPGRADE-PROGRESS.md
 .upgrade-findings/
 FEATURES-FABLE.md
 temp/
+
+# Python (native desktop app)
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+.pytest_cache/
