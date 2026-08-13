@@ -1,9 +1,10 @@
 #!/usr/bin/env -S npx tsx
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync, realpathSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
+import net from 'node:net';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const INSTANCES_FILE = join(ROOT, '.api-gateway.instances');
@@ -154,7 +155,70 @@ async function ensureBuilt() {
   if (needsBuild()) await build();
 }
 
-function startServer(port) {
+// Some other process may hold the port without being recorded in our
+// instances file — the classic case is the systemd user unit
+// (api-gateway.service), which runs server/dist/index.js on the .env PORT
+// and is not managed by this CLI. Spawning anyway makes the child die with
+// EADDRINUSE and prints a misleading crash message, so probe the port
+// first and refuse cleanly when something unmanaged is already listening.
+function portInUse(port) {
+  const { promise, resolve } = Promise.withResolvers();
+  const socket = new net.Socket();
+  socket.setTimeout(1000);
+  socket.once('connect', () => { socket.destroy(); resolve(true); });
+  socket.once('timeout', () => { socket.destroy(); resolve(true); });
+  socket.once('error', () => resolve(false));
+  socket.connect(port, '127.0.0.1');
+  return promise;
+}
+
+const SYSTEMD_UNIT = 'api-gateway.service';
+
+// The systemd user unit (api-gateway.service) runs server/dist/index.js on
+// the .env PORT but is not recorded in our instances file. Detect it via
+// `systemctl --user show` so status/list/stop see it like a CLI instance.
+function systemdInstance() {
+  try {
+    const res = spawnSync('systemctl', ['--user', 'show', SYSTEMD_UNIT, '--property=ActiveState,SubState,MainPID'], { encoding: 'utf8', timeout: 5000 });
+    if (res.status !== 0 || res.error) return null;
+    const props = Object.fromEntries(res.stdout.split('\n').filter(Boolean).map((l) => {
+      const idx = l.indexOf('=');
+      return idx === -1 ? [l, ''] : [l.slice(0, idx), l.slice(idx + 1)];
+    }));
+    if (props.ActiveState !== 'active') return null;
+    const pid = parseInt(props.MainPID, 10);
+    if (!pid || !isRunning(pid)) return null;
+    if (!isOurServerProcess(pid)) return null;
+    // The unit's WorkingDirectory is the repo root; the unit was
+    // installed from resources/systemd/, so locate it there.
+    const unitPath = join(ROOT, 'resources', 'systemd', SYSTEMD_UNIT);
+    if (!existsSync(unitPath)) return null;
+    const unit = readFileSync(unitPath, 'utf8');
+    const m = unit.match(/^PORT=(\d+)/m);
+    return { port: m ? parseInt(m[1], 10) : 3001, pid, manager: 'systemd' };
+  } catch { return null; }
+}
+
+// Combined view: CLI-managed instances (from the registry) plus the
+// systemd unit if active. The systemd instance is read-only — the CLI
+// must never signal it, only point at `systemctl`.
+function allInstances() {
+  const inst = cleanInstances();
+  const sd = systemdInstance();
+  const out = {};
+  for (const [port, pid] of Object.entries(inst)) out[port] = { pid, manager: 'cli' };
+  if (sd && !out[String(sd.port)]) out[String(sd.port)] = sd;
+  return out;
+}
+
+function printSystemdHint(port) {
+  console.log(`The systemd unit (${SYSTEMD_UNIT}) is running on port ${port}. It is not managed by this CLI.`);
+  const unitPath = join(ROOT, 'resources', 'systemd', SYSTEMD_UNIT);
+  if (existsSync(unitPath)) console.log(`Stop it with:  systemctl --user stop ${SYSTEMD_UNIT}`);
+  else console.log(`Stop it with:  systemctl --user stop ${SYSTEMD_UNIT}   (unit file not found in repo — check your installed copy)`);
+}
+
+async function startServer(port) {
   const inst = cleanInstances();
 
   if (inst[String(port)]) {
@@ -164,6 +228,20 @@ function startServer(port) {
       printInfo(port);
       return;
     }
+  }
+
+  const sd = systemdInstance();
+  if (sd && sd.port === port) {
+    console.log(`Server is already running on port ${port} (systemd unit ${SYSTEMD_UNIT}, PID ${sd.pid}).`);
+    printInfo(port);
+    return;
+  }
+
+  if (await portInUse(port)) {
+    console.log(`Port ${port} is already in use by another process (not tracked by this CLI).`);
+    console.log('If that is the systemd service, manage it with: systemctl --user status api-gateway.service');
+    console.log('To run a CLI-managed instance instead, stop that service first or pick a free port: api start --port <port>');
+    return;
   }
 
   rotateLogIfNeeded();
@@ -271,7 +349,15 @@ function stopOne(port) {
   const inst = readInstances();
   const key = String(port);
   const pid = inst[key];
-  if (!pid) { console.log(`No server running on port ${port}.`); return Promise.resolve(); }
+  if (!pid) {
+    const sd = systemdInstance();
+    if (sd && sd.port === port) {
+      printSystemdHint(port);
+      return Promise.resolve();
+    }
+    console.log(`No server running on port ${port}.`);
+    return Promise.resolve();
+  }
   if (!isRunning(pid)) {
     console.log(`PID ${pid} on port ${port} is not running. Cleaning up.`);
     delete inst[key];
@@ -315,25 +401,34 @@ function stopOne(port) {
 
 function stopAll() {
   const inst = cleanInstances();
-  if (Object.keys(inst).length === 0) { console.log('No servers running.'); return Promise.resolve(); }
+  const sd = systemdInstance();
+  if (sd) {
+    printSystemdHint(sd.port);
+    console.log('Skipping the systemd unit; stopping only CLI-managed instances.');
+  }
+  if (Object.keys(inst).length === 0) { console.log('No CLI-managed servers running.'); return Promise.resolve(); }
   return Promise.all(Object.keys(inst).map(port => stopOne(parseInt(port, 10))));
 }
 
 function showList() {
-  const inst = cleanInstances();
-  const ports = Object.keys(inst);
+  const all = allInstances();
+  const ports = Object.keys(all);
   if (ports.length === 0) { console.log('No servers running.'); return; }
   console.log('Running instances:');
-  for (const [port, pid] of Object.entries(inst)) console.log(`  Port ${port} — PID ${pid}`);
+  for (const [port, inst] of Object.entries(all)) {
+    console.log(`  Port ${port} — PID ${inst.pid}${inst.manager === 'systemd' ? ' (systemd unit)' : ''}`);
+  }
 }
 
 function showStatus() {
-  const inst = cleanInstances();
-  const ports = Object.keys(inst);
+  const all = allInstances();
+  const ports = Object.keys(all);
   if (ports.length === 0) { console.log('No servers running.'); return; }
   if (ports.length === 1) {
     const port = ports[0];
-    console.log(`Server is running on port ${port} (PID ${inst[port]}).`);
+    const inst = all[port];
+    const manager = inst.manager === 'systemd' ? ' (systemd unit)' : '';
+    console.log(`Server is running on port ${port} (PID ${inst.pid})${manager}.`);
     printInfo(parseInt(port, 10));
   } else { showList(); }
 }
@@ -382,10 +477,14 @@ async function main() {
     if (flags.all) { await stopAll(); }
     else if (flags.port) { await stopOne(flags.port); }
     else {
-      const inst = cleanInstances();
-      const ports = Object.keys(inst);
+      const all = allInstances();
+      const ports = Object.keys(all);
       if (ports.length === 0) { console.log('No servers running.'); }
-      else if (ports.length === 1) { await stopOne(parseInt(ports[0], 10)); }
+      else if (ports.length === 1) {
+        const inst = all[ports[0]];
+        if (inst.manager === 'systemd') { printSystemdHint(inst.port); }
+        else { await stopOne(parseInt(ports[0], 10)); }
+      }
       else { console.log('Multiple instances running. Use --port or --all:'); showList(); process.exit(1); }
     }
     return;
@@ -393,6 +492,12 @@ async function main() {
 
   if (cmd === 'restart') {
     const envPort = readPort();
+    const sd = systemdInstance();
+    if (sd && sd.port === envPort) {
+      printSystemdHint(envPort);
+      console.log('Not restarting; the unit is managed by systemd (systemctl --user restart api-gateway.service).');
+      return;
+    }
     const inst = cleanInstances();
     if (inst[String(envPort)]) await stopOne(envPort);
     await ensureBuilt();
