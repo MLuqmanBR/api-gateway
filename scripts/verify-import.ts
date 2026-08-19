@@ -40,6 +40,11 @@ interface Scenario {
   expectProbe: 'no-keys' | 'encrypted-with-passphrase' | 'plaintext' | 'compatible' | 'mismatch';
   expectImportAdded: number;
   expectImportErrors: number;
+  /** Optional hook for scenarios with labeled payload: assert that each
+   * platform's rows decrypt to their own distinct per-account key (not a
+   * single shared one). Rows passed as { platform, label, plaintext } after
+   * decrypt. */
+  verifyEachPerAccount?: (rows: Array<{ platform: string; label: string; plaintext: string }>) => string[];
 }
 
 function buildKeysCipherEnvelopes(): Scenario {
@@ -55,7 +60,7 @@ function buildKeysCipherEnvelopes(): Scenario {
         _plain: `sk-secret-value-${i}-${crypto.randomBytes(8).toString('hex')}`,
       }));
       const cipher = encryptKeysWithPassphrase(
-        rows.map((r) => ({ platform: r.platform, key: r._plain as string })),
+        rows.map((r) => ({ platform: r.platform, label: r.label, key: r._plain as string })),
         PASSPHRASE,
       );
       // Build apiKey rows that ALSO carry per-row ciphertext — matches
@@ -93,6 +98,26 @@ function buildKeysCipherEnvelopes(): Scenario {
     expectProbe: 'encrypted-with-passphrase',
     expectImportAdded: 64,
     expectImportErrors: 0,
+    verifyEachPerAccount: (rows) => {
+      // 8 platforms × 8 accounts; every account's key must be distinct.
+      const failures: string[] = [];
+      const byPlatform = new Map<string, Array<{ label: string; plaintext: string }>>();
+      for (const r of rows) {
+        if (!byPlatform.has(r.platform)) byPlatform.set(r.platform, []);
+        byPlatform.get(r.platform)!.push({ label: r.label, plaintext: r.plaintext });
+      }
+      for (const [platform, entries] of byPlatform) {
+        const unique = new Set(entries.map((e) => e.plaintext));
+        if (unique.size !== entries.length) {
+          // Find the dup: which accounts got the same key.
+          const seen: Record<string, string[]> = {};
+          for (const e of entries) (seen[e.plaintext] ??= []).push(e.label);
+          const dup = Object.entries(seen).filter(([, ls]) => ls.length > 1);
+          failures.push(...dup.map(([, labels]) => `${platform}: accounts [${labels.join(',')}] share one key`));
+        }
+      }
+      return failures;
+    },
   };
 }
 
@@ -144,6 +169,9 @@ function buildUserBackupScenario(env: ConfigEnvelope): Scenario {
 
 async function runScenario(s: Scenario): Promise<{ pass: boolean; notes: string[] }> {
   const notes: string[] = [];
+  // build() uses ENCRYPTION_KEY to build per-row ciphertext; set the
+  // destination key before calling it.
+  process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
   const envelope = s.build();
 
   // ── Preview path ─────────────────────────────────────────────────────
@@ -161,7 +189,6 @@ async function runScenario(s: Scenario): Promise<{ pass: boolean; notes: string[
   // ── Import path ──────────────────────────────────────────────────────
   const SANDBOX_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'gateway-verify-'));
   const SANDBOX_DB = path.join(SANDBOX_DIR, 'sandbox.db');
-  process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
   try {
     initDb(SANDBOX_DB);
     const result = runImport({ envelope, options: s.importOptions });
@@ -181,16 +208,27 @@ async function runScenario(s: Scenario): Promise<{ pass: boolean; notes: string[
     // the freshly generated key.
     if (errors === 0 && (ak?.added ?? 0) > 0) {
       const db = getDb();
-      const rows = db.prepare('SELECT encrypted_key, iv, auth_tag FROM api_keys').all() as Array<{
-        encrypted_key: string; iv: string; auth_tag: string;
+      const rows = db.prepare('SELECT platform, label, encrypted_key, iv, auth_tag FROM api_keys').all() as Array<{
+        platform: string; label: string; encrypted_key: string; iv: string; auth_tag: string;
       }>;
       let decryptedOk = 0;
+      const plainRows: Array<{ platform: string; label: string; plaintext: string }> = [];
       for (const r of rows) {
-        try { decrypt(r.encrypted_key, r.iv, r.auth_tag); decryptedOk++; } catch { /* ignore */ }
+        try {
+          plainRows.push({ platform: r.platform, label: r.label, plaintext: decrypt(r.encrypted_key, r.iv, r.auth_tag) });
+          decryptedOk++;
+        } catch { /* ignore */ }
       }
       notes.push(`post-import decrypt=${decryptedOk}/${rows.length}`);
       if (decryptedOk !== rows.length) {
         return { pass: false, notes: [...notes, 'not every row decrypts'] };
+      }
+      // Scenario may require that multi-account platforms do NOT collapse to
+      // one shared key (the keysByPlatform regression).
+      if (s.verifyEachPerAccount) {
+        const failures = s.verifyEachPerAccount(plainRows);
+        notes.push(`per-account verification: ${failures.length === 0 ? 'ok' : failures.join('; ')}`);
+        if (failures.length > 0) return { pass: false, notes };
       }
     }
 

@@ -299,7 +299,7 @@ export function buildExport(opts: BuildExportOptions = {}): ConfigEnvelope {
     }
     const plaintext = sections.apiKeys
       .filter((k) => typeof k.key === 'string' && k.key.length > 0)
-      .map((k) => ({ platform: k.platform, key: k.key as string }));
+      .map((k) => ({ platform: k.platform, label: k.label, key: k.key as string }));
     if (plaintext.length === 0) {
       throw new ConfigExportError(
         'no decryptable API keys to encrypt — every key failed to decrypt',

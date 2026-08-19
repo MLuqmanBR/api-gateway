@@ -37,13 +37,17 @@ function deriveKey(passphrase: string, salt: Buffer): Buffer {
 }
 
 /**
- * Encrypt `plaintextKeys` (a JSON-serialisable array of `{ platform, key }`
- * — small, ≤ 64 KB on disk even with dozens of platforms) under a
- * passphrase. The result is self-describing: the consumer only needs the
- * passphrase to recover the keys.
+ * Encrypt `plaintextKeys` (a JSON-serialisable array of `{ platform, label,
+ * key }` — small, ≤ 64 KB on disk even with dozens of accounts) under a
+ * passphrase. `label` lets a multi-account platform map each decrypted key
+ * back to its own account row on import (without it, a platform's keys
+ * collapse to one and duplicate across every account). Exporters always
+ * supply it; it's optional only so tests/tooling can simulate legacy
+ * pre-label payloads. The result is self-describing: the consumer only
+ * needs the passphrase to recover the keys.
  */
 export function encryptKeysWithPassphrase(
-  plaintextKeys: Array<{ platform: string; key: string }>,
+  plaintextKeys: Array<{ platform: string; label?: string; key: string }>,
   passphrase: string,
 ): KeysCipher {
   if (!passphrase || passphrase.length === 0) {
@@ -66,15 +70,18 @@ export function encryptKeysWithPassphrase(
 }
 
 /**
- * Decrypt a `keysCipher` blob produced by `encryptKeysWithPassphrase`. An
- * incorrect passphrase raises (GCM auth tag mismatch) — there's no
- * recoverable state to return. The caller should surface that as a 401-
- * style error: "wrong passphrase" is not knowable without trying.
+ * Decrypt a `keysCipher` blob produced by `encryptKeysWithPassphrase` into
+ * `{ platform, key }` entries that additionally carry `label` when the
+ * blob was written by a current gateway (legacy passphrase exports have no
+ * `label` — readers must tolerate its absence). An incorrect passphrase
+ * raises (GCM auth tag mismatch) — there's no recoverable state to
+ * return. The caller should surface that as a 401-style error: "wrong
+ * passphrase" is not knowable without trying.
  */
 export function decryptKeysWithPassphrase(
   blob: KeysCipher,
   passphrase: string,
-): Array<{ platform: string; key: string }> {
+): Array<{ platform: string; label?: string; key: string }> {
   if (blob.kdf !== 'pbkdf2-sha256-310000') {
     throw new Error(`Unsupported KDF: ${blob.kdf}`);
   }
@@ -89,7 +96,7 @@ export function decryptKeysWithPassphrase(
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(authTag);
   const json = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
-  const parsed = JSON.parse(json) as Array<{ platform: string; key: string }>;
+  const parsed = JSON.parse(json) as Array<{ platform: string; label?: string; key: string }>;
   if (!Array.isArray(parsed)) {
     throw new Error('decrypted payload is not an array');
   }
