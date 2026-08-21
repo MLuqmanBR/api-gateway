@@ -13,9 +13,9 @@ import { recordMetricsRequest, recordMetricsTokens } from '../services/metrics.j
 import { acquireSlot, isQueueEnabled, QueueTimeoutError } from '../services/queue.js';
 import { isCircuitOpen, recordCircuitSuccess, recordCircuitFailure, shouldMarkExhausted } from '../services/circuit-breaker.js';
 import { setRetryAfter } from '../lib/http-headers.js';
-import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { getDb, getUnifiedApiKey, cachedPrepare } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
-import { checkAndReserve, recordSpend, estimateCostCents } from '../services/budgets.js';
+import { checkAndReserve, recordSpend, releaseBudget, estimateCostCents } from '../services/budgets.js';
 import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -169,14 +169,13 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
   if (!key) return;
   stickySessionMap.set(key, { modelDbId, lastUsed: Date.now() });
 
-  // Cleanup old entries — after the TTL sweep, still over the hard cap?
-  // Evict the oldest lastUsed entry to ensure the map never grows unbounded.
+  // Cleanup old entries — sweep expired, then evict oldest until under cap.
   if (stickySessionMap.size > 500) {
     const now = Date.now();
     for (const [k, v] of stickySessionMap) {
       if (now - v.lastUsed > STICKY_TTL_MS) stickySessionMap.delete(k);
     }
-    if (stickySessionMap.size > 2000) {
+    while (stickySessionMap.size > 500) {
       let oldestKey = '';
       let oldestTime = Infinity;
       for (const [k, v] of stickySessionMap) {
@@ -476,7 +475,6 @@ export function isRetryableError(err: any): boolean {
   // message heuristics below, but without parsing ambiguity.
   if (typeof err?.status === 'number') {
     // Transient/retriable HTTP status codes (matching message heuristics).
-    // Transient/retriable HTTP status codes (matching message heuristics).
     // 400 is included because providers often return 400 for bad API keys
     // (per-key error) — the key rotation logic expects this to be retryable
     // so it can cycle to the next key on the same model.
@@ -485,7 +483,7 @@ export function isRetryableError(err: any): boolean {
         err.status === 403 || err.status === 404) {
       return true;
     }
-    // Non-retryable statuses: 400 (validation), 401 (auth), 402 (payment - handled by isPaymentRequiredError), etc.
+    // Non-retryable statuses: 401 (auth), 402 (payment - handled by isPaymentRequiredError), etc.
     return false;
   }
   // Fallback: message-based heuristics (legacy path, keeps existing behavior).
@@ -834,7 +832,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   let preferredModel: number | undefined;
   if (isAutoModel(requestedModel)) {
     // Explicit "auto" → behave exactly like an omitted model field.
-    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+    preferredModel = getStickyModel(token, messages, sessionIdHeader);
   } else if (requestedModel) {
     const db = getDb();
     const resolution = resolvePinnedModel(db, requestedModel);
@@ -852,7 +850,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       return;
     }
   } else {
-    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+    preferredModel = getStickyModel(token, messages, sessionIdHeader);
   }
 
   // For analytics: the model id the client pinned, null when auto-routed
@@ -932,18 +930,27 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const cached = getCachedResponse(cacheKey);
     if (cached) {
       res.setHeader('X-Cache', 'HIT');
-      if (stream) {
+      const sse = stream ? synthesizeSSE(cached) : null;
+      if (stream && sse !== null) {
         // Synthesize SSE from the cached non-streaming JSON (OmniRoute pattern).
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.flushHeaders();
-        res.write(synthesizeSSE(cached));
+        res.write(sse);
         res.end();
       } else {
+        // M04: tool_calls can't be faithfully replayed as SSE; fall back to
+        // the non-streaming JSON envelope even for a streaming request. A
+        // stream-requesting client gets the full tool_calls payload, which
+        // is strictly better than an SSE replay that silently drops them.
+        if (stream) res.setHeader('X-Cache-Fallback', 'tool-calls');
         res.setHeader('Cache-Control', 'no-cache');
         res.json(JSON.parse(cached));
       }
       publish({ type: 'request.done', id: requestId, model: requestedModel ?? 'auto', provider: 'cache', keyId: 0, latencyMs: Date.now() - start, tokens: { in: 0, out: 0 }, at: Date.now() });
+      // M03: the response is already ended; detach the client-abort watcher
+      // so its `close` listener doesn't outlive the request.
+      detachAbortWatcher();
       return;
     }
     // Cacheable but no hit — mark MISS so the client can see the cache is active.
@@ -954,6 +961,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // on the first enabled attempt; reused across retries/fallbacks so the
   // AI interceptor (Stage-2) runs once per request, not per attempt.
   let middleSession: MiddleSession | undefined;
+
+  // F4: estimated cost in cents for budget tracking (0 when no client key
+  // or no budget row). Set by the budget check after route selection.
+  // Declared OUTSIDE the try so the finally can release an outstanding
+  // reservation on any exit (C02).
+  let budgetEstCostCents = 0;
+  let budgetPricing: { actual_cost_input_per_m: number | null; actual_cost_output_per_m: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null } | undefined;
+  // C02: true while a checkAndReserve estimate is outstanding (reserved but
+  // not yet reconciled by recordSpend). Every exit that doesn't settle must
+  // releaseBudget() — phantom reservations permanently inflate budgets.
+  let budgetOpen = false;
 
   try {
   outerLoop: for (let totalAttempt = 0; ; totalAttempt++) {
@@ -981,7 +999,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const msg = `Recovery limit reached after ${upstreamAttempts} upstream attempt(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
       publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
       if (!res.headersSent) {
-        res.setHeader('X-Routed-Via', 'none'); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
+        res.setHeader('X-Routed-Via', 'none');
+        if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         res.setHeader('X-Upstream-Attempts', String(upstreamAttempts));
         res.status(429).json({
           error: {
@@ -996,7 +1015,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       const msg = `All models rate-limited after ${totalAttempt} recovery iteration(s). Last: ${sanitizeProviderErrorMessage(lastError?.message)}`;
       publish({ type: 'request.error', id: requestId, error: msg, at: Date.now() });
       if (!res.headersSent) {
-        res.setHeader('X-Routed-Via', 'none'); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
+        res.setHeader('X-Routed-Via', 'none');
+        if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         res.setHeader('X-Recovery-Iterations', String(totalAttempt));
         res.status(429).json({
           error: {
@@ -1020,10 +1040,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
     // ---- Get route ----
     let route: RouteResult;
-    // F4: estimated cost in cents for budget tracking (0 when no client key
-    // or no budget row). Set by the budget check after route selection.
-    let budgetEstCostCents = 0;
-    let budgetPricing: { actual_cost_input_per_m: number | null; actual_cost_output_per_m: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null } | undefined;
     try {
       // When a handoff could fire this turn, pad the token estimate so the router's
       // context-window and TPM checks account for the extra system message overhead.
@@ -1052,31 +1068,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // Only enforced when a budget row exists for the scope — an empty
       // budgets table means no enforcement (today's behavior). The estimate
       // uses the selected model's pricing: actual_cost ?? paid ?? FALLBACK.
-      if (auth.clientKey) {
-        budgetPricing = getDb().prepare(
-          'SELECT actual_cost_input_per_m, actual_cost_output_per_m, paid_input_per_m, paid_output_per_m FROM models WHERE id = ?',
-        ).get(route.modelDbId) as { actual_cost_input_per_m: number | null; actual_cost_output_per_m: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null } | undefined;
-        const estOutputTokens = max_tokens ?? route.maxOutputTokens ?? 1000;
-        budgetEstCostCents = estimateCostCents(
-          estimatedInputTokens, estOutputTokens,
-          budgetPricing?.actual_cost_input_per_m ?? null, budgetPricing?.actual_cost_output_per_m ?? null,
-          budgetPricing?.paid_input_per_m ?? null, budgetPricing?.paid_output_per_m ?? null,
-        );
-        const budgetResult = checkAndReserve('client_key', auth.clientKey.id, budgetEstCostCents);
-        if (!budgetResult.allowed) {
-          route.release();
-          res.status(402).json({
-            error: {
-              type: 'budget_exhausted',
-              message: `Budget exhausted (${budgetResult.exhaustedPeriod} limit reached)`,
-              overage_cents: budgetResult.overageCents,
-              scope: budgetResult.scope,
-              period: budgetResult.exhaustedPeriod,
-            },
-          });
-          return;
-        }
-      }
     } catch (err: any) {
       // Pinned model has no more keys — enter 1 RPM mode.
       if (err.code === 'PINNED_MODEL_EXHAUSTED') {
@@ -1115,8 +1106,55 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         await abortableSleep(1000, abortSignal);
       }
       publish({ type: 'routing.recovery', id: requestId, cycle: oneRPMCycles, max: globalRetryMax > 0 ? globalRetryMax : null, reason: 'All models exhausted', at: Date.now() });
-      console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? '/' + globalRetryMax : '/\u221E'})`);
-      continue;
+        console.log(`[Proxy] All models exhausted, entering 1 RPM recovery (cycle ${oneRPMCycles}${globalRetryMax > 0 ? '/' + globalRetryMax : '/\u221E'})`);
+        continue;
+    }
+    // Budget booking runs AFTER a successful acquisition: a throw anywhere in
+    // here (DB error, corrupt pricing row) must release the provider slot and
+    // the provisional reservations — otherwise the in-flight slot leaks for
+    // the lifetime of the process. (H07)
+    try {
+      if (auth.clientKey) {
+        // C02: a previous attempt's reservation may still be outstanding
+        // (failover moved on without settling). Release it before reserving
+        // for this attempt so failed attempts never accumulate phantom spend.
+        if (budgetOpen) {
+          releaseBudget('client_key', auth.clientKey.id, budgetEstCostCents);
+          budgetOpen = false;
+        }
+        // M24: cached statement — this prepare fired on every routed request.
+        budgetPricing = cachedPrepare(
+          'SELECT actual_cost_input_per_m, actual_cost_output_per_m, paid_input_per_m, paid_output_per_m FROM models WHERE id = ?',
+        ).get(route.modelDbId) as { actual_cost_input_per_m: number | null; actual_cost_output_per_m: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null } | undefined;
+        const estOutputTokens = max_tokens ?? route.maxOutputTokens ?? 1000;
+        budgetEstCostCents = estimateCostCents(
+          estimatedInputTokens, estOutputTokens,
+          budgetPricing?.actual_cost_input_per_m ?? null, budgetPricing?.actual_cost_output_per_m ?? null,
+          budgetPricing?.paid_input_per_m ?? null, budgetPricing?.paid_output_per_m ?? null,
+        );
+        const budgetResult = checkAndReserve('client_key', auth.clientKey.id, budgetEstCostCents);
+        if (!budgetResult.allowed) {
+          route.release();
+          res.status(402).json({
+            error: {
+              type: 'budget_exhausted',
+              message: `Budget exhausted (${budgetResult.exhaustedPeriod} limit reached)`,
+              overage_cents: budgetResult.overageCents,
+              scope: budgetResult.scope,
+              period: budgetResult.exhaustedPeriod,
+            },
+          });
+          return;
+        }
+        budgetOpen = true;
+      }
+    } catch (err) {
+      route.release();
+      if (budgetOpen) {
+        releaseBudget('client_key', auth.clientKey!.id, budgetEstCostCents);
+        budgetOpen = false;
+      }
+      throw err;
     }
     // The provider slot acquired by routeRequest above is released exactly
     // once per acquire, in the single finally at the end of this iteration —
@@ -1166,11 +1204,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // use the catalog's recorded max_output_tokens for the resolved model.
     // Some upstreams — notably NVIDIA NIM's minimax-m3 — return an empty
     // 200 (choices:[]) when max_tokens is absent, making the request
-    // indistinguishable from "model just has nothing to say". Surfacing a
-    const effectiveMaxTokens = max_tokens ?? route.maxOutputTokens ?? undefined;
+    // indistinguishable from "model just has nothing to say". Surfacing the
+    // catalog cap as a default avoids that. The cap is nullable ("no known
+    // bound"); normalize to undefined so CompletionOptions never carries an
+    // explicit null down to providers.
+    const catalogCap = route.maxOutputTokens ?? undefined;
+    const effectiveMaxTokens = max_tokens ?? catalogCap;
 
     // MiniMax M2.x/M3 on aggregatorc / openrouter / nvidia returns reasoning
-    // inline in `content` wrapped in `` tags instead of using a separate
+    // inline in `content` wrapped in `<think>` tags instead of using a separate
     // `reasoning_content` field. The api-gateway splits that into the
     // `reasoning_content` transport field so clients see a clean answer. The
     // gate shares the family detector with `buildModelCapabilities`
@@ -1208,13 +1250,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         let totalOutputTokens = 0;
         let headerSent = false;
         let ttfbMs: number | null = null;
+        // L07: TTFB reference point — set when THIS attempt is dispatched to
+        // the provider, not when the client request arrived. Measuring from
+        // request start charged every fallback attempt for all prior attempts'
+        // routing/retry wait, inflating the latency signal the bandit learns
+        // from.
+        let dispatchedAtMs = 0;
 
         // Hold-window state: 'undecided' until the first text either matches
         // a dialect marker (→ 'dialect': buffer everything, rescue at end) or
         // provably cannot (→ 'passthrough': flush and stream normally).
         let mode: 'undecided' | 'passthrough' | 'dialect' = 'undecided';
         let heldText = '';
-        // `` tag extraction state. Independent of the dialect detector:
+        // `<think>` tag extraction state. Independent of the dialect detector:
         // both machines consume the same `text` chunk, the dialect
         // detector only ever sees visible text (post-extraction).
         const thinkStream = new ThinkTagStream();
@@ -1233,11 +1281,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         const flushHeaders = () => {
           if (headerSent) return;
-          ttfbMs = Date.now() - start;
+          ttfbMs = Date.now() - dispatchedAtMs;
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
-          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
+          res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+          if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
           if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
           headerSent = true;
           for (const p of preamble) res.write(`data: ${JSON.stringify(p)}\n\n`);
@@ -1254,6 +1303,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
         try {
           upstreamAttempts++; // counted toward the global recovery limit. (#292)
+          dispatchedAtMs = Date.now();
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
             {
@@ -1278,7 +1328,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               writeChunk({ error: { message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(String(msg))}`, type: 'stream_error' } });
               try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
               recordRateLimitHit(route.modelDbId);
-              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId);
+              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId, headerSent);
               return;
             }
 
@@ -1307,7 +1357,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             normalizeOutboundContent(chunk);
             let text = typeof choice.delta?.content === 'string' ? choice.delta.content : '';
             // Native reasoning_content: some models (DeepSeek v4 Pro, etc.) emit
-            // reasoning in a dedicated delta key rather than in-band `` tags.
+            // reasoning in a dedicated delta key rather than in-band `<think>` tags.
             // Forward it as a reasoning_content chunk immediately so the client
             // sees the thinking stream, then check for visible content normally.
             const reasoningText = typeof choice.delta?.reasoning_content === 'string' ? choice.delta.reasoning_content : '';
@@ -1345,7 +1395,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             totalOutputTokens += Math.ceil(text.length / 4);
 
             if (mode === 'passthrough') {
-              // Strip `` tags from the chunk in-flight, emit any
+              // Strip `<think>` tags from the chunk in-flight, emit any
               // extracted reasoning as a `reasoning_content` delta, and
               // forward the visible remainder. Reasoning arrives ahead of
               // the visible text it described — typical for a long-form
@@ -1367,10 +1417,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
                 text = visibleUnredactor ? visibleUnredactor.feed(text) : text;
                 if (text.length === 0) continue;
               }
-              // reasoning_content is stripped here: any reasoning on this chunk
-              // was already forwarded above (line ~1153), so leaving it in the
-              // spread would re-emit it if a provider ever packs content and
-              // reasoning_content into the same delta.
+              // reasoning_content is stripped here: any reasoning on this
+              // chunk was already forwarded by the native reasoning_content
+              // block above, so leaving it in the spread would re-emit it if
+              // a provider ever packs content and reasoning_content into the
+              // same delta.
               writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, content: text, tool_calls: undefined, reasoning_content: undefined }, finish_reason: null }] });
               continue;
             }
@@ -1497,9 +1548,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           recordRequest(route.platform, route.modelId, route.keyId);
           recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + injectedHandoffTokens + totalOutputTokens);
           recordSuccess(route.modelDbId);
-          setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
+          setStickyModel(token, messages, route.modelDbId, sessionIdHeader);
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId, headerSent);
           publish({ type: 'request.done', id: requestId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: estimatedInputTokens + injectedHandoffTokens, out: totalOutputTokens }, at: Date.now() });
           clearExhausted(route.keyId, route.modelId);
           recordCircuitSuccess(route.platform, route.modelId, route.keyId);
@@ -1513,6 +1564,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             );
             recordSpend('client_key', auth.clientKey.id, actualCostCents, budgetEstCostCents);
           }
+          budgetOpen = false;
           return;
         } catch (streamErr: any) {
           if (isAbortError(streamErr) || abortSignal.aborted) throw streamErr;
@@ -1523,7 +1575,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             const payload = { error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } };
             try { res.write(`data: ${JSON.stringify(payload)}\n\n`); } catch { /* socket gone */ }
             try { res.write('data: [DONE]\n\n'); res.end(); } catch { /* socket gone */ }
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), null, pinnedModelId);
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), null, pinnedModelId, headerSent);
             recordRateLimitHit(route.modelDbId);
             return;
           }
@@ -1596,10 +1648,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
-        setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
+        setStickyModel(token, messages, route.modelDbId, sessionIdHeader);
         if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
 
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
+        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
         if (inOneRPMMode) res.setHeader('X-Recovery-Mode', '1rpm');
         // Repair double-encoded tool arguments against the request's tool
@@ -1641,8 +1694,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             if (inbound.newSecretsFound) respMsg.content = inbound.text;
           }
         }
-        // Normalize array-shaped message.content to a string on the way out (#166).
-        res.json(normalizeOutboundContent(result));
+        // Normalize array-shaped message.content to a string on the way out
+        // (#166). L18: compute ONCE — the result feeds both the client
+        // response and the cache write below (the normalizer mutates in place,
+        // so re-running it per consumer was pure duplicate work).
+        const outboundResult = normalizeOutboundContent(result);
+        res.json(outboundResult);
 
         logRequest(
           route.platform, route.modelId, route.keyId, 'success',
@@ -1663,9 +1720,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           );
           recordSpend('client_key', auth.clientKey.id, actualCostCents, budgetEstCostCents);
         }
+        budgetOpen = false;
         // F5: store the response in the cache (only temp-0, non-streaming).
         if (cacheKey && !stream) {
-          setCachedResponse(cacheKey, JSON.stringify(normalizeOutboundContent(result)));
+          setCachedResponse(cacheKey, JSON.stringify(outboundResult));
         }
         return;
       }
@@ -1746,7 +1804,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // the gateway must not pretend is a transient retryable condition.
             const errorMsg = `Provider error (${route.displayName}): ${safeError}`;
             publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
-            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
+            res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+            if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
             if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
             res.status(502).json({ error: { message: errorMsg, type: 'provider_error' } });
             return;
@@ -1794,7 +1853,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Non-retryable error (auth, 4xx, etc.): don't retry.
         const errorMsg = `Provider error (${route.displayName}): ${safeError}`;
         publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`); if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
+        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+        if (attemptedModels.size > 0) res.setHeader('X-Attempted-Models', [...attemptedModels].join(','));
         if (totalAttempt > 0) res.setHeader('X-Fallback-Attempts', String(totalAttempt));
         res.status(502).json({
           error: {
@@ -1860,6 +1920,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       res.status(502).json({ error: { message: `Internal error: ${sanitizeProviderErrorMessage(err?.message)}`, type: 'provider_error' } });
     }
   } finally {
+    // C02: safety net — any exit that didn't settle the budget (abort,
+    // mid-stream error, failover exhaustion, unexpected throw) releases the
+    // outstanding reservation instead of leaving phantom spend behind.
+    if (budgetOpen && auth.clientKey) {
+      releaseBudget('client_key', auth.clientKey.id, budgetEstCostCents);
+    }
     detachAbortWatcher();
   }
 
@@ -1880,6 +1946,10 @@ export function logRequest(
   // analytics split pinned vs auto traffic and detect failover overrides
   // (requested_model set but != model_id).
   requestedModel: string | null = null,
+  // L07: whether an SSE (text/event-stream) response was actually sent to the
+  // client. The old inference (`outputTokens > 0 && ttfbMs !== null`) labeled
+  // a 0-token stream as non-stream; callers now report what was really sent.
+  streamed: boolean = false,
 ) {
   try {
     const db = getDb();
@@ -1897,7 +1967,7 @@ export function logRequest(
     recordMetricsRequest({
       platform, model: modelId,
       status: status === 'success' ? 'success' : 'error',
-      stream: outputTokens > 0 && ttfbMs !== null,
+      stream: streamed,
       latencyMs,
     });
     if (inputTokens > 0 || outputTokens > 0) {

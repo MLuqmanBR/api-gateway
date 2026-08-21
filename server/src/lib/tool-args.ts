@@ -50,8 +50,12 @@ export function repairToolArguments(args: string, paramSchema?: JsonSchemaish): 
     }
   }
 
+  // Scalars / null / arrays: nothing to repair here. The string-unwrap above
+  // either returned or left a plain object, so `changed` is always false on
+  // this path — plain `return args`. The type check also keeps
+  // Object.entries below away from null.
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return changed ? JSON.stringify(parsed) : args;
+    return args;
   }
 
   const props = paramSchema?.properties;

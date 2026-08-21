@@ -11,8 +11,10 @@ export function startRequestRetentionPruner(): void {
   if (pruneTimer) return;
   console.log('[Retention] Starting request analytics pruner (every 10m)');
   pruneRequestAnalytics({ force: true });
+  // L20: no force here — the 60 s throttle in pruneRequestAnalytics stays
+  // meaningful, so an opportunistic prune elsewhere can skip this tick.
   pruneTimer = setInterval(() => {
-    pruneRequestAnalytics({ force: true });
+    pruneRequestAnalytics();
   }, PRUNE_TIMER_MS);
 }
 

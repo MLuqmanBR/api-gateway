@@ -69,6 +69,19 @@ describe('anthropicThinking', () => {
   it('omits fields when nothing was set', () => {
     expect(anthropicThinking(undefined)).toEqual({});
   });
+  // M33: type:'enabled' WITHOUT budget_tokens is a 400 from Anthropic.
+  it('M33: effort-only enabled derives budget_tokens from effort', () => {
+    const out = anthropicThinking({ enabled: true, effort: 'high' });
+    expect(out.thinking).toEqual({ type: 'enabled', budget_tokens: 16384 });
+  });
+  it('M33: bare enabled clamps to the Anthropic floor of 1024', () => {
+    const out = anthropicThinking({ enabled: true });
+    expect(out.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
+  });
+  it('M33: minimal effort clamps to the floor (budget 0 is invalid when enabled)', () => {
+    const out = anthropicThinking({ enabled: true, effort: 'minimal' });
+    expect(out.thinking).toEqual({ type: 'enabled', budget_tokens: 1024 });
+  });
 });
 
 describe('geminiThinkingConfig', () => {
@@ -90,6 +103,19 @@ describe('geminiThinkingConfig', () => {
   it('emits thinkingBudget on 2.5-series when effort is set', () => {
     expect(geminiThinkingConfig({ enabled: true, effort: 'low' }, 'gemini-2.5-flash'))
       .toMatchObject({ includeThoughts: true, thinkingBudget: 2048 });
+  });
+
+  it('H14: effort "minimal" on 2.5-series maps to a DEFINED budget (was silently dropped)', () => {
+    const cfg = geminiThinkingConfig({ enabled: true, effort: 'minimal' }, 'gemini-2.5-flash');
+    expect(cfg).toMatchObject({ includeThoughts: true });
+    expect((cfg as Record<string, unknown>).thinkingBudget).toBe(0);
+  });
+
+  it('H14: every ThinkingEffort produces a defined 2.5 budget', () => {
+    for (const effort of ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      const cfg = geminiThinkingConfig({ enabled: true, effort }, 'gemini-2.5-pro') as Record<string, unknown>;
+      expect(Number.isFinite(cfg.thinkingBudget as number)).toBe(true);
+    }
   });
 
   it('uses explicit budget when no effort is set', () => {

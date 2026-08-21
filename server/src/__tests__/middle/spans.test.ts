@@ -114,11 +114,11 @@ describe('applySpans', () => {
 
   it('handles spans at string boundaries', () => {
     const spans: Span[] = [
-      { start: 0, end: 3, value: 'ABC', placeholder: '⟦R1:abc⟧' },
-      { start: 5, end: 8, value: 'XYZ', placeholder: '⟦R1:xyz⟧' },
+      { start: 0, end: 3, value: 'ABC', placeholder: '⟦R1:a1b2c3d4e5f6⟧' },
+      { start: 5, end: 8, value: 'XYZ', placeholder: '⟦R1:f6e5d4c3b2a1⟧' },
     ];
     const result = applySpans('ABCtoXYZ', spans);
-    expect(result.out).toBe('⟦R1:abc⟧to⟦R1:xyz⟧');
+    expect(result.out).toBe('⟦R1:a1b2c3d4e5f6⟧to⟦R1:f6e5d4c3b2a1⟧');
   });
 
   it('handles unicode/CJK content straddling span edges', () => {

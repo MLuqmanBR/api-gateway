@@ -28,9 +28,9 @@ export class CohereProvider extends BaseProvider {
       messages: flattenMessageContent(messages),
     };
     if (options?.temperature !== undefined) body.temperature = options.temperature;
-    if (options?.max_tokens !== undefined) body.max_tokens = options.max_tokens;
+    if (options?.max_tokens !== undefined && options.max_tokens > 0) body.max_tokens = options.max_tokens;
     if (options?.top_p !== undefined) body.top_p = options.top_p;
-    if (options?.tools) body.tools = options.tools;
+    if (options?.tools?.length) body.tools = options.tools;
     if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
     if (options?.reasoning_effort) body.reasoning_effort = options.reasoning_effort;
     if (options?.thinking) body.thinking = options.thinking;

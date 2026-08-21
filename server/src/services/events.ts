@@ -93,8 +93,11 @@ export function subscribeSse(res: Response): () => void {
   // Tests for the eviction/limit behaviour don't need the timer — the
   // pure `subscribe` API above is what they exercise, and the timer is
   // paid for only by the real prod code path.
+  // N24: check headersSent BEFORE writing — if the subscriber registered
+  // before the route flushed headers, a heartbeat here would commit the
+  // response as SSE and freeze whatever status/headers the route later sets.
   const heartbeat = setInterval(() => {
-    if (res.destroyed) return;
+    if (res.destroyed || !res.headersSent) return;
     try { res.write(': heartbeat\n\n'); } catch { /* socket gone */ }
   }, 30_000);
 

@@ -10,6 +10,8 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
+import { clearExhausted } from '../services/key-exhaustion.js';
+import { recordCircuitSuccess } from '../services/circuit-breaker.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
@@ -22,6 +24,7 @@ import {
   classifyCooldownReason,
   timingSafeStringEqual,
   extractApiToken,
+  authenticateRequest,
   getStickyModel,
   setStickyModel,
   logRequest,
@@ -51,7 +54,9 @@ export const responsesRouter = Router();
 // bookkeeping, sticky sessions, logging) are imported, not re-implemented.
 // ─────────────────────────────────────────────────────────────────────────
 
-const MAX_RETRIES = 20;
+// N23: this caps upstream ATTEMPTS per request (not retries) — the first
+// try plus up to 19 recovery attempts.
+const MAX_ATTEMPTS = 20;
 
 function newId(prefix: string): string {
   return `${prefix}_${crypto.randomBytes(18).toString('hex')}`;
@@ -114,7 +119,10 @@ const responsesRequestSchema = z.object({
   stream: z.boolean().optional(),
   temperature: z.number().min(0).max(2).nullable().optional(),
   top_p: z.number().min(0).max(1).nullable().optional(),
-  max_output_tokens: z.number().int().positive().nullable().optional(),
+  // L16: <= 0 (or -1) means "no limit" in several clients — accepted here and
+  // normalized to unset below, matching the /chat/completions surface (#200)
+  // instead of being rejected outright.
+  max_output_tokens: z.number().int().nullable().optional(),
   tools: z.array(responsesToolSchema).optional(),
   tool_choice: z.union([
     z.enum(['none', 'auto', 'required']),
@@ -271,10 +279,11 @@ export function buildResponseObject(opts: {
 responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const start = Date.now();
 
-  // Same unified-key auth as the proxy (accepts Bearer or x-api-key).
+  // Same auth as the proxy (unified key OR scoped client keys) — the shared
+  // authenticateRequest helper accepts Bearer or x-api-key tokens.
   const token = extractApiToken(req);
-  const unifiedKey = getUnifiedApiKey();
-  if (!token || !timingSafeStringEqual(token, unifiedKey)) {
+  const auth = authenticateRequest(token);
+  if (!auth.authenticated) {
     res.status(401).json({ error: { message: 'Invalid API key', type: 'authentication_error' } });
     return;
   }
@@ -291,6 +300,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   }
 
   const reqData = parsed.data;
+
+  // L16: treat max_output_tokens <= 0 as unset ("no limit"), same as the
+  // proxy's max_tokens handling (#200).
+  const maxOutputTokens = reqData.max_output_tokens != null && reqData.max_output_tokens > 0
+    ? reqData.max_output_tokens
+    : undefined;
 
   // Vision isn't carried through the Responses translation yet — fail clearly
   if (responsesInputHasImage(reqData)) {
@@ -322,7 +337,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // created below; the base opts are built here for both call sites. (#292)
   const completionOpts = {
     temperature: reqData.temperature ?? undefined,
-    max_tokens: reqData.max_output_tokens ?? undefined,
+    max_tokens: maxOutputTokens,
     top_p: reqData.top_p ?? undefined,
     tools,
     tool_choice,
@@ -333,7 +348,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
     0,
   );
-  const estimatedTotal = estimatedInputTokens + (reqData.max_output_tokens ?? 1000);
+  const estimatedTotal = estimatedInputTokens + (maxOutputTokens ?? 1000);
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
@@ -344,15 +359,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   let preferredModel: number | undefined;
   if (reqData.model && reqData.model !== 'auto') {
     const db = getDb();
-    const requestedModel = reqData.model;
-    const resolution = resolvePinnedModel(db, requestedModel);
+    const resolution = resolvePinnedModel(db, reqData.model);
     if (resolution.kind === 'resolved') {
       preferredModel = resolution.modelDbId;
     } else {
       const reason = formatPinnedModelRejection(resolution);
       res.status(400).json({
         error: {
-          message: `Model '${requestedModel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+          message: `Model '${reqData.model}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
           type: 'invalid_request_error',
           code: 'model_not_found',
         },
@@ -361,8 +375,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     }
   }
   const isPinned = !!(reqData.model && reqData.model !== 'auto');
+  // L15: the client-pinned model id (null when auto/sticky routing), passed to
+  // logRequest like the proxy's pinnedModelId so analytics can split pinned vs
+  // auto traffic — without it every /v1/responses request read as auto-routed.
+  const pinnedModelId: string | null = isPinned ? (reqData.model as string) : null;
   if (!preferredModel) {
-    preferredModel = getStickyModel(extractApiToken(req), messages, sessionIdHeader);
+    preferredModel = getStickyModel(token, messages, sessionIdHeader); // N3: reuse the token extracted at auth
   }
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
@@ -383,14 +401,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   // Client-disconnect abort wiring — mirrors /chat/completions. A Stop /
   // session-close cancels the in-flight upstream call and breaks out of the
-  // retry loop instead of running all MAX_RETRIES. (#292)
+  // retry loop instead of running all MAX_ATTEMPTS. (#292)
   const { controller: abortController, detach: detachAbortWatcher } = attachClientAbort(res);
   const abortSignal = abortController.signal;
   // Global recovery limit: counts actual upstream attempts (not cycles), same
-  // setting as /chat/completions. Falls back to MAX_RETRIES when the user
+  // setting as /chat/completions. Falls back to MAX_ATTEMPTS when the user
   // configured 0 (infinite) so this Codex path never runs away. (#292)
   const configuredLimit = getGlobalRetryLimit();
-  const attemptLimit = configuredLimit > 0 ? configuredLimit : MAX_RETRIES;
+  const attemptLimit = configuredLimit > 0 ? configuredLimit : MAX_ATTEMPTS;
   let upstreamAttempts = 0;
 
   const skipKeys = new Set<string>();
@@ -434,7 +452,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       return;
     }
 
-        let attemptEmitted = false; // per-attempt: true when real output emitted beyond the skeleton
+    let attemptEmitted = false; // per-attempt: true when real output emitted beyond the skeleton
     // CoT families (MiniMax M2.x/M3, DeepSeek-R1, QwQ, …) return reasoning
     // inline in `content` wrapped in `<think>` tags, or in a dedicated
     // `reasoning_content` delta field. Same family gate as routes/proxy.ts —
@@ -454,6 +472,16 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // `outputIndex` is mutated afterward by tool-call handling and a
         // late-opened text item (after tool calls) is no longer at 0.
         let msgOutputIndex = 0;
+        // M18: true only while a message output item is open (assigned an
+        // output_index). Distinguishes "index 0 because nothing opened yet"
+        // from "index 0 because the text item is at 0" — the old length-based
+        // test collided a following function_call onto output_index 0 when the
+        // un-redactor held back all text.
+        let msgItemOpen = false;
+        // M18: set when a message item was opened and then closed (its
+        // output_index is consumed). Function_call item indices must be
+        // offset by 1 in that case even if no text was emitted.
+        let wasMsgItemClosed = false;
         // tool-call accumulator keyed by the provider's tool_call index
         const toolAcc = new Map<number, { outputIndex: number; itemId: string; callId: string; name: string; args: string }>();
         let totalOutputTokens = 0;
@@ -468,12 +496,20 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // streamed normally). Mirrors the /chat/completions stream loop.
         let dialectMode: 'undecided' | 'passthrough' | 'dialect' = 'undecided';
         let heldText = '';
+        // Reasoning-family gate (C08): CoT models inline <think>…</think> in
+        // `content`. Strip it before the text reaches the dialect window or
+        // the client — the shim has no reasoning side channel, so extracted
+        // reasoning is dropped deliberately (same policy as the comment
+        // above). Null for non-reasoning models: zero overhead, no behavior
+        // change for models that never emit the tags.
+        const thinkStream = isReasoningModel ? new ThinkTagStream() : null;
 
         // Open the text output item and stream `text` as its first delta.
         const openTextItem = (text: string) => {
           attemptEmitted = true;
           msgItemId = newId('msg');
           msgOutputIndex = outputIndex;
+          msgItemOpen = true;
           sse('response.output_item.added', {
             output_index: msgOutputIndex,
             item: { id: msgItemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
@@ -533,8 +569,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           if (!delta) continue;
 
           // Text deltas → output_text events on a single message item, after
-          // the dialect hold window has decided the text is real prose.
-          const text = delta.content ?? '';
+          // think-tag extraction (reasoning models) and the dialect hold
+          // window has decided the text is real prose.
+          const rawText = delta.content ?? '';
+          const text = thinkStream && rawText ? thinkStream.feed(rawText).visible : rawText;
           if (text) {
             totalOutputTokens += Math.ceil(text.length / 4);
             if (dialectMode === 'passthrough') {
@@ -569,14 +607,23 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             let acc = toolAcc.get(idx);
             if (!acc) {
               // First time we see this tool call: open a new output item.
-              if (msgItemId !== null && msgText.length > 0) {
+              if (msgItemId !== null) {
+                // M18: close the text item even when EMPTY (msgText === '').
+                // The un-redactor can hold back every text delta, leaving the
+                // item open with zero content; the old `msgText.length > 0`
+                // guard skipped the close and the function_call below reused
+                // output_index 0 — two items with the same output_index.
                 // close the text item (at the index it was opened at) before starting a function_call item
                 sse('response.output_text.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, text: msgText });
                 sse('response.content_part.done', { item_id: msgItemId, output_index: msgOutputIndex, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
                 sse('response.output_item.done', { output_index: msgOutputIndex, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
                 msgItemId = null;
+                msgItemOpen = false;
+                wasMsgItemClosed = true;
               }
-              outputIndex = toolAcc.size + (msgText.length > 0 ? 1 : 0);
+              // M18: index by whether a message item was open-and-closed
+              // (occupied an output_index), not by text length.
+              outputIndex = toolAcc.size + (wasMsgItemClosed ? 1 : 0);
               acc = { outputIndex, itemId: newId('fc'), callId: tc.id || newId('call'), name: tc.function?.name ?? '', args: '' };
               toolAcc.set(idx, acc);
               sse('response.output_item.added', {
@@ -595,6 +642,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           }
         }
 
+        // End-of-stream think flush: an unclosed <think> opener leaves its
+        // tail buffered; policy (lib/think-tags.ts) treats it as visible so
+        // the answer is never dropped. Feed it into the same dialect window
+        // the streamed text went through.
+        if (thinkStream) {
+          const { residual } = thinkStream.flush();
+          if (residual) heldText += residual;
+        }
+
         // Resolve the dialect hold window now that the full text is known.
         // Held text was never emitted, so a dead dialect turn can still fail
         // over on the same SSE stream (only the skeleton events are out).
@@ -603,7 +659,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             ? rescueInlineToolCalls(heldText, new Set((tools ?? []).map(t => t.function.name)))
             : { detected: false as const, calls: null, cleanText: heldText };
           if (rescue.detected && !rescue.calls) {
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, `unparseable inline tool-call dialect: ${heldText.slice(0, 120)}`);
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, `unparseable inline tool-call dialect: ${heldText.slice(0, 120)}`, null, pinnedModelId, streamStarted);
             skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
             setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false), 'unparseable_tool_call');
             recordRateLimitHit(route.modelDbId);
@@ -687,7 +743,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // already has to tolerate), so it's safe to fail over to the next
         // model on the same SSE stream.
         if (msgText.length === 0 && finalToolCalls.length === 0) {
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no valid tool_calls)');
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no valid tool_calls)', null, pinnedModelId, streamStarted);
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
           setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false), 'empty_completion');
           recordRateLimitHit(route.modelDbId);
@@ -705,8 +761,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
         recordSuccess(route.modelDbId);
-        setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
-        logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+        // H16: mirror the proxy's success bookkeeping — a key benched by a
+        // chat request is un-benched here, and circuits see the success.
+        clearExhausted(route.keyId, route.modelId);
+        recordCircuitSuccess(route.platform, route.modelId, route.keyId);
+        setStickyModel(token, messages, route.modelDbId, sessionIdHeader);
+        logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, null, pinnedModelId, streamStarted);
         return;
       } else {
         upstreamAttempts++; // counted toward the global recovery limit. (#292)
@@ -714,6 +774,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         const msg = result.choices[0]?.message;
         let text = contentToString(msg?.content ?? '');
+        // C08: reasoning models may inline <think>…</think> in content —
+        // strip it so reasoning never reaches Codex's visible output_text.
+        if (isReasoningModel) {
+          text = extractThinkTags(text).visible;
+        }
         let toolCalls = (msg?.tool_calls ?? []).map((tc) => ({
           ...tc,
           function: { ...tc.function, arguments: repairToolArguments(tc.function.arguments, toolSchemas.get(tc.function.name)) },
@@ -740,7 +805,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         // Empty completion → fail over (see the streaming-path comment above).
         if (!text && toolCalls.length === 0) {
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId);
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
           setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false), 'empty_completion');
           recordRateLimitHit(route.modelDbId);
@@ -749,8 +814,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         }
 
         recordRequest(route.platform, route.modelId, route.keyId);
-        recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? 0);
+        // H15: upstreams that omit usage must not record 0 tokens (TPM/RPD
+        // would undercount every such request) — fall back to the shim's own
+        // tracked counts, same as the proxy path.
+        recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? (promptTokens + completionTokens));
         recordSuccess(route.modelDbId);
+        // H16: mirror the proxy's success bookkeeping (exhaustion + circuit).
+        clearExhausted(route.keyId, route.modelId);
+        recordCircuitSuccess(route.platform, route.modelId, route.keyId);
         setStickyModel(extractApiToken(req), messages, route.modelDbId, sessionIdHeader);
 
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
@@ -779,7 +850,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         publish({ type: 'request.done', id: responseId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: promptTokens, out: completionTokens }, at: Date.now() });
 
         logRequest(route.platform, route.modelId, route.keyId, 'success',
-          promptTokens, completionTokens, Date.now() - start, null);
+          promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
         return;
       }
     } catch (err: any) {
@@ -795,7 +866,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
       const latency = Date.now() - start;
       const safeError = sanitizeProviderErrorMessage(err.message);
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, streamStarted);
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
       // The attempt must have actually emitted output, not just the skeleton.

@@ -4,7 +4,9 @@
 // labels, which callers treat as "no budget info".
 export function parseBudget(s: string): number {
   if (!s) return 0;
-  const m = s.match(/~?([\d.]+)(?:-([\d.]+))?([MK])?/);
+  // N33: `[\d.]+` matched "12.5.3" as "12.5" (prefix bite) — require a
+  // well-formed number so malformed labels parse as 0 ("no budget info").
+  const m = s.match(/~?(\d+(?:\.\d+)?)(?:-(\d+(?:\.\d+)?))?([MK])?/);
   if (!m) return 0;
   const high = parseFloat(m[2] ?? m[1]);
   if (Number.isNaN(high)) return 0;

@@ -19,13 +19,21 @@
 
 import { createHash } from 'crypto';
 import { getDb, getSetting } from '../db/index.js';
+import { parseIntSetting } from '../lib/settings-parse.js';
 import type { DatabasePort } from '../db/types.js';
 
 const L1_MAX = 2048;
-const lru = new Map<string, { response: string; createdAtMs: number }>();
+// L17: a synchronous `hits+1` UPDATE on every L1 hit put a write on the hot
+// path of every cache serve. Batch the counter instead — an entry accrues
+// pending hits in memory and flushes them to L2 in one UPDATE every
+// HIT_FLUSH_EVERY hits (or when the entry leaves the cache). Final counts
+// are identical; only the write cadence changes.
+const HIT_FLUSH_EVERY = 16;
+type L1Entry = { response: string; createdAtMs: number; pendingHits?: number };
+const lru = new Map<string, L1Entry>();
 
 /** LRU get: move to end (most-recently-used). */
-function lruGet(key: string): { response: string; createdAtMs: number } | undefined {
+function lruGet(key: string): L1Entry | undefined {
   const entry = lru.get(key);
   if (entry) {
     lru.delete(key);
@@ -35,7 +43,7 @@ function lruGet(key: string): { response: string; createdAtMs: number } | undefi
 }
 
 /** LRU set: evict least-recently-used if over capacity. */
-function lruSet(key: string, entry: { response: string; createdAtMs: number }) {
+function lruSet(key: string, entry: L1Entry) {
   lru.set(key, entry);
   if (lru.size > L1_MAX) {
     const oldest = lru.keys().next().value;
@@ -46,10 +54,21 @@ function lruSet(key: string, entry: { response: string; createdAtMs: number }) {
 /** Clear the L1 cache (for tests / admin purge). */
 function clearL1() { lru.clear(); }
 
-/** Compute TTL in seconds from settings (default 86400 = 24h). */
+/** Flush an L1 entry's batched hit count into L2 (best-effort — the L2 row
+ *  may already be purged; stats must never break serving). */
+function flushPendingHits(key: string, entry: L1Entry): void {
+  const n = entry.pendingHits ?? 0;
+  if (n <= 0) return;
+  try { getDb().prepare('UPDATE response_cache SET hits = hits + ? WHERE key = ?').run(n, key); } catch { /* L2 may be purged */ }
+  entry.pendingHits = 0;
+}
+
+/** Compute TTL in seconds from settings (default 86400 = 24h).
+ *  M20: NaN-safe — a corrupt stored value previously caused parseInt to
+ *  return NaN, making every TTL comparison false and instantly expiring
+ *  every entry. */
 function getTtlSeconds(): number {
-  const raw = getSetting('cache_ttl_seconds');
-  return raw ? parseInt(raw, 10) : 86400;
+  return parseIntSetting('cache_ttl_seconds', 86400);
 }
 
 /** Is the cache enabled? Default true (opt-out). */
@@ -118,10 +137,13 @@ export function getCachedResponse(key: string): string | null {
   const l1 = lruGet(key);
   if (l1) {
     if (now - l1.createdAtMs < ttlMs) {
-      // Increment L2 hits counter even for L1 hits (so stats are accurate)
-      try { getDb().prepare('UPDATE response_cache SET hits = hits + 1 WHERE key = ?').run(key); } catch { /* L2 may be purged */ }
+      // Count the hit (L2 rows back the stats UI) but batched — see the L17
+      // note at HIT_FLUSH_EVERY.
+      l1.pendingHits = (l1.pendingHits ?? 0) + 1;
+      if (l1.pendingHits >= HIT_FLUSH_EVERY) flushPendingHits(key, l1);
       return l1.response;
     }
+    flushPendingHits(key, l1); // expired — flush residue before eviction
     lru.delete(key); // expired
   }
 
@@ -147,6 +169,8 @@ export function getCachedResponse(key: string): string | null {
 /** Store a response in the cache (both L1 and L2). */
 export function setCachedResponse(key: string, responseJson: string): void {
   const now = Date.now();
+  const prev = lru.get(key);
+  if (prev) flushPendingHits(key, prev); // overwrite — flush old entry's residue
   lruSet(key, { response: responseJson, createdAtMs: now });
 
   const db = getDb();
@@ -177,24 +201,48 @@ export function getCacheStats(): { entries: number; hits: number; l1Size: number
  * Synthesize an SSE stream from a cached non-streaming JSON response.
  * Emits the same chunk sequence a real streaming response would produce:
  * a first chunk with the role, then content delta chunks, then [DONE].
+ *
+ * M04: returns null when the cached response carries tool_calls — they
+ * cannot be faithfully replayed as SSE (argument chunking, parallel-call
+ * indices, per-call deltas), so the caller must fall back to non-stream
+ * replay instead of silently dropping the calls.
+ * M04: the cached `created` timestamp is echoed on every chunk.
  */
-export function synthesizeSSE(cachedJson: string): string {
+export function synthesizeSSE(cachedJson: string): string | null {
   const response = JSON.parse(cachedJson) as {
     id: string;
     model: string;
-    choices: Array<{ message?: { content?: string }; finish_reason?: string }>;
+    created?: number;
+    choices: Array<{
+      message?: {
+        content?: string;
+        tool_calls?: Array<{
+          id?: string; type?: string;
+          function?: { name?: string; arguments?: string };
+        }>;
+      };
+      finish_reason?: string;
+    }>;
   };
+
+  // M04: refuse to replay tool-bearing completions as SSE. Content deltas
+  // and tool-call argument chunks are interleaved by a real provider stream;
+  // replaying text-only while claiming finish_reason 'tool_calls' loses all
+  // tool data — worse than falling back to a non-streaming JSON response.
+  const message = response.choices?.[0]?.message;
+  if (message?.tool_calls && message.tool_calls.length > 0) return null;
 
   const id = response.id;
   const model = response.model;
-  const content = response.choices?.[0]?.message?.content ?? '';
+  const created = response.created ?? Math.floor(Date.now() / 1000);
+  const content = message?.content ?? '';
   const finishReason = response.choices?.[0]?.finish_reason ?? 'stop';
 
   const chunks: string[] = [];
 
   // First chunk: role
   chunks.push(`data: ${JSON.stringify({
-    id, object: 'chat.completion.chunk', model,
+    id, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }],
   })}\n\n`);
 
@@ -203,14 +251,14 @@ export function synthesizeSSE(cachedJson: string): string {
   for (let i = 0; i < content.length; i += segmentSize) {
     const segment = content.slice(i, i + segmentSize);
     chunks.push(`data: ${JSON.stringify({
-      id, object: 'chat.completion.chunk', model,
+      id, object: 'chat.completion.chunk', created, model,
       choices: [{ index: 0, delta: { content: segment }, finish_reason: null }],
     })}\n\n`);
   }
 
   // Final chunk: finish_reason
   chunks.push(`data: ${JSON.stringify({
-    id, object: 'chat.completion.chunk', model,
+    id, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
   })}\n\n`);
 

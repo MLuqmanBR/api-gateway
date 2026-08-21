@@ -22,6 +22,9 @@ export function verifyPassword(password: string, stored: string): boolean {
   } catch {
     return false;
   }
-  // Constant-time compare; lengths match by construction (both KEYLEN).
+  // Constant-time compare. M40: `expected` is parsed from storage and may
+  // be ANY length (corrupt/truncated/hand-edited) — the length check exists
+  // precisely because the two sides do NOT match by construction, and
+  // timingSafeEqual throws on length mismatch.
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }

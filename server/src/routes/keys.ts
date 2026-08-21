@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { getDb } from '../db/index.js';
 import { getProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
+import { clearKeyRuntimeState } from '../services/ratelimit.js';
+import { clearExhaustedForKey } from '../services/key-exhaustion.js';
 import { mintClientKey, listClientKeys, deleteClientKey, updateClientKey } from '../lib/client-keys.js';
 
 export const keysRouter = Router();
@@ -33,18 +35,65 @@ const updateKeySchema = z.object({
   message: 'At least one of enabled or label must be provided',
 });
 
+// L11: strict numeric-id guard for :id path params. parseInt('12abc') === 12
+// silently accepted garbage; this accepts only whole numbers ('' and
+// whitespace included — Number('') is 0).
+function parseIdParam(raw: string): number | null {
+  const n = Number(raw);
+  return raw.trim() !== '' && Number.isInteger(n) ? n : null;
+}
+
 // List all keys (masked)
+// M19: masks are cached in a module-level map keyed by key id. Previously
+// every dashboard poll decrypted EVERY stored key just to compute '****xyz'
+// — one AES-GCM round-trip per key per poll. The cache populates on first
+// request and is invalidated whenever a key is added/updated/deleted.
+const keyMaskCache = new Map<number, string>();
+
+/** N21: exactly the columns the list endpoint SELECTs — the ciphertext trio
+ *  is required for the mask; nothing else leaves the row. */
+interface KeysListRow {
+  id: number;
+  platform: string;
+  label: string;
+  encrypted_key: string;
+  iv: string;
+  auth_tag: string;
+  base_url: string | null;
+  status: string;
+  enabled: number;
+  created_at: string;
+  last_checked_at: string | null;
+}
+
+function computeMask(row: KeysListRow): string {
+  try {
+    return maskKey(decrypt(row.encrypted_key, row.iv, row.auth_tag));
+  } catch {
+    return '[decrypt failed]';
+  }
+}
+
+function invalidateKeyMask(id?: number): void {
+  if (id !== undefined) keyMaskCache.delete(id);
+  else keyMaskCache.clear();
+}
+
 keysRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
-  const rows = db.prepare('SELECT * FROM api_keys ORDER BY created_at DESC').all() as any[];
+  // N21: enumerate exactly the columns this endpoint reads — the ciphertext
+  // trio is required for the mask, everything else stays unpulled.
+  const rows = db.prepare(`
+    SELECT id, platform, label, encrypted_key, iv, auth_tag,
+           base_url, status, enabled, created_at, last_checked_at
+    FROM api_keys ORDER BY created_at DESC
+  `).all() as KeysListRow[];
 
   const keys = rows.map(row => {
-    let maskedKey = '****';
-    try {
-      const realKey = decrypt(row.encrypted_key, row.iv, row.auth_tag);
-      maskedKey = maskKey(realKey);
-    } catch {
-      maskedKey = '[decrypt failed]';
+    let maskedKey = keyMaskCache.get(row.id as number);
+    if (maskedKey === undefined) {
+      maskedKey = computeMask(row);
+      keyMaskCache.set(row.id as number, maskedKey);
     }
     return {
       id: row.id,
@@ -104,7 +153,10 @@ keysRouter.post('/', (req: Request, res: Response) => {
   if (isKeyless) {
     const existing = db.prepare('SELECT id FROM api_keys WHERE platform = ? LIMIT 1').get(platform) as { id: number } | undefined;
     if (existing) {
-      db.prepare("UPDATE api_keys SET enabled = 1, status = 'unknown' WHERE id = ?").run(existing.id);
+      // L14: persist the submitted label too — the UPDATE used to set only
+      // enabled/status while the response echoed `label ?? ''`, so the stored
+      // row kept its old (or empty) label and the echo lied.
+      db.prepare("UPDATE api_keys SET enabled = 1, status = 'unknown', label = ? WHERE id = ?").run(label ?? '', existing.id);
       res.status(200).json({
         id: existing.id,
         platform,
@@ -123,6 +175,10 @@ keysRouter.post('/', (req: Request, res: Response) => {
     VALUES (?, ?, ?, ?, ?, 'unknown', 1, ?)
   `).run(platform, label ?? '', encrypted, iv, authTag, baseUrl);
 
+  // M19: seed the mask cache for the new id so the first GET doesn't
+  // decrypt anything for this key either.
+  keyMaskCache.set(Number(result.lastInsertRowid), maskKey(keyToStore));
+
   res.status(201).json({
     id: result.lastInsertRowid,
     platform,
@@ -136,8 +192,8 @@ keysRouter.post('/', (req: Request, res: Response) => {
 
 // Delete a key
 keysRouter.delete('/:id', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id as string, 10);
-  if (isNaN(id)) {
+  const id = parseIdParam(req.params.id as string);
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
     return;
   }
@@ -152,10 +208,17 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
   // Custom models are owned by their custom_providers row, not by a key — so
   // deleting a key never orphans its models. (The migration V23 moved the
   // cascade from here to DELETE /api/custom-providers/:slug.)
-  const remove = db.transaction(() => {
-    db.prepare('DELETE FROM api_keys WHERE id = ?').run(id);
-  });
-  remove();
+  // L13: no transaction wrapper — better-sqlite3 runs each statement
+  // atomically on its own, so wrapping the single DELETE bought nothing but
+  // ceremony.
+  getDb().prepare('DELETE FROM api_keys WHERE id = ?').run(id);
+  invalidateKeyMask(id);
+  // L13: drop this key's stale runtime state so nothing resurrects it —
+  // cooldowns/usage (memory + persisted rows) and exhaustion markers would
+  // otherwise linger until their TTLs (and the persisted cooldowns would
+  // re-seed the exhaustion map on restart).
+  clearKeyRuntimeState(id);
+  clearExhaustedForKey(id);
 
   res.json({ success: true });
 });
@@ -188,8 +251,8 @@ keysRouter.patch('/platform/:platform', (req: Request, res: Response) => {
 // Update key (toggle enable/disable or edit label)
 keysRouter.patch('/:id', (req: Request, res: Response) => {
 
-  const id = parseInt(req.params.id as string, 10);
-  if (isNaN(id)) {
+  const id = parseIdParam(req.params.id as string);
+  if (id === null) {
     res.status(400).json({ error: { message: 'Invalid key ID' } });
     return;
   }
@@ -258,7 +321,16 @@ keysRouter.post('/client', (req: Request, res: Response) => {
     const minted = mintClientKey(getDb(), parsed.data.label);
     res.status(201).json({ key: minted.key, id: minted.id, label: minted.label });
   } catch (err: any) {
-    res.status(409).json({ error: { message: err.message } });
+    // L12: only the active-key cap is a client-side conflict (409). Every
+    // other throw (DB failure, crypto error) is a server fault — mapping it
+    // to 409 told the operator to "resolve the conflict" and retry against a
+    // broken backend. Message matches the cap throw in lib/client-keys.ts.
+    if (typeof err?.message === 'string' && err.message.startsWith('Client key cap reached')) {
+      res.status(409).json({ error: { message: err.message } });
+      return;
+    }
+    console.error('[Keys] Failed to mint client key:', err);
+    res.status(500).json({ error: { message: 'Failed to mint client key' } });
   }
 });
 

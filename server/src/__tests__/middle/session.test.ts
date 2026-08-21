@@ -84,11 +84,12 @@ describe('RedactionSession — redactOutbound', () => {
     const out = session.redactOutbound(messages);
     const content = out[0].content as ChatContentBlock[];
     // Text block redacted
-    const textBlock = content[0];
-    if (typeof textBlock === 'object' && textBlock !== null) {
-      expect(textBlock.text).not.toContain('img-secret');
-      expect(textBlock.text).toContain('⟦R');
-    }
+    // M47: assert unconditionally — a shape mismatch must FAIL, not
+    // silently skip the redaction assertions.
+    const textBlock = content[0] as { type: string; text: string };
+    expect(textBlock.type).toBe('text');
+    expect(textBlock.text).not.toContain('img-secret');
+    expect(textBlock.text).toContain('⟦R');
     // Image URL block NOT redacted — stringify to avoid type-narrowing noise,
     // just verify the plaintext survived (the block is off-limits).
     expect(JSON.stringify(content[1])).toContain('img-secret');

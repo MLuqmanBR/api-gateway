@@ -31,7 +31,16 @@ const JSON_BLOCK_RE = /^\s*[\[{][\s\S]*[\]}]\s*$/;
 // Numbers, ALLCAPS constants, URLs, file paths, hex hashes, and other tokens
 // that a compressor must never drop. Techniques consult this via mustKeepMatches.
 export const mustKeepRe =
-  /\b\d+\.?\d*\b|ABCDEFGHIJKLMNOPQRSTUVWXYZ|https?:\/\/[^\s]+|\/[^\s]+|[0-9a-f]{32,}|[A-Z][A-Z_]{2,}[A-Z0-9_]*\b/g;
+  // Number tokens that carry meaning beyond a bare row index: decimals/versions,
+  // and prefixed numeric codes (`error 404`, `code 42`, `# 7`), but NOT a bare
+  // integer — every dataset row carries an id/index, so matching those marks
+  // every row must-keep and kills the entire lossy drop path. (Also drops the
+  // prior corrupted `ABCDEFGHIJKLMNOPQRSTUVWXYZ` alternative — a char class that
+  // lost its brackets, matching only the literal text "ABCDEFGHIJKLMNOPQRSTUVWXYZ".)
+  // Plus URLs, ABSOLUTE paths only (M42: the old `\/[^\s]+` matched any
+  // slash-prefixed fragment — "and/or" kept "/or" alive), hex hashes, and
+  // ALLCAPS constants.
+  /(?:\b\d+\.\d+\b|\b(?:err(?:or)?|code|line|pg?|no\.?|#)\s*[-:]?\s*\d+\b)|https?:\/\/[^\s]+|(?<=^|[\s(])\/[^\s]+|\b[0-9a-f]{16,}\b|[A-Z][A-Z_]{2,}[A-Z0-9_]*\b/gi;
 
 export type Span = { start: number; end: number };
 

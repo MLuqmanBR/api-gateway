@@ -1,39 +1,48 @@
-// Pure `` tag extractor for MiniMax reasoning content.
+// Pure `<think>` tag extractor for MiniMax reasoning content.
 //
 // Some providers (aggregatorc, openrouter, nvidia) return MiniMax M3 / M2.x
-// reasoning inline in the `content` field wrapped in `` tags, with no
+// reasoning inline in the `content` field wrapped in `<think>` tags, with no
 // separate `reasoning_content` field. Both the streaming and non-streaming
 // code paths in `routes/proxy.ts` use this module to split that into
 // reasoning (goes to `reasoning_content`) and visible answer (stays in
 // `content`).
 //
 // Rules (live-verified 2026-06-19):
-//   1. Only the literal 7-char tag `` is an opener. The word
+//   1. Only the literal 7-char tag `<think>` is an opener. The word
 //      "think" alone is never an opener.
-//   2. Non-greedy: the first `` after the opener wins, not the last.
+//   2. Non-greedy: the first `</think>` after the opener wins, not the last.
 //      Critical for the adversarial case where a code block contains
 //      `r"<think>example</think>"` after the real think block.
 //   3. Multiple sequential blocks are extracted in order; reasoning is
 //      concatenated, visible preserves interleaving.
-//   4. An opener with no `` is treated as visible text. The literal
+//   4. An opener with no `</think>` is treated as visible text. The literal
 //      tag text is part of `visible`. Safe default: losing one block of
 //      reasoning is much less bad than dropping the actual answer.
+//      Streaming nuance: an unclosed opener is only held up to
+//      THINK_UNCLOSED_HOLD_MAX — past the cap it is downgraded to prose
+//      immediately (see L43 note at the constant).
 
 const THINK_OPEN = '<think>';
 const THINK_CLOSE = '</think>';
+// L43: an unclosed `<think>` used to buffer the ENTIRE remaining stream
+// until a close tag or end-of-stream — unbounded memory and first-token
+// latency when a model emits the tag inside ordinary prose and never closes
+// it. Past this many held characters the opener is downgraded to prose:
+// everything held is flushed as visible text and streaming resumes.
+const THINK_UNCLOSED_HOLD_MAX = 64 * 1024;
 
 /** Result of a full-text scan. Used by the non-streaming path and by tests. */
 export interface ThinkTagResult {
-  /** Concatenated content of every complete `` block, in order. Empty when none. */
+  /** Concatenated content of every complete `<think>...</think>` block, in order. Empty when none. */
   reasoning: string;
-  /** Content with every complete `` block removed. */
+  /** Content with every complete `<think>...</think>` block removed. */
   visible: string;
   /** True when at least one complete block was found. */
   extracted: boolean;
 }
 
 /**
- * Find every complete `` block in `text` and split it into
+ * Find every complete `<think>...</think>` block in `text` and split it into
  * (reasoning, visible). See file header for the rules.
  */
 export function extractThinkTags(text: string): ThinkTagResult {
@@ -78,7 +87,7 @@ export function extractThinkTags(text: string): ThinkTagResult {
  * `reasoning_content` delta. `visible` is what should land in the
  * visible-content buffer (or be forwarded directly in passthrough).
  *
- * When a complete `` block is consumed, the post-close text in the
+ * When a complete `<think>...</think>` block is consumed, the post-close text in the
  * same feed (or in subsequent feeds) is returned via `visible` on the
  * call that completes the close. `flush()` only returns the
  * unclosed-opener-tail as `residual` (the case where the stream ended
@@ -117,7 +126,7 @@ export class ThinkTagStream {
       if (openIdx < 0) {
         // No complete opener. Before flushing the rest as visible, retain the
         // longest suffix of the buffer that is a proper prefix of THINK_OPEN,
-        // so a `` opener split across feeds (e.g. `...<thi` | `nk>...`)
+        // so a `<think>` opener split across feeds (e.g. `...<thi` | `nk>...`)
         // isn't leaked as visible text. flush() emits a genuine trailing
         // partial opener at true end-of-stream.
         const len = this.buffer.length;
@@ -140,6 +149,13 @@ export class ThinkTagStream {
       if (openIdx > cursor) visibleParts.push(this.buffer.slice(cursor, openIdx));
       const closeIdx = this.buffer.indexOf(THINK_CLOSE, openIdx + THINK_OPEN.length);
       if (closeIdx < 0) {
+        if (this.buffer.length - cursor > THINK_UNCLOSED_HOLD_MAX) {
+          // L43: hold cap exceeded — treat the opener as literal prose,
+          // flush the held tail as visible, and keep streaming normally.
+          visibleParts.push(this.buffer.slice(cursor));
+          cursor = this.buffer.length;
+          break;
+        }
         // Opener present, no close yet — keep opener-tail in buffer for the
         // next feed. visibleParts already has the pre-open content.
         hadUnclosedOpener = true;

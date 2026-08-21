@@ -6,7 +6,6 @@ import { mintDashboardToken } from '../helpers/auth.js';
 import {
   recordMetricsRequest,
   recordMetricsTokens,
-  recordMetricsCooldown,
   getMetricsText,
   isMetricsAuthEnabled,
   verifyMetricsToken,
@@ -45,13 +44,6 @@ describe('Prometheus /metrics (F7)', () => {
       expect(text).toContain('api_gateway_tokens_total');
       expect(text).toContain('direction="input"');
       expect(text).toContain('direction="output"');
-    });
-
-    it('recordMetricsCooldown increments cooldown counter', async () => {
-      recordMetricsCooldown({ platform: 'groq', model: 'test', reason: 'rate_limit' });
-      const text = await getMetricsText();
-      expect(text).toContain('api_gateway_cooldowns_total');
-      expect(text).toContain('reason="rate_limit"');
     });
   });
 

@@ -45,11 +45,16 @@ describe('B1-3: shouldCompress (extension whitelist)', () => {
   it('allows when no extension or content-type specified', () => {
     expect(shouldCompress('text', '', '')).toBe(true);
   });
-  it('rejects content > 500KB', () => {
+  it('rejects content above 512 KiB', () => {
     expect(shouldCompress('x'.repeat(524_289), '', 'md')).toBe(false);
   });
-  it('accepts content exactly 500KB', () => {
+  it('accepts content exactly 512 KiB', () => {
     expect(shouldCompress('x'.repeat(524_288), '', 'md')).toBe(true);
+  });
+  it('M35: counts BYTES, not UTF-16 units — multibyte content over the limit is rejected', () => {
+    // '日' is 3 bytes in UTF-8 but 1 UTF-16 unit: 524_288 such chars are
+    // 1_572_864 bytes — far over the gate, though `.length` says 524_288.
+    expect(shouldCompress('日'.repeat(524_288), '', 'md')).toBe(false);
   });
 });
 

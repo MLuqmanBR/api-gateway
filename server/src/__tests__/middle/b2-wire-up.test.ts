@@ -76,8 +76,9 @@ beforeEach(() => {
   db.prepare("DELETE FROM api_keys WHERE platform='fake'").run();
   db.prepare("INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled) VALUES ('fake', 'test', 'enc', 'iv', 'tag', 'healthy', 1)").run();
   db.prepare("INSERT INTO models (id, platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled) VALUES (9999, 'fake', 'fake-model', 'Fake Model', 5, 5, 'Small', 1) ON CONFLICT(id) DO UPDATE SET platform='fake', model_id='fake-model', enabled=1").run();
+  // M47: a missing seed row must FAIL the suite, not log and continue.
   const checkModel = db.prepare("SELECT id, model_id, enabled FROM models WHERE model_id = 'fake-model'").get();
-  if (!checkModel) console.log('DEBUG: model not found after INSERT!');
+  expect(checkModel).toBeDefined();
 });
 
 afterEach(() => {

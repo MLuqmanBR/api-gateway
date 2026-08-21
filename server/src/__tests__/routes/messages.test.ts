@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import type { Express } from 'express';
+import type { Server } from 'http';
 
 // F6: Anthropic /v1/messages integration test — verifies the endpoint accepts
 // Anthropic-format requests and returns Anthropic-format responses by
@@ -23,6 +24,7 @@ import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
 import { setRoutingStrategy, setGlobalRetryLimit } from '../../services/router.js';
+import { setMessagesHttpServer } from '../../routes/messages.js';
 
 async function postMessages(app: Express, key: string, body: any) {
   const server = app.listen(0);
@@ -40,11 +42,19 @@ async function postMessages(app: Express, key: string, body: any) {
 describe('Anthropic /v1/messages inbound (F6)', () => {
   let app: Express;
   let key: string;
+  // The messages route forwards to /v1/chat/completions via a loopback
+  // sub-request to setMessagesHttpServer's registered server. Registering an
+  // ephemeral server scoped to this suite makes the sub-request hit THIS app,
+  // not whatever happens to be listening on PORT/3001 (a stale dev gateway,
+  // etc.). The helper's per-call listen() still validates the outer endpoint.
+  let selfServer: Server;
 
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     initDb(':memory:');
     app = createApp();
+    selfServer = app.listen(0);
+    setMessagesHttpServer(selfServer);
     key = getUnifiedApiKey();
 
     setRoutingStrategy('priority');
@@ -78,6 +88,11 @@ describe('Anthropic /v1/messages inbound (F6)', () => {
       }],
       usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
     }));
+  });
+
+  afterAll(() => {
+    selfServer.close();
+    setMessagesHttpServer(null as unknown as Server);
   });
 
   it('accepts x-api-key auth (Anthropic convention)', async () => {

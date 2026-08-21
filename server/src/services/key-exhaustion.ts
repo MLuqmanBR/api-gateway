@@ -53,6 +53,15 @@ export function clearExhausted(keyId: number, modelId: string): void {
   db.prepare('DELETE FROM rate_limit_cooldowns WHERE key_id = ? AND model_id = ?').run(keyId, modelId);
 }
 
+/** Drop every exhaustion entry for a key across all models. Called when the
+ *  key is deleted so stale entries don't linger in the in-memory map. */
+export function clearExhaustedForKey(keyId: number): void {
+  const prefix = `${keyId}:`;
+  for (const compositeKey of exhaustionMap.keys()) {
+    if (compositeKey.startsWith(prefix)) exhaustionMap.delete(compositeKey);
+  }
+}
+
 /** Check whether a key is currently marked exhausted. */
 export function isExhausted(keyId: number, modelId: string): boolean {
   return exhaustionMap.has(`${keyId}:${modelId}`);
@@ -86,31 +95,4 @@ export function getExhaustedKeysForModel(provider: string, modelId: string): Arr
   }
   result.sort((a, b) => a.exhaustedAt - b.exhaustedAt);
   return result;
-}
-/** Check if all enabled keys for a provider+model combo are exhausted. */
-export function areAllKeysExhausted(provider: string, modelId: string): boolean {
-  const db = getDb();
-  const keys = db.prepare(
-    "SELECT id FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(provider) as Array<{ id: number }>;
-
-  if (keys.length === 0) return true;
-  return keys.every(k => exhaustionMap.has(`${k.id}:${modelId}`));
-}
-
-/** Check if all enabled keys for a provider (across all models) are exhausted. */
-export function areAllProviderKeysExhausted(provider: string): boolean {
-  const db = getDb();
-  const keys = db.prepare(
-    "SELECT id FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(provider) as Array<{ id: number }>;
-
-  if (keys.length === 0) return true;
-  const prefix = (id: number) => `${id}:`;
-  return keys.every(k => {
-    for (const compositeKey of exhaustionMap.keys()) {
-      if (compositeKey.startsWith(prefix(k.id))) return true;
-    }
-    return false;
-  });
 }

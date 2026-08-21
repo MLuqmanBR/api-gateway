@@ -31,6 +31,10 @@ export interface BuildExportOptions {
   sections?: ConfigSection[];
   passphrase?: string;
   label?: string;
+  /** M38: plain exports embed every decryptable key in cleartext ONLY when
+   * explicitly requested. Default (false) yields a ciphertext-only
+   * envelope; `passphrase` implies key transport via keysCipher instead. */
+  includePlaintextKeys?: boolean;
 }
 
 const ALL_SECTIONS: ConfigSection[] = [
@@ -237,8 +241,14 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
       const weights = db.prepare(
         "SELECT value FROM settings WHERE key = 'routing_custom_weights'",
       ).get() as { value: string } | undefined;
+      // L30: the fourth inventory-counted settings key — emitted so the
+      // inventory count and the emitted fields stay aligned.
+      const fam = db.prepare(
+        "SELECT value FROM settings WHERE key = 'embeddings_default_family'",
+      ).get() as { value: string } | undefined;
       if (strat) s.routingStrategy = strat.value as ConfigSettings['routingStrategy'];
       if (retry) s.globalRetryLimit = parseInt(retry.value, 10);
+      if (fam) s.embeddingsDefaultFamily = fam.value;
       if (weights) {
         try {
           s.customWeights = JSON.parse(weights.value);
@@ -297,15 +307,29 @@ export function buildExport(opts: BuildExportOptions = {}): ConfigEnvelope {
         'api_keys section not in export — nothing to encrypt',
       );
     }
+    // Include the row's label so multiple keys per platform survive the
+    // passphrase round-trip — keying by platform alone collapsed every key
+    // of a platform into the last one on import (C14).
     const plaintext = sections.apiKeys
       .filter((k) => typeof k.key === 'string' && k.key.length > 0)
-      .map((k) => ({ platform: k.platform, key: k.key as string }));
+      .map((k) => ({ platform: k.platform, label: k.label, key: k.key as string }));
     if (plaintext.length === 0) {
       throw new ConfigExportError(
         'no decryptable API keys to encrypt — every key failed to decrypt',
       );
     }
     keysCipher = encryptKeysWithPassphrase(plaintext, opts.passphrase);
+    sections.apiKeys = sections.apiKeys.map((k) => {
+      const { key: _omit, ...rest } = k;
+      return rest;
+    });
+  }
+
+  if (!opts.passphrase && !opts.includePlaintextKeys && sections.apiKeys) {
+    // M38: a plain export used to embed every decryptable API key in
+    // cleartext by default. Require explicit opt-in (includePlaintextKeys)
+    // or a passphrase; the default envelope carries ciphertext only, so an
+    // exported file is inert on any host with a different ENCRYPTION_KEY.
     sections.apiKeys = sections.apiKeys.map((k) => {
       const { key: _omit, ...rest } = k;
       return rest;

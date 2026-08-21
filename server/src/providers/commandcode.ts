@@ -227,9 +227,17 @@ export class CommandCodeProvider extends BaseProvider {
         // misclassified as a valid key.
         if (/insufficient credits|insufficient\s+balance|weekly usage limit|rate[-_ ]?limited|quota|out of credit/i.test(err)) return true;
       }
+      // M23: consume/cancel the response body BEFORE returning — the probe
+      // fires with stream:true and previously left the upstream socket
+      // hanging, leaking a connection per health-check sweep.
+      try { await res.body?.cancel(); } catch { /* already closed */ }
       return false;
-    } catch {
-      return true;
+    } catch (err) {
+      // M23: transport failures (DNS, timeout, TLS) previously returned `true`
+      // — a VALID verdict for a key that may well be bad. Let them propagate:
+      // the health checker already classifies a thrown transport error as a
+      // transient 'error' rather than 'invalid', which is the honest answer.
+      throw err;
     }
   }
 
@@ -247,7 +255,7 @@ export class CommandCodeProvider extends BaseProvider {
     // The CommandCode API rejects max_tokens > 200_000 with 400. The catalog
     // stores per-model max_output_tokens which can exceed this (e.g. 262144 for
     // deepseek-v4-pro), and callers may also ask for more than the upstream
-    // accepts. Clamp to the API ceiling so every model can serve at least up
+    // accepts. Clamp to the API ceiling so no request trips the 400.
     const maxTokens = Math.min(options?.max_tokens ?? FALLBACK_MAX_TOKENS, API_MAX_TOKENS);
     return {
       config: this.defaultConfig(),
@@ -294,7 +302,9 @@ export class CommandCodeProvider extends BaseProvider {
       'Content-Type': 'application/json',
       'x-command-code-version': version,
       'x-cli-environment': 'production',
-      'Accept': 'text/event-stream',
+      // N18: the stream endpoint replies with newline-delimited JSON (see
+      // readNdjsonEvents), not SSE — ask for the right media type.
+      'Accept': 'application/x-ndjson',
     };
   }
 
@@ -392,7 +402,7 @@ export class CommandCodeProvider extends BaseProvider {
    *  Matches the Go reference proxy's `parseContent()` in convert.go — every
    *  block type the Go proxy preserves is preserved here so conversation
    *  history is never silently truncated. */
-  private contentToBlocks(content: unknown, _toolNames?: Map<string, string>): CCContentBlock[] {
+  private contentToBlocks(content: unknown): CCContentBlock[] {
     if (content === null || content === undefined) return [];
     if (typeof content === 'string') {
       return content.length > 0 ? [{ type: 'text', text: content }] : [];
@@ -643,6 +653,10 @@ export class CommandCodeProvider extends BaseProvider {
       case 'tool-use': {
         const idx = getIdx();
         toolCallSlot[event.toolCallId!] = idx;
+        // H11: increment like tool-input-start/tool-call do — without this,
+        // every tool-use shares index 0 and tool-delta's prevIdx computes
+        // -1, silently dropping ALL streamed tool arguments.
+        setIdx(idx + 1);
         const tc: StreamingToolDelta = { index: idx, id: event.toolCallId!, type: 'function', function: { name: event.toolName } };
         const delta: StreamingDelta = { tool_calls: [tc] };
         if (!getRole()) { delta.role = 'assistant'; setRole(true); }

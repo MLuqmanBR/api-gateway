@@ -109,7 +109,9 @@ export function decrypt(encrypted: string, iv: string, authTag: string): string 
 }
 
 export function maskKey(key: string): string {
-  if (key.length <= 3) return '****';
+  // M45: short keys revealed 3/4 of their content ('abcd' → '****bcd').
+  // Only show a tail when at least half the key stays hidden.
+  if (key.length <= 6) return '****';
   return '****' + key.slice(-3);
 }
 
@@ -117,7 +119,8 @@ export function maskKey(key: string): string {
 // scrypt is Node's stdlib KDF — slower than plain SHA-256 but standard for
 // cross-tool interop. The secret format is <key_id>:<secret> so the auth
 // flow can do an O(1) PK lookup BEFORE the scrypt (avoids O(N) scrypt DoS
-// when multiple client keys exist). routiium S5 concept (Apache-2.0).
+// when multiple client keys exist). Routiium S5 concept (Apache-2.0,
+// github.com/labiium/routiium).
 
 const SCRYPT_N = 16384;
 const SCRYPT_R = 8;

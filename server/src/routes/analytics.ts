@@ -44,7 +44,12 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
       AVG(r.latency_ms) as avg_latency_ms,
       MIN(r.created_at) as first_request_at,
       SUM(CASE WHEN r.requested_model IS NOT NULL THEN 1 ELSE 0 END) as pinned_count,
-      SUM(CASE WHEN r.requested_model = r.model_id THEN 1 ELSE 0 END) as pin_honored_count,
+      -- M13: requested_model can be "platform/model_id", "api-gateway/model_id",
+      -- or bare "model_id"; model_id (right) is always unprefixed. Compare on
+      -- suffix match: requested ends with model_id (after optional "prefix/").
+      SUM(CASE WHEN r.requested_model = r.model_id
+                    OR r.requested_model LIKE '%/' || r.model_id
+               THEN 1 ELSE 0 END) as pin_honored_count,
       SUM(CASE WHEN r.status = 'success' THEN
         r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
         r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0
@@ -183,16 +188,9 @@ analyticsRouter.get('/timeline', (req: Request, res: Response) => {
 });
 
 // Error distribution (grouped by error type and platform)
-analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
-  const range = (req.query.range as string) ?? '7d';
-  const since = getSinceTimestamp(range);
-  const db = getDb();
-
-  // Group errors by category (extract the key part of the error message)
-  const rows = db.prepare(`
-    SELECT
-      platform,
-      model_id,
+// N8: single source of truth for the error-category classifier shared by the
+// per-platform distribution query and the totals-by-category query below.
+const ERROR_CATEGORY_CASE = `
       CASE
         WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
         WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid%key%' THEN 'Auth Error (401)'
@@ -202,7 +200,17 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
         WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
         WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
         ELSE 'Other'
-      END as error_category,
+      END`;
+analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const since = getSinceTimestamp(range);
+  const db = getDb();
+
+  const rows = db.prepare(`
+    SELECT
+      platform,
+      model_id,
+      ${ERROR_CATEGORY_CASE} as error_category,
       COUNT(*) as count
     FROM requests
     WHERE status = 'error' AND created_at >= ?
@@ -213,16 +221,7 @@ analyticsRouter.get('/error-distribution', (req: Request, res: Response) => {
   // Also get totals by category
   const byCategory = db.prepare(`
     SELECT
-      CASE
-        WHEN error LIKE '%429%' OR error LIKE '%rate limit%' OR error LIKE '%too many%' OR error LIKE '%quota%' THEN 'Rate Limited (429)'
-        WHEN error LIKE '%401%' OR error LIKE '%unauthorized%' OR error LIKE '%invalid%key%' THEN 'Auth Error (401)'
-        WHEN error LIKE '%403%' OR error LIKE '%forbidden%' THEN 'Forbidden (403)'
-        WHEN error LIKE '%404%' OR error LIKE '%not found%' THEN 'Not Found (404)'
-        WHEN error LIKE '%timeout%' OR error LIKE '%ETIMEDOUT%' OR error LIKE '%ECONNREFUSED%' THEN 'Timeout/Connection'
-        WHEN error LIKE '%500%' OR error LIKE '%internal server%' THEN 'Server Error (500)'
-        WHEN error LIKE '%503%' OR error LIKE '%unavailable%' THEN 'Unavailable (503)'
-        ELSE 'Other'
-      END as category,
+      ${ERROR_CATEGORY_CASE} as category,
       COUNT(*) as count
     FROM requests
     WHERE status = 'error' AND created_at >= ?

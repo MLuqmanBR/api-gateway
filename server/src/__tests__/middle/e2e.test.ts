@@ -166,7 +166,6 @@ describe('B2-8: interceptor-failure floor', () => {
       model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
-    expect(status).toBe(200);
     // Stage-1 still applied: provider saw placeholder, not secret
     const userOutboundE2e = capturedMessages!.find((m: any) => m.role !== 'system');
     expect(userOutboundE2e?.content).not.toContain(SECRET);

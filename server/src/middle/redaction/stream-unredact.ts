@@ -17,7 +17,15 @@
 
 import { PLACEHOLDER_RE, couldBePlaceholderPrefix, PLACEHOLDER_OPEN } from './spans.js';
 
-const MAX_HOLD = 16; // max placeholder length: ⟦R + digits + : + 12 hex + ⟧
+// Global copy for replace-all use — the shared export is deliberately
+// non-global (lastIndex is mutable state); derive from .source so the
+// pattern can never drift.
+const PLACEHOLDER_RE_ALL = new RegExp(PLACEHOLDER_RE.source, 'g');
+
+// Max placeholder length the un-redactor must be able to hold across a chunk
+// boundary: ⟦R + digits + : + up to 12 hex + ⟧. With multi-digit R counters
+// that is 17+ chars, so hold headroom (20) beyond the literal minimum (16).
+const MAX_HOLD = 20;
 
 export class StreamUnredactor {
   private buffer = '';
@@ -49,7 +57,7 @@ export class StreamUnredactor {
     // 1. Replace complete canonical placeholders in the buffer.
     let replaced = this.buffer;
     if (this.map.size > 0) {
-      replaced = this.buffer.replace(PLACEHOLDER_RE, (match) => {
+      replaced = this.buffer.replace(PLACEHOLDER_RE_ALL, (match) => {
         const val = this.map.get(match);
         return val !== undefined ? val : match;
       });

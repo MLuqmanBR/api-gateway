@@ -81,7 +81,7 @@ export interface AnthropicStreamEvent {
 export function anthropicToChatMessages(req: AnthropicInboundRequest): {
   messages: ChatMessage[];
   tools?: ChatToolDefinition[];
-  tool_choice?: 'auto' | 'required' | 'none' | { type: 'function'; name: string };
+  tool_choice?: 'auto' | 'required' | 'none' | { type: 'function'; function: { name: string } };
   temperature?: number;
   top_p?: number;
   max_tokens?: number;
@@ -171,14 +171,17 @@ export function anthropicToChatMessages(req: AnthropicInboundRequest): {
       },
     }));
   }
-  let tool_choice: 'auto' | 'required' | 'none' | { type: 'function'; name: string } | undefined;
+  let tool_choice: 'auto' | 'required' | 'none' | { type: 'function'; function: { name: string } } | undefined;
   if (req.tool_choice) {
     if (typeof req.tool_choice === 'string') {
       tool_choice = req.tool_choice === 'any' ? 'required' : 'auto';
     } else if (req.tool_choice.type === 'any') {
       tool_choice = 'required';
     } else if (req.tool_choice.type === 'tool' && req.tool_choice.name) {
-      tool_choice = { type: 'function', name: req.tool_choice.name };
+      // Emit the OpenAI wire shape — this object is forwarded verbatim into
+      // the internal /v1/chat/completions sub-request, whose schema requires
+      // { type: 'function', function: { name } }.
+      tool_choice = { type: 'function', function: { name: req.tool_choice.name } };
     } else {
       tool_choice = 'auto';
     }
@@ -262,76 +265,3 @@ export function chatCompletionToAnthropic(
   };
 }
 
-// ── Streaming: synthesize Anthropic SSE events from OpenAI streaming ──
-
-export function synthesizeAnthropicSSE(
-  openaiChunks: Array<{
-    choices: Array<{
-      delta?: { content?: string; role?: string; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> };
-      finish_reason?: string;
-    }>;
-  }>,
-  modelId: string,
-  responseId: string,
-): string[] {
-  const events: string[] = [];
-
-  // message_start
-  events.push(`event: message_start\ndata: ${JSON.stringify({
-    type: 'message_start',
-    message: {
-      id: responseId,
-      type: 'message',
-      role: 'assistant',
-      model: modelId,
-      content: [],
-      stop_reason: null,
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0 },
-    },
-  })}\n\n`);
-
-  // content_block_start (text block at index 0)
-  events.push(`event: content_block_start\ndata: ${JSON.stringify({
-    type: 'content_block_start',
-    index: 0,
-    content_block: { type: 'text', text: '' },
-  })}\n\n`);
-
-  // Stream text deltas
-  for (const chunk of openaiChunks) {
-    const delta = chunk.choices?.[0]?.delta;
-    if (delta?.content) {
-      events.push(`event: content_block_delta\ndata: ${JSON.stringify({
-        type: 'content_block_delta',
-        index: 0,
-        delta: { type: 'text_delta', text: delta.content },
-      })}\n\n`);
-    }
-  }
-
-  // content_block_stop
-  events.push(`event: content_block_stop\ndata: ${JSON.stringify({
-    type: 'content_block_stop',
-    index: 0,
-  })}\n\n`);
-
-  // message_delta with final stop_reason
-  const lastChunk = openaiChunks[openaiChunks.length - 1];
-  const finishReason = lastChunk?.choices?.[0]?.finish_reason;
-  const stopMap: Record<string, 'end_turn' | 'max_tokens' | 'tool_use'> = {
-    stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use',
-  };
-  const stopReason = finishReason ? (stopMap[finishReason] ?? 'end_turn') : 'end_turn';
-
-  events.push(`event: message_delta\ndata: ${JSON.stringify({
-    type: 'message_delta',
-    delta: { stop_reason: stopReason, stop_sequence: null },
-    usage: { output_tokens: 0 },
-  })}\n\n`);
-
-  // message_stop
-  events.push(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
-
-  return events;
-}

@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
 import { hasProvider, getAllProviders } from '../providers/index.js';
-import { syncModelsFromProvider } from './custom.js';
+import { syncModelsFromProvider, type ProviderSyncResult } from './custom.js';
 
 export const modelsRouter = Router();
 
@@ -80,8 +80,22 @@ modelsRouter.post('/sync-all', async (_req: Request, res: Response) => {
   }
 
 
-  const results = await Promise.allSettled(
-    targets.map(t => syncModelsFromProvider(t.baseUrl, t.slug))
+  // L25: bounded pool — one unbounded Promise.allSettled opened a fetch per
+  // provider simultaneously (each with a 15 s timeout); a fixed-size worker
+  // pool keeps concurrent sockets at 5 while preserving per-target results
+  // by index.
+  const SYNC_POOL_SIZE = 5;
+  const results: PromiseSettledResult<ProviderSyncResult>[] = new Array(targets.length);
+  let nextTarget = 0;
+  const worker = async (): Promise<void> => {
+    while (nextTarget < targets.length) {
+      const i = nextTarget++;
+      results[i] = await Promise.allSettled([syncModelsFromProvider(targets[i].baseUrl, targets[i].slug)])
+        .then(([r]) => r);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(SYNC_POOL_SIZE, targets.length) }, () => worker()),
   );
   let totalFetched = 0;
   const errors: { slug: string; error: string }[] = [];

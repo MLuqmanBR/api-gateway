@@ -11,6 +11,16 @@ const REDACTIONS: Array<[RegExp, string]> = [
   [/\bhttps?:\/\/[^\s"'<>)]*/gi, '[redacted-url]'],
 ];
 
+// Public documentation hosts are safe to keep in provider error messages —
+// they usually point at the exact fix. Everything else still gets
+// '[redacted-url]' from the generic rule above (audit L55).
+const SAFE_DOCS_URL_RE =
+  /\bhttps?:\/\/(?:docs\.[a-z0-9.-]+|[a-z0-9.-]+\.readme\.io|(?:www\.)?github\.com|developer\.mozilla\.org|stackoverflow\.com)\/[^\s"'<>)]*/gi;
+// Private-use sentinels wrapping kept URLs while the redaction passes run —
+// characters that never occur in provider error text.
+const KEEP_OPEN = '\uE000';
+const KEEP_CLOSE = '\uE001';
+
 // High-entropy token redaction — runs AFTER the prefix patterns above so
 // known-prefix tokens (sk-, gsk_, api-gateway-, AIza, JWT-shape) are already
 // matched. Catches long opaque tokens that don't match any known prefix:
@@ -40,6 +50,14 @@ export function sanitizeProviderErrorMessage(message: unknown): string {
 
   if (!sanitized) return 'Provider error';
 
+  // Stash safe docs links so the generic URL rule and the entropy pass
+  // can't touch them; restored verbatim at the end.
+  const kept: string[] = [];
+  sanitized = sanitized.replace(SAFE_DOCS_URL_RE, (url) => {
+    kept.push(url);
+    return `${KEEP_OPEN}${kept.length - 1}${KEEP_CLOSE}`;
+  });
+
   for (const [pattern, replacement] of REDACTIONS) {
     sanitized = sanitized.replace(pattern, replacement);
   }
@@ -49,7 +67,7 @@ export function sanitizeProviderErrorMessage(message: unknown): string {
   sanitized = sanitized.replace(HIGH_ENTROPY_PATTERN, (match) =>
     shannonEntropy(match) >= ENTROPY_FLOOR ? '[redacted-token]' : match,
   );
-
+  sanitized = sanitized.replace(/\uE000(\d+)\uE001/g, (_, i) => kept[Number(i)] ?? '');
   sanitized = sanitized.replace(/\s+/g, ' ').trim();
   if (sanitized.length > MAX_PROVIDER_ERROR_LENGTH) {
     sanitized = `${sanitized.slice(0, MAX_PROVIDER_ERROR_LENGTH - 3).trimEnd()}...`;

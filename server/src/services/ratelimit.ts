@@ -36,6 +36,35 @@ interface Reservation {
 const reservations = new Map<number, Reservation>();
 let reservationSeq = 0;
 
+// M26: live-leaf buckets indexed by "platform:keyId". provisionalSummary was
+// O(all in-flight reservations) per rate-limit check and runs from
+// requestCount/tokenCount (per model-row) plus both provider-minute counters
+// — under burst routing that was O(chain × keys × in-flight) per request.
+// Buckets hold only live, unexpired leaves; expiry and release remove leaves
+// so scans stay bounded by that pair's in-flight count, not the global map.
+interface CounterLeaf { id: number; ts: number; tokens: number; modelId: string }
+const pairLeaves = new Map<string, CounterLeaf[]>();
+
+function getPairLeaves(pairKey: string): CounterLeaf[] {
+  let l = pairLeaves.get(pairKey);
+  if (!l) {
+    l = [];
+    pairLeaves.set(pairKey, l);
+  }
+  return l;
+}
+
+function removeLeaf(leaves: CounterLeaf[], id: number): number {
+  for (let i = 0; i < leaves.length; i++) {
+    if (leaves[i].id === id) {
+      const tokens = leaves[i].tokens;
+      leaves.splice(i, 1);
+      return tokens;
+    }
+  }
+  return 0;
+}
+
 /** Reserve a provisional request + token slot for a just-selected route.
  *  Returns an opaque handle to release exactly once via releaseReservation(). */
 export function reserveRequest(
@@ -46,31 +75,46 @@ export function reserveRequest(
 ): number {
   const id = ++reservationSeq;
   const tokens = Number.isFinite(estimatedTokens) && estimatedTokens > 0 ? estimatedTokens : 0;
-  reservations.set(id, { platform, modelId, keyId, ts: Date.now(), tokens });
+  const ts = Date.now();
+  reservations.set(id, { platform, modelId, keyId, ts, tokens });
+  getPairLeaves(`${platform}:${keyId}`).push({ id, ts, tokens, modelId });
   return id;
 }
 
 /** Release a reservation. Idempotent — a missing id is a no-op. */
 export function releaseReservation(id: number): void {
+  const r = reservations.get(id);
+  if (!r) return;
   reservations.delete(id);
+  const leaves = pairLeaves.get(`${r.platform}:${r.keyId}`);
+  if (leaves) removeLeaf(leaves, id);
 }
 
 /** Summarize provisional reservations for a platform+key, optionally
- *  filtered by modelId. Returns { count, tokens } in one pass. */
+ *  filtered by modelId. Returns { count, tokens } in one pass over the
+ *  pair's live leaves (bounded by that key's in-flight count). */
 function provisionalSummary(
   platform: string,
   keyId: number,
   cutoff: number,
   modelId?: string,
 ): { count: number; tokens: number } {
+  const pairKey = `${platform}:${keyId}`;
+  const leaves = pairLeaves.get(pairKey);
+  if (!leaves || leaves.length === 0) return { count: 0, tokens: 0 };
   let count = 0, tokens = 0;
-  for (const r of reservations.values()) {
-    if (r.keyId === keyId && r.ts > cutoff && r.platform === platform &&
-        (modelId === undefined || r.modelId === modelId)) {
+  let writeTo = 0;
+  for (let read = 0; read < leaves.length; read++) {
+    const leaf = leaves[read];
+    if (leaf.ts <= cutoff) continue; // expired — drop from bucket
+    if (reservations.get(leaf.id) === undefined) continue; // released — drop
+    if (modelId === undefined || leaf.modelId === modelId) {
       count++;
-      tokens += r.tokens;
+      tokens += leaf.tokens;
     }
+    leaves[writeTo++] = leaf; // compact in place
   }
+  leaves.length = writeTo;
   return { count, tokens };
 }
 
@@ -109,11 +153,16 @@ function recordUsage(
   now: number,
 ) {
   withDb(db => {
-    db.prepare(`
-      INSERT INTO rate_limit_usage (platform, model_id, key_id, kind, tokens, created_at_ms)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(platform, modelId, keyId, kind, tokens, now);
-    db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
+    // L27: INSERT + prune DELETE are one unit — wrap them so a failure between
+    // the two statements rolls back atomically (the WASM backend implements
+    // transactions as savepoints, where partial application would stick).
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO rate_limit_usage (platform, model_id, key_id, kind, tokens, created_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(platform, modelId, keyId, kind, tokens, now);
+      db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
+    })();
   });
 }
 
@@ -238,65 +287,10 @@ export function canUseTokens(
   return true;
 }
 
-// ── Provider-wide daily request caps (#162) ──
-// Some providers enforce one daily REQUEST quota across the WHOLE account,
-// shared by every model — not per model. OpenRouter's free tier is the classic
-// case: ~1000 requests/day total (50/day if you've bought <10 credits) no
-// matter how many different free models you spread them across. The
-// per-(platform,model,key) rpd ledger can't see that, so without a provider-wide
-// gate the router happily fires (models × rpd) requests and earns surprise 429s.
-//
-// Defaults below; override per provider with an env var, e.g.
-//   PROVIDER_DAILY_REQUEST_CAP_OPENROUTER=50   (set 0 to disable the cap)
-const DEFAULT_PROVIDER_DAILY_REQUEST_CAPS: Record<string, number> = {
-  openrouter: 1000,
-};
-
-export function getProviderDailyRequestCap(platform: string): number | null {
-  const raw = process.env[`PROVIDER_DAILY_REQUEST_CAP_${platform.toUpperCase()}`];
-  if (raw !== undefined && raw.trim() !== '') {
-    const n = Number(raw);
-    if (Number.isFinite(n) && n >= 0) return n === 0 ? null : n;
-  }
-  return DEFAULT_PROVIDER_DAILY_REQUEST_CAPS[platform] ?? null;
-}
-
-// Total requests today for a provider account+key, summed across every model.
-// Uses midnight-UTC epoch-ms for the cutoff so the gate resets at a fixed wall-clock
-// boundary matching real provider caps (OpenRouter ~1000/day, NVIDIA per-account),
-// rather than a sliding 24h window that benches providers past their true reset time.
-export function providerDailyRequestCount(platform: string, keyId: number, now = Date.now()): number {
-  const dayStartMs = new Date(now).setUTCHours(0, 0, 0, 0);
-  const provisional = provisionalSummary(platform, keyId, dayStartMs).count;
-  const persisted = withDb(db => {
-    const row = db.prepare(`
-      SELECT COUNT(*) AS used
-        FROM rate_limit_usage
-       WHERE platform = ?
-         AND key_id = ?
-         AND kind = 'request'
-         AND created_at_ms > ?
-    `).get(platform, keyId, dayStartMs) as { used: number };
-    return row.used;
-  });
-  if (persisted !== undefined) return persisted + provisional;
-  // DB-unavailable fallback: sum the per-model rpd windows for this platform+key.
-  // Window key format is "platform:modelId:keyId:rpd" (modelId may contain ':').
-  let total = 0;
-  for (const [key, w] of windows) {
-    if (key.startsWith(`${platform}:`) && key.endsWith(`:${keyId}:rpd`)) {
-      total += w.timestamps.filter(ts => ts > dayStartMs).length;
-    }
-  }
-  return total + provisional;
-}
-
 // X1: canUseProvider (per-DAY provider-wide gate) REMOVED — no long bench.
 // The per-MINUTE provider-wide gate (canUseProviderMinute) STAYS.
-// getProviderDailyRequestCap / providerDailyRequestCount retained as vestigial
-// (analytics-only, no longer called from the routing path).
 // ── Provider-wide per-minute caps (#295) ──
-// Mirror of the provider-wide daily cap above, but per-minute. Some providers
+// Some providers
 // enforce ONE per-minute request (and/or per-minute token) quota across the
 // WHOLE account, shared by every model — not per model. NVIDIA NIM is the
 // case in point: a single 40 RPM budget is drawn from by glm-5.1, glm-5.2,
@@ -561,40 +555,32 @@ export function setCooldown(
 export function isOnCooldown(platform: string, modelId: string, keyId: number): boolean {
   const key = `${platform}:${modelId}:${keyId}:cooldown`;
   const now = Date.now();
+  // M11: memory-first — setCooldown() writes to both memory and DB, so a
+  // hit here is authoritative and saves a SQLite round-trip that runs once
+  // per (key × model) in the router's outer loop.
+  const memoryExpiry = cooldowns.get(key);
+  if (memoryExpiry !== undefined) {
+    if (now > memoryExpiry) {
+      cooldowns.delete(key);
+      clearPersistedCooldown(platform, modelId, keyId);
+      return false;
+    }
+    return true;
+  }
+  // Not in memory: check the persistent store (covers cross-process
+  // cooldowns written before this process started). Hydrate memory on hit.
   const persistedExpiry = persistedCooldownExpiry(platform, modelId, keyId);
   if (persistedExpiry !== undefined && persistedExpiry !== null) {
     if (now > persistedExpiry) {
-      cooldowns.delete(key);
       clearPersistedCooldown(platform, modelId, keyId);
       return false;
     }
     cooldowns.set(key, persistedExpiry);
     return true;
   }
-
-  const expiry = cooldowns.get(key);
-  if (!expiry) return false;
-  if (now > expiry) {
-    cooldowns.delete(key);
-    return false;
-  }
-  return true;
+  return false;
 }
 
-export function getRateLimitStatus(
-  platform: string,
-  modelId: string,
-  keyId: number,
-  limits: { rpm: number | null; rpd: number | null; tpm: number | null; tpd: number | null },
-) {
-  const now = Date.now();
-
-  return {
-    rpm: { used: requestCount(platform, modelId, keyId, MINUTE, now), limit: limits.rpm },
-    rpd: { used: requestCount(platform, modelId, keyId, DAY, now), limit: limits.rpd },
-    tpm: { used: tokenCount(platform, modelId, keyId, MINUTE, now), limit: limits.tpm },
-  };
-}
 
 /** Clear all in-memory rate-limit state for a platform (cooldowns, windows, hit counters).
  *  Called when a custom provider is deleted so stale entries don't accumulate. */
@@ -609,4 +595,35 @@ export function clearPlatformCaches(platform: string): void {
   for (const [id, r] of reservations) {
     if (r.platform === platform) reservations.delete(id);
   }
+}
+
+/** Clear all rate-limit state for one key — in-memory (cooldowns, windows,
+ *  provisional reservations) and persisted (cooldown + usage rows). Called
+ *  when a key is deleted so stale entries don't linger until their TTLs.
+ *  Window keys are "platform:modelId:keyId:type" and modelId may contain ':',
+ *  so the keyId is matched positionally from the end, never by substring. */
+export function clearKeyRuntimeState(keyId: number): void {
+  const matchesKey = (key: string): boolean => {
+    const type = key.slice(key.lastIndexOf(':') + 1);
+    if (type !== 'rpm' && type !== 'rpd' && type !== 'tpm' && type !== 'tpd' && type !== 'cooldown') return false;
+    const rest = key.slice(0, key.lastIndexOf(':'));
+    return Number(rest.slice(rest.lastIndexOf(':') + 1)) === keyId;
+  };
+  for (const key of cooldowns.keys()) {
+    if (matchesKey(key)) cooldowns.delete(key);
+  }
+  for (const key of windows.keys()) {
+    if (matchesKey(key)) windows.delete(key);
+  }
+  for (const [id, r] of reservations) {
+    if (r.keyId === keyId) {
+      reservations.delete(id);
+      const leaves = pairLeaves.get(`${r.platform}:${keyId}`);
+      if (leaves) removeLeaf(leaves, id);
+    }
+  }
+  withDb(db => {
+    db.prepare('DELETE FROM rate_limit_cooldowns WHERE key_id = ?').run(keyId);
+    db.prepare('DELETE FROM rate_limit_usage WHERE key_id = ?').run(keyId);
+  });
 }

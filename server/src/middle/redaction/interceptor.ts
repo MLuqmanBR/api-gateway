@@ -9,8 +9,10 @@
  *
  * Failure floor (decided by user, not revisited): any throw/timeout/non-JSON/
  * schema-mismatch → log one line, increment a counter, continue with Stage-1
- * output. Never retried within a request, never blocks.
- */
+ * output. Never blocks a request. A failed scan is retried after a backoff
+ * window (not within the same request, and not forever — a transient timeout
+ * must not permanently disable detection for a message an agent resends
+ * every turn). */
 
 import crypto from 'crypto';
 import type { ChatMessage } from '@api-gateway/shared/types.js';
@@ -20,30 +22,56 @@ import { buildProviderFor } from '../../providers/index.js';
 import { publish } from '../../services/events.js';
 import { RedactionSession } from './session.js';
 import { addSecret, getActiveSecretsForRedaction } from './store.js';
-// --- Scanned-LRU cache (module-level, per-boot) ---
+// --- Scanned cache (module-level, per-boot) ---
 // Agentic clients resend the whole history every turn. With this cache, only
 // the NEW tail messages get scanned — identical history messages are skipped.
+// Value: 0 = scanned successfully (never rescanned this boot); >0 = a failed
+// scan's not-before timestamp — the text is retried once the backoff passes.
+// True LRU: hits refresh recency (re-insert at the Map tail), so the hot
+// prefix of a long conversation survives capacity eviction; the coldest
+// entry is evicted per insert once at SCANNED_CACHE_MAX.
 
-const scannedCache = new Map<string, true>();
+const scannedCache = new Map<string, number>();
 const SCANNED_CACHE_MAX = 4096;
+const SCAN_FAILURE_RETRY_MS = 60_000;
 
 function textHash(text: string): string {
   return crypto.createHash('sha256').update(text).digest('hex');
 }
 
 function isScanned(text: string): boolean {
-  return scannedCache.has(textHash(text));
+  const hash = textHash(text);
+  const until = scannedCache.get(hash);
+  if (until === undefined) return false;
+  if (!(until === 0 || until > Date.now())) return false;
+  // Hit — refresh recency so repeated history entries stay hot. A plain
+  // Map.set on an existing key keeps the old position, so re-insert.
+  scannedCache.delete(hash);
+  scannedCache.set(hash, until);
+  return true;
 }
 
-function markScanned(text: string): void {
+function cacheInsert(text: string, value: number): void {
   const hash = textHash(text);
+  scannedCache.delete(hash); // re-insert: overwrites must refresh recency too
   if (scannedCache.size >= SCANNED_CACHE_MAX) {
-    // Evict oldest (first-inserted key — Map preserves insertion order)
+    // Evict least-recently-used (head of the insertion-ordered Map).
     const oldest = scannedCache.keys().next().value;
     if (oldest !== undefined) scannedCache.delete(oldest);
   }
-  scannedCache.set(hash, true);
+  scannedCache.set(hash, value);
 }
+
+function markScanned(text: string): void {
+  cacheInsert(text, 0);
+}
+
+function markScanFailed(text: string): void {
+  cacheInsert(text, Date.now() + SCAN_FAILURE_RETRY_MS);
+}
+
+// Exported for regression tests (H02 backoff semantics).
+export { isScanned, markScanned, markScanFailed, SCAN_FAILURE_RETRY_MS };
 
 // --- Interceptor prompt (fixed, versioned) ---
 
@@ -191,14 +219,40 @@ async function dispatchInterceptor(
 
 /** Find all verbatim occurrences of `exact` in `text` via indexOf scanning.
  * Values not found verbatim are DISCARDED — the model can only nominate
- * substrings that actually exist in the text. */
-function extractNewSecrets(
+ * substrings that actually exist in the text. Nominated values must also be
+ * PLAUSIBLE secrets (H03): the interceptor model can nominate "the" or
+ * "user", and an unguarded common word becomes a stored secret that is
+ * redacted from all future traffic — catastrophic over-redaction. */
+const COMMON_WORD_DENYLIST = new Set([
+  'the', 'and', 'that', 'this', 'with', 'from', 'have', 'not', 'are', 'was',
+  'for', 'you', 'your', 'user', 'users', 'name', 'value', 'string', 'number',
+  'email', 'phone', 'address', 'person', 'account', 'message', 'content',
+  'please', 'thanks', 'hello', 'there', 'their', 'would', 'could', 'should',
+  'which', 'where', 'when', 'what', 'data', 'text', 'code', 'model', 'system',
+]);
+
+export function isPlausibleSecret(value: string, fullText: string): boolean {
+  if (value.length < 6) return false;
+  // Note: no relative-length cap. A user can legitimately send a message
+  // that IS the secret ("ghp_..." alone, a PAT, an API key) — that secret
+  // must still be redacted. The verbatim-indexOf check already bounds the
+  // span to text actually present.
+  void fullText;
+  if (!/[0-9a-zA-Z]/.test(value)) return false; // punctuation-only spans are never secrets
+  const lower = value.toLowerCase();
+  // Pure alphabetic values must not be common words ("user" would otherwise
+  // pass the length check via longer phrases only).
+  if (/^[a-z]+$/.test(lower) && COMMON_WORD_DENYLIST.has(lower)) return false;
+  return true;
+}
+
+export function extractNewSecrets(
   text: string,
   spans: InterceptorSpan[],
 ): Array<{ value: string; kind: string }> {
   const found: Array<{ value: string; kind: string }> = [];
   for (const span of spans) {
-    if (text.indexOf(span.exact) !== -1) {
+    if (text.indexOf(span.exact) !== -1 && isPlausibleSecret(span.exact, text)) {
       found.push({ value: span.exact, kind: span.kind });
     }
   }
@@ -270,10 +324,14 @@ export async function interceptOutbound(
   for (const msg of messages) {
     for (const text of messageTexts(msg)) {
       if (isScanned(text)) continue;
-      markScanned(text);
 
       try {
         const spans = await dispatchInterceptor(text, modelId, timeoutMs, detectionTargets);
+        // H02: mark scanned only on SUCCESS — a failed scan (timeout,
+        // non-JSON, transport error) gets a short retry backoff instead of
+        // being cached forever, so transient failures never permanently
+        // disable detection for a message the agent resends every turn.
+        markScanned(text);
         const newSecrets = extractNewSecrets(text, spans);
         for (const { value, kind } of newSecrets) {
           addSecret(value, kind, 'ai');
@@ -282,7 +340,8 @@ export async function interceptOutbound(
       } catch (err) {
         // Failure floor: log, increment counter, continue. Never block.
         interceptorFailures++;
-        console.warn('[Middle] Interceptor failed:', err instanceof Error ? err.message : String(err));
+        markScanFailed(text);
+        console.warn('[Middle] Interceptor failed (will retry after backoff):', err instanceof Error ? err.message : String(err));
       }
     }
   }
@@ -318,10 +377,10 @@ export async function interceptInbound(
   const detectionTargets = getDetectionTargets();
 
   if (isScanned(text)) return { text, newSecretsFound: false };
-  markScanned(text);
 
   try {
     const spans = await dispatchInterceptor(text, modelId, timeoutMs, detectionTargets);
+    markScanned(text); // H02: success-only marking, same as the outbound path
     const newSecrets = extractNewSecrets(text, spans);
     for (const { value, kind } of newSecrets) {
       addSecret(value, kind, 'ai');
@@ -340,6 +399,7 @@ export async function interceptInbound(
     }
   } catch (err) {
     interceptorFailures++;
+    markScanFailed(text); // H02: retry after backoff, not cached-forever
     console.warn('[Middle] Inbound interceptor failed:', err instanceof Error ? err.message : String(err));
   }
   return { text, newSecretsFound: false };

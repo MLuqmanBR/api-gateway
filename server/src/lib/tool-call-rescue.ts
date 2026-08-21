@@ -175,7 +175,7 @@ function parseFunctionTagDialect(text: string, toolNames: Set<string>): { calls:
       try { JSON.parse(extracted.json); ok = true; } catch { /* fall through */ }
       if (ok) calls.push({ name, arguments: extracted.json });
     }
-    if (!ok) parsedAll = false; // array-shaped or invalid args: not a callable shape
+    if (!ok) parsedAll = false; // no balanced JSON, unknown tool name, array-shaped payload, or invalid JSON — none of those is a rescuable call
     const closeTag = text.indexOf('</function>', extracted?.end ?? m.index + m[0].length);
     spans.push({ from: m.index, to: closeTag === -1 ? (extracted?.end ?? m.index + m[0].length) : closeTag + '</function>'.length });
   }

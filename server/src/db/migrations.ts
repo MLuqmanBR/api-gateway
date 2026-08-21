@@ -42,13 +42,16 @@ export function migrateDbSchema(db: DatabasePort) {
       migrateModelsV13(db);
       migrateModelsV14(db);
       migrateModelsV15(db);
-      migrateModelsV16Vision(db);
-      migrateModelsV17IntelligenceTiers(db);
+      // V16Vision/V17IntelligenceTiers/V22Tools moved OUT of this one-time
+      // transaction to the per-boot section below (M15) — they are rule-based
+      // LIKE-pattern UPDATEs that must re-assert on every boot so models added
+      // AFTER first boot are also flagged/tiered. Keeping them inside this
+      // block means a model added post-first-boot never gets flagged/tiered
+      // until a new data-migration version is introduced.
       migrateModelsV18OpenCodeZen(db);
       migrateModelsV19Gemma4(db);
       migrateModelsV20KiloFree(db);
       migrateModelsV21PruneDead(db);
-      migrateModelsV22Tools(db);
       migrateModelsV23FreeTierAudit(db);
       migrateModelsV24ZenRefresh(db);
       migrateModelsV25ZenDeadPromos(db);
@@ -60,6 +63,14 @@ export function migrateDbSchema(db: DatabasePort) {
   }
 
   // Non-destructive refreshes that should run every boot (updates, not resets).
+  // M15: V16Vision/V17IntelligenceTiers/V22Tools are rule-based UPDATEs
+  // (LIKE … SET …) that must re-assert on every boot so models added after
+  // first boot (via sync or new provider catalogs) are flagged/tiered
+  // immediately. They were previously inside the one-time migration block
+  // and ran exactly once — models synced later never got flagged.
+  migrateModelsV16Vision(db);
+  migrateModelsV17IntelligenceTiers(db);
+  migrateModelsV22Tools(db);
   applyModelPricing(db);
   applyActualCostPricing(db);
   migrateQuirksV1(db);
@@ -396,9 +407,6 @@ function seedModels(db: DatabasePort) {
  */
 function migrateModels(db: DatabasePort) {
   // 1) Replace outdated models in-place (preserves fallback_config & any references)
-  const renames: Array<[string, string, string, string, number, string, number | null, number | null, number]> = [
-    // platform, oldModelId, newModelId, newDisplayName, intelligenceRank, monthlyBudget, rpdLimit, contextWindow, sizeLabelPriority(unused)
-  ];
   const renameStmt = db.prepare(`
     UPDATE models
        SET model_id = ?, display_name = ?, intelligence_rank = ?,
@@ -1870,6 +1878,15 @@ function migrateModelsV22Tools(db: DatabasePort) {
  * tiers match V17's bands.
  */
 function migrateModelsV23FreeTierAudit(db: DatabasePort) {
+  // M15 exposed a latent ordering bug: the INSERT below references
+  // supports_tools, which V22Tools normally adds first — but V23 runs inside
+  // its own transaction, and if V22 is deferred (now: moved to per-boot by
+  // M15) nothing guarantees the column when this INSERT prepares. Create it
+  // when missing, same guard idiom V16/V22 use.
+  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'supports_tools')) {
+    db.prepare('ALTER TABLE models ADD COLUMN supports_tools INTEGER NOT NULL DEFAULT 0').run();
+  }
   const apply = db.transaction(() => {
     for (const platform of ['sambanova', 'chutes']) {
       db.prepare(`
@@ -2080,7 +2097,7 @@ function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
   tx();
 }
 
-// V26 NOTE (June 2026, recurring-free audit pass 2): the model-data changes
+// V26 NOTE (June 2026, model-catalog audit): the model-data changes
 // from this audit (4 OVH rows, opencode/north-mini-code-free, Cerebras
 // 5 RPM/30K TPM/1M TPD limits, NVIDIA "free · 40 RPM" labels, LLM7 60-100/hr
 // label) were briefly shipped as a data migration and then MOVED to the
@@ -2501,25 +2518,33 @@ function migrateModelsV33NvidiaMinimaxM3(db: DatabasePort) {
 //      entirely while sibling GLM/DeepSeek/Nemotron rows self-throttled at 40 —
 //      the "glm-5.2 exhausts all keys, minimax-m3 works on the same key"
 //      asymmetry (#295). Backfill them to 40 so the per-model floor is uniform.
-//   2. The authoritative shared cap now lives at the provider level so a provider-WIDE per-minute gate (canUseProviderMinute) can enforce it; seed
-//      built_in_provider_settings.nvidia.rpm_limit = 40 (the documented NIM rate)
-//      so it's visible/overridable in the dashboard and the provider-minute gate
-//      reads it as the cap source. Env var PROVIDER_MINUTE_REQUEST_CAP_NVIDIA overrides both.
+//   2. The authoritative shared cap now lives at the provider level so a
+//      provider-WIDE per-minute gate (canUseProviderMinute) can enforce it;
+//      seed built_in_provider_settings.nvidia.rpm_limit = 40 (the documented
+//      NIM rate) so it's visible/overridable in the dashboard and the
+//      provider-minute gate reads it as the cap source. Env var
+//      PROVIDER_MINUTE_REQUEST_CAP_NVIDIA overrides both.
 //
 // One-shot sentinel gates the backfill so an operator who intentionally clears
 // the nvidia rpm limit isn't silently reverted on restart.
 function migrateModelsV34NvidiaSharedQuota(db: DatabasePort) {
-  const sentinel = db.prepare("SELECT value FROM settings WHERE key = 'migrated_v34_nvidia'").get() as { value: string } | undefined;
-  if (sentinel) return;
-  db.prepare(
-    `UPDATE models SET rpm_limit = 40
-       WHERE platform = 'nvidia' AND rpm_limit IS NULL AND enabled = 1`,
-  ).run();
-  db.prepare(
-    `UPDATE built_in_provider_settings SET rpm_limit = 40
-       WHERE platform = 'nvidia' AND rpm_limit IS NULL`,
-  ).run();
-  db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated_v34_nvidia', '1')").run();
+  // L04: sentinel check + both backfills + sentinel write are one atomic
+  // unit — a crash mid-way must not leave a half-applied backfill (the
+  // sentinel would then skip the retry on next boot).
+  const tx = db.transaction(() => {
+    const sentinel = db.prepare("SELECT value FROM settings WHERE key = 'migrated_v34_nvidia'").get() as { value: string } | undefined;
+    if (sentinel) return;
+    db.prepare(
+      `UPDATE models SET rpm_limit = 40
+         WHERE platform = 'nvidia' AND rpm_limit IS NULL AND enabled = 1`,
+    ).run();
+    db.prepare(
+      `UPDATE built_in_provider_settings SET rpm_limit = 40
+         WHERE platform = 'nvidia' AND rpm_limit IS NULL`,
+    ).run();
+    db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('migrated_v34_nvidia', '1')").run();
+  });
+  tx();
 }
 
 // ── V35: rate_limit_usage created_at index (2026-07) ──
@@ -2647,14 +2672,20 @@ function migrateSchemaV42Webhooks(db: DatabasePort) {
 // Records latency_ms / output_tokens when outputTokens > 0; null otherwise.
 // Used by the anti-herd buffer-random tiebreak in the router.
 function migrateSchemaV43LatencyPerToken(db: DatabasePort) {
-  try { db.exec('ALTER TABLE requests ADD COLUMN latency_per_token_ms REAL'); } catch { /* duplicate column */ }
+  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'latency_per_token_ms')) {
+    db.prepare('ALTER TABLE requests ADD COLUMN latency_per_token_ms REAL').run();
+  }
 }
 
 // C3: add tags column to models for tag/metadata-based filtering.
 // JSON string array, default '[]'. Inbound X-API-Gateway-Tags header
 // filters the chain to models whose tags intersect the request tags.
 function migrateSchemaV44ModelTags(db: DatabasePort) {
-  try { db.exec("ALTER TABLE models ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'"); } catch { /* duplicate column */ }
+  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'tags')) {
+    db.prepare("ALTER TABLE models ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'").run();
+  }
 }
 
 // B2-2: metadata table for the encrypted known-secrets store. The secret

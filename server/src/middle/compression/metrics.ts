@@ -60,10 +60,14 @@ export function recordStep(metrics: CompressionMetrics, result: CompressResult, 
   metrics.tokensBefore += originalTokens;
   if (result.applied) {
     metrics.compressionApplied++;
-    metrics.tokensAfter += countTokensEstimate(result.out);
+    const outTokens = countTokensEstimate(result.out);
+    metrics.tokensAfter += outTokens;
     metrics.tokensSaved += result.saved;
+    // M41: an inflation counts only when it was APPLIED with output ≥ the
+    // original. A technique declining (applied=false, passthrough) is not a
+    // "reverted inflation" — that inflated nothing.
+    if (outTokens >= originalTokens) metrics.inflationsReverted++;
   } else {
     metrics.tokensAfter += originalTokens;
-    if (countTokensEstimate(result.out) >= originalTokens) metrics.inflationsReverted++;
   }
 }

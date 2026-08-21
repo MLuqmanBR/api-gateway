@@ -46,6 +46,8 @@ const exportRequestSchema = z.object({
     'embeddings', 'settings', 'quirks',
   ])).max(16).optional(),
   passphrase: z.string().min(1).max(1024).optional(),
+  // M38: plaintext keys are opt-in. Default exports carry ciphertext only.
+  includePlaintextKeys: z.boolean().optional(),
   label: z.string().max(120).optional(),
   // When `true`, set the Content-Disposition to attachment so the browser
   // downloads a file. Otherwise the JSON is returned inline (used by the
@@ -160,9 +162,19 @@ configRouter.post('/preview', (req: Request, res: Response) => {
 // ── Import ────────────────────────────────────────────────────────────────
 
 // Accepted by the app-level 10 MB cap; in-handler rejects oversized payloads.
+const MAX_IMPORT_BYTES = 5 * 1024 * 1024;
+
 configRouter.post('/import', (req: Request, res: Response) => {
   try {
-    if (Buffer.byteLength(JSON.stringify(req.body ?? {})) > 5 * 1024 * 1024) {
+    // L21: prefer the transport-declared Content-Length over re-serializing
+    // the already-parsed body just to measure it (a full JSON.stringify per
+    // import, for a number the client already sent). Fall back to measuring
+    // only when the header is absent (chunked transfer).
+    const declared = Number(req.headers['content-length']);
+    const bodyBytes = Number.isSafeInteger(declared) && declared >= 0
+      ? declared
+      : Buffer.byteLength(JSON.stringify(req.body ?? {}));
+    if (bodyBytes > MAX_IMPORT_BYTES) {
       res.status(413).json({ error: { message: 'Import envelope exceeds 5 MB' } });
       return;
     }

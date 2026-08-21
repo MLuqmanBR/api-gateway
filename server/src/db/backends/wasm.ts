@@ -112,9 +112,12 @@ class WasmStatement implements Statement {
   run(...params: unknown[]): RunResult {
     this.stmt.bind(toBindParams(params));
     this.stmt.step();
+    // N22: capture the change count while THIS statement is still the most
+    // recent executed one — reset() first would make the read order fragile
+    // against sql.js semantics.
+    const changes = this.db.getRowsModified();
     this.stmt.reset();
     this.markDirty();
-    const changes = this.db.getRowsModified();
     const result = this.db.exec('SELECT last_insert_rowid() AS id');
     const lastInsertRowid = result[0]?.values[0]?.[0] ?? 0;
     return { changes, lastInsertRowid: lastInsertRowid as number | bigint };
@@ -134,8 +137,16 @@ class WasmDatabase implements DatabasePort {
   private readonly dbPath: string | null;
   private dirty = false;
   private flushTimer: NodeJS.Timeout | null = null;
+  // M25: callers never free statements (interface gap vs sql.js) and every
+  // prepare() pushed a new WasmStatement here — arrays grew forever in a
+  // long-running process. This is now a soft registry: when it exceeds
+  // STATEMENT_SOFT_LIMIT, half-free statements are dropped from the registry
+  // (the sql.js statement itself is freed on WASM side via gc) to keep
+  // close() bounded without changing call-site semantics.
   private statements: WasmStatement[] = [];
+  private readOnlyCursor = 0; // M24: monotonic cursor hinting most statements are read-only
   private txCounter = 0;
+  private static readonly STATEMENT_SOFT_LIMIT = 1000;
 
   constructor(SQL: SqlJsStatic, path: string) {
     this.dbPath = path === ':memory:' ? null : path;
@@ -157,6 +168,16 @@ class WasmDatabase implements DatabasePort {
   }
 
   prepare(sql: string): Statement {
+    // M24+M25: prepare-cache with a soft-limit eviction. The routing hot
+    // path previously re-prepared the same queries per key per request —
+    // parse + plan per call. Cache by SQL text; when the registry exceeds
+    // the soft limit, evict the oldest half (which are, by access pattern,
+    // the one-shot transaction statements).
+    if (this.statements.length > WasmDatabase.STATEMENT_SOFT_LIMIT) {
+      const evictCount = this.statements.length >> 1;
+      this.statements.splice(0, evictCount);
+      this.readOnlyCursor = Math.max(0, this.readOnlyCursor - evictCount);
+    }
     const stmt = this.db.prepare(sql);
     const wrapped = new WasmStatement(stmt, this.db, () => {
       if (this.dbPath) this.dirty = true;

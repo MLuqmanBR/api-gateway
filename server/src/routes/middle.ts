@@ -24,10 +24,8 @@ export const middleRouter = Router();
 const CONFIG_KEYS = [
   'middle_redaction_enabled',
   'middle_compression_enabled',
-  'middle_compression_min_tokens',
   'middle_compression_protect_recent',
   'middle_compression_smart_crusher',
-  'middle_compression_toon',
   'middle_compression_emit_sentinel',
   'middle_compression_smart_crusher_lossless_only',
   'middle_compression_min_savings_ratio',
@@ -40,10 +38,8 @@ const CONFIG_KEYS = [
 const DEFAULTS: Record<string, string> = {
   middle_redaction_enabled: '0',
   middle_compression_enabled: '0',
-  middle_compression_min_tokens: '250',
   middle_compression_protect_recent: '4',
   middle_compression_smart_crusher: '0',
-  middle_compression_toon: '0',
   middle_compression_emit_sentinel: '1',
   middle_compression_smart_crusher_lossless_only: '1',
   middle_compression_min_savings_ratio: '0.15',
@@ -64,10 +60,8 @@ middleRouter.get('/config', (_req: Request, res: Response) => {
 const updateConfigSchema = z.object({
   middle_redaction_enabled: z.string().optional(),
   middle_compression_enabled: z.string().optional(),
-  middle_compression_min_tokens: z.string().optional(),
   middle_compression_protect_recent: z.string().optional(),
   middle_compression_smart_crusher: z.string().optional(),
-  middle_compression_toon: z.string().optional(),
   middle_compression_emit_sentinel: z.string().optional(),
   middle_compression_smart_crusher_lossless_only: z.string().optional(),
   middle_compression_min_savings_ratio: z.string().optional(),

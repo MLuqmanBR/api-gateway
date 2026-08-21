@@ -56,13 +56,10 @@ function emit(level: LogLevel, msg: unknown, fields?: LogFields): void {
   }
   const tail = fieldParts.length > 0 ? ` ${fieldParts.join(' ')}` : '';
   const line = `${tag} ${safeMsg}${tail}`;
-  // debug → stderr; info/warn → stderr; error → stderr. We deliberately
-  // route everything to stderr so PM2/systemd log shippers can split
-  // stdout/stderr as they see fit without losing the level signal.
-  // (Redirect at the log-shipper layer by prefix if you need it.)
-  if (level === 'error') console.error(line);
-  else if (level === 'warn') console.warn(line);
-  else console.log(line);
+  // M16: every level goes to stderr so PM2/systemd log shippers can split
+  // stdout/stderr by stream without losing the level signal. (Previously
+  // info/debug used console.log → stdout, contradicting the comment above.)
+  process.stderr.write(line + '\n');
 }
 
 export const logger = {

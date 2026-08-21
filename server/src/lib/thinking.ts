@@ -98,6 +98,30 @@ export function normalizeThinking(opts: {
  * We don't know which Anthropic model we're talking to at the provider layer —
  * the choice between `enabled` and `adaptive` is left to the caller; the
  * proxy decides based on the model id from the catalog, when available. */
+// Anthropic rejects budget_tokens < 1024 in enabled mode (M33) — that is the
+// floor the `minimal` effort clamps to below.
+const ANTHROPIC_MIN_BUDGET = 1024;
+
+// Effort→thinking-budget ladder in tokens, shared by Anthropic and Gemini 2.5
+// (M33 deliberately put both providers on one scale). Only `minimal` is
+// provider-specific: Anthropic clamps to its 1024-token enabled-mode floor,
+// Gemini 2.5 floors at 0 (the closest supported "off").
+const EFFORT_BUDGET_TOKENS = {
+  low: 2048,
+  medium: 8192,
+  high: 16384,
+  ceiling: 24576, // xhigh and max clamp here
+} as const;
+
+const ANTHROPIC_EFFORT_BUDGET: Record<ThinkingEffort, number> = {
+  minimal: ANTHROPIC_MIN_BUDGET,
+  low: EFFORT_BUDGET_TOKENS.low,
+  medium: EFFORT_BUDGET_TOKENS.medium,
+  high: EFFORT_BUDGET_TOKENS.high,
+  xhigh: EFFORT_BUDGET_TOKENS.ceiling,
+  max: EFFORT_BUDGET_TOKENS.ceiling,
+};
+
 export function anthropicThinking(
   normalized: ThinkingRequest | undefined,
 ): { thinking?: Record<string, unknown>; output_config?: Record<string, unknown> } {
@@ -112,7 +136,17 @@ export function anthropicThinking(
     out.thinking = { type: 'adaptive' };
   } else if (normalized.enabled === true) {
     const t: Record<string, unknown> = { type: 'enabled' };
-    if (normalized.budget !== undefined) t.budget_tokens = normalized.budget;
+    // M33: Anthropic REQUIRES budget_tokens (≥ 1024) alongside
+    // type:'enabled' — an effort-only request used to emit a bare
+    // {type:'enabled'} and get rejected. Derive the budget from effort;
+    // with neither, clamp to the Anthropic floor.
+    if (normalized.budget !== undefined) {
+      t.budget_tokens = normalized.budget;
+    } else if (normalized.effort) {
+      t.budget_tokens = ANTHROPIC_EFFORT_BUDGET[normalized.effort];
+    } else {
+      t.budget_tokens = ANTHROPIC_MIN_BUDGET;
+    }
     if (normalized.display) t.display = normalized.display;
     out.thinking = t;
   }
@@ -138,12 +172,17 @@ const GEMINI_3_LEVEL: Record<GeminiEffort, string> = {
   medium: 'medium',
   low: 'low',
 };
-const GEMINI_BUDGET: Record<GeminiEffort, number> = {
-  max: 24576,
-  xhigh: 24576,
-  high: 16384,
-  medium: 8192,
-  low: 2048,
+// Full-effort map: exhaustive over ThinkingEffort so the compiler enforces
+// every reachable value (H14 — the previous `Exclude<..., 'minimal'>` map +
+// cast silently produced `thinkingBudget: undefined` for effort:'minimal'
+// on Gemini 2.5, dropping the user's effort entirely).
+const GEMINI_BUDGET: Record<ThinkingEffort, number> = {
+  minimal: 0, // 2.5 floor: budget 0 is the closest supported equivalent
+  max: EFFORT_BUDGET_TOKENS.ceiling,
+  xhigh: EFFORT_BUDGET_TOKENS.ceiling,
+  high: EFFORT_BUDGET_TOKENS.high,
+  medium: EFFORT_BUDGET_TOKENS.medium,
+  low: EFFORT_BUDGET_TOKENS.low,
 };
 export function geminiThinkingConfig(
   normalized: ThinkingRequest | undefined,
@@ -184,9 +223,9 @@ export function geminiThinkingConfig(
     if (normalized.budget !== undefined) {
       cfg.thinkingBudget = normalized.budget;
     } else if (normalized.effort) {
-      // `minimal` was already filtered into the 2.5 disable path above;
-      // remaining values are bounded by GeminiEffort.
-      cfg.thinkingBudget = GEMINI_BUDGET[normalized.effort as GeminiEffort];
+      // Exhaustive Record — 'minimal' maps to the 2.5 floor (budget 0);
+      // every other effort has an explicit budget. (H14)
+      cfg.thinkingBudget = GEMINI_BUDGET[normalized.effort];
     }
   }
   return cfg;
@@ -205,11 +244,11 @@ export function geminiThinkingConfig(
 //                            string (derived from `reasoning_effort` OR
 //                            `thinking.effort`). Most OpenAI-compat hosts
 //                            (NVIDIA, OpenRouter, Groq, Cerebras, …) accept it.
-//   'none'                   GLM hosts — emit NOTHING. GLM's API rejects both
-//                            `reasoning_effort` (unknown field) and the rich
-//                            `thinking` object (literal_error on its
-//                            narrower enum), so the only safe move is to let
-//                            GLM run with its own default reasoning.
+//   'glm_mapped'            GLM hosts — MAP effort onto GLM's narrow enum
+//                            (`low|medium|high`, see mapGlmEffort) and emit
+//                            only that. GLM's API rejects the rich
+//                            `thinking` object outright (literal_error on its
+//                            narrower enum), so the rich object is dropped.
 //   'both'                   hosts verified to accept the rich `thinking`
 //                            object alongside `reasoning_effort`. Reserved for
 //                            explicit allowlisting once a host is confirmed.
@@ -218,10 +257,8 @@ export type OpenAiCompatThinkingPolicy =
   | 'glm_mapped'              // GLM — map effort to GLM's narrow enum, drop the rich object
   | 'glm_nvidia'              // GLM on NVIDIA NIM — needs chat_template_kwargs.enable_thinking; accepts full effort range
   | 'glm52_synthetic'             // gatewaysynth × glm-5.2 — synthesize thinking={type:enabled} so reasoning_content surfaces; forward effort verbatim across the full 7-value enum
-  | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only);
+  | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only)
 
-// Legacy alias kept for clarity in comments; 'none' is now 'glm_mapped' because
-// GLM does accept a (narrow) reasoning_effort — we just have to map it.
 
 // GLM-family hosts. GLM's OpenAI-compat wrapper accepts ONLY
 // `reasoning_effort` and ONLY the values `none | low | medium | high` — it
@@ -300,33 +337,46 @@ export function openAiCompatThinkingPolicy(platform: string, modelId?: string): 
   return 'reasoning_effort_only';
 }
 
-/** Map a unified effort level onto GLM's accepted enum (`low|medium|high`).
- *  GLM rejects `max` and `xhigh` (literal_error) and has no `minimal` slot, so
- *  we clamp the out-of-range levels into GLM's range WITHOUT disabling
- *  thinking — `max`/`xhigh` → `high` (most thinking GLM offers), `minimal` →
- *  `low` (least thinking, but still on). The user's intent (more vs less
- *  thinking) is preserved; thinking is never turned off by the mapping.
+/** Exhaustiveness guard: passing a value that isn't `never` is a compile
+ *  error, so a switch over a union that handles every member can funnel its
+ *  default here — future union members break the build instead of falling
+ *  into a silent catch-all. */
+function assertNever(x: never): never {
+  throw new Error(`unreachable: ${String(x)}`);
+}
+
+/** Map a unified effort level onto GLM's accepted wire enum
+ *  (`none | low | medium | high`). GLM rejects `max` and `xhigh`
+ *  (literal_error) and has no `minimal` slot, so we clamp the out-of-range
+ *  levels into GLM's range WITHOUT disabling thinking — `max`/`xhigh` →
+ *  `high` (most thinking GLM offers), `minimal` → `low` (least thinking,
+ *  but still on). The mapping itself only ever EMITS `low|medium|high` — it
+ *  never sends `none`, because mapping must not turn thinking off. The
+ *  user's intent (more vs less thinking) is preserved.
  *  Confirmed live against GlmAggregatorB GLM-5.1-FP8. (#292) */
 function mapGlmEffort(effort: ThinkingEffort): 'low' | 'medium' | 'high' {
   switch (effort) {
     case 'minimal':
     case 'low': return 'low';
     case 'medium': return 'medium';
-    case 'high': return 'high';
+    case 'high':
     case 'xhigh':
     case 'max': return 'high';
-    default: return 'high';
+    // Exhaustive over ThinkingEffort: a future enum member fails to compile
+    // here (never-argument) instead of silently clamping to 'high'.
+    default: return assertNever(effort);
   }
 }
 
 /** Decide which thinking fields to put on the outbound OpenAI-compat body,
  *  honoring the host's policy. Never forwards a field the host doesn't accept.
  *
- *  - `none`: drop everything (GLM).
  *  - `reasoning_effort_only`: emit `reasoning_effort`, derived from either the
  *    explicit `reasoning_effort` string or, when only a `thinking` object was
  *    sent, from `thinking.effort`. The rich `thinking` object is NEVER
  *    forwarded here — that's the field that triggers literal_errors.
+ *  - `glm_mapped`: map the effort onto GLM's narrow enum via mapGlmEffort
+ *    and emit ONLY `reasoning_effort` — never the rich object (GLM).
  *  - `both`: forward `reasoning_effort` and `thinking` verbatim (only for
  *    hosts verified to accept the rich object).
  *  - `glm_nvidia`: GLM 5.2 on NVIDIA NIM — emit the
@@ -384,7 +434,6 @@ export function openaiCompatThinkingBody(
     // reasoning_content — the thinking={type:enabled} switch is required.
     // So when the caller asks for thinking by any means, ensure the thinking
     // object reaches gatewaysynth. Confirmed live (Turn 1).
-    const effort = original?.reasoning_effort ?? original?.thinking?.effort;
 
     // Honor an explicit disable: forward verbatim, send no effort.
     if (original?.thinking?.type === 'disabled') {

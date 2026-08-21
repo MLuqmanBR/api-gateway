@@ -51,6 +51,15 @@ describe('sanitizeProviderErrorMessage', () => {
     expect(out).not.toContain('api.example.com');
   });
 
+  it('keeps public docs links while stripping other URLs (L55 allowlist)', () => {
+    const out = sanitizeProviderErrorMessage(
+      'rate limited — see https://docs.anthropic.com/en/docs/rate-limits and https://api.example.com/v1/models',
+    );
+    expect(out).toContain('https://docs.anthropic.com/en/docs/rate-limits');
+    expect(out).toContain('[redacted-url]');
+    expect(out).not.toContain('api.example.com');
+  });
+
   it('strips high-entropy tokens adjacent to key/token/secret words', () => {
     // A 64-char hex token next to "api_key" (no : or = so the key-word regex
     // does not fire — the high-entropy pass catches it instead).

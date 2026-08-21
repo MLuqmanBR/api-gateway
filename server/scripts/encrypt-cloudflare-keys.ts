@@ -1,11 +1,14 @@
 #!/usr/bin/env -S npx tsx
 /**
- * One-shot script to delete stale Cloudflare keys and insert 10 distinct
- * Cloudflare account keys. Run AFTER Step 4a (cooldowns + old keys deleted).
+ * One-shot script to insert Cloudflare account keys into the api_keys table
+ * (platform='cloudflare'), AES-256-GCM encrypted with ENCRYPTION_KEY from the
+ * environment or the project .env file.
  *
  *        npx tsx server/scripts/encrypt-cloudflare-keys.ts
  *
- * Or load from the project's .env file.
+ * The key set comes from the KEY_SETS_JSON env var (a JSON array of
+ * { "label": "<email>", "raw": "<account_id>:<api_token>" } objects); nothing
+ * is deleted or deduplicated — existing rows are left untouched.
  */
 
 import crypto from 'crypto';
@@ -52,10 +55,10 @@ if (!/^[0-9a-f]{64}$/i.test(ENCRYPTION_KEY)) {
   process.exit(1);
 }
 
-const key = Buffer.from(ENCRYPTION_KEY, 'hex');
 
 function encrypt(text) {
-  const iv = crypto.randomBytes(16);
+  // 12-byte nonce — the GCM standard, matching server/src/lib/crypto.ts.
+  const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   let encrypted = cipher.update(text, 'utf8', 'hex');
   encrypted += cipher.final('hex');
@@ -67,7 +70,8 @@ function encrypt(text) {
   };
 }
 
-// 10 distinct Cloudflare account keys (account_id:api_token).
+// Cloudflare account keys (account_id:api_token) — as many as KEY_SETS_JSON
+// provides; there is no fixed count.
 // IMPORTANT: Provide real tokens via KEY_SETS_JSON env var — NEVER commit
 // real tokens to git. GitHub push protection blocks them.
 // Format: [{ "label": "<email>", "raw": "<account_id>:<api_token>" }]

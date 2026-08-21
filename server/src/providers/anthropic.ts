@@ -143,7 +143,13 @@ export class AnthropicCompatProvider extends BaseProvider {
     this.baseUrl = opts.baseUrl;
     this.timeoutMs = opts.timeoutMs ?? 120000;
     this.keyless = opts.keyless ?? false;
+    // H21: colon-format keys ("token:account_id") must be split like the
+    // openai-compat provider does — previously keyFormat was accepted and
+    // silently ignored, sending the whole colon key as x-api-key and never
+    // substituting {account_id} in the URL.
+    this.keyFormat = opts.keyFormat ?? 'simple';
   }
+  private readonly keyFormat: string;
 
   /** OpenAI tools are wrapped as `{ type: 'function', function: { ... } }`;
    * Anthropic tools are flat `{ name, description, input_schema }`. */
@@ -414,12 +420,33 @@ export class AnthropicCompatProvider extends BaseProvider {
   }
 
 
+  /** Extract the account_id from a composite "account_id:api_token" key
+   *  (colon keyFormat — H21). Throws when no colon is present. */
+  private accountId(apiKey: string): string {
+    const sep = apiKey.indexOf(':');
+    if (sep === -1) throw new Error(`${this.name} key must be in format "account_id:api_token"`);
+    return apiKey.slice(0, sep);
+  }
+
+  /** The x-api-key value: for colon-format keys the TOKEN half only. */
+  private tokenPart(apiKey: string): string {
+    return this.keyFormat === 'colon' ? apiKey.slice(apiKey.indexOf(':') + 1) : apiKey;
+  }
+
+  /** Build the effective URL, substituting {account_id} when keyFormat is
+   *  'colon' (H21). */
+  private resolveUrl(apiKey: string, path: string): string {
+    if (this.keyFormat !== 'colon') return `${this.baseUrl}${path}`;
+    const base = (this.baseUrl ?? '').replace(/\{account_id\}/g, this.accountId(apiKey));
+    return `${base}${path}`;
+  }
+
   private buildRequestHeaders(apiKey: string): Record<string, string> {
     // Keyless providers (self-hosted proxies that need no key) get an empty
     // header bag so we never send a `x-api-key: undefined` string the upstream
     // might reject.
     return {
-      ...(this.keyless ? {} : { 'x-api-key': apiKey }),
+      ...(this.keyless ? {} : { 'x-api-key': this.tokenPart(apiKey) }),
       'anthropic-version': ANTHROPIC_VERSION,
       'anthropic-beta': ANTHROPIC_BETA,
       'Content-Type': 'application/json',
@@ -434,7 +461,7 @@ export class AnthropicCompatProvider extends BaseProvider {
   ): Promise<ChatCompletionResponse> {
     const body = this.buildRequestBody(messages, modelId, options, false);
     const res = await this.fetchWithTimeout(
-      `${this.baseUrl}/v1/messages`,
+      this.resolveUrl(apiKey, '/v1/messages'),
       {
         method: 'POST',
         headers: this.buildRequestHeaders(apiKey),
@@ -477,7 +504,7 @@ export class AnthropicCompatProvider extends BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk> {
     const body = this.buildRequestBody(messages, modelId, options, true);
     const res = await this.fetchWithTimeout(
-      `${this.baseUrl}/v1/messages`,
+      this.resolveUrl(apiKey, '/v1/messages'),
       {
         method: 'POST',
         headers: this.buildRequestHeaders(apiKey),
@@ -556,7 +583,7 @@ export class AnthropicCompatProvider extends BaseProvider {
           index: 0,
           delta: {},
           finish_reason: finalStopReason ?? 'stop',
-      },],
+        }],
       };
       if (finalUsage) chunk.usage = finalUsage;
       return chunk;
@@ -596,10 +623,12 @@ export class AnthropicCompatProvider extends BaseProvider {
           let dataLine: string | undefined;
           for (const line of rawEvent.split('\n')) {
             const trimmed = line.trimEnd();
-            if (trimmed.startsWith('event: ')) {
-              eventType = trimmed.slice(7).trim();
-            } else if (trimmed.startsWith('data: ')) {
-              dataLine = trimmed.slice(6);
+            // N12: SSE permits "field:value" without the space after the
+            // colon — accept both spellings instead of requiring 'event: '.
+            if (trimmed.startsWith('event:')) {
+              eventType = trimmed.slice(6).trim();
+            } else if (trimmed.startsWith('data:')) {
+              dataLine = trimmed.slice(5).trimStart();
             }
           }
           if (!eventType || dataLine == null) continue;
@@ -769,29 +798,27 @@ export class AnthropicCompatProvider extends BaseProvider {
   }
 
   async validateKey(apiKey: string): Promise<boolean> {
-    // Anthropic's Messages API rejects GET with 405, so we can't probe it
-    // directly. POST a minimal messages request (1 token budget) and treat
-    // 200 or 400 (bad request, e.g. invalid model id) as authenticated; only
-    // 401/403 indicate an invalid key. Transport errors propagate — health.ts
-    // catches them and marks the key status='error' without disabling it.
-    //
-    // Note: some Anthropic-compatible proxies reject POST /v1/messages
-    // without a body, so we send `{}` to a dedicated lightweight endpoint
-    // (count_tokens) when available, falling back to /v1/messages otherwise.
-    const url = `${this.baseUrl}/v1/messages`;
-    const res = await this.fetchWithTimeout(
-      url,
-      {
+    // H22: probe the FREE /v1/messages/count_tokens endpoint — the previous
+    // probe fired a real (billable) haiku GENERATION on every health sweep
+    // while its comment claimed count_tokens was used "when available".
+    // 200/400-class responses prove the key authenticates; 401/403 mark it
+    // invalid. Only when the endpoint is genuinely absent (404/405, e.g.
+    // minimal Anthropic-compatible proxies) do we fall back to a minimal
+    // 1-token messages probe. Transport errors propagate — health.ts marks
+    // status='error' without disabling the key.
+    const probe = (path: string, body: unknown): Promise<Response> =>
+      this.fetchWithTimeout(this.resolveUrl(apiKey, path), {
         method: 'POST',
         headers: this.buildRequestHeaders(apiKey),
-        body: JSON.stringify({
-          model: 'claude-3-haiku-20240307',
-          max_tokens: 1,
-          messages: [{ role: 'user', content: 'hi' }],
-        }),
-      },
-      30000,
-    );
-    return res.status !== 401 && res.status !== 403;
+        body: JSON.stringify(body),
+      }, 30000);
+
+    const minimal = { model: 'claude-3-haiku-20240307', messages: [{ role: 'user', content: 'hi' }] };
+    const countRes = await probe('/v1/messages/count_tokens', minimal);
+    if (countRes.status === 404 || countRes.status === 405) {
+      const fallback = await probe('/v1/messages', { ...minimal, max_tokens: 1 });
+      return fallback.status !== 401 && fallback.status !== 403;
+    }
+    return countRes.status !== 401 && countRes.status !== 403;
   }
 }

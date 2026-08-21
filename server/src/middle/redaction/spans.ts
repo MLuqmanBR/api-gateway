@@ -39,8 +39,17 @@ export function buildPlaceholder(generation: number, hexTag: string): string {
   return `${PLACEHOLDER_PREFIX}${generation}:${hexTag}${PLACEHOLDER_CLOSE}`;
 }
 
-/** Regex matching a complete canonical placeholder. Captures gen + hex. */
-export const PLACEHOLDER_RE = /\u27E6R(\d+):([0-9a-f]{6,12})\u27E7/g;
+/** Regex matching a complete canonical placeholder. Captures gen + hex.
+ * Tag width: the store emits 12-hex tags (48-bit, post-C06); 6-hex remains
+ * accepted for legacy persisted text — do NOT narrow to a single width.
+ * Deliberately NOT global: an exported /g regex is shared mutable state
+ * (lastIndex). Call sites that need global matching build their own /g from
+ * `PLACEHOLDER_RE.source`. */
+export const PLACEHOLDER_RE = /\u27E6R(\d+):([0-9a-f]{6,12})\u27E7/;
+
+/** Private global copy for replace-all use inside this module (String.replace
+ * resets lastIndex itself, so reuse is safe here). */
+const PLACEHOLDER_RE_ALL = new RegExp(PLACEHOLDER_RE.source, 'g');
 
 /**
  * Check whether a string's suffix could be the start of a placeholder.
@@ -118,16 +127,21 @@ export function applySpans(text: string, spans: Span[]): { out: string; applied:
   const sorted = [...spans].sort((a, b) => a.start - b.start);
 
   const parts: string[] = [];
+  const applied: Span[] = [];
   let cursor = 0;
   for (const span of sorted) {
     if (span.start < cursor) continue; // skip overlapping (shouldn't happen post-resolution)
     parts.push(text.slice(cursor, span.start));
     parts.push(span.placeholder);
     cursor = span.end;
+    applied.push(span);
   }
   parts.push(text.slice(cursor));
 
-  return { out: parts.join(''), applied: sorted };
+  // H37: `applied` must contain ONLY the spans that produced a placeholder in
+  // `out` — skipped overlaps are excluded so downstream session maps never
+  // register placeholder→value pairs that were never emitted.
+  return { out: parts.join(''), applied };
 }
 
 /**
@@ -160,7 +174,7 @@ export function unredact(text: string, map: ReadonlyMap<string, string>): string
   if (map.size === 0) return text;
 
   // 1. Canonical placeholders: ⟦R7:a3f2c9⟧
-  let out = text.replace(PLACEHOLDER_RE, (match) => {
+  let out = text.replace(PLACEHOLDER_RE_ALL, (match) => {
     const val = map.get(match);
     return val !== undefined ? val : match;
   });

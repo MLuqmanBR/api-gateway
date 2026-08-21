@@ -13,7 +13,7 @@
  * Attribution: circuit-breaker pattern from litellm (MIT, litellm/proxy/utils.py).
  */
 
-import { getSetting } from '../db/index.js';
+import { parseIntSetting } from '../lib/settings-parse.js';
 
 type CircuitState = 'closed' | 'open' | 'half_open';
 
@@ -32,10 +32,13 @@ function circuitKey(platform: string, model: string, keyId: number): string {
 }
 
 function getThresholds() {
+  // M20: NaN-safe parsing — a corrupt setting value previously poisoned
+  // every threshold comparison (NaN > x is false), silently disabling the
+  // breaker. parseIntSetting falls back to the numeric default and logs once.
   return {
-    failureThreshold: parseInt(getSetting('circuit_breaker_failure_threshold') ?? '5', 10),
-    cooldownMs: parseInt(getSetting('circuit_breaker_cooldown_ms') ?? '30000', 10),
-    maxReopens: parseInt(getSetting('circuit_breaker_max_reopens') ?? '3', 10),
+    failureThreshold: parseIntSetting('circuit_breaker_failure_threshold', 5),
+    cooldownMs: parseIntSetting('circuit_breaker_cooldown_ms', 30000),
+    maxReopens: parseIntSetting('circuit_breaker_max_reopens', 3),
   };
 }
 
@@ -116,12 +119,6 @@ export function shouldMarkExhausted(platform: string, model: string, keyId: numb
   if (!entry) return false;
   const thresholds = getThresholds();
   return entry.openCount >= thresholds.maxReopens;
-}
-
-/** Get circuit state for a specific key (for debugging/admin). */
-export function getCircuitState(platform: string, model: string, keyId: number): CircuitState | null {
-  const key = circuitKey(platform, model, keyId);
-  return circuits.get(key)?.state ?? null;
 }
 
 /** Get all circuit states (for /api/circuits admin route). */

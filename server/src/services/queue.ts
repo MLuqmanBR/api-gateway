@@ -12,6 +12,7 @@
  */
 
 import { getSetting } from '../db/index.js';
+import { parseIntSetting } from '../lib/settings-parse.js';
 
 interface Waiter {
   resolve: (release: () => void) => void;
@@ -100,12 +101,36 @@ export class QueueTimeoutError extends Error {
 
 const semaphores = new Map<string, ProviderSemaphore>();
 
+// H19: settings may change at runtime — a semaphore's cached limits go
+// stale until restart. Track the settings fingerprint each semaphore was
+// built with and rebuild when the relevant settings changed.
+let lastSemaphoreFingerprint = '';
+
+function queueSettingsFingerprint(): string {
+  return [
+    getSetting('max_concurrency_per_provider') ?? '0',
+    getSetting('max_queue_size') ?? '100',
+    getSetting('queue_timeout_ms') ?? '2000',
+  ].join('|');
+}
+
 function getSemaphore(platform: string): ProviderSemaphore {
+  const fingerprint = queueSettingsFingerprint();
+  if (fingerprint !== lastSemaphoreFingerprint) {
+    // Config changed: drop the old semaphores (in-flight releases still
+    // work — the release closure holds its own semaphore reference) so new
+    // acquires use the current limits.
+    semaphores.clear();
+    lastSemaphoreFingerprint = fingerprint;
+  }
   let sem = semaphores.get(platform);
   if (!sem) {
-    const maxConcurrency = parseInt(getSetting('max_concurrency_per_provider') ?? '0', 10);
-    const maxQueueSize = parseInt(getSetting('max_queue_size') ?? '100', 10);
-    const timeoutMs = parseInt(getSetting('queue_timeout_ms') ?? '2000', 10);
+    // M20: NaN-safe — parseInt on a corrupt setting previously yielded NaN,
+    // making the concurrency cap check (`acquired < NaN`) false for every
+    // acquire and effectively disabling the queue limits.
+    const maxConcurrency = parseIntSetting('max_concurrency_per_provider', 0);
+    const maxQueueSize = parseIntSetting('max_queue_size', 100);
+    const timeoutMs = parseIntSetting('queue_timeout_ms', 2000);
     sem = new ProviderSemaphore(platform, maxConcurrency, maxQueueSize, timeoutMs);
     semaphores.set(platform, sem);
   }
@@ -120,8 +145,7 @@ export async function acquireSlot(platform: string): Promise<() => void> {
 
 /** Check if concurrency caps are enabled (max_concurrency_per_provider > 0). */
 export function isQueueEnabled(): boolean {
-  const max = parseInt(getSetting('max_concurrency_per_provider') ?? '0', 10);
-  return max > 0;
+  return parseIntSetting('max_concurrency_per_provider', 0) > 0;
 }
 
 /** Get queue stats for all providers (for /api/queue admin route). */

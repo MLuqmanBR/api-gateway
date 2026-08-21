@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { getDb, getSetting, setSetting } from '../db/index.js';
+import { getDb, getSetting, setSetting, cachedPrepare } from '../db/index.js';
 import { buildProviderFor } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { canMakeRequest, canUseTokens, isOnCooldown, canUseProviderMinute, reserveRequest, releaseReservation } from './ratelimit.js';
@@ -58,6 +58,15 @@ interface ChainRow {
   tags: string | null;
 }
 
+// N6: the preview endpoint selects a narrower column set than ChainRow (no
+// supports_vision/tools, context_window, max_output_tokens, key_id or tags),
+// so it must not cast to the full row type — that would assert columns the
+// SELECT never returns.
+type ChainPreviewRow = Pick<ChainRow,
+  'model_db_id' | 'priority' | 'enabled' | 'platform' | 'model_id' | 'display_name'
+  | 'intelligence_rank' | 'size_label' | 'monthly_token_budget'
+  | 'rpm_limit' | 'rpd_limit' | 'tpm_limit' | 'tpd_limit'>;
+
 export interface RouteResult {
   provider: BaseProvider;
   modelId: string;
@@ -91,7 +100,10 @@ const roundRobinIndex = new Map<string, number>();
 const providerInFlight = new Map<string, { count: number; limit: number | null }>();
 
 /** Try to reserve one in-flight slot for the given platform slug.
- *  Returns true if the slot was reserved, false if the provider is at capacity. */
+ *  Returns true if the slot was reserved, false if the provider is at capacity.
+ *  The limit is read from the CURRENT argument on every call (H19) — editing
+ *  `max_parallel_requests` takes effect immediately, not after a restart:
+ *  the first-seen limit is never cached against the platform. */
 function tryReserveSlot(platform: string, maxParallel: number | null): boolean {
   if (maxParallel === null || maxParallel === undefined || maxParallel <= 0) return true;
   let entry = providerInFlight.get(platform);
@@ -99,6 +111,8 @@ function tryReserveSlot(platform: string, maxParallel: number | null): boolean {
     entry = { count: 0, limit: maxParallel };
     providerInFlight.set(platform, entry);
   }
+  // Refresh in case the configured limit changed since first sight.
+  entry.limit = maxParallel;
   if (entry.count >= maxParallel) return false;
   entry.count++;
   return true;
@@ -363,7 +377,14 @@ function decayWeight(ageDays: number): number {
 export function refreshStatsCache(db: DatabasePort, force = false): void {
   if (!force && statsCache && Date.now() - statsCacheTime < CACHE_TTL_MS) return;
 
-  const since = new Date(Date.now() - WINDOW_MS).toISOString();
+  // created_at is stored via SQLite's datetime('now') → 'YYYY-MM-DD HH:MM:SS'.
+  // An ISO-8601 cutoff ('…THH:MM:SS.sssZ') compares lexically wrong against
+  // that format ('T' > ' ', so '2026-08-16T…' > every '2026-08-16 …' row),
+  // silently dropping the boundary day's rows — format the cutoff to match.
+  const cutoff = new Date(Date.now() - WINDOW_MS);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const since = `${cutoff.getUTCFullYear()}-${pad(cutoff.getUTCMonth() + 1)}-${pad(cutoff.getUTCDate())} ` +
+    `${pad(cutoff.getUTCHours())}:${pad(cutoff.getUTCMinutes())}:${pad(cutoff.getUTCSeconds())}`;
   const buckets = db.prepare(`
     SELECT platform, model_id,
       CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days,
@@ -448,8 +469,14 @@ interface ScoredEntry {
   score: number;
 }
 
+// N6: only these columns are read — a Pick lets both the full ChainRow path
+// and the narrower ChainPreviewRow path call this without an unsafe cast.
+type ScoreInput = Pick<ChainRow,
+  'model_db_id' | 'platform' | 'model_id' | 'size_label' | 'intelligence_rank'
+  | 'monthly_token_budget'>;
+
 function scoreChainEntry(
-  entry: ChainRow,
+  entry: ScoreInput,
   weights: RoutingWeights,
   intelMin: number,
   intelMax: number,
@@ -626,13 +653,16 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // models whose tags don't intersect — UNLESS the model has the 'default'
     // tag (always eligible) or reqTags is undefined/empty (today's behavior).
     if (options?.reqTags && options.reqTags.size > 0) {
-      let modelTags: Set<string> | null = null;
-      try { modelTags = new Set(JSON.parse(entry.tags ?? '[]') as string[]); } catch { modelTags = new Set(); }
-      const hasDefault = modelTags?.has('default');
+      // N5: parse once — the result is always a Set (the catch assigns the
+      // empty fallback), so downstream `.has` needs no optional chaining.
+      let parsedTags: string[] = [];
+      try { parsedTags = JSON.parse(entry.tags ?? '[]') as string[]; } catch { parsedTags = []; }
+      const modelTags = new Set(parsedTags);
+      const hasDefault = modelTags.has('default');
       if (!hasDefault) {
         let intersects = false;
         for (const tag of options.reqTags) {
-          if (modelTags?.has(tag)) { intersects = true; break; }
+          if (modelTags.has(tag)) { intersects = true; break; }
         }
         if (!intersects) continue;
       }
@@ -680,7 +710,9 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     const provider = buildProviderFor(entry.platform);
     if (!provider) continue;
     // Get enabled keys that have not already failed validation or decryption.
-    const keys = db.prepare(
+    // M24: cached prepared statement — this prepare previously ran once per
+    // model per request (parse + plan each time).
+    const keys = cachedPrepare(
       "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
     ).all(entry.platform) as KeyRow[];
 
@@ -760,7 +792,10 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     if (stickyEnabled && options?.stickySessionKey) {
       const hash = crypto.createHash('sha1').update(options.stickySessionKey).digest();
       const hashInt = hash.readUInt32BE(0);
-      idx = hashInt % keyOrder.length;
+      // N7: an empty keyOrder (all keys filtered out upstream) would make
+      // this NaN and the loop below a silent no-op — fall back to index 0;
+      // the attempt loop still guards on length.
+      idx = keyOrder.length > 0 ? hashInt % keyOrder.length : 0;
     } else {
       idx = oneRPM ? 0 : (roundRobinIndex.get(rrKey) ?? 0);
     }
@@ -962,7 +997,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     WHERE m.enabled = 1
-  `).all() as ChainRow[];
+  `).all() as ChainPreviewRow[];
 
   // For display we score under 'balanced' weights when in priority mode, so the
   // table still shows a meaningful ranking even with the bandit turned off.

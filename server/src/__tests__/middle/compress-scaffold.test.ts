@@ -140,8 +140,10 @@ describe('B1-1: intersectsOffLimits', () => {
 
 describe('B1-1: mustKeep treasury', () => {
   it('finds numbers', () => {
-    expect(mustKeepMatches('error code 404 at line 42')).toContain('404');
-    expect(mustKeepMatches('error code 404 at line 42')).toContain('42');
+    const matches = mustKeepMatches('error code 404 at line 42');
+    // New mustKeep regex matches "code 404" and "line 42" as phrase-token pairs
+    expect(matches.some(m => /code\s*404/i.test(m))).toBe(true);
+    expect(matches.some(m => /line\s*42/i.test(m))).toBe(true);
   });
   it('finds URLs', () => {
     const matches = mustKeepMatches('see https://example.com/docs for details');
@@ -159,7 +161,31 @@ describe('B1-1: mustKeep treasury', () => {
     const matches = mustKeepMatches('set MAX_RETRIES to TIMEOUT_LIMIT');
     expect(matches).toContain('MAX_RETRIES');
   });
+  it('M42: does NOT keep slash-prefixed fragments of ordinary words', () => {
+    // The old `\/[^\s]+` alternative matched "/or" inside "and/or".
+    const matches = mustKeepMatches('use and/or but never /etc/hosts');
+    expect(matches.some(m => m.includes('/or'))).toBe(false);
+    expect(matches.some(m => m.includes('/etc/hosts'))).toBe(true); // absolute path still kept
+  });
 });
+
+describe('B1-1: recordStep metrics (M41)', () => {
+  it('counts inflationsReverted ONLY when an applied result inflated', () => {
+    const m = emptyMetrics();
+    // Applied result that inflated (out ≥ original) → counts.
+    recordStep(m, { out: 'a much longer compressed output than before', saved: -5, applied: true }, 3);
+    expect(m.inflationsReverted).toBe(1);
+  });
+  it('a declined passthrough never counts as a reverted inflation', () => {
+    const m = emptyMetrics();
+    const long = 'x'.repeat(200);
+    recordStep(m, { out: long, saved: 0, applied: false }, countTokensEstimate(long));
+    expect(m.inflationsReverted).toBe(0);
+    expect(m.compressionApplied).toBe(0);
+    expect(m.tokensAfter).toBe(countTokensEstimate(long));
+  });
+});
+
 
 // ── Inflation guard ────────────────────────────────────────────────────────
 
@@ -227,12 +253,15 @@ describe('B1-1: metrics', () => {
     expect(m.tokensSaved).toBeGreaterThan(0);
   });
 
-  it('recordStep tracks inflation reversion', () => {
+  // M41: the guard-reverted compressStep result is a DECLINE (applied=false),
+  // which no longer increments inflationsReverted — only an APPLIED result
+  // whose output inflates does.
+  it('recordStep: guard-reverted step counts as declined, not inflation reverted', () => {
     const m = emptyMetrics();
     const originalTokens = countTokensEstimate('short');
     const result = compressStep('short', 'longer compressed version that is bigger');
     recordStep(m, result, originalTokens);
-    expect(m.inflationsReverted).toBe(1);
+    expect(m.inflationsReverted).toBe(0);
     expect(m.compressionApplied).toBe(0);
   });
 });
@@ -244,12 +273,11 @@ describe('B1-1: compression config defaults', () => {
     clearCompressionConfigCache();
     const cfg = getCompressionConfig();
     expect(cfg.enabled).toBe(false);
-    expect(cfg.minTokens).toBe(250);
     expect(cfg.protectRecent).toBe(4);
     expect(cfg.smartCrusher).toBe(false);
-    expect(cfg.toon).toBe(false);
-    expect(cfg.emitSentinel).toBe(false); // B1-2 will add this setting
-    expect(cfg.smartCrusherLosslessOnly).toBe(false); // B1-2 will add this setting
-    expect(cfg.minSavingsRatio).toBe(0.15); // B1-2 will add this setting
+    expect(cfg.emitSentinel).toBe(false); // setting: middle_compression_emit_sentinel
+    expect(cfg.smartCrusherLosslessOnly).toBe(false); // setting: middle_compression_smart_crusher_lossless_only
+    expect(cfg.minSavingsRatio).toBe(0.15); // setting: middle_compression_min_savings_ratio
+    // M28: minTokens/toon removed — dead config (read, never used).
   });
 });

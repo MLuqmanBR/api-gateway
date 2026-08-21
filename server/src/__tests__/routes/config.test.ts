@@ -8,7 +8,7 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb, getDb } from '../../db/index.js';
+import { initDb, getDb, setSetting } from '../../db/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 import { encrypt, decrypt } from '../../lib/crypto.js';
 import { encryptKeysWithPassphrase } from '../../lib/config/passphrase-crypto.js';
@@ -130,7 +130,15 @@ describe('Config API', () => {
     expect(Array.isArray(body.sections.models)).toBe(true);
     expect(body.sections.fallbackChain).toHaveLength(1);
     expect(body.sections.apiKeys).toHaveLength(1);
-    expect(body.sections.apiKeys[0].key).toBe('sk-test-1234567890');
+    // M38: plaintext keys are opt-in — a plain export carries ciphertext only.
+    expect(body.sections.apiKeys[0].key).toBeUndefined();
+  });
+
+  it('M38: export includes plaintext keys only on explicit opt-in', async () => {
+    const optIn = await request(app, 'POST', '/api/config/export', { includePlaintextKeys: true });
+    expect(optIn.status).toBe(200);
+    expect(optIn.body.sections.apiKeys[0].key).toBe('sk-test-1234567890');
+    expect(optIn.body.keysCipher).toBeUndefined();
   });
 
   it('POST /api/config/export with passphrase produces a keysCipher blob', async () => {
@@ -139,7 +147,7 @@ describe('Config API', () => {
     });
     expect(status).toBe(200);
     expect(body.keysCipher).toBeDefined();
-    expect(body.keysCipher.kdf).toBe('pbkdf2-sha256-310000');
+    expect(body.keysCipher.kdf).toBe('pbkdf2-sha256-600000'); // L31: bumped from 310k
     expect(body.sections.apiKeys[0].key).toBeUndefined();
     expect(body.sections.apiKeys[0].encryptedKey).toBeDefined();
     expect(body.sections.apiKeys[0].iv).toBeDefined();
@@ -534,6 +542,117 @@ describe('Config API', () => {
     // After replace, the row's status should be 'unknown' (re-inserted fresh).
     const after = db.prepare("SELECT status, last_checked_at FROM api_keys WHERE platform='groq'").get() as { status: string; last_checked_at: string | null };
     expect(after.status).toBe('unknown');
+  });
+
+  it('M32: mode=replace on api_keys wipes destination-only keys', async () => {
+    const db = getDb();
+    const k = encrypt('sk-dest-only-key');
+    db.prepare(`INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES ('destonly', 'extra', ?, ?, ?, 'healthy', 1)`).run(k.encrypted, k.iv, k.authTag);
+    // Envelope carries ONLY the groq key (built manually — a full export
+    // would include destonly too).
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [{ platform: 'groq', label: 'main', enabled: true, key: 'sk-test-1234567890' }],
+      },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.api_keys?.errors ?? []).toEqual([]);
+    // True section wipe: the destonly key is GONE — replace previously
+    // deleted only envelope-matching rows, leaving stragglers alive.
+    const platforms = db.prepare('SELECT DISTINCT platform FROM api_keys').all() as Array<{ platform: string }>;
+    expect(platforms.map((p) => p.platform)).toEqual(['groq']);
+  });
+
+  it('M32: replace leaves sections omitted from the envelope untouched', async () => {
+    const db = getDb();
+    // Envelope carries ONLY the models section.
+    const exp = await request(app, 'POST', '/api/config/export', { sections: ['models'] });
+    const env = exp.body as ConfigEnvelope;
+    expect(env.sections.apiKeys).toBeUndefined();
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    // api_keys was not in the envelope → the destination keys survive
+    // (documented: absent sections leave the destination untouched).
+    const n = (db.prepare('SELECT COUNT(*) AS n FROM api_keys').get() as { n: number }).n;
+    expect(n).toBe(1);
+  });
+
+  it('M32: replace on custom_providers unlinks dependents of ALL wiped providers', async () => {
+    const db = getDb();
+    // Destination: two providers, each with a model + fallback + key.
+    db.prepare(`INSERT INTO custom_providers (slug, display_name, base_url) VALUES ('cp-dest', 'A', 'https://a.test/v1')`).run();
+    db.prepare(`INSERT INTO custom_providers (slug, display_name, base_url) VALUES ('cp-only', 'B', 'https://b.test/v1')`).run();
+    const insModel = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
+        size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
+        context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+        paid_input_per_m, paid_output_per_m)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '', NULL, 1, 0, 0, NULL, NULL, NULL)
+    `);
+    insModel.run('cp-dest', 'a-model', 'A Model', 10, 5, 'Medium');
+    insModel.run('cp-only', 'b-model', 'B Model', 11, 6, 'Medium');
+    const idA = (db.prepare("SELECT id FROM models WHERE platform='cp-dest'").get() as { id: number }).id;
+    const idB = (db.prepare("SELECT id FROM models WHERE platform='cp-only'").get() as { id: number }).id;
+    db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 1, 1), (?, 2, 1)').run(idA, idB);
+    const kB = encrypt('sk-cp-only-key');
+    db.prepare(`INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES ('cp-only', 'main', ?, ?, ?, 'healthy', 1)`).run(kB.encrypted, kB.iv, kB.authTag);
+
+    // Envelope carries ONLY cp-dest's provider + model. Note seedModels()
+    // wiped custom_providers in beforeEach, so cp-dest exists ONLY via the
+    // envelope; cp-only exists only in the destination.
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        customProviders: [{
+          slug: 'cp-dest', displayName: 'A', baseUrl: 'https://a.test/v1',
+          rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
+          maxParallelRequests: null, archived: false, keyless: false,
+          apiFormat: 'openai',
+        }],
+        models: [{
+          platform: 'cp-dest', modelId: 'a-model',
+          displayName: 'A Model', intelligenceRank: 10, speedRank: 5,
+          sizeLabel: 'Medium', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
+          monthlyTokenBudget: '', contextWindow: null,
+          enabled: true, supportsVision: false, supportsTools: false,
+          maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
+        }],
+      },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.custom_providers?.errors ?? []).toEqual([]);
+    expect(imp.body.sections.models?.errors ?? []).toEqual([]);
+    // cp-only was wiped with the section AND its dependents were unlinked —
+    // previously only ENVELOPE slugs were unlinked, orphaning cp-only's rows.
+    const counts = db.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM custom_providers WHERE slug='cp-only') AS providers,
+        (SELECT COUNT(*) FROM models WHERE platform='cp-only') AS models,
+        (SELECT COUNT(*) FROM api_keys WHERE platform='cp-only') AS keys,
+        (SELECT COUNT(*) FROM fallback_config WHERE model_db_id=?) AS fallbacks
+    `).get(idB) as { providers: number; models: number; keys: number; fallbacks: number };
+    expect(counts).toEqual({ providers: 0, models: 0, keys: 0, fallbacks: 0 });
+    // And cp-dest survived via the envelope.
+    const cpDest = db.prepare("SELECT COUNT(*) AS n FROM custom_providers WHERE slug='cp-dest'").get() as { n: number };
+    expect(cpDest.n).toBe(1);
   });
 
   it('passphrase-encrypted keys round-trip when passphrase is supplied', async () => {
@@ -1201,5 +1320,62 @@ describe('Config API', () => {
       .map((r) => `${r.platform}\u0000${r.model_id}\u0000${r.priority}\u0000${r.enabled}`)
       .join('|');
     expect(afterPriorities).toBe(beforePriorities);
+  });
+
+  // ── Audit L30 / L44 / L46 regressions ─────────────────────────────────
+
+  it('L30: export emits embeddings_default_family in settings; import applies it', async () => {
+    const db = getDb();
+    setSetting('embeddings_default_family', 'minimax');
+    const { status, body } = await request(app, 'POST', '/api/config/export', {});
+    expect(status).toBe(200);
+    expect(body.sections.settings.embeddingsDefaultFamily).toBe('minimax');
+    // Inventory counts these 4 settings keys — emitted fields must align
+    // with how many of them actually exist in the DB.
+    const counted = (db.prepare(
+      "SELECT COUNT(*) AS n FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family')",
+    ).get() as { n: number }).n;
+    expect(Object.keys(body.sections.settings).length).toBe(counted);
+    db.prepare("UPDATE settings SET value = 'openai' WHERE key = 'embeddings_default_family'").run();
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: body,
+      options: { sections: ['settings'] },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.settings.updated).toBe(1);
+    expect(db.prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get())
+      .toMatchObject({ value: 'minimax' });
+  });
+
+  it('L44: duplicate (platform,label) api_keys rows are rejected, not collapsed', async () => {
+    const env = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [
+          { platform: 'openai', label: 'dup', enabled: true, key: 'sk-dup-1' },
+          { platform: 'openai', label: 'dup', enabled: false, key: 'sk-dup-2' },
+        ],
+      },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', { envelope: env });
+    expect(imp.status).toBe(400);
+    expect(imp.body.error.message).toMatch(/duplicate \(platform, label\) rows/);
+  });
+
+  it('L46: import with an empty sections array is rejected', async () => {
+    const env = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: { quirks: [] },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { sections: [] },
+    });
+    expect(imp.status).toBe(400);
+    expect(imp.body.error.message).toMatch(/Invalid import options/);
   });
 });

@@ -31,10 +31,12 @@ export function attachRealtimeServer(server: Server): void {
   httpServer = server;
 
   server.on('upgrade', (req, socket, head) => {
-    // Only handle /v1/realtime upgrades
+    // Only handle /v1/realtime upgrades — any other upgrade request MUST be
+    // destroyed, otherwise the socket hangs open until the client times out.
     const url = new URL(req.url ?? '', `http://${req.headers.host ?? 'localhost'}`);
     if (url.pathname !== '/v1/realtime') {
-      return; // Let other upgrade handlers deal with it (none today)
+      socket.destroy();
+      return;
     }
 
     // Auth: extract token from headers (bearer or x-api-key)
@@ -73,16 +75,21 @@ function handleConnection(ws: WebSocket, token: string): void {
   }));
 
   ws.on('message', async (data) => {
-    let event: any;
+    // H20: any throw inside this async handler becomes an unhandled
+    // rejection, and index.ts exits the process on those — one bad client
+    // message (e.g. a send on a half-closed socket) must never kill the
+    // gateway. Contain everything; report and close on unexpected errors.
     try {
-      event = JSON.parse(data.toString());
-    } catch {
-      ws.send(JSON.stringify({
-        type: 'error',
-        error: { type: 'invalid_request', message: 'Invalid JSON' },
-      }));
-      return;
-    }
+      let event: any;
+      try {
+        event = JSON.parse(data.toString());
+      } catch {
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: { type: 'invalid_request', message: 'Invalid JSON' },
+        }));
+        return;
+      }
 
     // Handle the main event types
     switch (event.type) {
@@ -120,6 +127,18 @@ function handleConnection(ws: WebSocket, token: string): void {
         // Unknown event — acknowledge silently
         break;
     }
+    } catch (err) {
+      // Contained (H20): log and close the offending socket — the server
+      // keeps serving every other connection.
+      console.error('[Realtime] message handler error:', err instanceof Error ? err.message : err);
+      try {
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: { type: 'server_error', message: 'Internal realtime error' },
+        }));
+      } catch { /* socket already gone */ }
+      ws.close();
+    }
   });
 
   ws.on('error', () => {
@@ -129,6 +148,10 @@ function handleConnection(ws: WebSocket, token: string): void {
 
 async function handleResponseCreate(session: RealtimeSession, event: any): Promise<void> {
   const responseId = crypto.randomUUID();
+  // One output item per response — every text event for this response must
+  // carry the SAME item_id so clients can correlate item-scoped events
+  // (regenerating it per delta made each delta look like a new item).
+  const itemId = crypto.randomUUID();
   const { ws, token } = session;
 
   // Extract the conversation context from the event
@@ -171,13 +194,12 @@ async function handleResponseCreate(session: RealtimeSession, event: any): Promi
     },
   }));
 
-  // Emit response.output_text.started (for the text content part)
+  // Announce the output item before streaming deltas into it.
   ws.send(JSON.stringify({
-    type: 'response.output_text.delta',
+    type: 'response.output_text.started',
     event_id: crypto.randomUUID(),
     response_id: responseId,
-    item_id: crypto.randomUUID(),
-    delta: '',
+    item_id: itemId,
     output_index: 0,
     content_index: 0,
   }));
@@ -238,7 +260,7 @@ async function handleResponseCreate(session: RealtimeSession, event: any): Promi
               type: 'response.output_text.delta',
               event_id: crypto.randomUUID(),
               response_id: responseId,
-              item_id: crypto.randomUUID(),
+              item_id: itemId,
               delta: delta.content,
               output_index: 0,
               content_index: 0,

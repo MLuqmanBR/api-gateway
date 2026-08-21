@@ -12,6 +12,7 @@ import {
 import { isTrustedRequest } from '../lib/ip-trust.js';
 import { setSessionCookie, clearSessionCookie, readSessionCookie } from '../lib/session-cookie.js';
 import { createPerIpLimiter } from '../middleware/rateLimit.js';
+import { dashboardRequireLoginEnabled } from '../middleware/requireAuth.js';
 
 export const authRouter = Router();
 
@@ -45,18 +46,28 @@ function recordFailure(email: string): void {
   }
   attempts.set(key, a);
   // Guard against unbounded growth — a remote attacker can POST unlimited
-  // random emails.  Evict stale entries past ~10k and, if still over cap,
-  // drop the oldest insertion.
+  // random emails. M21: the previous eviction only dropped entries with
+  // `count === 0 && lockedUntil === 0` — i.e. exactly the entries a fresh
+  // failed login doesn't produce — so a single-attempt entry pinned the map
+  // forever. Now evict: (a) expired lockouts that already served ban time,
+  // (b) any entry whose timestamp marks it stale (>24h), then (c) oldest
+  // until under the cap, looping rather than one-per-call.
   if (attempts.size > 10_000) {
+    const now = Date.now();
+    const STALE_MS = 24 * 60 * 60 * 1000;
     for (const [k, v] of attempts) {
-      if (v.lockedUntil < Date.now() && v.count === 0) attempts.delete(k);
+      const expiredLock = v.lockedUntil !== 0 && v.lockedUntil < now;
+      const stale = now - v.lockedUntil > STALE_MS && v.count === 0;
+      const staleLock = v.lockedUntil !== 0 && now - v.lockedUntil > STALE_MS;
+      if (expiredLock || stale || staleLock) attempts.delete(k);
     }
-    if (attempts.size > 10_000) {
+    while (attempts.size > 10_000) {
       let oldestKey = '';
       let oldestTime = Infinity;
       for (const [k, v] of attempts) {
         if (v.lockedUntil < oldestTime) { oldestTime = v.lockedUntil; oldestKey = k; }
       }
+      if (!oldestKey) break;
       attempts.delete(oldestKey);
     }
   }
@@ -85,8 +96,7 @@ authRouter.get('/status', (req: Request, res: Response) => {
   // line 24): when that env is set, LAN auto-trust is off, so `authenticated`
   // must not report true for a LAN caller with no session. `hasSession` tells
   // the AuthGate whether the caller has a real login session independent of
-  // network trust, so it can force a login when a requireSession endpoint 401s.
-  const lanTrusted = !process.env.DASHBOARD_REQUIRE_LOGIN && isTrustedRequest(req);
+  const lanTrusted = !dashboardRequireLoginEnabled() && isTrustedRequest(req);
   res.json({
     needsSetup: userCount() === 0,
     authenticated: !!session || lanTrusted,

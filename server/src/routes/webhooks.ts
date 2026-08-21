@@ -9,6 +9,8 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { listWebhooks, createWebhook, deleteWebhook, toggleWebhook } from '../services/webhooks.js';
+import { getSetting } from '../db/index.js';
+import { assertPublicHttpUrl } from '../lib/url-guard.js';
 
 export const webhooksRouter = Router();
 
@@ -22,13 +24,21 @@ webhooksRouter.get('/', (_req: Request, res: Response) => {
   res.json(listWebhooks());
 });
 
-webhooksRouter.post('/', (req: Request, res: Response) => {
+webhooksRouter.post('/', async (req: Request, res: Response) => {
   const parsed = createWebhookSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.issues[0]?.message ?? 'Invalid input' } });
     return;
   }
   try {
+    // H10: resolve-and-check SSRF guard (not just literal host matching) —
+    // names that resolve privately, mapped-IPv6, and hex/octal IP spellings
+    // are rejected too. `allow_internal_webhooks` (or the
+    // WEBHOOK_ALLOW_PRIVATE_HOSTS env) stays as the explicit operator opt-in
+    // for internal receivers.
+    if (getSetting('allow_internal_webhooks') !== 'true' && process.env.WEBHOOK_ALLOW_PRIVATE_HOSTS !== '1') {
+      await assertPublicHttpUrl(parsed.data.url);
+    }
     const webhook = createWebhook(parsed.data);
     res.status(201).json(webhook);
   } catch (e: any) {

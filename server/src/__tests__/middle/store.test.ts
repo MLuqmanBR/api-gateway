@@ -45,7 +45,7 @@ describe('SecretsStore — round-trip persistence', () => {
   it('writes the encrypted file to disk', () => {
     addSecret('tok_abc123', 'api_key', 'manual');
     const file = join(tempDir, 'middle-secrets.enc');
-    const stat = statSync(file);
+    statSync(file); // existence check (M44: was an unused `stat` binding)
 
     // File should be encrypted — plaintext value must NOT appear
     const raw = readFileSync(file, 'utf8');
@@ -56,7 +56,7 @@ describe('SecretsStore — round-trip persistence', () => {
   it('sets file permissions to 0600', () => {
     addSecret('secret-value', 'api_key', 'manual');
     const file = join(tempDir, 'middle-secrets.enc');
-    const stat = existsSync(file) ? require('fs').statSync(file) : null;
+    const stat = statSync(file); // M44: was a bare require('fs') call in ESM
     // Skip mode check on platforms where chmod is advisory (Windows)
     if (process.platform !== 'win32') {
       const mode = stat.mode & 0o777;

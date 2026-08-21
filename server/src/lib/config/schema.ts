@@ -20,7 +20,12 @@ const slug = z.string().regex(/^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/, {
   message: 'slug must be lowercase letters, digits and dashes (2-32 chars, no leading/trailing dash)',
 });
 const url = z.string().url().max(2048);
-const hex64 = z.string().regex(/^[0-9a-f]+$/, { message: 'must be lowercase hex' });
+// AES-GCM envelope fields are fixed-width lowercase hex, sized by
+// passphrase-crypto.ts: salt = 16 bytes → 32 chars, IV = 12 bytes → 24,
+// auth tag = 16 bytes → 32.
+const hexSalt = z.string().regex(/^[0-9a-f]{32}$/, { message: 'must be 32 lowercase hex chars (16-byte salt)' });
+const hexIv = z.string().regex(/^[0-9a-f]{24}$/, { message: 'must be 24 lowercase hex chars (12-byte IV)' });
+const hexTag = z.string().regex(/^[0-9a-f]{32}$/, { message: 'must be 32 lowercase hex chars (16-byte auth tag)' });
 
 // ── Per-section schemas ───────────────────────────────────────────────────
 
@@ -117,6 +122,9 @@ const settingsSchema = z.object({
     speed: z.number().min(0).max(1),
     intelligence: z.number().min(0).max(1),
   }).optional(),
+  // L30: the export inventory counts embeddings_default_family among the
+  // settings keys — the section must carry it for round-trip parity.
+  embeddingsDefaultFamily: z.string().min(1).max(100).optional(),
 }).refine(
   (v) => Object.values(v).some((x) => x !== undefined),
   { message: 'settings section cannot be empty' },
@@ -128,8 +136,10 @@ const quirkTargetSchema = z.object({
 });
 
 const quirkSchema = z.object({
-  slug: z.string().min(1).max(80).regex(/^[a-z0-9][a-z0-9-]*$/i, {
-    message: 'quirk slug must be alphanumeric (dashes allowed)',
+  slug: z.string().min(1).max(80).regex(/^[a-z0-9][a-z0-9-]*$/, {
+    // Lowercase only — quirk slugs are generated lowercase and matched
+    // case-sensitively against the dashboard's quirk list.
+    message: 'quirk slug must be lowercase alphanumeric (dashes allowed)',
   }),
   title: z.string().min(1).max(200),
   body: z.string().max(8192).default(''),
@@ -138,10 +148,12 @@ const quirkSchema = z.object({
 });
 
 const keysCipherSchema = z.object({
-  kdf: z.literal('pbkdf2-sha256-310000'),
-  salt: hex64,
-  iv: hex64,
-  authTag: hex64,
+  // Versioned KDF ids — new exports use 600k iterations; legacy 310k
+  // envelopes must stay importable (the loader switches on this string).
+  kdf: z.union([z.literal('pbkdf2-sha256-600000'), z.literal('pbkdf2-sha256-310000')]),
+  salt: hexSalt,
+  iv: hexIv,
+  authTag: hexTag,
   ciphertext: z.string().min(1).max(131072), // 64 KB ciphertext cap
 });
 
@@ -152,7 +164,10 @@ const keysCipherSchema = z.object({
 export const configEnvelopeSchema = z.object({
   schemaVersion: z.number().int().min(1).max(1000),
   generator: z.string().min(1).max(64),
-  exportedAt: z.string().datetime({ offset: true }).or(z.string().min(1).max(64)),
+  // M43: the old `.or(z.string().min(1).max(64))` accepted ANY non-empty
+  // string, voiding datetime validation entirely. Strict ISO-8601 only;
+  // importers of pre-normalization envelopes must fix exportedAt upstream.
+  exportedAt: z.string().datetime({ offset: true }),
   label: z.string().max(120).optional(),
   sections: z.object({
     models: z.array(modelSchema).max(2000).optional(),
@@ -177,7 +192,7 @@ export const configImportOptionsSchema = z.object({
   passphrase: z.string().min(1).max(1024).optional(),
   sections: z.array(z.enum([
     'models', 'fallback_chain', 'custom_providers', 'api_keys', 'embeddings', 'settings', 'quirks',
-  ])).max(16).optional(),
+  ])).min(1).max(16).optional(),
 });
 
 export type ParsedEnvelope = z.infer<typeof configEnvelopeSchema>;

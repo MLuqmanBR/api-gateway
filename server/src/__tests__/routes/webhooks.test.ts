@@ -53,7 +53,7 @@ describe('Webhooks (F8)', () => {
       expect(matchesFilter('routing.*', 'routing.key_exhausted')).toBe(true);
       expect(matchesFilter('routing.*,request.error', 'request.error')).toBe(true);
       expect(matchesFilter('routing.*', 'request.error')).toBe(false);
-      expect(matchesFilter('*', 'anything')).toBe(false); // * is literal, not wildcard
+      expect(matchesFilter('*', 'anything')).toBe(true); // bare '*' = documented catch-all default (C13)
     });
 
     it('isInternalUrl detects private hosts', () => {
@@ -122,7 +122,10 @@ describe('Webhooks (F8)', () => {
         secret: 's',
       });
       expect(res.status).toBe(400);
-      expect(res.body.error.message).toContain('Internal URLs');
+      // The route validates via the shared URL guard whose error is phrased
+      // 'Blocked URL <url>: <reason>'; the service layer uses the older
+      // 'Internal URLs' wording. Assert the guard's stable prefix.
+      expect(res.body.error.message).toContain('Blocked URL');
     });
 
     it('GET /api/webhooks lists all', async () => {

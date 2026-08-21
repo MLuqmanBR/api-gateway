@@ -195,6 +195,8 @@ register(new OpenAICompatProvider({
 
 // Chutes was evaluated for V11 and dropped: probe with a free-tier key
 // returned 402 on every model — "Quota exceeded and account balance is
+// empty". Not registered.
+
 // Locally-hosted inference (llama.cpp / vLLM / Ollama on CPU) can be slow, so
 // custom providers get the same extended timeout as Ollama Cloud.
 const CUSTOM_PROVIDER_TIMEOUT_MS = 120000;

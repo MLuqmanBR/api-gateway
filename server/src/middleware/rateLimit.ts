@@ -31,12 +31,37 @@ function parseLimit(): number {
   return Math.floor(n);
 }
 
-export function createProxyRateLimiter() {
-  const limit = parseLimit();
+interface WindowLimiterOptions {
+  // Max requests per window. A limit <= 0 disables the limiter entirely.
+  limit: number;
+  windowMs: number;
+  // Skip counting requests carrying `x-api-gateway-internal: 1` (trusted only
+  // in the sense that the /v1 mount enables it — see createProxyRateLimiter).
+  exemptInternal?: boolean;
+  // Body of the 429 error message. Receives (limit, retryAfterSeconds).
+  tooManyMessage: (limit: number, retryAfterSec: number) => string;
+}
+
+// L08: ONE fixed-window implementation shared by every per-IP limiter. The
+// proxy limiter and the dashboard per-IP limiter used to be two drifted copies
+// of the same body; they only ever differed in configuration (window length,
+// internal-subrequest exemption, error wording), which is exactly what the
+// options below express.
+//
+// Eviction guarantee: when the IP map overflows, expired entries are pruned
+// first, then the OLDEST active window is evicted — but never the caller's own
+// entry. Evicting the current IP would reset its counter mid-request, so the
+// X-RateLimit-* headers just written would describe a window that no longer
+// exists and the next request would start a fresh (unthrottled) count.
+function createWindowLimiter(options: WindowLimiterOptions) {
   const windows = new Map<string, WindowState>();
 
-  return function proxyRateLimit(req: Request, res: Response, next: NextFunction): void {
-    if (limit === 0) {
+  return function windowLimit(req: Request, res: Response, next: NextFunction): void {
+    if (options.exemptInternal && req.headers['x-api-gateway-internal'] === '1') {
+      next();
+      return;
+    }
+    if (options.limit <= 0) {
       next();
       return;
     }
@@ -46,7 +71,7 @@ export function createProxyRateLimiter() {
 
     let state = windows.get(ip);
     if (!state || now >= state.resetAt) {
-      state = { count: 0, resetAt: now + WINDOW_MS };
+      state = { count: 0, resetAt: now + options.windowMs };
       windows.set(ip, state);
     }
     state.count += 1;
@@ -56,30 +81,31 @@ export function createProxyRateLimiter() {
         if (now >= value.resetAt) windows.delete(key);
       }
       // If all entries are still active (not expired), evict the oldest window
-      // to guarantee the map never exceeds MAX_TRACKED_IPS.
+      // to guarantee the map never exceeds MAX_TRACKED_IPS. The current IP is
+      // excluded from the candidates (see the factory comment above).
       if (windows.size > MAX_TRACKED_IPS) {
-        let oldestKey = '';
+        let oldestKey: string | null = null;
         let oldestReset = Infinity;
         for (const [k, v] of windows) {
-          if (v.resetAt < oldestReset) {
+          if (k !== ip && v.resetAt < oldestReset) {
             oldestReset = v.resetAt;
             oldestKey = k;
           }
         }
-        windows.delete(oldestKey);
+        if (oldestKey !== null) windows.delete(oldestKey);
       }
     }
 
-    res.setHeader('X-RateLimit-Limit', String(limit));
-    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, limit - state.count)));
+    res.setHeader('X-RateLimit-Limit', String(options.limit));
+    res.setHeader('X-RateLimit-Remaining', String(Math.max(0, options.limit - state.count)));
     res.setHeader('X-RateLimit-Reset', String(Math.ceil(state.resetAt / 1000)));
 
-    if (state.count > limit) {
+    if (state.count > options.limit) {
       const retryAfter = Math.max(1, Math.ceil((state.resetAt - now) / 1000));
       res.setHeader('Retry-After', String(retryAfter));
       res.status(429).json({
         error: {
-          message: `Rate limit exceeded: more than ${limit} requests per minute. Retry in ${retryAfter}s.`,
+          message: options.tooManyMessage(options.limit, retryAfter),
           type: 'rate_limit_error',
         },
       });
@@ -90,45 +116,23 @@ export function createProxyRateLimiter() {
   };
 }
 
+export function createProxyRateLimiter() {
+  return createWindowLimiter({
+    limit: parseLimit(),
+    windowMs: WINDOW_MS,
+    exemptInternal: true,
+    tooManyMessage: (limit, retryAfterSec) =>
+      `Rate limit exceeded: more than ${limit} requests per minute. Retry in ${retryAfterSec}s.`,
+  });
+}
+
 /** Per-IP fixed-window rate limiter for arbitrary routes (e.g. /api/auth/login).
  *  Reuses the same window logic as the proxy limiter but with a smaller limit
  *  and a JSON error shape that suits dashboard endpoints. */
-export function createPerIpLimiter(limit: number, _windowMs = 60_000) {
-  const windows = new Map<string, WindowState>();
-  return function perIpLimit(req: Request, res: Response, next: NextFunction): void {
-    if (limit <= 0) { next(); return; }
-    const now = Date.now();
-    const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
-    let state = windows.get(ip);
-    if (!state || now >= state.resetAt) {
-      state = { count: 0, resetAt: now + _windowMs };
-      windows.set(ip, state);
-    }
-    state.count += 1;
-    if (windows.size > MAX_TRACKED_IPS) {
-      for (const [key, value] of windows) {
-        if (now >= value.resetAt) windows.delete(key);
-      }
-      if (windows.size > MAX_TRACKED_IPS) {
-        let oldestKey = '';
-        let oldestReset = Infinity;
-        for (const [k, v] of windows) {
-          if (v.resetAt < oldestReset) { oldestReset = v.resetAt; oldestKey = k; }
-        }
-        windows.delete(oldestKey);
-      }
-    }
-    if (state.count > limit) {
-      const retryAfter = Math.max(1, Math.ceil((state.resetAt - now) / 1000));
-      res.setHeader('Retry-After', String(retryAfter));
-      res.status(429).json({
-        error: {
-          message: `Too many requests. Retry in ${retryAfter}s.`,
-          type: 'rate_limit_error',
-        },
-      });
-      return;
-    }
-    next();
-  };
+export function createPerIpLimiter(limit: number, windowMs: number = WINDOW_MS) {
+  return createWindowLimiter({
+    limit,
+    windowMs,
+    tooManyMessage: (_limit, retryAfterSec) => `Too many requests. Retry in ${retryAfterSec}s.`,
+  });
 }

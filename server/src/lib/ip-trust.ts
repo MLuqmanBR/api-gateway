@@ -134,38 +134,23 @@ function parseIpv6(s: string): Hextets | null {
 }
 
 /** Test that the top `prefix` bits of `addr` match the top `prefix` bits of
- * `expected`. For prefixes that fit in the top hextet (<=16), `expected` is
- * a 16-bit value; for longer prefixes, it's a 128-bit value with the relevant
- * bits placed in the corresponding hextets. The remaining bits of `addr` are
- * not constrained — RFC 4291's fe80::/10 and fc00::/7 allow arbitrary values
- * in the bottom bits. */
+ * `expected`. Two shapes cover every trusted range: prefixes ≤ 16 compare
+ * within the top hextet (fc00::/7, fe80::/10 — RFC 4291 leaves the bottom
+ * bits free), and prefix 128 is an exact match (::1, ::). Every callsite's
+ * `expected` fits in the low hextet. Any other prefix fails closed — the
+ * removed BigInt path existed for multi-hextet `expected` values that no
+ * trusted range ever needed. */
 function ipv6MatchesPrefix(addr: Hextets, prefix: number, expected: number): boolean {
-  if (prefix < 0 || prefix > 128) return false;
   if (prefix === 0) return true; // every address matches a /0.
-  if (prefix <= 16) {
-    const mask = prefix === 16 ? 0xffff : (0xffff << (16 - prefix)) & 0xffff;
-    return (addr[0]! & mask) === (expected & mask);
+  if (prefix === 128) {
+    for (let i = 0; i < 7; i++) {
+      if (addr[i] !== 0) return false;
+    }
+    return addr[7] === expected;
   }
-  // For prefixes that span more than one hextet, the 128-bit `expected` value
-  // needs shifts ≥ 32, which wrap modulo 32 in plain JS. Use BigInt to dodge
-  // that — the only callsite in this file passes small integers (1 for ::1,
-  // 0 for ::, larger 128-bit values for `expected` is actually never used
-  // because all the trusted ranges fit in prefix ≤ 16).
-  const fullHextets = Math.floor(prefix / 16);
-  const exp = BigInt(expected);
-  for (let i = 0; i < fullHextets; i++) {
-    const shiftBits = BigInt((8 - 1 - i) * 16);
-    const e = Number((exp >> shiftBits) & 0xffffn);
-    if (addr[i] !== e) return false;
-  }
-  const tailBits = prefix - fullHextets * 16;
-  if (tailBits > 0) {
-    const mask = (0xffff << (16 - tailBits)) & 0xffff;
-    const shiftBits = BigInt((8 - 1 - fullHextets) * 16);
-    const e = Number((exp >> shiftBits) & 0xffffn);
-    if ((addr[fullHextets]! & mask) !== (e & mask)) return false;
-  }
-  return true;
+  if (prefix < 0 || prefix > 16) return false;
+  const mask = prefix === 16 ? 0xffff : (0xffff << (16 - prefix)) & 0xffff;
+  return (addr[0]! & mask) === (expected & mask);
 }
 
 /** Test an IPv6 against the trusted IPv6 ranges. */
@@ -193,19 +178,41 @@ function ipv6FromPossiblyMapped(s: string): Hextets | null {
   const ipv4Str = s.slice(lastColon + 1);
   const ipv4 = parseIpv4(ipv4Str);
   if (!ipv4) return null;
-  // Drop the trailing ':' so parseIpv6 sees "::ffff" (no empty tail hextet).
+  // The part before the embedded IPv4 is either compressed ("::ffff") or
+  // six explicit hextets ("0:0:0:0:0:ffff" — the RFC 4291 §2.5.5.2 mapped
+  // prefix written out in full).
   const hex = s.slice(0, lastColon);
-  const parsed = parseIpv6(hex || '::');
-  if (!parsed) return null;
-  // Sanity: the parsed low hextets should be 0, otherwise the input wasn't
-  // actually an IPv4-mapped address.
-  if (!(parsed[0] === 0 && parsed[1] === 0 && parsed[2] === 0 && parsed[3] === 0
-        && parsed[4] === 0 && parsed[5] === 0 && parsed[6] === 0)) {
+  let head: Hextets | null;
+  if (hex.includes('::')) {
+    // Drop the trailing ':' so parseIpv6 sees "::ffff" (no empty tail hextet).
+    head = parseIpv6(hex || '::');
+  } else {
+    const parts = hex.split(':');
+    if (parts.length !== 6) return null;
+    const out: number[] = [];
+    for (const p of parts) {
+      const n = parseHextet(p);
+      if (n === null) return null;
+      out.push(n);
+    }
+    // The six written groups are hextets 0-5; the embedded IPv4 overwrites
+    // hextets 6-7 below.
+    out.push(0, 0);
+    head = out as Hextets;
+  }
+  if (!head) return null;
+  // Sanity: the top 80 bits must be zero for this to be an IPv4-mapped /
+  // -compatible address (hextet 5 is 0xffff in the mapped form, 0 in the
+  // compatible form). Checking only [0..4] keeps the compressed
+  // "::ffff:a.b.c.d" spelling and the uncompressed
+  // "0:0:0:0:0:ffff:a.b.c.d" spelling on exactly the same footing.
+  if (!(head[0] === 0 && head[1] === 0 && head[2] === 0 && head[3] === 0
+        && head[4] === 0)) {
     return null;
   }
-  parsed[6] = (ipv4[0] << 8) | ipv4[1];
-  parsed[7] = (ipv4[2] << 8) | ipv4[3];
-  return parsed;
+  head[6] = (ipv4[0] << 8) | ipv4[1];
+  head[7] = (ipv4[2] << 8) | ipv4[3];
+  return head;
 }
 
 /** Returns true if the address belongs to a range we auto-trust. */
@@ -255,14 +262,82 @@ export function isTrustedSourceIp(addr: string | null | undefined): boolean {
 }
 
 /**
- * Best-effort resolution of the client IP, honoring `X-Forwarded-For` when
- * Express has been configured with `trust proxy`. Falls back to
- * `req.socket.remoteAddress`.
+ * Resolve the effective client IP. `X-Forwarded-For` is honored ONLY when
+ * the direct TCP peer is itself a trusted proxy (H09):
+ *
+ *  - `TRUST_PROXY=1` / `true` — single-hop trust: the peer must be loopback
+ *    (the canonical local reverse proxy). A remote client that connects
+ *    directly while forging `X-Forwarded-For: 127.0.0.1` is NOT trusted.
+ *  - `TRUST_PROXY=<cidr>[,<cidr>…]` — the peer must match one of the listed
+ *    proxy CIDRs; XFF entries are then walked right-to-left across trusted
+ *    proxies and the first untrusted address is the client.
+ *
+ * Without TRUST_PROXY, the socket peer address is always used verbatim.
  */
-export function getClientIp(req: Pick<Request, 'ip' | 'socket'>): string | null {
-  if (req.ip && req.ip.length > 0) return req.ip;
+export function getClientIp(req: Pick<Request, 'headers' | 'socket'>): string | null {
   const sock = req.socket as { remoteAddress?: string | null } | undefined;
-  return sock?.remoteAddress ?? null;
+  const peer = normalizeIpString(sock?.remoteAddress);
+  if (!trustProxyConfigured()) return peer;
+  if (peer === null || !isTrustedProxyPeer(peer)) return peer; // no/foreign proxy: ignore XFF entirely
+
+  const xff = String(req.headers['x-forwarded-for'] ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (xff.length === 0) return peer;
+  for (let i = xff.length - 1; i >= 0; i--) {
+    const entry = normalizeIpString(xff[i]);
+    if (entry === null || !isTrustedProxyPeer(entry)) return entry; // first untrusted from the right = client
+  }
+  return peer; // every hop was a trusted proxy — the peer itself is the client
+}
+
+// ── Trusted-proxy configuration (H09) ──────────────────────────────────────
+// NOTE: read at call time, never snapshotted at module load — tests and the
+// PM2 wrapper set TRUST_PROXY after imports resolve.
+
+function trustProxyConfigured(): boolean {
+  const raw = process.env.TRUST_PROXY ?? '';
+  return raw.length > 0 && raw !== '0' && raw !== 'false';
+}
+
+function normalizeIpString(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let ip = raw.trim();
+  if (ip.startsWith('[') && ip.endsWith(']')) ip = ip.slice(1, -1);
+  if (ip.toLowerCase().startsWith('::ffff:')) ip = ip.slice(7);
+  return ip.length > 0 ? ip : null;
+}
+
+/** True when `ip` is a proxy we are willing to believe about XFF contents. */
+function isTrustedProxyPeer(ip: string): boolean {
+  const raw = process.env.TRUST_PROXY ?? '';
+  if (raw === '1' || raw === 'true') {
+    // Single-hop mode: only a loopback peer (local reverse proxy) is trusted.
+    return ip === '::1' || /^127\./.test(ip);
+  }
+  // CIDR-list mode: match any listed subnet.
+  for (const cidr of raw.split(',').map((s) => s.trim()).filter(Boolean)) {
+    if (ipInCidr(ip, cidr)) return true;
+  }
+  return false;
+}
+
+function ipInCidr(ip: string, cidr: string): boolean {
+  const [baseRaw, prefixRaw] = cidr.split('/');
+  const prefix = prefixRaw !== undefined ? Number(prefixRaw) : 32;
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return false;
+  const base = parseIpv4(baseRaw ?? '');
+  const addr = parseIpv4(ip);
+  if (!base || !addr) return false;
+  let bits = prefix;
+  for (let i = 0; i < 4; i++) {
+    if (bits <= 0) break;
+    const mask = bits >= 8 ? 0xff : (0xff << (8 - bits)) & 0xff;
+    if ((addr[i] & mask) !== (base[i] & mask)) return false;
+    bits -= 8;
+  }
+  return true;
 }
 
 /**
@@ -272,6 +347,6 @@ export function getClientIp(req: Pick<Request, 'ip' | 'socket'>): string | null 
  * `authenticated: true` for the LAN case; the gate middleware uses the same
  * check to skip session validation for those callers.
  */
-export function isTrustedRequest(req: Pick<Request, 'ip' | 'socket'>): boolean {
+export function isTrustedRequest(req: Pick<Request, 'headers' | 'socket'>): boolean {
   return isTrustedSourceIp(getClientIp(req));
 }

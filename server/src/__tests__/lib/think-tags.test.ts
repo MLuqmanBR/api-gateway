@@ -42,7 +42,7 @@ describe('extractThinkTags', () => {
   });
 
   // Adversarial: code block containing literal tags. The extractor
-  // is text-only — it cannot tell that the second `` is inside
+  // is text-only — it cannot tell that the second `<think>` is inside
   // a string literal — so it extracts BOTH complete blocks. The
   // visible output is what is between the two blocks. This is
   // the documented limit of text-only extraction; the real model
@@ -165,6 +165,30 @@ describe('ThinkTagStream', () => {
     const f = s.flush();
     expect(f.residual).toBe('<thi');
     expect(f.reasoning).toBe('');
+  });
+
+  it('downgrades an unclosed opener to prose once the hold cap is exceeded (L43)', () => {
+    const s = new ThinkTagStream();
+    // Deterministic input: opener + more than THINK_UNCLOSED_HOLD_MAX (64K)
+    // chars of never-closed reasoning, fed in fixed-size chunks.
+    const pre = 'answer ';
+    const CHUNK = 'x'.repeat(4096); // never forms an opener prefix or '</think>'
+    const first = s.feed(pre + OPEN);
+    expect(first).toEqual({ visible: pre, reasoning: '' });
+    let outVisible = '';
+    for (let i = 0; i < 20; i++) {
+      const out = s.feed(CHUNK);
+      outVisible += out.visible;
+    }
+    // Past the cap the held tail (opener included) must have been flushed
+    // as visible — not held until flush.
+    expect(outVisible).toContain(OPEN);
+    expect(outVisible.length).toBeGreaterThan(64 * 1024 - 8);
+    // Streaming resumed: later text passes straight through as visible.
+    const tail = s.feed('plain prose');
+    expect(tail).toEqual({ visible: 'plain prose', reasoning: '' });
+    // Nothing left to hold at end-of-stream.
+    expect(s.flush().residual).toBe('');
   });
 
   it('returns empty result for an empty feed', () => {

@@ -33,8 +33,10 @@ describe('Crypto', () => {
       expect(maskKey('gsk_test1234567890abcdef')).toBe('****def');
     });
 
-    it('should mask short keys', () => {
-      expect(maskKey('abcd')).toBe('****bcd');
+    it('should fully mask keys of 6 chars or fewer (M45)', () => {
+      expect(maskKey('abcd')).toBe('****');
+      expect(maskKey('abcdef')).toBe('****'); // boundary — 3/6 revealed would be too much
+      expect(maskKey('abcdefg')).toBe('****efg'); // 7+ shows a tail
     });
   });
 });

@@ -8,7 +8,6 @@ import {
   recordCircuitSuccess,
   recordCircuitFailure,
   shouldMarkExhausted,
-  getCircuitState,
   getAllCircuits,
   resetCircuit,
   resetAllCircuits,
@@ -34,6 +33,12 @@ async function request(app: Express, method: string, path: string, body?: any) {
   return { status: res.status, body: data };
 }
 
+// getCircuitState was a production export with no non-test caller (audit L01);
+// observe state through the admin surface (getAllCircuits) instead.
+function stateOf(platform: string, model: string, keyId: number): string | null {
+  return getAllCircuits().find(c => c.key === `${platform}:${model}:${keyId}`)?.state ?? null;
+}
+
 describe('Circuit breaker (F10)', () => {
   let app: Express;
 
@@ -54,7 +59,7 @@ describe('Circuit breaker (F10)', () => {
   describe('state machine', () => {
     it('starts in CLOSED — isCircuitOpen returns false', () => {
       expect(isCircuitOpen('groq', 'llama-3', 1)).toBe(false);
-      expect(getCircuitState('groq', 'llama-3', 1)).toBeNull();
+      expect(stateOf('groq', 'llama-3', 1)).toBeNull();
     });
 
     it('N consecutive failures open the circuit', () => {
@@ -63,7 +68,7 @@ describe('Circuit breaker (F10)', () => {
       expect(recordCircuitFailure('groq', 'llama-3', 1)).toBe(false); // 2
       expect(recordCircuitFailure('groq', 'llama-3', 1)).toBe(true);  // 3 → opens
       expect(isCircuitOpen('groq', 'llama-3', 1)).toBe(true);
-      expect(getCircuitState('groq', 'llama-3', 1)).toBe('open');
+      expect(stateOf('groq', 'llama-3', 1)).toBe('open');
     });
 
     it('circuit transitions to HALF_OPEN after cooldown', async () => {
@@ -74,7 +79,7 @@ describe('Circuit breaker (F10)', () => {
       expect(isCircuitOpen('openai', 'gpt-4', 1)).toBe(true);
       await new Promise(r => setTimeout(r, 60));
       expect(isCircuitOpen('openai', 'gpt-4', 1)).toBe(false); // half_open — probe allowed
-      expect(getCircuitState('openai', 'gpt-4', 1)).toBe('half_open');
+      expect(stateOf('openai', 'gpt-4', 1)).toBe('half_open');
     });
 
     it('HALF_OPEN probe success → CLOSED', async () => {
@@ -85,7 +90,7 @@ describe('Circuit breaker (F10)', () => {
       await new Promise(r => setTimeout(r, 60));
       isCircuitOpen('groq', 'llama', 1); // triggers half_open
       recordCircuitSuccess('groq', 'llama', 1);
-      expect(getCircuitState('groq', 'llama', 1)).toBe('closed');
+      expect(stateOf('groq', 'llama', 1)).toBe('closed');
       expect(isCircuitOpen('groq', 'llama', 1)).toBe(false);
     });
 
@@ -97,7 +102,7 @@ describe('Circuit breaker (F10)', () => {
       await new Promise(r => setTimeout(r, 60));
       isCircuitOpen('groq', 'llama', 1); // triggers half_open
       recordCircuitFailure('groq', 'llama', 1); // probe failed → re-open
-      expect(getCircuitState('groq', 'llama', 1)).toBe('open');
+      expect(stateOf('groq', 'llama', 1)).toBe('open');
     });
 
     it('shouldMarkExhausted after max reopens', () => {
@@ -134,7 +139,7 @@ describe('Circuit breaker (F10)', () => {
       recordCircuitFailure('groq', 'llama-3', 1);
       recordCircuitFailure('groq', 'llama-3', 1); // opens
       recordCircuitSuccess('groq', 'llama-3', 1);
-      expect(getCircuitState('groq', 'llama-3', 1)).toBe('closed');
+      expect(stateOf('groq', 'llama-3', 1)).toBe('closed');
       expect(isCircuitOpen('groq', 'llama-3', 1)).toBe(false);
     });
 
@@ -151,7 +156,7 @@ describe('Circuit breaker (F10)', () => {
       recordCircuitFailure('groq', 'llama', 1);
       recordCircuitFailure('groq', 'llama', 1); // opens
       resetCircuit('groq', 'llama', 1);
-      expect(getCircuitState('groq', 'llama', 1)).toBeNull();
+      expect(stateOf('groq', 'llama', 1)).toBeNull();
       expect(isCircuitOpen('groq', 'llama', 1)).toBe(false);
     });
   });

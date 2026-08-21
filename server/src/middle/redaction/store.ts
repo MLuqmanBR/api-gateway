@@ -15,6 +15,7 @@ import fs from 'fs';
 import path from 'path';
 import { encrypt, decrypt, maskKey } from '../../lib/crypto.js';
 import { getDb } from '../../db/index.js';
+import { getDataDir } from '../../lib/data-dir.js';
 import { buildPlaceholder, type KnownSecret } from './spans.js';
 
 const SECRETS_FILENAME = 'middle-secrets.enc';
@@ -54,8 +55,10 @@ export function initSecretsStore(dataDir?: string): void {
     secretsFilePath = path.join(dataDir, SECRETS_FILENAME);
     gitGuardChecked = true; // skip guard for explicit (test) paths
   } else {
-    const defaultDir = path.join(process.cwd(), 'server', 'data');
-    secretsFilePath = path.join(defaultDir, SECRETS_FILENAME);
+    // Same resolver as the database (lib/data-dir.ts): module-relative, not
+    // cwd-relative, honoring API_GATEWAY_DATA_DIR so the store and the DB
+    // always live in the same directory.
+    secretsFilePath = path.join(getDataDir(), SECRETS_FILENAME);
     gitGuardChecked = false;
   }
   cache = null; // force lazy reload
@@ -86,16 +89,44 @@ function ensureGitGuard(): void {
   gitGuardChecked = true;
 }
 
-/** Deterministic 6-hex tag for a secret value. Same value → same tag within
- * a store generation, so repeated secrets map to a stable placeholder across
- * requests (required for agentic multi-turn coherence). */
-function hexTagFor(value: string): string {
-  return crypto.createHash('sha256').update(value).digest('hex').slice(0, 6);
+/** Tag width in hex chars: 12 hex = 48 bits. At ~4M distinct secrets the
+ * birthday-collision probability stays ≈ 1e-6 — and `idFor` below resolves
+ * even that deterministically, so a collision can never silently map two
+ * different secrets onto one placeholder (the pre-48-bit bug substituted the
+ * WRONG secret on un-redact at ~4k secrets). */
+const TAG_HEX_WIDTH = 12;
+
+/** Deterministic tag for a secret value (first `width` hex of sha256). Same
+ * value → same tag within a store generation, so repeated secrets map to a
+ * stable placeholder across requests (required for agentic multi-turn
+ * coherence). */
+function hexTagFor(value: string, width: number = TAG_HEX_WIDTH): string {
+  return crypto.createHash('sha256').update(value).digest('hex').slice(0, width);
 }
 
-/** Build the canonical placeholder for a given secret value. */
-function placeholderFor(value: string): string {
-  return buildPlaceholder(STORE_GENERATION, hexTagFor(value));
+/** Resolve a collision-proof id for a value against the current entries:
+ * returns the base 12-hex id when free (or already bound to this exact
+ * value — true dedupe); on a genuine hash collision with a different value,
+ * widens the tag until unique. Placeholders always derive from the stored
+ * id, so widened entries stay internally consistent. */
+export function idFor(value: string, entries: Map<string, SecretEntry>): string {
+  const base = `s_${hexTagFor(value)}`;
+  const existing = entries.get(base);
+  if (!existing || existing.value === value) return base;
+  for (let width = TAG_HEX_WIDTH + 1; width <= 64; width++) {
+    const candidate = `s_${hexTagFor(value, width)}`;
+    const held = entries.get(candidate);
+    if (!held || held.value === value) return candidate;
+  }
+  // Unreachable (sha256 yields exactly 64 hex) — defensive last resort.
+  return `s_${crypto.createHash('sha256').update(value + '\u0000' + entries.size).digest('hex').slice(0, TAG_HEX_WIDTH)}`;
+}
+
+/** Build the canonical placeholder for a stored entry. ALWAYS derived from
+ * the entry id (never recomputed from the value) so collision-widened and
+ * legacy-migrated entries emit exactly the placeholder they were stored as. */
+function placeholderFromEntry(e: SecretEntry): string {
+  return buildPlaceholder(STORE_GENERATION, e.id.slice(2));
 }
 
 function loadFromDisk(): Map<string, SecretEntry> {
@@ -107,13 +138,40 @@ function loadFromDisk(): Map<string, SecretEntry> {
     const plaintext = decrypt(parsed.encrypted, parsed.iv, parsed.authTag);
     const entries = JSON.parse(plaintext) as SecretEntry[];
     const map = new Map<string, SecretEntry>();
-    for (const e of entries) map.set(e.id, e);
+    for (const e of entries) {
+      // Migrate legacy tag widths (pre-48-bit ids) to the current width so
+      // lookups and placeholder derivation stay consistent; idFor also
+      // resolves any historical collision between two stored values.
+      const id = idFor(e.value, map);
+      if (e.id !== id) {
+        try {
+          getDb().prepare('UPDATE middle_secret_meta SET id = ? WHERE id = ?').run(id, e.id);
+        } catch { /* meta row absent (fresh DB, old file) — nothing to fix */ }
+        e.id = id;
+      }
+      map.set(e.id, e);
+    }
     return map;
   } catch (err) {
-    // Tampered file, wrong key, or corruption → treat as empty store.
-    // Never crash — a broken secrets file should not take down the server.
-    console.warn('[Middle] Failed to read secrets file, treating as empty:', err instanceof Error ? err.message : String(err));
-    return new Map();
+    // Tampered file, wrong key, or corruption. The old bytes may be
+    // recoverable (e.g. the operator fixes ENCRYPTION_KEY) — QUARANTINE the
+    // file before any subsequent save overwrites it. Silently treating it as
+    // empty destroyed the only copy on the next addSecret (H04).
+    const reason = err instanceof Error ? err.message : String(err);
+    try {
+      const quarantinePath = `${fp}.corrupt-${Date.now()}`;
+      fs.renameSync(fp, quarantinePath);
+      console.warn(`[Middle] Secrets file unreadable (${reason}) — quarantined as ${quarantinePath}; starting a fresh store`);
+      return new Map();
+    } catch (renameErr) {
+      // Could not preserve the old bytes — refuse to start empty, because
+      // the next save would irreversibly destroy possibly-recoverable data.
+      throw new Error(
+        `Secrets file at ${fp} is unreadable (${reason}) and could not be quarantined: ` +
+        (renameErr instanceof Error ? renameErr.message : String(renameErr)) +
+        ' — fix the file permissions or move it aside manually before continuing.',
+      );
+    }
   }
 }
 
@@ -127,10 +185,11 @@ function saveToDisk(entries: Map<string, SecretEntry>): void {
   const { encrypted, iv, authTag } = encrypt(plaintext);
   const payload = JSON.stringify({ encrypted, iv, authTag });
 
-  // Atomic write: tmp file → rename. chmod 0600 before rename so the file
-  // is never world-readable even momentarily.
+  // Atomic write: tmp file → rename. M34: the mode goes ON the write call
+  // (0644-then-chmod left a world-readable window); the explicit chmod is
+  // kept for umask edges where the OS would not honor the requested mode.
   const tmpPath = fp + '.tmp';
-  fs.writeFileSync(tmpPath, payload, 'utf8');
+  fs.writeFileSync(tmpPath, payload, { encoding: 'utf8', mode: 0o600 });
   fs.chmodSync(tmpPath, 0o600);
   fs.renameSync(tmpPath, fp);
 }
@@ -149,7 +208,7 @@ function rebuildSortedSecrets(): void {
   // re-sorts internally, but this keeps the precompiled array consistent).
   sortedSecrets = [...cache.values()]
     .filter(e => e.enabled)
-    .map(e => ({ value: e.value, placeholder: placeholderFor(e.value) }))
+    .map(e => ({ value: e.value, placeholder: placeholderFromEntry(e) }))
     .sort((a, b) => b.value.length - a.value.length);
 }
 
@@ -181,15 +240,26 @@ export function listSecrets(): SecretMeta[] {
   });
 }
 
-/** Add a secret. Deduplicates by value hash — returns existing id if the
- * same value is already stored. */
+/** Add a secret. Deduplicates by value — returns the existing id (and
+ * re-enables it if it was disabled) when the same value is already stored;
+ * a genuine tag collision with a DIFFERENT value is resolved by widening. */
 export function addSecret(value: string, kind: string, addedBy: 'manual' | 'ai', label?: string): string {
   const db = getDb();
-  const hexTag = hexTagFor(value);
-  const id = `s_${hexTag}`;
   const entries = ensureCache();
+  const id = idFor(value, entries);
+  const existing = entries.get(id);
 
-  if (entries.has(id)) return id; // dedupe — same value already stored
+  if (existing) {
+    // Same value already stored. Re-enable if disabled so a re-observed
+    // secret becomes active again without a restart (parity with bulk path).
+    if (!existing.enabled) {
+      existing.enabled = true;
+      saveToDisk(entries);
+      rebuildSortedSecrets();
+      db.prepare('UPDATE middle_secret_meta SET enabled = 1 WHERE id = ?').run(id);
+    }
+    return id;
+  }
 
   const entry: SecretEntry = {
     id,
@@ -232,20 +302,27 @@ export function addSecretsBulk(
   const results: Array<{ id: string; value: string; kind: string; existed: boolean }> = [];
 
   for (const item of items) {
-    const hexTag = hexTagFor(item.value);
-    const id = `s_${hexTag}`;
-    const existed = entries.has(id);
-    if (!existed) {
+    const id = idFor(item.value, entries);
+    const existing = entries.get(id);
+    if (!existing) {
       const entry: SecretEntry = {
         id, value: item.value, kind: item.kind,
         label: item.label ?? '', addedBy, createdAtMs: now, enabled: true,
       };
       entries.set(id, entry);
       insertStmt.run(id, item.kind, item.label ?? '', addedBy, entry.createdAtMs, maskKey(item.value));
+      results.push({ id, value: item.value, kind: item.kind, existed: false });
     } else {
+      // Re-enables disabled secrets that match — BOTH the DB row (upsert
+      // above) and the in-memory entry, so redaction is active again in this
+      // process without a restart.
+      if (!existing.enabled) {
+        existing.enabled = true;
+        db.prepare('UPDATE middle_secret_meta SET enabled = 1 WHERE id = ?').run(id);
+      }
       insertStmt.run(id, item.kind, item.label ?? '', addedBy, now, maskKey(item.value));
+      results.push({ id, value: item.value, kind: item.kind, existed: true });
     }
-    results.push({ id, value: item.value, kind: item.kind, existed });
   }
 
   saveToDisk(entries);

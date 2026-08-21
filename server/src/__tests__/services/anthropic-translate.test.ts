@@ -132,7 +132,9 @@ describe('Anthropic inbound translation (F6)', () => {
         tool_choice: { type: 'tool', name: 'get_weather' },
       };
       const result = anthropicToChatMessages(req);
-      expect(result.tool_choice).toEqual({ type: 'function', name: 'get_weather' });
+      // C07: the internal /v1/chat/completions schema requires the OpenAI
+      // nested shape — the flat Anthropic form was rejected with 400.
+      expect(result.tool_choice).toEqual({ type: 'function', function: { name: 'get_weather' } });
     });
 
     it('passes through temperature, top_p, max_tokens', () => {

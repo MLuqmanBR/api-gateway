@@ -14,10 +14,17 @@ import { contentToString } from '../lib/content.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 import { geminiThinkingConfig, normalizeThinking } from '../lib/thinking.js';
 import { createAbortRace } from '../lib/abort.js';
+import { assertPublicHttpUrl } from '../lib/url-guard.js';
+// N13: import the runtime crypto API explicitly rather than relying on the
+// globalThis binding — same convention as routes/proxy.ts.
+import { randomUUID } from 'node:crypto';
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+// N13: named so the timeout value and its error message can't drift apart.
+const STREAM_INACTIVITY_TIMEOUT_MS = 300_000;
 
 // Gemini 3 REQUIRES the `thoughtSignature` that accompanied a function call to
 // be echoed back whenever that call appears in conversation history, or it
+// rejects the follow-up turn outright.
 // OpenAI-format clients (the API surface we expose) have no field to carry a
 // provider-specific signature, so it's dropped on the round-trip and every
 // multi-turn tool conversation through Gemini fails. To bridge this without a
@@ -234,13 +241,19 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
       // Block internal / private IPs to prevent SSRF probing of local services.
       // Single-user self-hosted proxy — but the unified API key is portable,
       // so internal-network requests a leaked key could make are worth blocking.
-      // Follow redirects manually so isInternalHost is re-checked on EACH hop's
-      // hostname before we fetch it: a public URL 302-redirecting to an internal
-      // host (e.g. http://169.254.169.254/) must never reach that host.
+      // Follow redirects manually so assertPublicHttpUrl is re-run on EACH
+      // hop (scheme + literal-IP + DNS-resolved private-range checks — H10):
+      // a public URL 302-redirecting to an internal host (e.g.
+      // http://169.254.169.254/ or a name that re-resolves privately) must
+      // never reach that host.
       let currentUrl = url;
       let res: Response | null = null;
       for (let hop = 0; hop < 3; hop++) {
-        if (isInternalHost(new URL(currentUrl).hostname)) return null;
+        try {
+          await assertPublicHttpUrl(currentUrl);
+        } catch {
+          return null;
+        }
         const hopRes = await fetchWithTimeout(currentUrl, { redirect: 'manual' });
         if (hopRes.status >= 300 && hopRes.status < 400) {
           const location = hopRes.headers.get('location');
@@ -261,17 +274,6 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
     }
   }
   return null;
-}
-
-/** Check whether hostname resolves to a private/internal IP range. */
-function isInternalHost(hostname: string): boolean {
-  // IPv4 loopback / private ranges / link-local (cloud metadata: 169.254.169.254) / unspecified
-  if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|0\.0\.0\.0$)/.test(hostname)) return true;
-  // IPv6 loopback / link-local / ULA / unique-local
-  if (hostname === '::1' || hostname.startsWith('fe80:') || hostname.startsWith('fc') || hostname.startsWith('fd')) return true;
-  // localhost / .local mDNS
-  if (hostname === 'localhost' || hostname.endsWith('.local')) return true;
-  return false;
 }
 
 // Build Gemini parts for a user message: joined text first, then any images as
@@ -399,7 +401,7 @@ function extractToolCalls(parts: GeminiPart[] | undefined): ChatToolCall[] {
     // Use crypto.randomUUID() for the fallback id — Date.now()+idx can
     // collide across concurrent requests, causing cross-request signature
     // bleed in the thoughtSigCache (a wrong sig → 400 → failover).
-    const id = part.functionCall.id ?? `call_${crypto.randomUUID()}`;
+    const id = part.functionCall.id ?? `call_${randomUUID()}`;
     // Cache the signature keyed by the id we hand the client, so when the client
     // echoes this call back (without the signature, as OpenAI format requires)
     // we can re-attach it and Gemini accepts the history.
@@ -463,10 +465,13 @@ export class GoogleProvider extends BaseProvider {
     };
     if (systemInstruction) body.systemInstruction = systemInstruction;
 
-    const url = `${API_BASE}/models/${modelId}:generateContent?key=${apiKey}`;
+    // API key in the x-goog-api-key HEADER, never the URL query — keys in
+    // URLs leak into proxy logs, error messages, and intermediaries. The
+    // model id is path-encoded.
+    const url = `${API_BASE}/models/${encodeURIComponent(modelId)}:generateContent`;
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
     }, 60000, options?.abortSignal);
     if (!res.ok) {
@@ -482,8 +487,10 @@ export class GoogleProvider extends BaseProvider {
       const reason = data.promptFeedback?.blockReason ?? 'UNKNOWN';
       throw new Error(`Gemini blocked the request: ${reason}`);
     }
-    const candidate = data.candidates?.[0];
-    const parts = candidate?.content?.parts;
+    // N13: candidates is non-null and non-empty past the guard above — only
+    // candidate.content itself may be absent.
+    const candidate = data.candidates[0];
+    const parts = candidate.content?.parts;
     const toolCalls = extractToolCalls(parts);
     const text = extractText(parts);
     const reasoning = extractReasoning(parts);
@@ -535,10 +542,10 @@ export class GoogleProvider extends BaseProvider {
     };
     if (systemInstruction) body.systemInstruction = systemInstruction;
 
-    const url = `${API_BASE}/models/${modelId}:streamGenerateContent?alt=sse&key=${apiKey}`;
+    const url = `${API_BASE}/models/${encodeURIComponent(modelId)}:streamGenerateContent?alt=sse`;
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
     }, 60000, options?.abortSignal);
     if (!res.ok) {
@@ -570,9 +577,11 @@ export class GoogleProvider extends BaseProvider {
         const result = await Promise.race([
           reader.read(),
           new Promise<never>((_, reject) => {
+            // N13: interpolate the actual timeout so the message can't drift
+            // from the value passed to setTimeout.
             timer = setTimeout(
-              () => reject(new Error(`Google AI Studio stream stalled: no data for 300000ms (timeout)`)),
-              300000,
+              () => reject(new Error(`Google AI Studio stream stalled: no data for ${STREAM_INACTIVITY_TIMEOUT_MS}ms (timeout)`)),
+              STREAM_INACTIVITY_TIMEOUT_MS,
             );
           }),
           ...(abortPromise ? [abortPromise] : []),
@@ -620,8 +629,14 @@ export class GoogleProvider extends BaseProvider {
           const parts = candidate?.content?.parts ?? [];
           const text = extractText(parts);
           const reasoning = extractReasoning(parts);
-          const toolCalls = extractToolCalls(parts).filter(call => {
-            const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
+          // M07: dedupe on call identity (provider-supplied id), NOT on call
+          // content. Two legitimate parallel calls to the same function with
+          // identical arguments shared a content key and were silently deduped
+          // away when provider ids were absent or reused. With no provider id
+          // available, fall back to a per-chunk positional key derived from
+          // the call index so each entry in the array is a distinct call.
+          const toolCalls = extractToolCalls(parts).filter((call, callIndex) => {
+            const key = call.id ?? `${callIndex}:${call.function?.name ?? ''}`;
             if (seenToolCallKeys.has(key)) return false;
             seenToolCallKeys.add(key);
             return true;
@@ -709,8 +724,8 @@ export class GoogleProvider extends BaseProvider {
     // Transport errors propagate — health.ts marks status='error' without
     // counting toward auto-disable. Only confirmed 401/403 disables a key.
     const res = await this.fetchWithTimeout(
-      `${API_BASE}/models?key=${apiKey}`,
-      { method: 'GET' },
+      `${API_BASE}/models`,
+      { method: 'GET', headers: { 'x-goog-api-key': apiKey } },
       10000,
     );
     return res.status !== 401 && res.status !== 403;

@@ -73,9 +73,24 @@ export function authenticateClientKey(token: string): AuthenticatedClientKey | n
   const hash = hashClientSecret(secret, row.salt);
   if (!timingSafeHexEqual(hash, row.secret_hash)) return null;
 
+  // M12: guard the JSON.parse — a single corrupt allowlist row previously
+  // 500'd every request authenticated by this key. On corrupt data, treat as
+  // no allowlist (null = all models allowed) and log once; fail-open is the
+  // safer default here because a DB-corruption fault should not lock out a
+  // key that was issued to be used.
+  let modelAllowlist: string[] | null = null;
+  if (row.model_allowlist) {
+    try {
+      modelAllowlist = JSON.parse(row.model_allowlist) as string[];
+    } catch {
+      console.warn(`[ClientKeys] Corrupt model_allowlist for key id=${row.id} — treating as no allowlist`);
+      modelAllowlist = null;
+    }
+  }
+
   return {
     id: row.id,
-    modelAllowlist: row.model_allowlist ? JSON.parse(row.model_allowlist) : null,
+    modelAllowlist,
     rpmOverride: row.rpm_override,
   };
 }

@@ -5,10 +5,7 @@ import {
   canUseTokens,
   recordRequest,
   recordTokens,
-  getRateLimitStatus,
   computeRetryCooldownMs,
-  providerDailyRequestCount,
-  getProviderDailyRequestCap,
   reserveRequest,
   releaseReservation,
 } from '../../services/ratelimit.js';
@@ -106,21 +103,6 @@ describe('Rate Limiter', () => {
     });
   });
 
-  describe('getRateLimitStatus', () => {
-    it('should return current usage counts', () => {
-      const limits = { rpm: 30, rpd: 1000, tpm: 6000, tpd: null };
-      recordRequest('groq', 'test-model', testId);
-      recordRequest('groq', 'test-model', testId);
-      recordTokens('groq', 'test-model', testId, 500);
-
-      const status = getRateLimitStatus('groq', 'test-model', testId, limits);
-      expect(status.rpm.used).toBe(2);
-      expect(status.rpm.limit).toBe(30);
-      expect(status.rpd.used).toBe(2);
-      expect(status.tpm.used).toBe(500);
-    });
-  });
-
   describe('persistent state', () => {
     it('preserves per-key usage and cooldowns after the limiter module reloads', async () => {
       process.env.ENCRYPTION_KEY = '0'.repeat(64);
@@ -159,35 +141,6 @@ describe('Rate Limiter', () => {
     });
   });
 
-  describe('provider-wide daily request cap (#162)', () => {
-    const ENV = 'PROVIDER_DAILY_REQUEST_CAP_OPENROUTER';
-    let original: string | undefined;
-
-    beforeEach(() => { original = process.env[ENV]; });
-    afterEach(() => {
-      if (original === undefined) delete process.env[ENV];
-      else process.env[ENV] = original;
-    });
-
-    it('defaults to OpenRouter ~1000/day and allows env override / disable', () => {
-      delete process.env[ENV];
-      expect(getProviderDailyRequestCap('openrouter')).toBe(1000);
-      expect(getProviderDailyRequestCap('groq')).toBeNull(); // no shared cap
-      process.env[ENV] = '50';
-      expect(getProviderDailyRequestCap('openrouter')).toBe(50);
-      process.env[ENV] = '0'; // 0 disables the cap
-      expect(getProviderDailyRequestCap('openrouter')).toBeNull();
-    });
-
-    it('counts requests across ALL of a provider\'s models for one key', () => {
-      recordRequest('openrouter', 'deepseek/deepseek-v3.1:free', testId);
-      recordRequest('openrouter', 'deepseek/deepseek-v3.1:free', testId);
-      recordRequest('openrouter', 'qwen/qwen3-coder:free', testId);
-      // Same key on a different provider must not bleed into the count.
-      recordRequest('groq', 'llama-70b', testId);
-      expect(providerDailyRequestCount('openrouter', testId)).toBe(3);
-    });
-  });
 });
 
 describe('Cooldown duration (X1: flat 90s after any error)', () => {

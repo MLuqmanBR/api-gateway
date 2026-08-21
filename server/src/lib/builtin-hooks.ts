@@ -38,9 +38,12 @@ export function registerBuiltInHooks(): void {
     },
   });
 
-  // Post-call-success: tool-rescue runs FIRST so the think-tag extractor only
-  // ever sees visible text (dialect markers like `<|tool_call_begin|>` never
-  // appear inside a real think block — verified at think-tags.ts:14-15).
+  // Post-call-success: tool-rescue runs FIRST so it sees the FULL response —
+  // including any dialect blocks a model emitted mid-reasoning — before the
+  // think-tag extractor moves <think>…</think> out of content. Extraction is
+  // not confused by dialect tokens either way: only the literal `<think>`
+  // opener triggers it, never other angle-bracket markup
+  // (think-tags.ts:11-12, rule 1).
   pipeline.registerPostCallSuccess({
     id: 'tool-rescue',
     run(ctx) {

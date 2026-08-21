@@ -132,9 +132,12 @@ describe('CommandCodeProvider', () => {
       expect(await provider.validateKey('k')).toBe(true);
     });
 
-    it('treats a transport throw as valid (no proof the key is bad)', async () => {
+    // M23 flipped the old `catch { return true }` semantics: a transport
+    // error is no longer a "valid" verdict — it propagates so the health
+    // checker classifies the key as a transient 'error' rather than healthy.
+    it('propagates transport errors so the checker marks them transient', async () => {
       vi.spyOn(global, 'fetch').mockRejectedValueOnce(new Error('ECONNREFUSED'));
-      expect(await provider.validateKey('k')).toBe(true);
+      await expect(provider.validateKey('k')).rejects.toThrow('ECONNREFUSED');
     });
   });
 });

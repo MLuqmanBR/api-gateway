@@ -8,6 +8,14 @@ import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../provid
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 import { decrypt } from '../lib/crypto.js';
 
+// L11: strict numeric-id guard for :id path params. parseInt('12abc') === 12
+// silently accepted garbage; this accepts only whole numbers ('' and
+// whitespace included — Number('') is 0).
+function parseIdParam(raw: string): number | null {
+  const n = Number(raw);
+  return raw.trim() !== '' && Number.isInteger(n) ? n : null;
+}
+
 export const customRouter = Router();
 
 // Built-in platform slugs are off-limits as custom slugs — the catalog
@@ -53,7 +61,8 @@ const updateProviderSchema = z.object({
   || d.keyFormat !== undefined || d.stickySessionsEnabled !== undefined, {
     message: `At least one of displayName, slug, baseUrl, stickySessionsEnabled, or limit must be provided`,
   });
-// tools by default (the most common case for OpenAI-compatible endpoints).
+// Defaults for models created under a custom provider: vision OFF, tools ON
+// (the most common case for OpenAI-compatible endpoints).
 const MODEL_DEFAULTS = {
   intelligenceRank: 50,
   speedRank: 50,
@@ -125,24 +134,34 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
     return { fetched: 0, added: [], error: 'invalid base URL' };
   }
 
-  // Look up the newest enabled API key for this slug. Many providers require
-  // the API key on their /models endpoint too — pass it as a Bearer header
-  // when one exists, so auto-discovery works for gated catalogs.
+  // Look up the newest enabled API key for this platform. Many providers
+  // require the API key on their /models endpoint too — pass it as a Bearer
+  // header when one exists, so auto-discovery works for gated catalogs.
+  // (api_keys is keyed by `platform`, which equals the provider slug for
+  // custom providers.)
   let authHeader = '';
+  let keyRow: { encrypted_key: string; iv: string; auth_tag: string } | undefined;
   try {
-    const keyRow = getDb().prepare(`
+    keyRow = getDb().prepare(`
       SELECT encrypted_key, iv, auth_tag
       FROM api_keys
-      WHERE slug = ? AND enabled = 1
+      WHERE platform = ? AND enabled = 1
       ORDER BY id DESC
       LIMIT 1
     `).get(slug) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
-    if (keyRow) {
+  } catch {
+    // A failed lookup (not a failed decryption) means no key row exists —
+    // proceed unauthenticated; /models may still be open.
+  }
+  if (keyRow) {
+    try {
       const key = decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag);
       authHeader = `Bearer ${key}`;
+    } catch {
+      // Decryption failed for a stored key — log it so silent key corruption
+      // can't quietly disable gated discovery, then proceed unauthenticated.
+      console.warn(`[models] Failed to decrypt stored key for '${slug}' — syncing /models unauthenticated`);
     }
-  } catch {
-    // Decryption failed — proceed unauthenticated; /models may still be open.
   }
 
   const controller = new AbortController();
@@ -345,10 +364,19 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
       const newSlug = `${slug}-archived-${Date.now()}`;
       const tx = db.transaction(() => {
         db.prepare('UPDATE custom_providers SET slug = ? WHERE slug = ?').run(newSlug, slug);
-        // Cascade the slug rename to api_keys and models so analytics stay
-        // connected to the archived provider.
         db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, slug);
         db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, slug);
+        //
+        // L05 (documented cost, deliberately synchronous): the `requests`
+        // UPDATE is an unindexed full-table scan that rewrites EVERY history
+        // row of the old slug. It must stay inside this transaction — moving
+        // it after the response (fire-and-forget) or into a background job
+        // would let a crash/restart strand rows under the old slug forever,
+        // splitting the provider's analytics across two names with no repair
+        // path (the new slug embeds Date.now()). The write lock it holds also
+        // stalls other writers for the scan duration; acceptable because this
+        // fires only on an explicit rename of an archived provider, never on
+        // the request hot path.
         db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, slug);
       });
       tx();
@@ -366,7 +394,7 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
       clearPlatformCaches(slug);
       clearRoundRobinIndex(slug);
       clearProviderConfigCache(slug);
-      const sync = await syncModelsFromProvider(baseUrl, slug);
+      await syncModelsFromProvider(baseUrl, slug);
       res.json({
         id: existing.id, slug, displayName: displayName.trim(), baseUrl,
         rpmLimit: rpmLimit ?? null, rpdLimit: rpdLimit ?? null,
@@ -387,7 +415,7 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
   `).run(slug, displayName.trim(), baseUrl, rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, apiFormat, keyFormat, stickySessionsEnabled ? 1 : 0);
 
   // Auto-discover models from the provider's /models endpoint.
-  const sync = await syncModelsFromProvider(baseUrl, slug);
+  await syncModelsFromProvider(baseUrl, slug);
 
   res.status(201).json({
     id: result.lastInsertRowid,
@@ -527,6 +555,12 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
     if (slugChanged) {
       db.prepare('UPDATE api_keys SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
       db.prepare('UPDATE models SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
+      // L05 (documented cost, same rationale as the archive-rename cascade in
+      // POST /api/custom-providers): rewriting requests.platform is an
+      // unindexed full-table scan held inside the write lock. It stays
+      // synchronous so the rename can't commit with history stranded under
+      // the old slug — deferring it risks permanent analytics split on a
+      // mid-job crash, for a cost only paid on explicit provider renames.
       db.prepare('UPDATE requests SET platform = ? WHERE platform = ?').run(newSlug, oldSlug);
     }
     db.prepare(`UPDATE custom_providers SET ${updates.join(', ')} WHERE slug = ?`).run(...values);
@@ -536,7 +570,7 @@ customRouter.patch('/api/custom-providers/:slug', (req: Request, res: Response) 
 
   res.json({ success: true, slug: slugChanged ? newSlug : oldSlug });
 });
-// Analytics retains historical request data. Re-adding the same slug+bare_url
+// Analytics retains historical request data. Re-adding the same slug+base_url
 // revives the provider from the archive.
 customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response) => {
   const slug = req.params.slug as string;
@@ -743,12 +777,11 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
 // Edit any subset of a custom or built-in model. Built-ins are editable
 // through this endpoint per the doc at line 93-94.
 customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id as string, 10);
-  if (isNaN(id)) {
+  const id = parseIdParam(req.params.id as string);
+  if (id === null) {
     res.status(400).json({ error: { message: 'invalid model id' } });
     return;
   }
-
   const parsed = updateModelSchema.safeParse(req.body);
   if (!parsed.success) {
     res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
@@ -794,12 +827,11 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
 // chain. The row stays for analytics. Use the provider DELETE to archive all
 // models at once. Re-adding the model revives it.
 customRouter.delete('/api/custom-models/:id', (req: Request, res: Response) => {
-  const id = parseInt(req.params.id as string, 10);
-  if (isNaN(id)) {
+  const id = parseIdParam(req.params.id as string);
+  if (id === null) {
     res.status(400).json({ error: { message: 'invalid model id' } });
     return;
   }
-
   const db = getDb();
   const existing = db.prepare('SELECT id, platform, enabled FROM models WHERE id = ?').get(id) as { id: number; platform: string; enabled: number } | undefined;
   if (!existing) {

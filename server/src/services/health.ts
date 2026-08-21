@@ -204,10 +204,11 @@ export async function runCheckAllGuarded(): Promise<boolean> {
 
 export function startHealthChecker(): void {
   if (intervalId) return;
-  // Clear any transport-error residue before the first check. Without this,
-  // a key that was marked 'error' 4 minutes before restart would sit on
-  // 'error' for another 5 minutes (until the next health check) — and
-  // routeRequest excludes 'error' keys, so every request would route
+  // M14: clear any transport-error residue before the first check. Keys
+  // marked 'error' before a restart must not stay benched until the next
+  // sweep — routeRequest excludes 'error' keys, so every request would
+  // route around a healthy key for up to CHECK_INTERVAL_MS. (#256)
+  resetErrorStatuses();
   console.log(`[Health] Starting health checker (every ${CHECK_INTERVAL_MS / 1000}s, concurrency ${CHECK_CONCURRENCY})`);
   // Kick an immediate first sweep so freshly-booted keys reach a real status
   // within seconds rather than waiting CHECK_INTERVAL_MS (default 5 min). The

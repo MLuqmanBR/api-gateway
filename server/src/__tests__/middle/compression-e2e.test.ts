@@ -7,6 +7,7 @@ import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey, setSetting } from '../../db/index.js';
 import { initSecretsStore, addSecret, _resetCacheForTesting } from '../../middle/redaction/store.js';
 import { clearMiddleConfigCache } from '../../middle/index.js';
+import { clearCompressionConfigCache } from '../../middle/compression/index.js';
 
 const { mockRouteRequest } = vi.hoisted(() => ({ mockRouteRequest: vi.fn() }));
 vi.mock('../../services/router.js', async (importOriginal) => {
@@ -57,6 +58,7 @@ beforeEach(() => {
   initSecretsStore(tempDir);
   _resetCacheForTesting();
   clearMiddleConfigCache();
+  clearCompressionConfigCache();
   capturedMessages = null;
   addSecret(SECRET, 'api_key', 'manual', 'Test');
   const db = getDb();
@@ -71,12 +73,23 @@ afterEach(() => {
   setSetting('middle_compression_smart_crusher_lossless_only', '1');
   setSetting('middle_redaction_enabled', '0');
   clearMiddleConfigCache();
+  clearCompressionConfigCache();
   _resetCacheForTesting();
   rmSync(tempDir, { recursive: true, force: true });
 });
 
 // Helper: make a large dict-array tool output
-function makeToolOutput(n: number, opts: { longKeys?: boolean } = {}): string {
+// Older compressible tool output that sits BEFORE the protect_recent window (default 4):
+// pad with trailing user messages so the tool message's index < messages.length - 4.
+function withToolWindow(toolContent: string, padding = 5): Array<{ role: string; content: string }> {
+  return [
+    { role: 'user', content: 'analyze' },
+    { role: 'tool', content: toolContent },
+    ...Array.from({ length: padding }, (_, i) => ({ role: 'user', content: `context ${i}` })),
+  ];
+}
+
+function makeToolOutput(n: number, opts: { longKeys?: boolean; errFree?: boolean } = {}): string {
   if (opts.longKeys) {
     return JSON.stringify(Array.from({ length: n }, (_, i) => ({
       user_identifier: `user_${i}`,
@@ -87,7 +100,9 @@ function makeToolOutput(n: number, opts: { longKeys?: boolean } = {}): string {
   return JSON.stringify(Array.from({ length: n }, (_, i) => ({
     id: i,
     message: `log entry ${i} with some padding text for realism`,
-    level: i % 10 === 0 ? 'error: failed' : 'info',
+    // errFree: drop the periodic error row so no must-keep constraint can
+    // hijack the crush (the lossy drop path then deterministically applies).
+    level: i % 10 === 0 && !opts.errFree ? 'error: failed' : 'info',
   })));
 }
 
@@ -121,7 +136,10 @@ describe('B1-6: compression e2e', () => {
 
   // ── 2. Compression-only (redaction OFF) → provider receives compacted form ─
   it('compression-only: provider receives compressed tool output', async () => {
-    const toolContent = makeToolOutput(200, { longKeys: true });
+    // Error-free rows: no must-keep constraint can hijack the crush, so the
+    // lossy drop path MUST apply (deterministic). Asserts the specific outcome —
+    // the prior `isCompressed || isPassthrough` tautology could never fail.
+    const toolContent = makeToolOutput(200, { errFree: true });
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
@@ -133,24 +151,27 @@ describe('B1-6: compression e2e', () => {
 
     setSetting('middle_compression_enabled', '1');
     setSetting('middle_compression_smart_crusher', '1');
-    setSetting('middle_compression_smart_crusher_lossless_only', '1');
+    setSetting('middle_compression_smart_crusher_lossless_only', '0');
+    setSetting('middle_compression_min_savings_ratio', '0.15');
+    setSetting('middle_compression_emit_sentinel', '1');
     clearMiddleConfigCache();
+    clearCompressionConfigCache();
 
     const { status } = await request(app, '/v1/chat/completions', {
       model: 'fake-model',
-      messages: [
-        { role: 'user', content: 'analyze' },
-        { role: 'tool', content: toolContent },
-      ],
+      // Pad past the protect_recent window (default 4) so the tool message is eligible.
+      messages: withToolWindow(toolContent),
       stream: false,
     }, key);
     expect(status).toBe(200);
     const toolMsg = capturedMessages!.find((m: any) => m.role === 'tool');
-    // The tool content should be compressed (either TOON or original if inflation guard)
-    // If TOON applied, content starts with [N]{...}
-    const isCompressed = toolMsg.content !== toolContent;
-    const isPassthrough = toolMsg.content === toolContent;
-    expect(isCompressed || isPassthrough).toBe(true);
+    // Lossy path MUST compress (no error rows, no fences, no must-keep ids).
+    expect(toolMsg.content).not.toBe(toolContent);                    // actually transformed
+    expect(String(toolMsg.content).length).toBeLessThan(toolContent.length); // smaller
+    // The sentinel is appended to the compressed tool message content itself
+    // (M46 — never a separate system message after tool messages).
+    const upstreamText = JSON.stringify(capturedMessages);
+    expect(upstreamText).toMatch(/⟦C7:<<crushed \d+ rows, hash [0-9a-f]{6}>>⟧/); // sentinel present upstream
   });
 
   // ── 3. Both-enabled ordering (§0 invariant #2) ──────────────────────────
@@ -193,7 +214,10 @@ describe('B1-6: compression e2e', () => {
 
   // ── 4. Sentinel round-trip: sentinel in upstream body, not in response ──
   it('sentinel: appears in upstream body, NOT in client response', async () => {
-    const toolContent = makeToolOutput(200, { longKeys: true });
+    // Error-free rows so the lossy drop path deterministically emits a sentinel
+    // (the longKeys variant's `error: timeout` rows keep the whole array alive
+    // via the must-keep constraint → passthrough, nothing upstream to assert).
+    const toolContent = makeToolOutput(200, { errFree: true });
     mockRouteRequest.mockReturnValue(fakeRoute({
       async chatCompletion(_k: string, messages: any[]) {
         capturedMessages = messages;
@@ -206,24 +230,25 @@ describe('B1-6: compression e2e', () => {
     setSetting('middle_compression_enabled', '1');
     setSetting('middle_compression_smart_crusher', '1');
     setSetting('middle_compression_smart_crusher_lossless_only', '0');
+    setSetting('middle_compression_min_savings_ratio', '0.15');
+    setSetting('middle_compression_emit_sentinel', '1');
     clearMiddleConfigCache();
+    clearCompressionConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
       model: 'fake-model',
-      messages: [
-        { role: 'user', content: 'analyze' },
-        { role: 'tool', content: toolContent },
-      ],
+      messages: withToolWindow(toolContent),
       stream: false,
     }, key);
     expect(status).toBe(200);
     // Client response should NOT contain the sentinel
     const responseContent = (body as any).choices[0].message.content;
     expect(responseContent).not.toMatch(/⟦C7:<<crushed/);
-    // If sentinel was emitted in upstream, it appears in capturedMessages
+    // The sentinel MUST reach the upstream provider — with an error-free 200-row
+    // tool output the lossy path always applies, so a missing sentinel means the
+    // compressor silently did nothing.
     const upstreamContent = JSON.stringify(capturedMessages);
-    // Either sentinel was emitted (compression applied) or not (inflation guard)
-    // Both are valid outcomes
+    expect(upstreamContent).toMatch(/⟦C7:<<crushed/);
   });
 
   // ── 5. Inflation guard: passthrough when compressed ≥ original ──────────
@@ -360,13 +385,17 @@ describe('B1-6: fuzz ≥200 cases', () => {
         if (!upstreamContent.match(/⟦R\d+:[0-9a-f]+⟧/)) { failures++; if (sampleErrors.length < 3) sampleErrors.push(`case ${i}: placeholder missing`); continue; }
       }
 
-      // Error rows must survive in the upstream content
+      // Error rows must survive in the upstream content — the must-keep
+      // constraint should prevent compression from dropping any. Rows are
+      // TOON-rendered as CSV (`<id>,<message>,...,<level>`), so an error row's
+      // `id` appears as a bare CSV number, e.g. `,7,` — assert on that form.
+      // The prior body was comments only and never actually checked.
       for (const errIdx of errorRows) {
-        const errRow = arr[errIdx];
-        if (!upstreamContent.includes(`error: failed`)) {
-          // Error keyword should be present if ANY error row survived
-          // (if compression dropped all rows, that's a failure — but the must-keep constraint
-          // should prevent this)
+        const re = new RegExp(`(?:^|[^0-9])${errIdx}(?:[^0-9]|$)`);
+        if (!re.test(upstreamContent)) {
+          failures++;
+          if (sampleErrors.length < 3) sampleErrors.push(`case ${i}: error row id=${errIdx} dropped`);
+          break;
         }
       }
     }

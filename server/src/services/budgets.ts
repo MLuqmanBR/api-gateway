@@ -65,8 +65,24 @@ function utcMonth(): string {
   return new Date().toISOString().slice(0, 7);
 }
 
-/** Get or create the budget row for a scope. */
-function getOrCreateBudget(db: DatabasePort, scope: BudgetScope, scopeId: string | null): BudgetRow | null {
+/** Get the UTC date (YYYY-MM-DD) on which the CURRENT budget week started
+ *  for the configured reset weekday (1=Monday … 7=Sunday) — i.e. the most
+ *  recent occurrence of that weekday, today included. A stored
+ *  `weekly_reset_at` older than this belongs to a previous week, whatever
+ *  day traffic actually resumes on (H18 catch-up semantics). */
+function isoWeekStartDate(resetDay: number): string {
+  const day = ((resetDay - 1) % 7 + 7) % 7 + 1; // clamp 1..7
+  const nowIsoWeekday = isoWeekday();
+  let diff = nowIsoWeekday - day;
+  if (diff < 0) diff += 7;
+  const start = new Date(Date.now() - diff * 86_400_000);
+  return start.toISOString().slice(0, 10);
+}
+
+/** Read the budget row for a scope; returns null when no budget is
+ *  configured (= no enforcement). Renamed from 'getOrCreateBudget' (M10) —
+ *  the old name implied write semantics this function never had. */
+function findBudget(db: DatabasePort, scope: BudgetScope, scopeId: string | null): BudgetRow | null {
   const row = db.prepare(
     'SELECT * FROM budgets WHERE scope = ? AND scope_id IS ?',
   ).get(scope, scopeId) as BudgetRow | undefined;
@@ -80,7 +96,6 @@ function getOrCreateBudget(db: DatabasePort, scope: BudgetScope, scopeId: string
 function resetIfNeeded(db: DatabasePort, row: BudgetRow): BudgetRow {
   const today = utcToday();
   const month = utcMonth();
-  const weekday = isoWeekday();
   const updates: string[] = [];
   const args: (string | number)[] = [];
 
@@ -92,13 +107,13 @@ function resetIfNeeded(db: DatabasePort, row: BudgetRow): BudgetRow {
     row.daily_reset_at = today;
   }
 
-  // Weekly reset: if the stored weekday < current weekday (wrapped), or
-  // reset_at is null, reset the weekly counter. Simplified: compare the
-  // stored reset_at date — if it's in a different ISO week, reset.
-  // For simplicity: reset weekly if daily_reset_at changed AND it's the
-  // configured weekly_reset_day (default Monday=1). This is a heuristic
-  // that works for the common case; the alternative is ISO week computation.
-  if (row.weekly_reset_at !== today && weekday === (row.weekly_reset_day || 1)) {
+  // Weekly reset with catch-up (H18): compare the stored reset date against
+  // the START of the current ISO week for the configured weekday. If the
+  // stored date is older than that, the counter belongs to a previous week —
+  // reset no matter which day traffic resumes on (an idle/down Monday must
+  // not leave the week over-counted until the next Monday).
+  const weekStartDate = isoWeekStartDate(row.weekly_reset_day || 1);
+  if ((row.weekly_reset_at ?? '') < weekStartDate) {
     updates.push('weekly_used_cents = 0', 'weekly_reset_at = ?');
     args.push(today);
     row.weekly_used_cents = 0;
@@ -126,7 +141,7 @@ function resetIfNeeded(db: DatabasePort, row: BudgetRow): BudgetRow {
  *  exhaustedPeriod, overageCents } for the proxy to 402. */
 export function checkAndReserve(scope: BudgetScope, scopeId: string | null, estimatedCostCents: number): BudgetCheckResult {
   const db = getDb();
-  const row = getOrCreateBudget(db, scope, scopeId);
+  const row = findBudget(db, scope, scopeId);
   if (!row) return { allowed: true, scope };
 
   const reset = resetIfNeeded(db, row);
@@ -167,12 +182,16 @@ export function checkAndReserve(scope: BudgetScope, scopeId: string | null, esti
     WHERE id = ?`,
   ).run(cost, cost, cost, reset.id);
 
-  // Soft-warn: if usage exceeds 90% of any limit, emit budget.warn.
+  // Soft-warn: if usage exceeds 90% of any limit, emit budget.warn with
+  // the TRIGGERING period and its numbers (previously always 'daily' with
+  // daily figures regardless of which limit tripped — M09).
   const warn = (used: number, limit: number | null) => limit != null && used / limit >= 0.9;
-  if (warn(reset.daily_used_cents + cost, reset.daily_limit_cents)
-    || warn(reset.weekly_used_cents + cost, reset.weekly_limit_cents)
-    || warn(reset.monthly_used_cents + cost, reset.monthly_limit_cents)) {
+  if (warn(reset.daily_used_cents + cost, reset.daily_limit_cents)) {
     publish({ type: 'budget.warn' as any, scope, scopeId, period: 'daily', usedCents: reset.daily_used_cents + cost, limitCents: reset.daily_limit_cents, at: Date.now() } as any);
+  } else if (warn(reset.weekly_used_cents + cost, reset.weekly_limit_cents)) {
+    publish({ type: 'budget.warn' as any, scope, scopeId, period: 'weekly', usedCents: reset.weekly_used_cents + cost, limitCents: reset.weekly_limit_cents, at: Date.now() } as any);
+  } else if (warn(reset.monthly_used_cents + cost, reset.monthly_limit_cents)) {
+    publish({ type: 'budget.warn' as any, scope, scopeId, period: 'monthly', usedCents: reset.monthly_used_cents + cost, limitCents: reset.monthly_limit_cents, at: Date.now() } as any);
   }
 
   return { allowed: true, scope };
@@ -182,7 +201,7 @@ export function checkAndReserve(scope: BudgetScope, scopeId: string | null, esti
  *  Adjusts the used counters by (actual - estimate). */
 export function recordSpend(scope: BudgetScope, scopeId: string | null, actualCostCents: number, estimatedCostCents: number): void {
   const db = getDb();
-  const row = getOrCreateBudget(db, scope, scopeId);
+  const row = findBudget(db, scope, scopeId);
   if (!row) return;
 
   const delta = Math.ceil(actualCostCents) - Math.ceil(estimatedCostCents);
@@ -195,6 +214,27 @@ export function recordSpend(scope: BudgetScope, scopeId: string | null, actualCo
       monthly_used_cents = MAX(0, monthly_used_cents + ?)
     WHERE id = ?`,
   ).run(delta, delta, delta, row.id);
+}
+
+/** Release a reservation in full — the request failed, aborted, or was
+ *  rejected after checkAndReserve succeeded, so the estimated spend never
+ *  happened. Without this, failed attempts permanently inflate the used
+ *  counters with phantom spend (C02). Mirrors recordSpend's clamping. */
+export function releaseBudget(scope: BudgetScope, scopeId: string | null, estimatedCostCents: number): void {
+  const db = getDb();
+  const row = findBudget(db, scope, scopeId);
+  if (!row) return;
+
+  const cost = Math.ceil(estimatedCostCents);
+  if (cost <= 0) return;
+
+  db.prepare(
+    `UPDATE budgets SET
+      daily_used_cents = MAX(0, daily_used_cents - ?),
+      weekly_used_cents = MAX(0, weekly_used_cents - ?),
+      monthly_used_cents = MAX(0, monthly_used_cents - ?)
+    WHERE id = ?`,
+  ).run(cost, cost, cost, row.id);
 }
 
 /** Compute the estimated cost in cents for a request.

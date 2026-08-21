@@ -16,7 +16,9 @@ api-gateway middle layer. The techniques and safety scaffolding are concept-port
     dedup + min-savings floor)
   - TOON `[N]{cols}` CSV-schema lossless re-render concept
   - `compress.py` inflation guard + fail-open + net-cost gate concepts
-  - `Kompress-v2-base` `_KOMPRESS_MUST_KEEP_RE` regex (literal pattern)
+  - `Kompress-v2-base` `_KOMPRESS_MUST_KEEP_RE` concept (our TS pattern is a
+    rewrite, not the literal regex — M42 changed the absolute-path alternative
+    to require a boundary, so "and/or" no longer keeps "/or")
   - The `--protect-tool-results` precedence lesson (we default `role:"tool"`
     lossless)
 - **Attribution statement:** "Adapted from headroom (Headroom Contributors,

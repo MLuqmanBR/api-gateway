@@ -61,26 +61,42 @@ export function createSession(userId: number): string {
   return token;
 }
 
+// L19: last_used is hygiene data, not an auth gate — writing it on every
+// authenticated /api/* request makes each dashboard poll a write. Throttle
+// to at most one UPDATE per session per 60 s (in-memory; losing an entry
+// only costs one extra write).
+const LAST_USED_WRITE_INTERVAL_MS = 60 * 1000;
+const lastUsedWrites = new Map<string, number>();
+
 /** Resolve a session token to its user, or null if missing/expired. */
 export function validateSession(token: string | undefined | null): SessionUser | null {
   if (!token) return null;
   const db = getDb();
+  const tokenHash = sha256(token);
   const row = db.prepare(`
     SELECT s.user_id, s.expires_at_ms, u.email
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = ?
-  `).get(sha256(token)) as { user_id: number; expires_at_ms: number; email: string } | undefined;
+  `).get(tokenHash) as { user_id: number; expires_at_ms: number; email: string } | undefined;
   if (!row) return null;
   if (row.expires_at_ms < Date.now()) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+    lastUsedWrites.delete(tokenHash);
     return null;
   }
-  db.prepare('UPDATE sessions SET last_used = ? WHERE token_hash = ?').run(Date.now(), sha256(token));
+  const now = Date.now();
+  const lastWrite = lastUsedWrites.get(tokenHash);
+  if (lastWrite === undefined || now - lastWrite >= LAST_USED_WRITE_INTERVAL_MS) {
+    db.prepare('UPDATE sessions SET last_used = ? WHERE token_hash = ?').run(now, tokenHash);
+    lastUsedWrites.set(tokenHash, now);
+  }
   return { userId: row.user_id, email: row.email };
 }
 export function deleteSession(token: string | undefined | null): void {
   if (!token) return;
-  getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+  const tokenHash = sha256(token);
+  getDb().prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+  lastUsedWrites.delete(tokenHash);
 }
 
 export function pruneSessions(): void {
@@ -89,8 +105,8 @@ export function pruneSessions(): void {
   // accumulate. The second predicate catches sessions idle for a full
   // SESSION_TTL_MS (stale last_used) — it must use a TTL cutoff, never
   // `now` itself, which would match every session that has ever been used.
-  getDb().prepare(
+  const pruned = getDb().prepare(
     'DELETE FROM sessions WHERE (expires_at_ms IS NOT NULL AND expires_at_ms < ?) OR (last_used IS NOT NULL AND last_used < ?)',
-  ).run(now, now - SESSION_TTL_MS);
-  console.log(`[Auth] Pruned expired/stale sessions as of ${new Date(now).toISOString()}`);
+  ).run(now, now - SESSION_TTL_MS).changes;
+  if (pruned > 0) console.log(`[Auth] Pruned ${pruned} expired/stale session(s) as of ${new Date(now).toISOString()}`);
 }

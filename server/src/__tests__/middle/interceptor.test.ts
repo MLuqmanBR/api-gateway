@@ -93,6 +93,26 @@ describe('interceptOutbound — valid spans', () => {
   });
 });
 
+describe('interceptOutbound — whole-message secret accepted', () => {
+  // Regression: a previous plausibility gate rejected spans whose length
+  // exceeded 40% of the text. A message that IS the secret (a bare PAT or
+  // API key, possibly pasted alone) must still be redacted.
+  it('redacts a secret that spans the entire message', async () => {
+    const wholeSecret = 'ghp_wholemessage0123456789abcdef';
+    mockChatCompletion.mockResolvedValue(mockResponse(JSON.stringify([
+      { exact: wholeSecret, kind: 'api_key' },
+    ])));
+
+    const session = new RedactionSession();
+    const messages: ChatMessage[] = [{ role: 'user', content: wholeSecret }];
+
+    const result = await interceptOutbound(session.redactOutbound(messages), session);
+    expect(result.newSecretsFound).toBe(true);
+    expect(result.messages[0].content).not.toContain(wholeSecret);
+    expect(result.messages[0].content).toContain('⟦R');
+  });
+});
+
 describe('interceptOutbound — absent substring discarded', () => {
   it('discards spans not found verbatim in the text', async () => {
     mockChatCompletion.mockResolvedValue(mockResponse(JSON.stringify([

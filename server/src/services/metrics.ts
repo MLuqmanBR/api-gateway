@@ -14,6 +14,7 @@
  * BerriAI/litellm (MIT, integrations/prometheus.py).
  */
 
+import crypto from 'crypto';
 import { Counter, Histogram, register, collectDefaultMetrics } from 'prom-client';
 
 // Collect default Node.js metrics (GC, event loop, memory, etc.)
@@ -39,11 +40,6 @@ const tokenCounter = new Counter({
   labelNames: ['platform', 'model', 'direction'] as const,
 });
 
-const cooldownCounter = new Counter({
-  name: 'api_gateway_cooldowns_total',
-  help: 'Total cooldown events (keys benched by upstream rate limits)',
-  labelNames: ['platform', 'model', 'reason'] as const,
-});
 
 /** Record a request's outcome for Prometheus metrics. Called from the proxy
  *  success/error paths alongside logRequest. */
@@ -75,14 +71,6 @@ export function recordMetricsTokens(params: {
   tokenCounter.inc({ platform: params.platform, model: params.model, direction: 'output' }, params.outputTokens);
 }
 
-/** Record a cooldown event for Prometheus metrics. */
-export function recordMetricsCooldown(params: {
-  platform: string;
-  model: string;
-  reason: string;
-}): void {
-  cooldownCounter.inc({ platform: params.platform, model: params.model, reason: params.reason });
-}
 
 /** Get the Prometheus metrics text (for the /metrics endpoint). */
 export async function getMetricsText(): Promise<string> {
@@ -99,9 +87,10 @@ export function verifyMetricsToken(token: string | undefined): boolean {
   const expected = process.env.METRICS_AUTH_TOKEN;
   if (!expected) return false; // fail-closed if not configured
   if (!token) return false;
-  // Timing-safe comparison
-  const a = Buffer.from(token);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return false;
-  return a.equals(b);
+  // Timing-safe AND length-leak-free: compare fixed-length digests instead
+  // of raw buffers (Buffer#equals short-circuits on the first differing
+  // byte, and an early length return leaks the expected token's length).
+  const ha = crypto.createHash('sha256').update(token, 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(expected, 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
 }

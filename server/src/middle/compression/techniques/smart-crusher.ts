@@ -2,7 +2,7 @@
 // Adapted from headroom (Headroom Contributors, Apache-2.0) SmartCrusher — concept port,
 // not code-copy. The reference is Rust+Python; this is original TS.
 
-import { detectOffLimits, mustKeepMatches, intersectsOffLimits } from '../protect.js';
+import { detectOffLimits, mustKeepMatches } from '../protect.js';
 import { countTokensEstimate } from '../metrics.js';
 
 // ── Error keywords (curated TS list, same intent as headroom error_keywords.rs) ──
@@ -35,7 +35,10 @@ export function detectShape(arr: unknown[]): ArrayShape {
   if (!Array.isArray(arr) || arr.length === 0) return 'scalar';
   const first = arr[0];
   if (first !== null && typeof first === 'object' && !Array.isArray(first)) {
-    // Check if ALL elements are objects (dict-array)
+    // Majority-object array (≥ 0.5) → dict-array; anything else is mixed.
+    // Note the threshold is a majority, NOT "all elements" — a single
+    // non-object row among many still lands here (isToonRenderable then
+    // rejects it in the TOON path, M29).
     const dictFraction = arr.filter(x => x !== null && typeof x === 'object' && !Array.isArray(x)).length / arr.length;
     if (dictFraction >= 0.5) return 'dict-array';
     return 'mixed';
@@ -53,37 +56,42 @@ export function detectShape(arr: unknown[]): ArrayShape {
   return 'mixed';
 }
 
-// ── SimHash (64-bit rolling hash for near-duplicate detection) ──────────────
+// ── SimHash (true 64-bit, BigInt-based) for near-duplicate detection ────────
+// H13: the previous implementation laundered the 64-bit FNV hash through
+// `Number()` (precision loss past 2^53) and then used 32-bit bitwise ops —
+// bits 32-63 were never examined and `1 << i` wrapped mod 32, aliasing upper
+// accumulator bits onto lower ones. Near-duplicate detection ran on
+// effectively-corrupted hashes. All arithmetic stays in BigInt here.
 
-function hashStr(str: string): number {
-  let h = 0xcbf29ce484222325n; // FNV offset
+function fnv1a64(str: string): bigint {
+  let h = 0xcbf29ce484222325n; // FNV offset basis
   for (let i = 0; i < str.length; i++) {
     h = BigInt.asUintN(64, h ^ BigInt(str.charCodeAt(i)));
     h = BigInt.asUintN(64, h * 0x100000001b3n); // FNV prime
   }
-  return Number(BigInt.asUintN(64, h));
+  return h;
 }
 
-export function simHash(str: string): number {
+export function simHash(str: string): bigint {
   const tokens = str.toLowerCase().split(/\s+/).filter(Boolean);
-  const v = new Int8Array(64);
+  const v = new Int16Array(64); // Int16: counts can't overflow at ±128 tokens
   for (const tok of tokens) {
-    const h = hashStr(tok);
+    const h = fnv1a64(tok);
     for (let i = 0; i < 64; i++) {
-      if ((h >> i) & 1) v[i]++; else v[i]--;
+      if ((h >> BigInt(i)) & 1n) v[i]++; else v[i]--;
     }
   }
-  let result = 0;
+  let result = 0n;
   for (let i = 0; i < 64; i++) {
-    if (v[i] > 0) result |= (1 << i);
+    if (v[i] > 0) result |= (1n << BigInt(i));
   }
-  return result >>> 0; // unsigned
+  return BigInt.asUintN(64, result);
 }
 
-function hammingDistance(a: number, b: number): number {
-  let x = (a ^ b) >>> 0;
+function hammingDistance(a: bigint, b: bigint): number {
+  let x = BigInt.asUintN(64, a ^ b);
   let d = 0;
-  while (x) { d += x & 1; x >>>= 1; }
+  while (x) { d += Number(x & 1n); x >>= 1n; }
   return d;
 }
 
@@ -151,7 +159,7 @@ function fillRemaining(
   const { kFirst, kLast } = splitK(k);
   const result: number[] = [];
   const seen = new Set<number>();
-  const hashes: number[] = [];
+  const hashes: bigint[] = [];
 
   // Always-keep indices are ALWAYS included, even if they exceed K.
   // (error rows, query-anchor matches, mustKeep tokens — hard constraints)
@@ -219,6 +227,30 @@ export function toonRender(arr: Record<string, unknown>[]): string {
   return [header, csvHeader, ...csvRows].join('\n');
 }
 
+/** M29: TOON render is structurally lossless ONLY when every row is a plain
+ * object with exactly the header's keys (same set AND order) and every value
+ * is a scalar (string | number | boolean). Anything else breaks the claim:
+ * nested objects/arrays stringify as "[object Object]" or ambiguous CSV
+ * fragments, null and missing keys both render '', and extra/missing keys
+ * are silently dropped by the `cols` projection. Callers MUST fall back to
+ * passthrough (lossless path) or JSON.stringify (lossy path) when false. */
+export function isToonRenderable(rows: Record<string, unknown>[]): boolean {
+  if (rows.length === 0) return false;
+  const cols = Object.keys(rows[0]);
+  for (const row of rows) {
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) return false;
+    const keys = Object.keys(row);
+    if (keys.length !== cols.length) return false;
+    for (let i = 0; i < keys.length; i++) {
+      if (keys[i] !== cols[i]) return false;
+      const v = row[cols[i]];
+      const t = typeof v;
+      if (v === null || (t !== 'string' && t !== 'number' && t !== 'boolean')) return false;
+    }
+  }
+  return true;
+}
+
 // ── Sentinel marker ──────────────────────────────────────────────────────────
 
 function makeSentinel(droppedCount: number, hash: string): string {
@@ -227,9 +259,10 @@ function makeSentinel(droppedCount: number, hash: string): string {
 
 function clusterDigest(arr: unknown[]): string {
   const s = JSON.stringify(arr);
-  // Simple 6-hex-char digest from a FNV hash of the array
-  const h = hashStr(s);
-  return (h >>> 0).toString(16).padStart(6, '0').slice(0, 6);
+  // Simple 6-hex-char digest from the FNV-1a hash of the array (low 24 bits
+  // of the true 64-bit hash — digest only, not collision-sensitive).
+  const h = fnv1a64(s);
+  return (h & 0xffffffn).toString(16).padStart(6, '0').slice(0, 6);
 }
 
 // ── SmartCrusher main entry ──────────────────────────────────────────────────
@@ -260,7 +293,13 @@ export function smartCrush(content: string, opts: SmartCrushOptions = {}): Smart
 
   // ── TOON lossless render (applies to dict-array only) ─────────────────────
   if (shape === 'dict-array' && losslessOnly) {
-    const toon = toonRender(arr as Record<string, unknown>[]);
+    // M29: nested values / ragged key-sets make TOON lossy — passthrough
+    // instead of falling through to the lossy row-drop path below.
+    const rows = arr as Record<string, unknown>[];
+    if (!isToonRenderable(rows)) {
+      return { output: content, sentinel: null, applied: false, originalCount, keptCount: originalCount, droppedCount: 0, shape };
+    }
+    const toon = toonRender(rows);
     const originalTokens = countTokensEstimate(content);
     const toonTokens = countTokensEstimate(toon);
     if (toonTokens < originalTokens) {
@@ -292,7 +331,9 @@ export function smartCrush(content: string, opts: SmartCrushOptions = {}): Smart
   // by running detectOffLimits on the row's string representation directly.
   // Also do a direct backtick/placeholder scan since JSON-escaped fences (\\n)
   // don't match the line-anchored regex.
-  for (const idx of [...arr.keys()]) {
+  // N31: iterate the key iterator directly — spreading it into an array
+  // materializes a throwaway index list on every compression call.
+  for (const idx of arr.keys()) {
     if (!indices.includes(idx)) {
       const rowStr = JSON.stringify(arr[idx]);
       // Direct check for triple-backtick fences (may be JSON-escaped as \\n)
@@ -310,9 +351,10 @@ export function smartCrush(content: string, opts: SmartCrushOptions = {}): Smart
     }
   }
 
-  // For dict-array, use TOON render on the subset; otherwise JSON.stringify
+  // For dict-array, use TOON render on the subset when the subset is
+  // renderable (M29); otherwise JSON.stringify — never a lossy TOON render.
   let output: string;
-  if (shape === 'dict-array') {
+  if (shape === 'dict-array' && isToonRenderable(subset as Record<string, unknown>[])) {
     output = toonRender(subset as Record<string, unknown>[]);
   } else {
     output = JSON.stringify(subset);

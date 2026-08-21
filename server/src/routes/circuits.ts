@@ -16,7 +16,15 @@ circuitsRouter.get('/', (_req: Request, res: Response) => {
 circuitsRouter.delete('/', (req: Request, res: Response) => {
   const { platform, model, keyId } = req.query;
   if (platform && model && keyId) {
-    resetCircuit(platform as string, model as string, parseInt(keyId as string, 10));
+    // L11: strict integer guard. parseInt('12abc') === 12 and parseInt('abc')
+    // === NaN both used to reach resetCircuit, where a NaN keyId matched
+    // nothing — a silent no-op reset that still reported { ok: true }.
+    const keyNum = Number(keyId);
+    if (String(keyId).trim() === '' || !Number.isInteger(keyNum)) {
+      res.status(400).json({ error: { message: 'keyId must be an integer' } });
+      return;
+    }
+    resetCircuit(platform as string, model as string, keyNum);
   } else {
     resetAllCircuits();
   }

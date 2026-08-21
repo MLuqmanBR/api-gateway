@@ -8,42 +8,50 @@
 // not sensitive) under a PBKDF2-SHA256 derivation of their passphrase and
 // keep the rest of the envelope in the clear.
 //
-// Parameters: 310,000 iterations per OWASP 2023 password storage guidance.
-// Salt is 16 bytes, IV is 12 bytes (AES-GCM), auth tag is 16 bytes.
+// Parameters: 600,000 iterations per current OWASP password storage guidance
+// for PBKDF2-HMAC-SHA256 (bumped from the 2023 figure of 310,000 — L31).
+// The `kdf` identifier encodes the iteration count so envelopes are
+// self-describing: new exports carry 'pbkdf2-sha256-600000', while legacy
+// 'pbkdf2-sha256-310000' blobs still decrypt via the version switch in
+// decryptKeysWithPassphrase. Salt is 16 bytes, IV is 12 bytes (AES-GCM),
+// auth tag is 16 bytes.
 import crypto from 'crypto';
 
-const PBKDF2_ITERATIONS = 310_000;
+const PBKDF2_ITERATIONS = 600_000;
+const LEGACY_PBKDF2_ITERATIONS = 310_000;
+export const KDF_ID = 'pbkdf2-sha256-600000' as const;
+export const LEGACY_KDF_ID = 'pbkdf2-sha256-310000' as const;
 const PBKDF2_KEY_LEN = 32; // AES-256
 const PBKDF2_DIGEST = 'sha256';
 const SALT_LEN = 16;
 const IV_LEN = 12;
 
 export interface KeysCipher {
-  kdf: 'pbkdf2-sha256-310000';
+  kdf: typeof KDF_ID | typeof LEGACY_KDF_ID;
   salt: string;
   iv: string;
   authTag: string;
   ciphertext: string;
 }
 
-function deriveKey(passphrase: string, salt: Buffer): Buffer {
+function deriveKey(passphrase: string, salt: Buffer, iterations: number): Buffer {
   return crypto.pbkdf2Sync(
     Buffer.from(passphrase, 'utf8'),
     salt,
-    PBKDF2_ITERATIONS,
+    iterations,
     PBKDF2_KEY_LEN,
     PBKDF2_DIGEST,
   );
 }
 
 /**
- * Encrypt `plaintextKeys` (a JSON-serialisable array of `{ platform, key }`
- * — small, ≤ 64 KB on disk even with dozens of platforms) under a
- * passphrase. The result is self-describing: the consumer only needs the
- * passphrase to recover the keys.
+ * Encrypt `plaintextKeys` (a JSON-serialisable array of
+ * `{ platform, label?, key }` — small, ≤ 64 KB on disk even with dozens of
+ * platforms) under a passphrase. The result is self-describing: the consumer
+ * only needs the passphrase to recover the keys.
  */
 export function encryptKeysWithPassphrase(
-  plaintextKeys: Array<{ platform: string; key: string }>,
+  plaintextKeys: Array<{ platform: string; label?: string; key: string }>,
   passphrase: string,
 ): KeysCipher {
   if (!passphrase || passphrase.length === 0) {
@@ -51,13 +59,13 @@ export function encryptKeysWithPassphrase(
   }
   const salt = crypto.randomBytes(SALT_LEN);
   const iv = crypto.randomBytes(IV_LEN);
-  const key = deriveKey(passphrase, salt);
+  const key = deriveKey(passphrase, salt, PBKDF2_ITERATIONS);
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
   const json = Buffer.from(JSON.stringify(plaintextKeys), 'utf8');
   const ciphertext = Buffer.concat([cipher.update(json), cipher.final()]);
   const authTag = cipher.getAuthTag();
   return {
-    kdf: 'pbkdf2-sha256-310000',
+    kdf: KDF_ID,
     salt: salt.toString('hex'),
     iv: iv.toString('hex'),
     authTag: authTag.toString('hex'),
@@ -74,8 +82,16 @@ export function encryptKeysWithPassphrase(
 export function decryptKeysWithPassphrase(
   blob: KeysCipher,
   passphrase: string,
-): Array<{ platform: string; key: string }> {
-  if (blob.kdf !== 'pbkdf2-sha256-310000') {
+): Array<{ platform: string; label?: string; key: string }> {
+  // Version switch: the kdf string encodes the iteration count, so each
+  // supported identifier maps to its exact derivation parameters. Legacy
+  // (310k) envelopes stay loadable; anything else is rejected loudly.
+  const iterations = blob.kdf === KDF_ID
+    ? PBKDF2_ITERATIONS
+    : blob.kdf === LEGACY_KDF_ID
+      ? LEGACY_PBKDF2_ITERATIONS
+      : undefined;
+  if (iterations === undefined) {
     throw new Error(`Unsupported KDF: ${blob.kdf}`);
   }
   if (!passphrase) {
@@ -85,11 +101,11 @@ export function decryptKeysWithPassphrase(
   const iv = Buffer.from(blob.iv, 'hex');
   const authTag = Buffer.from(blob.authTag, 'hex');
   const ciphertext = Buffer.from(blob.ciphertext, 'base64');
-  const key = deriveKey(passphrase, salt);
+  const key = deriveKey(passphrase, salt, iterations);
   const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(authTag);
   const json = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
-  const parsed = JSON.parse(json) as Array<{ platform: string; key: string }>;
+  const parsed = JSON.parse(json) as Array<{ platform: string; label?: string; key: string }>;
   if (!Array.isArray(parsed)) {
     throw new Error('decrypted payload is not an array');
   }

@@ -217,7 +217,13 @@ export abstract class BaseProvider {
     // immediately rather than waiting for the inactivity timer (which is
     // 300s) or the provider's own EOF. We attach once and reject the pending
     // read via the race below. (#292)
-    if (abortSignal?.aborted) throw new RequestAbortError();
+    if (abortSignal?.aborted) {
+      // N11: the reader already exists at this point — cancel it before the
+      // early throw (the finally below is not reached from here) so the
+      // upstream connection is released instead of left open.
+      reader.cancel().catch(() => { /* upstream already gone */ });
+      throw new RequestAbortError();
+    }
     const { abortPromise, isAborted, cleanup } = createAbortRace(abortSignal);
 
     try {

@@ -118,12 +118,18 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
   try {
     // Internal sub-request to the existing /v1/chat/completions handler.
     // Same Express app, localhost — reuses all the router/retry/budget/cache
-    // machinery without duplicating it.
-    const subRes = await fetch(`http://127.0.0.1:${getPort(req)}/v1/chat/completions`, {
+    // machinery without duplicating it. The target port comes from the
+    // server's OWN bound address (set at wiring time), never from the
+    // client-controlled Host header.
+    const subRes = await fetch(`http://127.0.0.1:${getSelfPort()}/v1/chat/completions`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
+        // M05: exempt the loopback sub-request from the /v1 rate limiter —
+        // the outer /v1/messages request already consumed a slot for the
+        // client IP; the sub-request would otherwise burn a second one.
+        'X-API-Gateway-Internal': '1',
         ...(req.get('X-Session-Id') ? { 'X-Session-Id': req.get('X-Session-Id')! } : {}),
       },
       body: JSON.stringify(openaiBody),
@@ -133,12 +139,16 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
     if (!subRes.ok) {
       // Forward the error, translated to Anthropic shape
       const errBody = await subRes.json().catch(() => ({})) as { error?: { message?: string } };
+      // L09: budget exhaustion (402 from the proxy) is a permanent condition,
+      // not a transient overload — mapping it to Anthropic's 529
+      // `overloaded_error` made clients retry forever against a limit that
+      // will never lift. Surface it as an invalid_request_error-shaped payload
+      // at the original 402 status so callers treat it as non-retryable.
       const errType = subRes.status === 401 ? 'authentication_error'
-        : subRes.status === 400 ? 'invalid_request_error'
-        : subRes.status === 402 ? 'overloaded_error'
+        : subRes.status === 400 || subRes.status === 402 ? 'invalid_request_error'
         : subRes.status === 429 ? 'rate_limit_error'
         : 'api_error';
-      res.status(subRes.status === 402 ? 529 : subRes.status).json({
+      res.status(subRes.status).json({
         type: 'error',
         error: {
           type: errType,
@@ -155,6 +165,13 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
       res.flushHeaders();
 
       // message_start
+      // M06: estimate input tokens from the translated messages so callers
+      // see a non-zero input count in usage (the old hardcoded 0 made
+      // Anthropic-compatible clients that read usage.input_tokens report
+      // 0 for every request).
+      const estimatedInputTokens = Math.max(1, Math.ceil(
+        JSON.stringify(translated.messages).length / 4,
+      ));
       res.write(`event: message_start\ndata: ${JSON.stringify({
         type: 'message_start',
         message: {
@@ -165,7 +182,7 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
           content: [],
           stop_reason: null,
           stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
+          usage: { input_tokens: estimatedInputTokens, output_tokens: 0 },
         },
       })}\n\n`);
 
@@ -177,10 +194,25 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
       })}\n\n`);
 
       let blockIndex = 0;
+      // M06: text deltas always belong to this block index; it stays 0
+      // until a tool_use block opens, then a new text block may open later.
+      let textBlockIndex = 0;
       let finishReason: string | undefined;
       let outputTokens = 0;
 
-      const reader = subRes.body!.getReader();
+      // N10: fetch resolves with a null body on 204/empty upstream replies —
+      // message_start is already on the wire, so fail as an SSE error event
+      // instead of dereferencing null.
+      if (!subRes.body) {
+        res.write(`event: error\ndata: ${JSON.stringify({
+          type: 'error',
+          error: { type: 'api_error', message: 'Upstream returned no response body' },
+        })}\n\n`);
+        res.end();
+        detachAbortWatcher();
+        return;
+      }
+      const reader = subRes.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
 
@@ -200,9 +232,14 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
             const chunk = JSON.parse(data);
             const delta = chunk.choices?.[0]?.delta;
             if (delta?.content) {
+              // M06: text always belongs to the current text block (index 0
+              // or, if a tool call already ended it, a new text block).
+              // Track whether the block-0 text block is still open so we
+              // never emit a text delta at index 0 after a tool_use block
+              // opened at a higher index.
               res.write(`event: content_block_delta\ndata: ${JSON.stringify({
                 type: 'content_block_delta',
-                index: 0,
+                index: textBlockIndex,
                 delta: { type: 'text_delta', text: delta.content },
               })}\n\n`);
             }
@@ -279,6 +316,10 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
       const anthropicResponse = chatCompletionToAnthropic(openaiResponse);
       res.json(anthropicResponse);
     }
+    // M03: response completed normally — detach the abort watcher on the
+    // success path as well (previously only the catch paths detached, so a
+    // successful request leaked the `close` listener until process exit).
+    detachAbortWatcher();
   } catch (err: any) {
     if (err.name === 'AbortError' || abortSignal.aborted) {
       // Client disconnect
@@ -294,9 +335,17 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
   }
 });
 
-/** Extract the listening port from the incoming request. */
-function getPort(req: Request): number {
-  const host = req.get('host') ?? '';
-  const portMatch = host.match(/:(\d+)$/);
-  return portMatch ? parseInt(portMatch[1], 10) : 3001;
+// The bound HTTP server, injected at wiring time (index.ts) — the internal
+// loopback sub-request must target the server's OWN address, never a port
+// parsed from the attacker-controlled Host header (SSRF-adjacent redirect
+// of an authenticated internal call).
+let selfHttpServer: import('http').Server | null = null;
+
+export function setMessagesHttpServer(server: import('http').Server): void {
+  selfHttpServer = server;
+}
+
+function getSelfPort(): number {
+  const addr = selfHttpServer?.address();
+  return addr && typeof addr === 'object' ? addr.port : Number(process.env.PORT ?? 3001);
 }

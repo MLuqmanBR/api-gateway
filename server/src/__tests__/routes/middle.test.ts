@@ -94,7 +94,7 @@ describe('B2-7: /api/middle routes', () => {
         label: 'Test Key',
       });
       expect(status).toBe(200);
-      expect((body as any).id).toMatch(/^s_[0-9a-f]{6}$/);
+      expect((body as any).id).toMatch(/^s_[0-9a-f]{12}$/);
       expect((body as any).ok).toBe(true);
     });
 

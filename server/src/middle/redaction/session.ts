@@ -11,6 +11,11 @@ import type { ChatMessage } from '@api-gateway/shared/types.js';
 import { findKnownSpans, applySpans, verifyRedaction, unredact, type KnownSecret } from './spans.js';
 import { getActiveSecretsForRedaction } from './store.js';
 
+// L29: the verifyRedaction warning says "Log once" — enforce it. The span
+// engine is deterministic, so one occurrence per process surfaces the bug
+// without spamming the log on every redacted request.
+let verifyFailureWarned = false;
+
 export class RedactionSession {
   private readonly map = new Map<string, string>(); // placeholder → value
   private secrets: KnownSecret[];
@@ -71,7 +76,10 @@ export class RedactionSession {
     if (!verifyRedaction(text, out, applied)) {
       // Should be impossible — the span engine is deterministic. Fall back
       // to the original string to preserve correctness. Log once.
-      console.warn('[Middle] Redaction verifyRedaction failed — using original string. This is a bug.');
+      if (!verifyFailureWarned) {
+        verifyFailureWarned = true;
+        console.warn('[Middle] Redaction verifyRedaction failed — using original string. This is a bug.');
+      }
       return text;
     }
     for (const span of applied) {

@@ -2,7 +2,7 @@
 // Adapted from caveman-compress (Julius Brussee, MIT) — concept port, not code-copy.
 // Shipped now as tested infra; meaningful for future text-compressor rows beyond SmartCrusher.
 
-const MAX_FILE_BYTES = 524_288; // 500KB — refuse to compress single content strings above this.
+const MAX_CONTENT_BYTES = 512 * 1024; // 512 KiB — refuse to compress single content strings above this.
 
 // ── Extension whitelist ────────────────────────────────────────────────────
 const COMPRESSIBLE_EXTENSIONS = new Set(['md', 'txt', 'markdown', 'rst', 'typ', 'tex']);
@@ -17,7 +17,9 @@ const NON_COMPRESSIBLE_CONTENT_TYPES = new Set([
 /** Determine whether content should be compressed based on extension/content-type. */
 export function shouldCompress(contentText: string, contentType: string = '', extension: string = ''): boolean {
   // Max-file gate
-  if (contentText.length > MAX_FILE_BYTES) return false;
+  // M35: measure BYTES, not UTF-16 code units — `.length` undercounts
+  // multi-byte content (CJK, emoji), letting oversized payloads through.
+  if (Buffer.byteLength(contentText, 'utf8') > MAX_CONTENT_BYTES) return false;
   // Extension whitelist
   const ext = extension.replace(/^\./, '').toLowerCase();
   if (ext && COMPRESSIBLE_EXTENSIONS.has(ext)) return true;
@@ -46,8 +48,9 @@ export function isJsonContent(text: string): boolean {
 export function isYamlContent(text: string): boolean {
   const lines = text.split('\n').filter(l => l.trim() && !l.trim().startsWith('#'));
   if (lines.length === 0) return false;
-  // YAML: key: value pattern, or list items (- )
-  const yamlLinePattern = /^(\s*[\w-]+:\s|---\s*$|\s*-\s)/;
+  // YAML: key: value pattern (space after the colon optional — compact
+  // `key:value` is valid YAML), document separator, or list items (- )
+  const yamlLinePattern = /^(\s*[\w-]+:\s?|---\s*$|\s*-\s)/;
   let yamlLines = 0;
   for (const line of lines) {
     if (yamlLinePattern.test(line)) yamlLines++;

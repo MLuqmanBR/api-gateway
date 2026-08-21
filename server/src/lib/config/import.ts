@@ -39,14 +39,6 @@ import { normalizeOpenAiBaseUrl } from '../base-url.js';
 import { configEnvelopeSchema, configImportOptionsSchema } from './schema.js';
 import { decryptKeysWithPassphrase } from './passphrase-crypto.js';
 
-// Sentinel substring used by the per-row safety net inside applyApiKeys
-// when a row's source ciphertext doesn't decrypt under the destination's
-// ENCRYPTION_KEY. The post-import banner in runImport and the preview
-// probe both key off this single phrase so the UI banner, the error
-// details panel, and the test expectations stay in lockstep.
-const KEY_MISMATCH_ERROR_RE =
-  /row is encrypted under a different ENCRYPTION_KEY than this gateway/;
-
 /**
  * Cheap, side-effect-free compatibility check between an envelope's
  * api_keys section and the destination gateway's `ENCRYPTION_KEY`. Used
@@ -182,6 +174,19 @@ function applySettings(db: DatabasePort, settings: ConfigSettings, diff: Section
       diff.skipped++;
     }
   }
+  if (settings.embeddingsDefaultFamily !== undefined) {
+    // L30: settings-section counterpart of the embeddings section's
+    // defaultFamily. When both are present the embeddings section (applied
+    // later) wins — same setting, last write is the section that also
+    // carries the family rows.
+    const current = getSetting('embeddings_default_family');
+    if (current !== settings.embeddingsDefaultFamily) {
+      setSetting('embeddings_default_family', settings.embeddingsDefaultFamily);
+      diff.updated++;
+    } else {
+      diff.skipped++;
+    }
+  }
 }
 
 // ── Custom providers ──────────────────────────────────────────────────────
@@ -202,7 +207,12 @@ function applyCustomProviders(
     // rows in the destination. Order matters: fallback_config first
     // (REFERENCES models), then models, then api_keys, then
     // custom_providers.
-    const slugs = list.map((cp) => cp.slug);
+    // M32: true section wipe — unlink dependents of ALL wiped providers
+    // (destination slugs ∪ envelope slugs). Previously only envelope slugs
+    // were unlinked, so destination-only providers were deleted here while
+    // their models/api_keys/fallback_config rows survived as orphans.
+    const destSlugs = (db.prepare('SELECT slug FROM custom_providers').all() as Array<{ slug: string }>).map((r) => r.slug);
+    const slugs = Array.from(new Set([...destSlugs, ...list.map((cp) => cp.slug)]));
     if (slugs.length > 0) {
       // Build a parameterized IN clause; never interpolate user input.
       const placeholders = slugs.map(() => '?').join(',');
@@ -234,12 +244,11 @@ function applyCustomProviders(
         if (mode === 'skip-existing') { diff.skipped++; continue; }
         const nextArchived = cp.archived ? 1 : 0;
         const nextKeyless = cp.keyless ? 1 : 0;
-        const sameAsRow = (a: number | string | null, b: number | string | null): boolean => {
-          if (a === b) return true;
-          if (a == null && b == null) return true;
-          if (a == null || b == null) return false;
-          return a === b;
-        };
+        const sameAsRow = (a: number | string | null, b: number | string | null): boolean =>
+          // Nullish values match each other (SQLite NULL columns); L47:
+          // everything else compares directly — the old three-branch form
+          // collapsed to this.
+          (a ?? null) === (b ?? null);
         const identical =
           existing.display_name === cp.displayName &&
         existing.base_url === normUrl(cp) &&
@@ -315,11 +324,15 @@ function applyModels(
   const diff = summary.models ?? emptyDiff();
   if (mode === 'replace') {
     // The export is the authoritative source for the model catalog. Wipe
-    // the entire table (and its dependent fallback_config rows) before
-    // re-inserting. The fallback_chain section is wiped+rebuilt by its
-    // own apply* function; if the operator didn't include it in this
-    // import, the chain will be empty (which is the documented
-    // behavior of replace mode).
+    // the ENTIRE table (and its dependent fallback_config rows) before
+    // re-inserting. M32, documented explicitly: this is a TRUE section
+    // wipe — an envelope carrying a partial models list (e.g. 1 model)
+    // leaves exactly that model in the destination; every other model,
+    // INCLUDING the built-in catalog, is GONE. Operators who want to keep
+    // built-ins must export them or use 'overwrite' mode. The
+    // fallback_chain section is wiped+rebuilt by its own apply* function;
+    // if the operator didn't include it in this import, the chain will be
+    // empty (which is the documented behavior of replace mode).
     db.prepare('DELETE FROM fallback_config').run();
     db.prepare('DELETE FROM models').run();
   }
@@ -448,9 +461,29 @@ function applyApiKeys(
   db: DatabasePort,
   list: ConfigApiKey[],
   keysByPlatform: Map<string, string> | null,
+  legacyKeysByPlatform: Map<string, string> | null,
   mode: ConfigImportOptions['mode'],
   summary: Record<string, SectionDiff>,
-): void {
+): Array<{ platform: string; label: string; message: string }> {
+  // M48: rows rejected for an ENCRYPTION_KEY mismatch are ALSO returned
+  // structured, so the summary builder never re-parses human strings.
+  const keyMismatchRows: Array<{ platform: string; label: string; message: string }> = [];
+  // L44: duplicate (platform,label) rows used to collapse silently — the
+  // destination lookup matched one row (LIMIT 1), so which duplicate's
+  // enabled/base_url won depended on row order. Reject them up-front with a
+  // clear error instead of guessing (throws roll the whole import back).
+  const seenKeyRows = new Set<string>();
+  for (let i = 0; i < list.length; i++) {
+    const rowId = `${list[i].platform}\u0000${list[i].label}`;
+    if (seenKeyRows.has(rowId)) {
+      throw new ConfigImportError(
+        `api_keys section contains duplicate (platform, label) rows for '${list[i].platform}' / '${list[i].label}' ` +
+        `(envelope entries ${i + 1} and earlier). Give each key a distinct label and re-export.`,
+        400,
+      );
+    }
+    seenKeyRows.add(rowId);
+  }
   const diff = summary.api_keys ?? emptyDiff();
   const fmtByPlatform = new Map<string, string>();
   const fmtRow = db.prepare('SELECT slug, api_format FROM custom_providers').all() as Array<{ slug: string; api_format: string }>;
@@ -460,21 +493,23 @@ function applyApiKeys(
     if ((fmtByPlatform.get(platform) ?? 'openai') === 'anthropic') return url.trim().replace(/\/+$/, '');
     return normalizeOpenAiBaseUrl(url);
   };
-  const inReplace = mode === 'replace';
+  if (mode === 'replace') {
+    // M32: true section wipe — the export is authoritative for api_keys.
+    // Previously only envelope-matching (platform,label) rows were deleted,
+    // so destination-only keys silently survived a "replace". Wipe the
+    // whole table up front; every envelope row then takes the fresh-insert
+    // path below (resets status, created_at, last_checked_at — all runtime
+    // state the export doesn't carry). The export's key material is
+    // authoritative and the operator is explicitly choosing destructive
+    // mode.
+    db.prepare('DELETE FROM api_keys').run();
+  }
   for (const k of list) {
     try {
       const existing = db.prepare(
         'SELECT id, enabled, base_url FROM api_keys WHERE platform = ? AND label = ? LIMIT 1',
       ).get(k.platform, k.label) as { id: number; enabled: number; base_url: string | null } | undefined;
-      if (existing && inReplace) {
-        // In replace mode, drop the existing row so the re-insert starts
-        // fresh (resets status, created_at, last_checked_at — all runtime
-        // state the export doesn't carry). We also don't try to preserve
-        // the old ciphertext: the export's key material is authoritative
-        // and the operator is explicitly choosing destructive mode.
-        // Fall through to the insert path below.
-        db.prepare('DELETE FROM api_keys WHERE id = ?').run(existing.id);
-      } else if (existing) {
+      if (existing) {
         if (mode === 'skip-existing') { diff.skipped++; continue; }
         if (k.enabled === undefined) { diff.skipped++; continue; }
         // The schema only carries enabled + base_url on the api_keys
@@ -492,22 +527,28 @@ function applyApiKeys(
         diff.updated++;
         continue;
       }
-      // Fall through to insert (no existing row, OR replace-mode wipe just removed it).
+      // Fall through to insert (no existing row; in replace mode the
+      // pre-wipe above means every envelope row lands here).
       {
         let encryptedKey: string;
         let iv: string;
         let authTag: string;
-        if (keysByPlatform?.has(k.platform)) {
+        // Composite `platform\0label` lookup first (each key of a platform
+        // restores its OWN value — C14); the platform-only legacy map only
+        // serves envelopes exported before labels were carried in the blob.
+        const blobKey = keysByPlatform?.get(`${k.platform}\u0000${k.label}`);
+        const blobValue = blobKey ?? legacyKeysByPlatform?.get(k.platform);
+        if (blobValue !== undefined) {
           // The envelope carried a `keysCipher` blob that we successfully
           // decrypted — the operator opted into passphrase-protected
-          // transport. The plaintext in `keysByPlatform` is the canonical,
-          // transport-independent value for every row at that platform; the
-          // `encryptedKey / iv / authTag` fields on this row were produced
-          // by the source machine's ENCRYPTION_KEY and will silently rot on
-          // the destination unless the keys happen to match. Always prefer
-          // the decrypted plaintext here so cross-machine restores work as
-          // long as the operator passed the correct passphrase.
-          const enc = encrypt(keysByPlatform.get(k.platform) as string);
+          // transport. The plaintext for THIS row is the canonical,
+          // transport-independent value; the `encryptedKey / iv / authTag`
+          // fields on this row were produced by the source machine's
+          // ENCRYPTION_KEY and will silently rot on the destination unless
+          // the keys happen to match. Always prefer the decrypted plaintext
+          // here so cross-machine restores work as long as the operator
+          // passed the correct passphrase.
+          const enc = encrypt(blobValue);
           encryptedKey = enc.encrypted;
           iv = enc.iv;
           authTag = enc.authTag;
@@ -526,11 +567,11 @@ function applyApiKeys(
           try {
             decrypt(k.encryptedKey, k.iv, k.authTag);
           } catch {
-            diff.errors.push(
-              `${k.platform}/${k.label}: row is encrypted under a different `
+            const message = `${k.platform}/${k.label}: row is encrypted under a different `
               + `ENCRYPTION_KEY than this gateway. Re-export with a passphrase `
-              + `and re-import so the keys travel as a re-encrypted blob.`,
-            );
+              + `and re-import so the keys travel as a re-encrypted blob.`;
+            diff.errors.push(message);
+            keyMismatchRows.push({ platform: k.platform, label: k.label, message });
             continue;
           }
           encryptedKey = k.encryptedKey;
@@ -551,6 +592,7 @@ function applyApiKeys(
     }
   }
   summary.api_keys = diff;
+  return keyMismatchRows;
 }
 
 // ── Fallback chain ────────────────────────────────────────────────────────
@@ -777,6 +819,32 @@ function quirkTargetsEqual(
   return true;
 }
 
+// L45: per-version migration table — each entry upgrades an envelope FROM
+// the keyed version TO key+1, and importing walks forward until it reaches
+// CONFIG_SCHEMA_VERSION. Only `current` and `current-1` are supported
+// explicitly; anything older is rejected with an upgrade hint. v1 is the
+// first schema version so the table is empty today — when
+// CONFIG_SCHEMA_VERSION bumps to 2, add `[1]: (env) => ...` here.
+const SCHEMA_MIGRATIONS: Record<number, (env: ConfigEnvelope) => ConfigEnvelope> = {};
+
+const OLDEST_IMPORTABLE_SCHEMA_VERSION = Math.max(1, CONFIG_SCHEMA_VERSION - 1);
+
+function migrateEnvelope(env: ConfigEnvelope): ConfigEnvelope {
+  let current = env;
+  while (current.schemaVersion < CONFIG_SCHEMA_VERSION) {
+    const step = SCHEMA_MIGRATIONS[current.schemaVersion];
+    if (current.schemaVersion < OLDEST_IMPORTABLE_SCHEMA_VERSION || !step) {
+      throw new ConfigImportError(
+        `Envelope schemaVersion ${current.schemaVersion} is too old — this server imports schemaVersion ` +
+        `${OLDEST_IMPORTABLE_SCHEMA_VERSION} through ${CONFIG_SCHEMA_VERSION}. Re-export the config with a newer gateway.`,
+        400,
+      );
+    }
+    current = { ...step(current), schemaVersion: current.schemaVersion + 1 };
+  }
+  return current;
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────
 
 export interface RunImportOptions {
@@ -797,13 +865,15 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
       400,
     );
   }
-  const env = parsedEnvelope.data as ConfigEnvelope;
-  if (env.schemaVersion > CONFIG_SCHEMA_VERSION) {
+  // L45: newer versions are rejected outright; older ones go through the
+  // explicit migration walk above (current and current-1 only).
+  if ((parsedEnvelope.data as ConfigEnvelope).schemaVersion > CONFIG_SCHEMA_VERSION) {
     throw new ConfigImportError(
-      `Envelope schemaVersion ${env.schemaVersion} is newer than this server supports (${CONFIG_SCHEMA_VERSION}). Upgrade the gateway to import this file.`,
+      `Envelope schemaVersion ${(parsedEnvelope.data as ConfigEnvelope).schemaVersion} is newer than this server supports (${CONFIG_SCHEMA_VERSION}). Upgrade the gateway to import this file.`,
       400,
     );
   }
+  const env = migrateEnvelope(parsedEnvelope.data as ConfigEnvelope);
   const warnings: string[] = [];
   if (env.generator !== CONFIG_GENERATOR) {
     // Foreign file: not fatal (we accept third-party envelopes — forward-compat),
@@ -829,7 +899,12 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
   // Decrypt the keysCipher blob up-front (if any) — outside the
   // transaction because PBKDF2 is slow and we want any wrong-passphrase
   // error surfaced before we start mutating.
+  // The blob is keyed `platform\0label` so multiple keys per platform each
+  // restore their own value (C14). Envelopes from older exports carry no
+  // label on cipher items — those fall back to a platform-only map, which
+  // preserves the historical single-key-per-platform behavior.
   let keysByPlatform: Map<string, string> | null = null;
+  let legacyKeysByPlatform: Map<string, string> | null = null;
   if (env.keysCipher) {
     if (!eff.passphrase) {
       throw new ConfigImportError(
@@ -837,7 +912,7 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
         400,
       );
     }
-    let decrypted: Array<{ platform: string; key: string }>;
+    let decrypted: Array<{ platform: string; label?: string; key: string }>;
     try {
       decrypted = decryptKeysWithPassphrase(env.keysCipher, eff.passphrase);
     } catch {
@@ -846,12 +921,24 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
         401,
       );
     }
-    keysByPlatform = new Map(decrypted.map((d) => [d.platform, d.key]));
+    keysByPlatform = new Map();
+    for (const d of decrypted) {
+      if (typeof d.label === 'string') {
+        keysByPlatform.set(`${d.platform}\u0000${d.label}`, d.key);
+      } else {
+        legacyKeysByPlatform ??= new Map();
+        legacyKeysByPlatform.set(d.platform, d.key);
+      }
+    }
+    if (keysByPlatform.size === 0) keysByPlatform = null;
   }
 
   const db = getDb();
   const summary: Record<string, SectionDiff> = {};
   const ids: ConfigImportSummary['ids'] = { models: [], customProviders: [] };
+  // M48: structured ENCRYPTION_KEY-mismatch rows, collected by applyApiKeys
+  // inside the transaction and consumed by the keyCompatibility summary.
+  let apiKeysMismatchRows: Array<{ platform: string; label: string; message: string }> = [];
 
   // Apply everything inside a single transaction. The savepoint pattern
   // (SAVEPOINT → work → RELEASE on success, ROLLBACK on dryRun) keeps
@@ -883,8 +970,9 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
     }
 
     if (sectionAllow.has('api_keys') && env.sections.apiKeys) {
-      applyApiKeys(db, env.sections.apiKeys, keysByPlatform, eff.mode, summary);
+      apiKeysMismatchRows = applyApiKeys(db, env.sections.apiKeys, keysByPlatform, legacyKeysByPlatform, eff.mode, summary);
     }
+
 
     if (sectionAllow.has('embeddings') && env.sections.embeddings) {
       applyEmbeddings(
@@ -925,8 +1013,11 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
   // single signal the UI banner needs to render a clear remediation
   // without forcing the operator to open the error details panel.
   const apiKeysDiff = summary.api_keys;
-  const mismatchErrors = apiKeysDiff?.errors.filter((e) => KEY_MISMATCH_ERROR_RE.test(e)) ?? [];
-  const keyCompatibility: ConfigImportSummary['keyCompatibility'] = apiKeysDiff && (apiKeysDiff.added + apiKeysDiff.updated + apiKeysDiff.skipped + mismatchErrors.length) > 0
+  // M48: use the STRUCTURED mismatch rows threaded out of applyApiKeys —
+  // no regex re-parsing of human-formatted error strings (labels may
+  // contain ':' and platforms '/').
+  const keyMismatchRows = apiKeysMismatchRows;
+  const keyCompatibility: ConfigImportSummary['keyCompatibility'] = apiKeysDiff && (apiKeysDiff.added + apiKeysDiff.updated + apiKeysDiff.skipped + keyMismatchRows.length) > 0
     ? {
         // Status reflects the most pessimistic outcome observed. A
         // mismatch after a probe says "mismatch"; if any rows came in
@@ -935,18 +1026,18 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
         // recover the failing ones.
         status: ((): ConfigKeyCompatibility => {
           if (env.keysCipher) return 'encrypted-with-passphrase';
-          if (mismatchErrors.length > 0) return 'mismatch';
+          if (keyMismatchRows.length > 0) return 'mismatch';
           // No mismatch errors — re-derive the verdict from a cheap
           // probe so the banner explains why the import worked even
           // when the operator didn't supply a passphrase.
           return probeKeyCompatibility(env);
         })(),
         totalRows: env.sections.apiKeys?.length ?? 0,
-        skippedDueToMismatch: mismatchErrors.length,
-        sampleFailure: mismatchErrors[0] ? {
-          platform: (mismatchErrors[0].match(/^([^/]+)\/[^:]+:/) ?? [, ''])[1],
-          label: (mismatchErrors[0].match(/^[^/]+\/([^:]+):/) ?? [, ''])[1],
-          message: mismatchErrors[0],
+        skippedDueToMismatch: keyMismatchRows.length,
+        sampleFailure: keyMismatchRows[0] ? {
+          platform: keyMismatchRows[0].platform,
+          label: keyMismatchRows[0].label,
+          message: keyMismatchRows[0].message,
         } : undefined,
       }
     : undefined;

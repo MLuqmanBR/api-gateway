@@ -112,14 +112,18 @@ describe('Response cache service (F5)', () => {
     expect(getCacheStats().entries).toBe(0);
   });
 
-  it('getCacheStats reports entries and hits', () => {
+  it('getCacheStats reports entries and hits (L1 hit counters batched — L17)', () => {
     const key = computeCacheKey({ model: 'auto', messages: [{ role: 'user', content: 'stats' }], temperature: 0 });
     setCachedResponse(key, JSON.stringify({ id: 's' }));
-    getCachedResponse(key); // hit 1 (L2 + promote)
-    getCachedResponse(key); // hit 2 (L1)
-    const stats = getCacheStats();
-    expect(stats.entries).toBe(1);
-    expect(stats.hits).toBeGreaterThanOrEqual(2);
+    const before = getCacheStats().hits;
+    getCachedResponse(key); // L1 hit 1 — setCachedResponse already seeded L1
+    getCachedResponse(key); // L1 hit 2 — accrued in memory, not yet written
+    expect(getCacheStats().entries).toBe(1);
+    expect(getCacheStats().hits).toBe(before); // batched residue not flushed yet
+    // 14 more L1 hits reach HIT_FLUSH_EVERY(16): the pending batch flushes
+    // as one UPDATE.
+    for (let i = 0; i < 14; i++) getCachedResponse(key);
+    expect(getCacheStats().hits).toBe(before + 16);
   });
 
   it('isCacheEnabled defaults to true, opt-out via setting', () => {

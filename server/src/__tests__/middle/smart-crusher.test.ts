@@ -7,6 +7,7 @@ import {
   splitK,
   keepConstraints,
   toonRender,
+  isToonRenderable,
   type SmartCrushOptions,
 } from '../../middle/compression/techniques/smart-crusher.js';
 
@@ -32,7 +33,13 @@ describe('B1-2: detectShape', () => {
 
 // ── SimHash ─────────────────────────────────────────────────────────────────
 
-describe('B1-2: simHash', () => {
+describe('B1-2: simHash (true 64-bit — H13)', () => {
+  function hamming(a: bigint, b: bigint): number {
+    let x = BigInt.asUintN(64, a ^ b);
+    let d = 0;
+    while (x) { d += Number(x & 1n); x >>= 1n; }
+    return d;
+  }
   it('returns same hash for identical strings', () => {
     expect(simHash('hello world')).toBe(simHash('hello world'));
   });
@@ -42,11 +49,30 @@ describe('B1-2: simHash', () => {
   it('near-duplicate strings have similar hashes (low Hamming distance)', () => {
     const h1 = simHash('error: connection refused at host 1.2.3.4');
     const h2 = simHash('error: connection refused at host 1.2.3.5');
-    // Hamming distance should be small (≤ ~10 for near-duplicates)
-    let x = (h1 ^ h2) >>> 0;
-    let d = 0;
-    while (x) { d += x & 1; x >>>= 1; }
-    expect(d).toBeLessThan(15);
+    // One token differs — far below the ~32 expected for unrelated strings.
+    expect(hamming(h1, h2)).toBeLessThanOrEqual(24);
+  });
+  it('unrelated strings average ~32 bits apart — the hash discriminates', () => {
+    const pairs: Array<[string, string]> = [
+      ['alpha beta gamma delta epsilon', 'zebra yak xenon walnut quasar'],
+      ['the quick brown fox jumps', 'lazy dogs sleep under trees'],
+      ['http error five zero three', 'connection timeout after seconds'],
+      ['user requested data export', 'system performed nightly backup'],
+      ['model produced tokens quickly', 'router selected fastest provider'],
+      ['cache hit ratio improved today', 'memory pressure rose slightly'],
+    ];
+    const ds = pairs.map(([a, b]) => hamming(simHash(a), simHash(b)));
+    const avg = ds.reduce((x, y) => x + y, 0) / ds.length;
+    // The pre-H13 hash aliased upper bits onto lower ones — unrelated pairs
+    // collapsed toward ~16 effective bits. A correct 64-bit simhash centers
+    // on 32.
+    expect(avg).toBeGreaterThan(24);
+  });
+  it('uses the upper 32 bits of the hash space', () => {
+    // With the broken 32-bit arithmetic, bits 32-63 were always zero.
+    let acc = 0n;
+    for (let i = 0; i < 16; i++) acc |= simHash(`sample corpus text number ${i} with varied words`);
+    expect(acc > 0xffffffffn).toBe(true);
   });
 });
 
@@ -116,6 +142,66 @@ describe('B1-2: toonRender', () => {
   });
 });
 
+describe('M29: isToonRenderable + lossless guard', () => {
+  it('accepts uniform scalar rows', () => {
+    expect(isToonRenderable([{ a: 'x', b: 1 }, { a: 'y', b: 2 }])).toBe(true);
+  });
+  it('rejects nested object values', () => {
+    expect(isToonRenderable([{ a: { nested: true } }])).toBe(false);
+  });
+  it('rejects array values', () => {
+    expect(isToonRenderable([{ a: [1, 2] }])).toBe(false);
+  });
+  it('rejects null values', () => {
+    expect(isToonRenderable([{ a: null }])).toBe(false);
+  });
+  it('rejects ragged key-sets (extra key on later row)', () => {
+    expect(isToonRenderable([{ a: 1 }, { a: 1, b: 2 }])).toBe(false);
+  });
+  it('rejects reordered keys', () => {
+    expect(isToonRenderable([{ a: 1, b: 2 }, { b: 2, a: 1 }])).toBe(false);
+  });
+  it('rejects empty rows array', () => {
+    expect(isToonRenderable([])).toBe(false);
+  });
+
+  it('lossless path passes through non-renderable dict-array instead of rendering [object Object]', () => {
+    const content = JSON.stringify([
+      { id: 1, meta: { deep: true } },
+      { id: 2, meta: { deep: false } },
+    ]);
+    const result = smartCrush(content, { losslessOnly: true, emitSentinel: false });
+    expect(result.applied).toBe(false);
+    expect(result.output).toBe(content); // byte-identical passthrough
+    expect(result.output).not.toContain('[object Object]');
+  });
+
+  it('lossless path still renders renderable dict-array as TOON, never with a sentinel', () => {
+    const content = JSON.stringify(
+      Array.from({ length: 20 }, (_, i) => ({ id: i, name: `row-${i}` })),
+    );
+    const result = smartCrush(content, { losslessOnly: true, emitSentinel: true });
+    expect(result.applied).toBe(true);
+    expect(result.output).toContain('[20]{id,name}');
+    expect(result.sentinel).toBeNull();
+  });
+
+  it('lossy path falls back to JSON when the subset is not renderable', () => {
+    const arr = Array.from({ length: 50 }, (_, i) => ({
+      id: i,
+      message: `row ${i}`,
+      status: i % 10 === 0 ? 'error: failed' : 'ok',
+      ...(i === 7 ? { extra: { nested: 1 } } : {}),
+    }));
+    const content = JSON.stringify(arr);
+    const result = smartCrush(content, { losslessOnly: false, emitSentinel: true });
+    expect(result.applied).toBe(true);
+    expect(result.output).not.toContain('[object Object]');
+    expect(result.output).not.toContain('[50]{');
+    expect(result.sentinel).not.toBeNull();
+  });
+});
+
 // ── SmartCrusher main ────────────────────────────────────────────────────────
 
 describe('B1-2: smartCrush', () => {
@@ -148,20 +234,18 @@ describe('B1-2: smartCrush', () => {
     const content = JSON.stringify(arr);
     const result = smartCrush(content, { losslessOnly: false });
     // Near-duplicate rows should be heavily compressed
-    if (result.applied) {
-      expect(result.keptCount).toBeLessThan(result.originalCount);
-    }
+    expect(result.applied).toBe(true);
+    expect(result.keptCount).toBeLessThan(result.originalCount);
   });
 
   it('(c) order is preserved (output indices are a monotone subset)', () => {
     const arr = Array.from({ length: 30 }, (_, i) => ({ id: i, data: `item ${i}` }));
     const content = JSON.stringify(arr);
     const result = smartCrush(content, { losslessOnly: false });
-    if (result.applied && result.shape === 'dict-array') {
-      // The output (if not TOON) should be valid JSON with a subset of rows in order
-      // TOON-rendered output preserves order in CSV rows
-      expect(result.output).toContain('item 0');
-    }
+    expect(result.applied).toBe(true);
+    expect(result.shape).toBe('dict-array');
+    // TOON-rendered output preserves order in CSV rows
+    expect(result.output).toContain('item 0');
   });
 
   it('(d) min-savings floor falls back to passthrough when subset ≥ 85%', () => {
@@ -180,10 +264,9 @@ describe('B1-2: smartCrush', () => {
     const content = JSON.stringify(arr);
     const result = smartCrush(content, { losslessOnly: true });
     // TOON render should be smaller than the original JSON
-    if (result.applied) {
-      expect(result.droppedCount).toBe(0);
-      expect(result.output).toContain('[30]{');
-    }
+    expect(result.applied).toBe(true);
+    expect(result.droppedCount).toBe(0);
+    expect(result.output).toContain('[30]{');
   });
 
   it('(f) fenced code inside a tool output survives (off-limits protection)', () => {
@@ -195,10 +278,10 @@ describe('B1-2: smartCrush', () => {
     ];
     const content = JSON.stringify(arr);
     const result = smartCrush(content, { losslessOnly: false });
-    // If compression is applied, the fenced code must survive
-    if (result.applied) {
-      expect(result.output).toContain('print("hello")');
-    }
+    expect(result.applied).toBe(true);
+    // M29: ragged-key subsets are not TOON-renderable → JSON fallback, so the
+    // kept row survives byte-exact (fence intact, no CSV re-escaping).
+    expect(result.output).toContain(JSON.stringify(arr[0]));
   });
 
   it('(g) redaction placeholder embedded in a tool-output JSON row survives verbatim', () => {
@@ -226,26 +309,28 @@ describe('B1-2: smartCrush', () => {
     const arr = Array.from({ length: 30 }, (_, i) => ({ id: i, data: `item ${i}` }));
     const content = JSON.stringify(arr);
     const result = smartCrush(content, { losslessOnly: false, emitSentinel: true });
-    if (result.applied && result.droppedCount > 0) {
-      expect(result.sentinel).toMatch(/⟦C7:<<crushed \d+ rows, hash [0-9a-f]{6}>>⟧/);
-    }
+    expect(result.applied).toBe(true);
+    expect(result.droppedCount).toBeGreaterThan(0);
+    expect(result.sentinel).toMatch(/⟦C7:<<crushed \d+ rows, hash [0-9a-f]{6}>>⟧/);
   });
 
   it('does not emit sentinel when emitSentinel=false', () => {
     const arr = Array.from({ length: 30 }, (_, i) => ({ id: i, data: `item ${i}` }));
     const content = JSON.stringify(arr);
     const result = smartCrush(content, { losslessOnly: false, emitSentinel: false });
-    if (result.applied) {
-      expect(result.sentinel).toBeNull();
-    }
+    expect(result.applied).toBe(true);
+    expect(result.droppedCount).toBeGreaterThan(0);
+    expect(result.sentinel).toBeNull();
   });
 
   it('inflation guard: returns original when compressed is larger', () => {
-    // A very small array that would inflate when compressed
+    // A single-element array can never clear the min-savings floor (kept
+    // fraction is 1.0 ≥ 0.85), so smartCrush passes it through untouched —
+    // and any "compressed" render of one row would only inflate.
     const content = JSON.stringify([{ a: 1 }]);
     const result = smartCrush(content, { losslessOnly: false });
-    // A single-element array should not compress
     expect(result.applied).toBe(false);
+    expect(result.output).toBe(content);
   });
 
   it('fail-open on invalid JSON: returns original', () => {

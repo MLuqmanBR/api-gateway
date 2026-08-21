@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import path from 'path';
+import { existsSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { keysRouter } from './routes/keys.js';
 import { budgetsRouter } from './routes/budgets.js';
@@ -145,7 +146,15 @@ export function createApp() {
       next();
       return;
     }
-    res.sendFile(path.join(clientDist, 'index.html'));
+    const indexHtml = path.join(clientDist, 'index.html');
+    // N25: a missing client build (fresh clone, CLIENT_DIST typo) previously
+    // turned every non-API route into an ECONNABORTED-ish ENOENT error page;
+    // fall through to 404 handling instead.
+    if (!existsSync(indexHtml)) {
+      res.status(404).json({ error: { message: 'Client build not found — run the client build first', type: 'not_found' } });
+      return;
+    }
+    res.sendFile(indexHtml);
   });
 
   return app;
