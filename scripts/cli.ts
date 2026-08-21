@@ -1,6 +1,5 @@
-#!/usr/bin/env -S npx tsx
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync, realpathSync } from 'node:fs';
+import { createReadStream, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync, realpathSync, writeSync, readSync, closeSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
@@ -47,13 +46,14 @@ function rotateLogIfNeeded() {
 
 
 function usage() {
+  const port = readPort();
   console.log(`
 API-Gateway CLI
 
   api start [--port <number>]   Start the server (uses .env PORT by default)
   api stop [--port <number>]    Stop a specific instance, or the only one
   api stop --all                Stop all running instances
-  api restart                   Stop then start (uses .env PORT)
+  api restart [--port <number>] Stop then start on a port (default .env PORT)
   api status                    Show running instances
   api list                      List all instances across ports
   api build                     Build the project
@@ -61,11 +61,13 @@ API-Gateway CLI
   api help                      Show this help
 
 After start, the server runs in the background. Access the dashboard
-at http://localhost:3001 and the API at http://localhost:3001/v1.
+at http://localhost:${port} and the API at http://localhost:${port}/v1.
 `);
 }
 
-function readInstances() {
+// Registry shape: port → PID for CLI-managed instances. The systemd entry is
+// never persisted here; allInstances() normalizes both into {pid, manager}.
+function readInstances(): Record<string, number> {
   try { return JSON.parse(readFileSync(INSTANCES_FILE, 'utf8')); } catch { return {}; }
 }
 
@@ -73,16 +75,26 @@ function writeInstances(inst) {
   writeFileSync(INSTANCES_FILE, JSON.stringify(inst, null, 2));
 }
 
-function readPort() {
+function readPort(dir = ROOT) {
   try {
-    const env = readFileSync(join(ROOT, '.env'), 'utf8');
+    const env = readFileSync(join(dir, '.env'), 'utf8');
     const m = env.match(/^PORT=(\d+)/m);
     return m ? parseInt(m[1], 10) : 3001;
   } catch { return 3001; }
 }
 
 function isRunning(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the PID exists but we may not signal it (different user,
+    // hardened sandbox). Treat as running — cleaning the registry entry
+    // would orphan a live server we simply can't see. Only ESRCH proves
+    // the PID is gone.
+    if ((err as NodeJS.ErrnoException).code === 'EPERM') return true;
+    return false;
+  }
 }
 
 // PIDs get recycled by the OS. `isRunning` only proves *some* process has
@@ -135,7 +147,7 @@ function cleanInstances() {
 }
 
 function build() {
-  return new Promise((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     console.log('Building API-Gateway…');
     const child = spawn('npm', ['run', 'build'], { cwd: ROOT, stdio: 'inherit' });
     child.on('close', (code) => {
@@ -189,23 +201,29 @@ function systemdInstance() {
     const pid = parseInt(props.MainPID, 10);
     if (!pid || !isRunning(pid)) return null;
     if (!isOurServerProcess(pid)) return null;
-    // The unit's WorkingDirectory is the repo root; the unit was
-    // installed from resources/systemd/, so locate it there.
+    // The unit carries no `PORT=` line — the real port comes from the `.env`
+    // in the unit's WorkingDirectory via dotenv. Parse that directory and read
+    // its `.env`; fall back to the repo root. (H32: the old regex `^PORT=`
+    // could never match the template and mis-reported 3001.)
     const unitPath = join(ROOT, 'resources', 'systemd', SYSTEMD_UNIT);
     if (!existsSync(unitPath)) return null;
     const unit = readFileSync(unitPath, 'utf8');
-    const m = unit.match(/^PORT=(\d+)/m);
-    return { port: m ? parseInt(m[1], 10) : 3001, pid, manager: 'systemd' };
+    const wdMatch = unit.match(/^WorkingDirectory=(.+)$/m);
+    const workDir = wdMatch ? wdMatch[1].trim().replace(/^~/, process.env.HOME || '') : ROOT;
+    return { port: readPort(existsSync(workDir) ? workDir : ROOT), pid, manager: 'systemd' };
   } catch { return null; }
 }
+
+// Normalized instance view shared by list/status output.
+type InstanceView = { pid: number; port?: number; manager: string };
 
 // Combined view: CLI-managed instances (from the registry) plus the
 // systemd unit if active. The systemd instance is read-only — the CLI
 // must never signal it, only point at `systemctl`.
-function allInstances() {
+function allInstances(): Record<string, InstanceView> {
   const inst = cleanInstances();
   const sd = systemdInstance();
-  const out = {};
+  const out: Record<string, InstanceView> = {};
   for (const [port, pid] of Object.entries(inst)) out[port] = { pid, manager: 'cli' };
   if (sd && !out[String(sd.port)]) out[String(sd.port)] = sd;
   return out;
@@ -250,21 +268,14 @@ async function startServer(port) {
   try { out = openSync(LOG_FILE, 'a'); } catch { out = 'ignore'; }
 
   const child = spawn('node', ['server/dist/index.js'], {
-    cwd: ROOT, detached: true, stdio: ['ignore', out, out],
+    cwd: ROOT, detached: true, stdio: ['ignore', out, 'pipe'],
     env: { ...process.env, PORT: String(port) },
   });
 
-  let crashed = false;
-  child.on('exit', (code) => {
-    if (code !== 0 && code !== null) {
-      crashed = true;
-      const i = readInstances();
-      delete i[String(port)];
-      if (Object.keys(i).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-      else { writeInstances(i); }
-      console.error(`Server on port ${port} exited with code ${code}. Check server.log.`);
-    }
-  });
+  // No exit-handler cleanup here: this process exits right after start,
+  // while the detached child keeps running, so an 'exit' listener could
+  // never fire for a post-ready crash. Registry liveness is reconciled by
+  // cleanInstances() at the start of every CLI command instead (M68).
 
   child.on('error', (err) => {
     console.error('Failed to start server:', err.message);
@@ -273,30 +284,38 @@ async function startServer(port) {
 
   child.unref();
 
-  inst[String(port)] = child.pid;
+  inst[String(port)] = child.pid!; // set synchronously on successful spawn; failures surface via the 'error' handler above
   writeInstances(inst);
 
   console.log(`Starting server on port ${port} (PID ${child.pid})…`);
-  return waitForReady(port, child).then(() => {
+  return waitForReady(port, child, out).then(() => {
     console.log('Server is ready.\n');
     printInfo(port);
   }).catch((err) => {
-    if (crashed) return;
+    // Same single reconciliation every command uses: drop the child's stale
+    // registry entry if it died mid-startup. On a slow-start timeout the PID
+    // is still live, so the entry correctly survives.
+    cleanInstances();
     console.error(err.message);
     process.exit(1);
   });
 }
 
-function waitForReady(port, child) {
+function waitForReady(port, child, logFd) {
   const start = Date.now();
   const timeout = 30000;
-  let stderrChunks = [];
+  const stderrChunks: Buffer[] = [];
   if (child.stderr) {
-    child.stderr.on('data', (chunk) => { stderrChunks.push(chunk); });
+    child.stderr.on('data', (chunk) => {
+      stderrChunks.push(chunk);
+      // Tee to the log file so the on-disk log also captures why it crashed
+      // (previously stderr was an unpiped dead end).
+      if (typeof logFd === 'number') { try { writeSync(logFd, chunk); } catch { /* ignore */ } }
+    });
   }
-  return new Promise((resolve, reject) => {
+  return new Promise<void>((resolve, reject) => {
     let settled = false;
-    const once = (fn) => (v) => { if (!settled) { settled = true; fn(v); } };
+    const once = (fn) => (v?) => { if (!settled) { settled = true; fn(v); } };
 
     child.on('exit', (code) => {
       if (code !== 0 && code !== null) {
@@ -310,8 +329,13 @@ function waitForReady(port, child) {
       }
     });
 
+    // Probe 127.0.0.1, never `localhost` — it can resolve ::1 first and
+    // miss an IPv4-bound listener (the same hazard client/vite.config.ts
+    // works around for its dev proxy). /api/ping is the PUBLIC readiness
+    // route (mounted above the requireAuth blanket); /api/health sits
+    // behind dashboard auth and would 401 whenever login is required.
     const check = () => {
-      const req = http.get(`http://localhost:${port}/api/health`, (res) => {
+      const req = http.get(`http://127.0.0.1:${port}/api/ping`, (res) => {
         res.resume();
         if (res.statusCode === 200) once(resolve)();
         else retry();
@@ -333,7 +357,7 @@ function waitForReady(port, child) {
 function printInfo(port) {
   console.log(`  Dashboard   http://localhost:${port}`);
   console.log(`  API base    http://localhost:${port}/v1`);
-  console.log(`  OpenAI SDK  client = OpenAI({ base_url: "http://localhost:${port}/v1", api_key: "…" })`);
+  console.log(`  OpenAI SDK  const client = new OpenAI({ baseURL: "http://localhost:${port}/v1", apiKey: "..." });`);
   console.log('');
   if (Object.keys(readInstances()).length > 1) {
     console.log(`  Stop:        api stop --port ${port}`);
@@ -346,7 +370,7 @@ function printInfo(port) {
 }
 
 function stopOne(port) {
-  const inst = readInstances();
+  const inst = cleanInstances();
   const key = String(port);
   const pid = inst[key];
   if (!pid) {
@@ -373,8 +397,8 @@ function stopOne(port) {
     return Promise.resolve();
   }
   console.log(`Stopping server on port ${port} (PID ${pid})…`);
-  try { process.kill(pid, 'SIGTERM'); } catch (e) { console.log(`Failed: ${e.message}`); }
-  return new Promise((resolve) => {
+  try { process.kill(pid, 'SIGTERM'); } catch (e) { console.log(`Failed: ${(e as Error).message}`); }
+  return new Promise<void>((resolve) => {
     let attempts = 0;
     const check = setInterval(() => {
       if (!isRunning(pid)) {
@@ -433,16 +457,82 @@ function showStatus() {
   } else { showList(); }
 }
 
+// `api logs` — print the last 50 lines of the server log, then keep
+// following appends. Pure-Node replacement for spawning GNU `tail -f -n 50`
+// (which does not exist on Windows). Rotation happens between sessions
+// (rotateLogIfNeeded), so a live follow normally only sees growth; a file
+// that shrinks underneath us (manual truncation/rotation) restarts at byte 0.
 function showLogs() {
   if (!existsSync(LOG_FILE)) { console.log('No log file found.'); return; }
-  const tail = spawn('tail', ['-f', '-n', '50', LOG_FILE], { stdio: 'inherit' });
-  tail.on('close', () => process.exit(0));
+
+  const TAIL_LINES = 50;
+  const CHUNK = 64 * 1024;
+  const FOLLOW_MS = 500;
+
+  let startSize;
+  try { startSize = statSync(LOG_FILE).size; } catch { console.log('No log file found.'); return; }
+
+  // Backwards chunked read until we hold more than TAIL_LINES newlines
+  // (or reach the start of the file).
+  const chunks: Buffer[] = [];
+  let newlineCount = 0;
+  let pos = startSize;
+  while (pos > 0 && newlineCount <= TAIL_LINES) {
+    const start = Math.max(0, pos - CHUNK);
+    const len = pos - start;
+    const buf = Buffer.alloc(len);
+    const fd = openSync(LOG_FILE, 'r');
+    try { readSync(fd, buf, 0, len, start); } finally { closeSync(fd); }
+    chunks.unshift(buf);
+    for (let i = 0; i < buf.length; i++) { if (buf[i] === 0x0a) newlineCount++; }
+    pos = start;
+  }
+
+  const lines = Buffer.concat(chunks).toString('utf8').split('\n');
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  // When we stopped early, the head chunk boundary split a line — drop it.
+  if (pos > 0 && lines.length > 0) lines.shift();
+  const out = lines.slice(-TAIL_LINES);
+  if (out.length) console.log(out.join('\n'));
+
+  // Follow appends from where the initial dump ended.
+  let offset = startSize;
+  setInterval(() => {
+    let size;
+    try { size = statSync(LOG_FILE).size; } catch { return; }
+    if (size < offset) offset = 0; // truncated or rotated mid-follow
+    if (size === offset) return;
+    const stream = createReadStream(LOG_FILE, { start: offset, end: size - 1 });
+    stream.on('data', (buf) => {
+      offset += buf.length;
+      if (!process.stdout.write(buf)) {
+        stream.pause();
+        process.stdout.once('drain', () => stream.resume());
+      }
+    });
+    stream.on('error', () => { /* vanished under us; next tick re-stats */ });
+  }, FOLLOW_MS);
 }
 
-function parseFlags(argv) {
-  const result = { port: null, all: false };
+// Flags each command accepts. Unknown flags are rejected outright instead
+// of being silently ignored — a typo like `--prot 4000` used to fall back
+// to the .env port with no hint anything was wrong.
+const COMMAND_FLAGS = {
+  start: ['--port', '-p'],
+  stop: ['--port', '-p', '--all', '-a'],
+  kill: ['--port', '-p', '--all', '-a'],
+  restart: ['--port', '-p'],
+};
+
+function parseFlags(cmd, argv) {
+  const allowed = COMMAND_FLAGS[cmd] || [];
+  const result = { port: null as number | null, all: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (!allowed.includes(a)) {
+      console.error(`Unknown flag "${a}" for "api ${cmd}". Valid flags: ${allowed.length ? allowed.join(', ') : 'none'}.`);
+      process.exit(1);
+    }
     if (a === '--port' || a === '-p') {
       result.port = parseInt(argv[++i], 10);
       if (!result.port || result.port < 1 || result.port > 65535) {
@@ -462,10 +552,16 @@ async function main() {
   if (argv.length === 0 || argv[0] === 'help') { usage(); return; }
 
   const cmd = argv[0];
-  const flags = parseFlags(argv.slice(1));
+  const flags = parseFlags(cmd, argv.slice(1));
+
+  // Single source of truth for registry liveness (M68): the server child is
+  // detached and outlives this process, so no exit handler here can police
+  // it. Before any command touches instance state, purge entries whose PID
+  // is dead.
+  cleanInstances();
 
   if (cmd === 'build') {
-    try { await build(); console.log('Build complete.'); } catch (e) { console.error(e.message); process.exit(1); }
+    try { await build(); console.log('Build complete.'); } catch (e) { console.error((e as Error).message); process.exit(1); }
     return;
   }
 
@@ -491,17 +587,20 @@ async function main() {
   }
 
   if (cmd === 'restart') {
-    const envPort = readPort();
+    const targetPort = flags.port || readPort();
     const sd = systemdInstance();
-    if (sd && sd.port === envPort) {
-      printSystemdHint(envPort);
+    if (sd && sd.port === targetPort) {
+      printSystemdHint(targetPort);
       console.log('Not restarting; the unit is managed by systemd (systemctl --user restart api-gateway.service).');
       return;
     }
+    // Stop everything this CLI manages, then come back on the target port —
+    // that is what makes `api restart --port 4000` MOVE the server instead
+    // of leaving the old instance running beside the new one.
     const inst = cleanInstances();
-    if (inst[String(envPort)]) await stopOne(envPort);
+    for (const port of Object.keys(inst)) await stopOne(parseInt(port, 10));
     await ensureBuilt();
-    await startServer(envPort);
+    await startServer(targetPort);
     return;
   }
 

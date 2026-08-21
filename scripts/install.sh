@@ -35,7 +35,8 @@ detect_distro() {
   esac
   # Otherwise fall through to ID_LIKE so derivatives (PikaOS->debian,
   # Bluefin->fedora, CachyOS->arch, ...) hit the right package manager.
-  for like_entry in $like; do
+  read -ra like_entries <<< "$like"
+  for like_entry in "${like_entries[@]}"; do
     case "$like_entry" in
       debian|ubuntu|fedora|arch|opensuse|alpine|void|gentoo)
         echo "$like_entry"; return ;;
@@ -51,7 +52,7 @@ install_python_deps() {
   case "$distro" in
     debian|ubuntu|pikaos|pika|linuxmint|pop|elementary|kali|mint)
       sudo apt-get update -qq
-      sudo apt-get install -y python3-pyqt6 python3-httpx python3-httpx-sse
+      sudo apt-get install -y python3-pyqt6 python3-httpx
       ;;
     fedora|bazzite|bluefin|aurora|nobara)
       sudo dnf install -y python3-qt6 python3-httpx
@@ -97,10 +98,30 @@ install_via_pip_user() {
 
 need_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# substitute SRC DST PATTERN VALUE
+# Copy SRC to DST with every match of PATTERN (extended regex) replaced by
+# VALUE. VALUE is spliced in verbatim via match()/substr(), so '/', '&' or
+# '\' in an arbitrary install path cannot corrupt the result the way they
+# would a sed s|…|…| program. Values travel through the environment because
+# awk's -v assignments interpret backslash escapes in their values.
+substitute() {
+  SUB_PATTERN="$3" SUB_VALUE="$4" awk '
+    {
+      pat = ENVIRON["SUB_PATTERN"]; val = ENVIRON["SUB_VALUE"]
+      out = ""
+      while (match($0, pat)) {
+        out = out substr($0, 1, RSTART - 1) val
+        $0 = substr($0, RSTART + RLENGTH)
+        if (RLENGTH == 0) break  # defensive: never loop on an empty match
+      }
+      print out $0
+    }' "$1" > "$2"
+}
+
 # ---------- 1) Python deps -----------------------------------------------------
 
 DISTRO="$(detect_distro)"
-echo "==> Distribution family: $DISTRO"
+say "Distribution family: $DISTRO"
 install_python_deps "$DISTRO"
 
 # ---------- 2) Locate the entry point -----------------------------------------
@@ -123,7 +144,7 @@ EOF
   BIN="$ENTRY_DIR/api-gateway"
   say "Registered repo source as $BIN (no pip available on this system)"
 fi
-echo "==> Entry point: $BIN"
+say "Entry point: $BIN"
 
 # ---------- 3) Icon + .desktop -------------------------------------------------
 
@@ -136,8 +157,8 @@ cp "$REPO_ROOT/resources/icons/api-gateway.svg" "$ICON_DIR/api-gateway.svg"
 
 # Rewrite Exec= to the resolved binary so the entry works even before PATH
 # picks up ~/.local/bin for a fresh install.
-sed "s|^Exec=.*|Exec=$BIN|" "$REPO_ROOT/resources/desktop/api-gateway.desktop" \
-  > "$APPS_DIR/api-gateway.desktop"
+substitute "$REPO_ROOT/resources/desktop/api-gateway.desktop" \
+  "$APPS_DIR/api-gateway.desktop" '^Exec=.*' "Exec=$BIN"
 
 if need_cmd update-desktop-database; then
   update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
@@ -150,25 +171,49 @@ fi
 
 UNIT_DIR="$HOME/.config/systemd/user"
 mkdir -p "$UNIT_DIR"
-sed "s|__REPO_ROOT__|$REPO_ROOT|g" \
-  "$REPO_ROOT/resources/systemd/api-gateway.service" > "$UNIT_DIR/api-gateway.service"
+substitute "$REPO_ROOT/resources/systemd/api-gateway.service" \
+  "$UNIT_DIR/api-gateway.service" '__REPO_ROOT__' "$REPO_ROOT"
 
-systemctl --user daemon-reload
-systemctl --user enable --now api-gateway.service
+HAVE_SYSTEMD=0
+if command -v systemctl >/dev/null 2>&1; then
+  HAVE_SYSTEMD=1
+  systemctl --user daemon-reload
+  systemctl --user enable --now api-gateway.service
+else
+  say 'systemd not found — start the server manually with: api start'
+fi
 
 # ---------- 5) Sanity ----------------------------------------------------------
 
+# Shell equivalent of scripts/cli.ts readPort(): the first `PORT=<digits>`
+# line in .env wins, otherwise the server default of 3001.
+APP_PORT=3001
+if [ -f "$REPO_ROOT/.env" ]; then
+  env_port="$(sed -n '/^PORT=[0-9]/{s/^PORT=\([0-9][0-9]*\).*/\1/p;q;}' "$REPO_ROOT/.env" 2>/dev/null || true)"
+fi
+if [ -n "${env_port:-}" ]; then
+  APP_PORT="$env_port"
+fi
+
 sleep 1
-if curl -sf --max-time 3 http://127.0.0.1:3001/api/ping >/dev/null 2>&1; then
-  say "Backend is listening on http://127.0.0.1:3001"
+if curl -sf --max-time 3 "http://127.0.0.1:$APP_PORT/api/ping" >/dev/null 2>&1; then
+  say "Backend is listening on http://127.0.0.1:$APP_PORT"
+elif [ "$HAVE_SYSTEMD" -eq 1 ]; then
+  warn "Backend not answering on :$APP_PORT — check 'systemctl --user status api-gateway'"
 else
-  warn "Backend not answering on :3001 — check 'systemctl --user status api-gateway'"
+  warn "Backend not answering on :$APP_PORT — start it manually with: api start"
+fi
+
+if [ "$HAVE_SYSTEMD" -eq 1 ]; then
+  service_hint="systemctl --user status api-gateway"
+else
+  service_hint="not managed (no systemd) — run '$BIN' or 'api start' yourself"
 fi
 
 cat <<EOF
 
 Done.
   Launch:   $BIN             (or from your app launcher: "API Gateway")
-  Service:  systemctl --user status api-gateway
-  Web UI:   http://localhost:3001 (unchanged, still works)
+  Service:  $service_hint
+  Web UI:   http://localhost:$APP_PORT (unchanged, still works)
 EOF

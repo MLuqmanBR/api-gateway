@@ -1,3 +1,10 @@
+# M77: EOL policy — a Windows checkout must never CRLF-ify the shell
+# installers or Python sources (bash chokes on CRLF shebangs).
+* text=auto
+*.sh text eol=lf
+*.py text eol=lf
+*.png binary
+
 # Force GitHub Linguist to classify all .ts/.tsx files as TypeScript,
 # even when they contain no TypeScript-specific syntax (e.g. pure-JS
 # config/tooling scripts with a .ts extension). Without this, Linguist's

@@ -21,6 +21,8 @@ update-hermes.sh
 
 # Monetization planning — private, never committed
 monetization/
+# OMP agent-memory mount artifact — a directory literally named "memory:"
+# (with the colon) at the repo root; local-only, never commit it.
 memory:/
 BUGFIX-REPORT-2026-06-25.md
 

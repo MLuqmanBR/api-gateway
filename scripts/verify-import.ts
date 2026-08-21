@@ -206,6 +206,12 @@ async function runScenario(s: Scenario): Promise<{ pass: boolean; notes: string[
 
 async function main(): Promise<void> {
   process.env.NODE_ENV = 'development';
+  // Envelope builders (e.g. the keysCipher scenario) encrypt at build() time,
+  // so a fresh key must exist before any scenario runs — not only inside the
+  // import sandbox below. Leave a pre-exported key untouched when present.
+  if (!process.env.ENCRYPTION_KEY || Buffer.from(process.env.ENCRYPTION_KEY, 'hex').length !== 32) {
+    process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');
+  }
   const scenarios: Scenario[] = [buildKeysCipherEnvelopes(), buildMismatchEnvelopes()];
 
   if (fs.existsSync(USER_BACKUP_PATH)) {

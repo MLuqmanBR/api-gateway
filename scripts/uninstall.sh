@@ -24,6 +24,15 @@ say "Removing Python package"
 if command -v pipx >/dev/null 2>&1; then
   pipx uninstall api-gateway-app 2>/dev/null || true
 fi
+# A `pip install --user` puts the package in ~/.local/lib/python3.X/site-packages,
+# where pipx never looks — uninstall it too and sweep any leftovers.
+if command -v python3 >/dev/null 2>&1; then
+  if python3 -m pip show api-gateway-app 2>/dev/null | grep -q 'Location: .*\.local/lib/python3\..*/site-packages'; then
+    say "Removing pip --user installation"
+    python3 -m pip uninstall -y api-gateway-app >/dev/null 2>&1 || true
+  fi
+fi
+rm -rf "$HOME"/.local/lib/python3.*/site-packages/api_gateway_app* 2>/dev/null || true
 # pip --user installs leave an entry point in ~/.local/bin
 rm -f "$HOME/.local/bin/api-gateway" 2>/dev/null || true
 
