@@ -37,7 +37,7 @@ Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per m
 
 | Feature | What it does | Why it matters |
 | --- | --- | --- |
-| **Adaptive routing engine** | Scores every model on reliability × speed × intelligence using Thompson sampling. Four presets: balanced, smartest, fastest, reliable. Or manual priority. | The router gets smarter the more you use it. No static list to maintain. |
+| **Adaptive routing engine** | Scores every model on reliability × speed × intelligence using Thompson sampling. Five presets: balanced, smartest, fastest, most-reliable, or fully custom weights. Or manual priority. | The router gets smarter the more you use it. No static list to maintain. |
 | **Per-key budget tracking** | Tracks RPM, RPD, TPM, TPD per `(provider, model, key)` *before* the request goes out. | You never blow through a daily cap. The router always picks a key with capacity. |
 | **Self-healing key rotation** | Three retries per key. When all keys are exhausted, drops to 1-RPM recovery mode — probing until one recovers. | Your app never sees an error, even when every key hits its daily limit. |
 | **Intelligent cascade** | On 429, 5xx, or timeout: flat 90-second cooldown on the key, cascade to the next model. Cooldowns are per-key, not per-model. | One rate-limited key never benches the whole provider. Other keys stay available. |
@@ -60,7 +60,7 @@ Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per m
 | **Request queueing** | Per-provider concurrency queue with fair scheduling. Configurable via `/api/queue`. | Burst traffic is queued, not dropped. Slow providers don't starve fast ones. |
 | **Circuit breaker** | Per-provider circuit breaker with configurable thresholds. Open/half-open/closed states via `/api/circuits`. | Failing providers are tripped automatically, reducing wasted upstream calls. |
 | **WebSocket Realtime API** | `/v1/realtime` WebSocket endpoint for OpenAI Realtime API sessions. | Audio and streaming conversations through one gateway endpoint. |
-| **Spend-cap budgets** | Set monthly spend limits per client key or per provider. `/api/budgets` for management. | Never exceed your budget. Alerts and auto-cutoff when the cap is reached. |
+| **Spend-cap budgets** | Set monthly spend limits per client key, or one global cap across all requests. `/api/budgets` for management. | Never exceed your budget. Alerts and auto-cutoff when the cap is reached. |
 | **Tag/metadata filtering** | `X-API-Gateway-Tags` header filters the routing chain to models with matching tags. | Route to specific model subsets (e.g. "coding only", "fast only") per request. |
 | **TTFT-per-token routing** | Scoring blends time-to-first-token and per-token latency, not just total time. Anti-herd randomization prevents all clients choosing the same model. | Better latency for streaming. Natural load distribution across providers. |
 | **Outbound Retry-After** | On 503, the gateway sends `Retry-After` to the client and cascades to the next model simultaneously. | Clients don't retry into the same failing provider. |
@@ -146,7 +146,7 @@ client = OpenAI(
 
 resp = client.chat.completions.create(
     model="auto",  # let the router pick; or specify e.g. "gemini-2.5-flash"
-    messages=[{"role": "user", "content": "Summarise the fall of Rome in one sentence."}],
+    messages=[{"role": "user", "content": "Summarize the fall of Rome in one sentence."}],
 )
 print(resp.choices[0].message.content)
 print("Routed via:", resp.headers.get("x-routed-via"))
@@ -309,6 +309,8 @@ Merge modes:
 Every import supports `dryRun: true` — runs inside a `SAVEPOINT`, rolls back, returns a diff summary. Always dry-run first against a populated database.
 
 </details>
+## How It Works
+
 ```mermaid
 flowchart LR
     Client["Your app<br/>OpenAI SDK / curl / any client"] -->|"Bearer api-gateway-…"| Gateway["Gateway :3001"]
@@ -346,7 +348,7 @@ flowchart LR
 | Webhooks | `server/src/services/webhooks.ts` | HMAC-SHA256 signed async event delivery |
 | Metrics | `server/src/services/metrics.ts` | Prometheus `/metrics` endpoint |
 | Realtime | `server/src/services/realtime.ts` | WebSocket `/v1/realtime` API server |
-| Anthropic translate | `server/src/routes/anthropic.ts` + `server/src/lib/anthropic-translate.ts` | `/v1/messages` inbound translation |
+| Anthropic translate | `server/src/routes/messages.ts` + `server/src/services/anthropic-translate.ts` | `/v1/messages` inbound translation |
 | Response cache | `server/src/services/cache.ts` | Exact-match cache for temp-0 requests |
 | Budgets | `server/src/services/budgets.ts` + `server/src/routes/budgets.ts` | Spend-cap budgets per client key |
 | Dashboard | `client/` | React + Vite + shadcn/ui |
@@ -394,7 +396,7 @@ npm test         # server vitest + client typecheck (tsc --noEmit)
 npm run build    # compile server and dashboard
 ```
 
-PRs should include a test, keep the existing test suite green, and match the `.editorconfig` / tsconfig defaults already in the repo. Issues and discussions are open.
+PRs should include a test, keep the existing test suite green, and match the tsconfig defaults already in the repo. Issues and discussions are open.
 
 ## Disclaimer
 

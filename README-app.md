@@ -13,7 +13,9 @@ same local gateway at the same time.
 - **Native Qt Widgets UI** — no browser engine, no Electron. Idle CPU is
   essentially zero; RSS in the tens of MiB, not hundreds.
 - **9 pages:** Dashboard, Analytics, Keys, Budget, Playground, Fallback,
-  Embeddings, Privacy, Settings — full parity with the web dashboard.
+  Embeddings, Privacy, Settings. Coverage mirrors the web dashboard's core
+  workflows (key management, routing, budgets, privacy); some web-only
+  niceties (e.g. live analytics charts) are simpler here.
 - **System tray:** closing the window minimizes to the tray; the backend
   keeps serving `/v1` traffic. Right-click the icon for full control.
 - **Autostart:** logind-managed (`systemctl --user enable api-gateway`) so
@@ -25,9 +27,8 @@ same local gateway at the same time.
 ## Install
 
 The installer is distro-aware and detects your package manager.
-
 ```bash
-git clone <your-fork> api-gateway
+git clone https://github.com/MLuqmanBR/api-gateway.git api-gateway
 cd api-gateway
 ./scripts/install.sh
 ```
@@ -52,7 +53,7 @@ api-gateway
 
 ### Manual dependencies (if the script can't auto-install)
 
-You need only two Python packages:
+You need three Python packages (plus one optional):
 
 | Distro | Command |
 |---|---|
@@ -64,6 +65,9 @@ You need only two Python packages:
 | Void | `sudo xbps-install -S python3-pyqt6 python3-httpx` |
 | Gentoo | `sudo emerge --ask=n dev-python/PyQt6 dev-python/httpx` |
 | NixOS | `pipx install .` (or `nix profile install` your own) |
+
+Optional: `PyQt6-Charts` enables the native analytics charts; without it the
+Analytics page falls back to a simpler text summary.
 
 Then `./scripts/install.sh` again — the package-detection step is idempotent.
 
@@ -92,13 +96,13 @@ native package.
 ## Architecture
 
 ```
-+---------------+          HTTP/JSON + SSE          +---------------------+
-| api-gateway   |  <------------------------------> | api-gateway.service |
-| PyQt6 GUI     |   http://127.0.0.1:3001/api/*    | systemctl --user    |
++---------------+          HTTP/JSON + SSE           +---------------------+
+| api-gateway   |<---------------------------------->| api-gateway.service |
+| PyQt6 GUI     |    http://127.0.0.1:3001/api/*     | systemctl --user    |
 +---------------+                                    +---------------------+
-         |                                                    |
-         |      the web dashboard is                       |
-         +---->  http://localhost:3001  <----- react client -+
+        |                                                       |
+        |      the web dashboard is                             |
++---->  http://localhost:3001  <-----  react client ------------+
 ```
 
 The app *controls* the service; it does not embed it. The Node server is the
