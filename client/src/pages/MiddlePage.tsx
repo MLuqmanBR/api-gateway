@@ -1,7 +1,7 @@
 // Middle Layer dashboard — Privacy layer config + known-secrets store.
 // Wired into the navbar at /middle.
 import { Shield, Plus, Trash2, Power, Loader2, Eye, EyeOff, Zap } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { addToast } from '@/lib/toast'
@@ -129,6 +129,14 @@ export default function MiddlePage() {
     onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
+  // Header select-all checkbox: reflect "some but not all" via :indeterminate.
+  const selectAllRef = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    const total = secrets.data?.length ?? 0
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = selected.size > 0 && selected.size < total
+    }
+  }, [selected, secrets.data])
   // Selection is cleared implicitly when selected IDs stop appearing in the refreshed list
   // (after delete/add, the re-fetched secrets data no longer contains those IDs).
   const cfg = config.data ?? {}
@@ -203,17 +211,6 @@ export default function MiddlePage() {
             />
           </div>
 
-          <div className="flex items-center justify-between">
-            <div>
-              <Label>Compression</Label>
-              <p className="text-sm text-muted-foreground">Compress tool outputs before sending (coming soon).</p>
-            </div>
-            <Switch
-              checked={configValue('middle_compression_enabled') === '1'}
-              onCheckedChange={(v) => setConfig('middle_compression_enabled', v ? '1' : '0')}
-            />
-          </div>
-
           <div className="space-y-2">
             <Label htmlFor="interceptor-model">Interceptor model ID</Label>
             <Input
@@ -278,17 +275,6 @@ export default function MiddlePage() {
 
           <div className="flex items-center justify-between">
             <div>
-              <Label>TOON lossless re-render</Label>
-              <p className="text-sm text-muted-foreground">Render JSON arrays as CSV-schema (no rows dropped).</p>
-            </div>
-            <Switch
-              checked={configValue('middle_compression_toon') === '1'}
-              onCheckedChange={(v) => setConfig('middle_compression_toon', v ? '1' : '0')}
-            />
-          </div>
-
-          <div className="flex items-center justify-between">
-            <div>
               <Label>Emit sentinel</Label>
               <p className="text-sm text-muted-foreground">Insert a note when rows are dropped (recommended).</p>
             </div>
@@ -310,17 +296,6 @@ export default function MiddlePage() {
           </div>
 
           <div className="grid grid-cols-3 gap-4">
-            <div className="space-y-1">
-              <Label htmlFor="min-tokens">Min tokens</Label>
-              <Input
-                id="min-tokens"
-                type="number"
-                min={50}
-                max={2000}
-                value={configValue('middle_compression_min_tokens', '250')}
-                onChange={(e) => setConfig('middle_compression_min_tokens', e.target.value)}
-              />
-            </div>
             <div className="space-y-1">
               <Label htmlFor="protect-recent">Protect recent</Label>
               <Input
@@ -443,7 +418,7 @@ export default function MiddlePage() {
                   id="bulk-textarea"
                   value={bulkText}
                   onChange={(e) => setBulkText(e.target.value)}
-                  placeholder={'sk-or-f83oirhdjfhdkjasd , api_key , account1\nnvapi-eowenyr834bfhjdsba , api_key , account1\ncfai-294831232434 , apiKey , lazy account'}
+                  placeholder={'sk-or-f83oirhdjfhdkjasd , api_key , account1\nnvapi-eowenyr834bfhjdsba , api_key , account1\ncfai-294831232434 , apiKey , acc_1234'}
                   className="font-mono text-sm min-h-[120px]"
                 />
               </div>
@@ -477,8 +452,9 @@ export default function MiddlePage() {
                   </div>
                 </div>
               )}
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
                 <input
+                  ref={selectAllRef}
                   type="checkbox"
                   className="h-4 w-4 rounded border-input"
                   checked={secrets.data.length > 0 && selected.size === secrets.data.length}
@@ -488,13 +464,14 @@ export default function MiddlePage() {
                   }}
                 />
                 Select all
-              </div>
+              </label>
               {secrets.data.map(s => (
                 <div key={s.id} className="flex items-center justify-between rounded-md border p-3">
                   <div className="flex items-center gap-3">
                     <input
                       type="checkbox"
                       className="h-4 w-4 rounded border-input"
+                      aria-label={`Select secret ${s.maskedPreview}${s.label ? ` (${s.label})` : ''}`}
                       checked={selected.has(s.id)}
                       onChange={() => toggleSelected(s.id)}
                     />

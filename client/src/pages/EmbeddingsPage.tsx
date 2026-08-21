@@ -98,7 +98,6 @@ export default function EmbeddingsPage() {
   )
   const totalProviders = families.reduce((n, f) => n + f.providers.length, 0)
   const matchedProviders = filteredFamilies.reduce((n, f) => n + f.providers.length, 0)
-  const families_ = filteredFamilies
   const hasChanges = localFamilies !== null || localDefault !== null
   const defaultFamily = localDefault ?? data?.defaultFamily ?? ''
   function updateProvider(familyName: string, id: number, patch: Partial<ProviderEntry>) {
@@ -168,7 +167,7 @@ export default function EmbeddingsPage() {
               />
               {query !== '' && totalProviders > 0 && matchedProviders > 0 && (
                 <p className="text-[11px] text-muted-foreground">
-                  Reorder is disabled while searching — clear the filter to drag rows.
+                  Reorder is disabled while searching — clear the filter to move providers with the arrow buttons.
                 </p>
               )}
             </div>
@@ -179,7 +178,7 @@ export default function EmbeddingsPage() {
                   No providers match <code className="rounded-md bg-muted px-1.5 py-0.5 font-mono">{query}</code>.
                 </p>
               </div>
-            ) : families_.map(f => {
+            ) : filteredFamilies.map(f => {
               const u = usageByFamily.get(f.family)
               const noKeys = f.providers.every(p => p.keyCount === 0)
               return (

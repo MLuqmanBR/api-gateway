@@ -19,7 +19,7 @@ const components: Components = {
     <a
       href={href}
       target="_blank"
-      rel="noreferrer noopener"
+      rel="noopener noreferrer"
       className="underline underline-offset-2 decoration-foreground/40 hover:decoration-foreground wrap-break-word"
     >
       {children}

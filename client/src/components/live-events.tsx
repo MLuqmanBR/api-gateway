@@ -142,7 +142,7 @@ function formatEvent(evt: LiveEvent): LogEntry | undefined {
         id: typeof anyEvent.id === 'string' ? anyEvent.id : `unknown-${ts}`,
         ts,
         kind: 'info',
-        text: `· [${fallbackId}] (unrecognised event: ${String(anyEvent.type ?? 'unknown')})`,
+        text: `· [${fallbackId}] (unrecognized event: ${String(anyEvent.type ?? 'unknown')})`,
       };
     }
   }
@@ -188,16 +188,21 @@ export function LiveEvents() {
   useEventStream((parsed) => {
     const entry = formatEvent(parsed as unknown as LiveEvent);
 
-    if (parsed.type === 'request.start') {
-      activeRef.current.add(parsed.id as string);
-      setActiveCount(activeRef.current.size);
-    } else if (parsed.type === 'request.done' || parsed.type === 'request.error' || parsed.type === 'request.aborted') {
-      // request.aborted also clears the in-flight counter — a request
-      // that completes via abort has no separate 'done' frame and would
-      // otherwise leak its 'start' id forever, leaving the pulsing dot
-      // stuck on screen.
-      activeRef.current.delete(parsed.id as string);
-      setActiveCount(activeRef.current.size);
+    // Malformed frames can arrive without a usable id; the old cast would put
+    // the literal string "undefined" into the in-flight set, where it never
+    // matches a closing frame and wedges the pulsing activity dot forever.
+    if (typeof parsed.id === 'string') {
+      if (parsed.type === 'request.start') {
+        activeRef.current.add(parsed.id);
+        setActiveCount(activeRef.current.size);
+      } else if (parsed.type === 'request.done' || parsed.type === 'request.error' || parsed.type === 'request.aborted') {
+        // request.aborted also clears the in-flight counter — a request
+        // that completes via abort has no separate 'done' frame and would
+        // otherwise leak its 'start' id forever, leaving the pulsing dot
+        // stuck on screen.
+        activeRef.current.delete(parsed.id);
+        setActiveCount(activeRef.current.size);
+      }
     }
 
     addLine(entry);

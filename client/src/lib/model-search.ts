@@ -9,7 +9,7 @@
  *  - case-insensitive
  *  - matches within displayName, modelId, AND platform
  *  - match can be at start, middle, or end — no anchors
- *  - the query is normalised before matching: spaces, dashes, dots,
+ *  - the query is normalized before matching: spaces, dashes, dots,
  *    underscores, slashes, colons all collapse to a single non-token so
  *    "kimi k2.6" and "kimi-k2-6" both hit the same id (see
  *    normalizeForSearch below). This is what makes typing
@@ -38,7 +38,7 @@ export function matchesModelQuery(query: string, fields: SearchableModel): boole
   const q = normalizeForSearch(query)
   if (q.length === 0) return true
   // Build the haystack once per row. Single .toLowerCase() + normalize
-  // pass per model — much cheaper than normalising each field separately.
+  // pass per model — much cheaper than normalizing each field separately.
   const haystack = normalizeForSearch(
     `${fields.displayName} ${fields.modelId} ${fields.platform}`,
   )

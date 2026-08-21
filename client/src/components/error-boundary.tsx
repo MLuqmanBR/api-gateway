@@ -26,7 +26,6 @@ export class ErrorBoundary extends Component<Props, State> {
 
 
   handleReload = () => {
-    this.setState({ hasError: false })
     window.location.reload()
   }
 

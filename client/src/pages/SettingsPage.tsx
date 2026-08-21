@@ -23,7 +23,8 @@ import {
   Check,
   X,
 } from 'lucide-react'
-import { apiFetch, getToken } from '@/lib/api'
+import { useDiscardGuard } from '@/lib/use-discard-guard'
+import { apiFetch } from '@/lib/api'
 import { addToast } from '@/lib/toast'
 import { makeConfigBackupFilename, getLocalTimezoneName, downloadBlob } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
@@ -53,6 +54,10 @@ const SECTIONS: { value: ConfigSection; label: string; description: string }[] =
 
 type Inventory = Record<ConfigSection, number>
 
+// Import files are read whole into memory; a real config export is kilobytes,
+// so anything past this is a mis-selected file, not a configuration.
+const MAX_IMPORT_BYTES = 20 * 1024 * 1024
+
 
 
 export default function SettingsPage() {
@@ -75,6 +80,10 @@ export default function SettingsPage() {
   const [exportPassphrase, setExportPassphrase] = useState('')
   const [exportLabel, setExportLabel] = useState('')
   const [showExportPassphrase, setShowExportPassphrase] = useState(false)
+  // M38: plaintext keys are opt-in — the server strips `key` fields unless
+  // this is set (or a passphrase is supplied, which routes keys through
+  // keysCipher instead).
+  const [includePlaintextKeys, setIncludePlaintextKeys] = useState(false)
 
   const sectionsParam = useMemo<ConfigSection[]>(() => {
     const out: ConfigSection[] = []
@@ -93,15 +102,10 @@ export default function SettingsPage() {
     | { ok: true; sections: Record<ConfigSection, number>; hasKeysCipher: boolean; label?: string; exportedAt: string; schemaVersion: number; keyCompatibility: ConfigKeyCompatibility }
     | { ok: false; error: string }
     | null
-  >(null);
+  >(null)
   const [dryRunResult, setDryRunResult] = useState<ConfigImportSummary | null>(null)
 
-  // Reset any stale state when the file picker changes.
   const fileInputRef = useRef<HTMLInputElement>(null)
-  useEffect(() => () => {
-    // Free any object URLs we created when the component unmounts.
-    if (fileInputRef.current?.value) fileInputRef.current.value = ''
-  }, [])
 
   // ── Mutations ────────────────────────────────────────────────────────
   // The export mutation can either save the file or stash the envelope in
@@ -114,8 +118,8 @@ export default function SettingsPage() {
         method: 'POST',
         headers: authHeaders(),
         body: JSON.stringify({
-          sections: sectionsParam,
           passphrase: exportPassphrase || undefined,
+          includePlaintextKeys: !exportPassphrase && includePlaintextKeys ? true : undefined,
           label: exportLabel.trim() || undefined,
           download: opts.download,
         }),
@@ -135,22 +139,22 @@ export default function SettingsPage() {
       // show a UTC timestamp and confuse the user. The optional
       // label ("Laptop staging" / "Production") is folded into the
       // filename so multiple exports can be told apart at a glance.
-      const trimmedLabel = exportLabel.trim();
-      const localFilename = makeConfigBackupFilename(new Date(), trimmedLabel || undefined);
-      return { res, body: text, envelope, filename: localFilename, localFilename }
+      const trimmedLabel = exportLabel.trim()
+      const localFilename = makeConfigBackupFilename(new Date(), trimmedLabel || undefined)
+      return { res, body: text, envelope, filename: localFilename }
     },
     onSuccess: ({ body, filename, envelope }, vars) => {
       if (vars.download) {
         downloadBlob(filename, new Blob([body], { type: 'application/json' }))
-        addToast({ kind: 'success', title: 'Configuration exported', sticky: false })
+        addToast({ kind: 'success', title: 'Configuration exported' })
       } else if (envelope) {
         setPreviewEnvelope(envelope)
       } else {
-        addToast({ kind: 'warning', title: 'Preview not available', description: 'Server returned a non-JSON response.', sticky: false })
+        addToast({ kind: 'warning', title: 'Preview not available', description: 'Server returned a non-JSON response.' })
       }
     },
     onError: (e: Error) => {
-      addToast({ kind: 'warning', title: 'Export failed', description: e.message, sticky: false })
+      addToast({ kind: 'warning', title: 'Export failed', description: e.message })
     },
   })
 
@@ -226,6 +230,21 @@ export default function SettingsPage() {
 
   // ── Handlers ─────────────────────────────────────────────────────────
   async function onFileSelected(file: File) {
+    // Reject oversize files BEFORE reading — File.text() slurps the entire
+    // file into memory, so a mis-selected dump would hang the tab.
+    if (file.size > MAX_IMPORT_BYTES) {
+      setImportFileName(null)
+      setImportEnvelope(null)
+      setPreview(null)
+      setDryRunResult(null)
+      addToast({
+        kind: 'warning',
+        title: 'File too large',
+        description: `${file.name} is ${(file.size / (1024 * 1024)).toFixed(1)} MB — import files are limited to 20 MB.`,
+        sticky: false,
+      })
+      return
+    }
     setImportFileName(file.name)
     setPreview(null)
     setDryRunResult(null)
@@ -344,11 +363,23 @@ export default function SettingsPage() {
                   <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-900 dark:text-amber-200 flex items-start gap-1.5">
                     <AlertTriangle className="size-3 mt-0.5 shrink-0" />
                     <div>
-                      Without a passphrase, this backup can only be restored on a gateway using the same
-                      <code className="font-mono mx-1">ENCRYPTION_KEY</code>. Add a passphrase if you're moving the
-                      file between machines.
+                      Without a passphrase, API keys are exported as ciphertext only (M38: never plaintext
+                      unless you tick the box below). The backup can only be restored on a gateway using the
+                      same <code className="font-mono mx-1">ENCRYPTION_KEY</code>. Add a passphrase if you're
+                      moving the file between machines.
                     </div>
                   </div>
+                )}
+                {exportSections.api_keys && exportPassphrase.length === 0 && (
+                  <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={includePlaintextKeys}
+                      onChange={(e) => setIncludePlaintextKeys(e.target.checked)}
+                      className="size-3.5 accent-primary"
+                    />
+                    Include plaintext API keys (readable by anyone with the file)
+                  </label>
                 )}
               </div>
             </div>
@@ -558,6 +589,9 @@ function ExportPreviewModal({
     [envelope.label],
   )
   const tz = useMemo(() => getLocalTimezoneName(), [])
+  // N55: read-only modal (no typed input to lose), so Escape closes it
+  // directly — the discard guard's dirty=false path is exactly that.
+  const { requestClose } = useDiscardGuard(false, onClose)
   const sectionCounts = useMemo(() => {
     return {
       models: envelope.sections.models?.length ?? 0,
@@ -616,7 +650,7 @@ function ExportPreviewModal({
   return (
     <div
       className="fixed inset-0 z-50 bg-background/60 backdrop-blur-sm flex items-center justify-center p-4"
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
         className="w-full max-w-3xl max-h-[85vh] rounded-3xl border bg-card p-5 shadow-lg flex flex-col"
@@ -681,13 +715,9 @@ function buildUrl(path: string): string {
 }
 
 function authHeaders(): Record<string, string> {
-  // Reuse the same auth token the apiFetch helper uses — direct fetch
-  // skips the helper so we don't have to type the response as JSON.
-  const token = getToken()
-  return {
-    'Content-Type': 'application/json',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  }
+  // Auth is the HttpOnly session cookie, sent automatically by fetch —
+  // no Authorization header to set.
+  return {}
 }
 
 // ── Sub-panels ─────────────────────────────────────────────────────────
@@ -745,7 +775,7 @@ function PreviewPanel({
 //     offline backups, but the operator should treat the file accordingly.
 //   - 'compatible' / 'no-keys': no banner needed.
 function KeyCompatibilityBanner({ status }: { status: ConfigKeyCompatibility }) {
-  if (status === 'compatible' || status === 'no-keys') return null;
+  if (status === 'compatible' || status === 'no-keys') return null
   if (status === 'mismatch') {
     return (
       <div className="rounded-lg border border-amber-500/50 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-900 dark:text-amber-200 flex items-start gap-2">
@@ -759,7 +789,7 @@ function KeyCompatibilityBanner({ status }: { status: ConfigKeyCompatibility }) 
           </div>
         </div>
       </div>
-    );
+    )
   }
   if (status === 'encrypted-with-passphrase') {
     return (
@@ -773,7 +803,7 @@ function KeyCompatibilityBanner({ status }: { status: ConfigKeyCompatibility }) 
           </div>
         </div>
       </div>
-    );
+    )
   }
   // 'plaintext'
   return (
@@ -784,7 +814,7 @@ function KeyCompatibilityBanner({ status }: { status: ConfigKeyCompatibility }) 
         the file can read the keys. Re-export with a passphrase for safer transport.
       </div>
     </div>
-  );
+  )
 }
 
 function Field({ label, value }: { label: string; value: string }) {
@@ -815,6 +845,10 @@ function SummaryPanel({ summary, dryRun }: { summary: ConfigImportSummary; dryRu
     (summary.sections.api_keys?.errors ?? []).some((e) =>
       /different ENCRYPTION_KEY than this gateway/.test(e),
     )
+  // Single source of truth so the displayed count and its pluralization agree.
+  const skippedKeyCount =
+    summary.keyCompatibility?.skippedDueToMismatch ??
+    (summary.sections.api_keys?.errors.length ?? 0)
   return (
     <div className="space-y-3">
       {showMismatchBanner && (
@@ -822,10 +856,8 @@ function SummaryPanel({ summary, dryRun }: { summary: ConfigImportSummary; dryRu
           <AlertTriangle className="size-4 mt-0.5 shrink-0" />
           <div className="space-y-1">
             <div className="font-medium">
-              {summary.keyCompatibility?.skippedDueToMismatch ?? (
-                summary.sections.api_keys?.errors.length ?? 0
-              )}{' '}
-              key{summary.keyCompatibility?.skippedDueToMismatch === 1 ? '' : 's'} couldn't be restored
+              {skippedKeyCount}{' '}
+              key{skippedKeyCount === 1 ? '' : 's'} couldn't be restored
               because they were encrypted under a different ENCRYPTION_KEY.
             </div>
             <div className="text-amber-800 dark:text-amber-300">

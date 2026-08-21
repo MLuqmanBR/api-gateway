@@ -17,13 +17,16 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
-import { ChevronDown, SlidersHorizontal, Pencil } from 'lucide-react'
+import { ChevronDown, SlidersHorizontal, Pencil, X } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { apiFetch } from '@/lib/api'
 import { addToast } from '@/lib/toast'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { useDiscardGuard } from '@/lib/use-discard-guard'
 import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { FloatingBar } from '@/components/floating-bar'
@@ -216,11 +219,14 @@ const platformColors: Record<string, string> = {
   cohere:      '#d946ef',
   cloudflare:  '#f38020',
   zhipu:       '#06b6d4',
-  ollama:      '#000000',
+  ollama:      '#cbd5e1',
   kilo:        '#7c3aed',
   pollinations: '#a855f7',
   llm7:        '#0ea5e9',
   huggingface: '#ff9d00',
+  opencode:    '#10b981',
+  commandcode: '#f43f5e',
+  ovh:         '#6366f1',
 }
 
 // A 0..1 value as a thin horizontal bar with the number beside it.
@@ -281,9 +287,9 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
       </div>
 
       <div className="flex h-2.5 rounded-full overflow-hidden bg-muted">
-        {modelsWithWidth.map((m, i) => (
+        {modelsWithWidth.map((m) => (
           <div
-            key={i}
+            key={`${m.platform}/${m.displayName}`}
             title={`${m.displayName} (${m.platform}): ${formatTokens(m.remainingTokens)} remaining`}
             style={{
               width: `${m.widthPct}%`,
@@ -306,8 +312,8 @@ function TokenUsageBar({ data }: { data: TokenUsageData }) {
         style={collapsible ? { maxHeight: expanded ? scrollH : LEGEND_COLLAPSED_PX } : undefined}
       >
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-5 gap-y-1.5 text-xs tabular-nums">
-          {modelsWithWidth.map((m, i) => (
-            <div key={i} className="flex items-center gap-2 min-w-0">
+          {modelsWithWidth.map((m) => (
+            <div key={`${m.platform}/${m.displayName}`} className="flex items-center gap-2 min-w-0">
               <span
                 className="size-2 rounded-sm flex-shrink-0"
                 style={{ backgroundColor: platformColors[m.platform] ?? '#94a3b8' }}
@@ -345,7 +351,7 @@ function EditModelModal({
 }) {
   const [displayName, setDisplayName] = useState(model.displayName)
   const [contextWindow, setContextWindow] = useState(model.contextWindow ?? 128000)
-  const [maxOutputTokens, setMaxOutputTokens] = useState(model.maxOutputTokens ?? null as number | null)
+  const [maxOutputTokens, setMaxOutputTokens] = useState((model.maxOutputTokens ?? null) as number | null)
   const [intelligenceRank, setIntelligenceRank] = useState(model.intelligenceRank)
   const [speedRank, setSpeedRank] = useState(model.speedRank)
   const [sizeLabel, setSizeLabel] = useState(model.sizeLabel)
@@ -356,6 +362,24 @@ function EditModelModal({
   const [rpdLimit, setRpdLimit] = useState(model.rpdLimit ?? null)
   const [tpmLimit, setTpmLimit] = useState(model.tpmLimit ?? null)
   const [tpdLimit, setTpdLimit] = useState(model.tpdLimit ?? null)
+
+  // N55: Escape/backdrop must not silently discard typed edits — any field
+  // deviating from the row's current values routes a close through a confirm.
+  const hasInput =
+    displayName !== model.displayName ||
+    contextWindow !== (model.contextWindow ?? 128000) ||
+    maxOutputTokens !== (model.maxOutputTokens ?? null) ||
+    intelligenceRank !== model.intelligenceRank ||
+    speedRank !== model.speedRank ||
+    sizeLabel !== model.sizeLabel ||
+    supportsTools !== model.supportsTools ||
+    supportsVision !== model.supportsVision ||
+    monthlyTokenBudget !== model.monthlyTokenBudget ||
+    rpmLimit !== (model.rpmLimit ?? null) ||
+    rpdLimit !== (model.rpdLimit ?? null) ||
+    tpmLimit !== (model.tpmLimit ?? null) ||
+    tpdLimit !== (model.tpdLimit ?? null)
+  const { confirming, setConfirming, requestClose } = useDiscardGuard(hasInput, onClose)
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -381,7 +405,7 @@ function EditModelModal({
   return (
     <div
       className="fixed inset-0 z-50 bg-background/60 backdrop-blur-sm flex items-center justify-center p-4"
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
         className="w-full max-w-lg rounded-3xl border bg-card p-5 shadow-lg max-h-[90vh] overflow-y-auto"
@@ -392,8 +416,8 @@ function EditModelModal({
             <h3 className="text-sm font-medium">Edit model</h3>
             <p className="text-xs text-muted-foreground font-mono mt-0.5">{model.platform}/{model.modelId}</p>
           </div>
-          <Button variant="ghost" size="xs" onClick={onClose}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          <Button variant="ghost" size="xs" onClick={requestClose}>
+            <X className="size-4" />
           </Button>
         </div>
         <form onSubmit={submit} className="space-y-3">
@@ -461,6 +485,14 @@ function EditModelModal({
           </div>
         </form>
       </div>
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={(o) => { if (!o) setConfirming(false) }}
+        title="Discard changes?"
+        description="You have unsaved edits to this model. Close without queueing them?"
+        confirmLabel="Discard"
+        onConfirm={onClose}
+      />
     </div>
   )
 }
@@ -511,7 +543,12 @@ function RowContent({
             <span className="text-[10px] text-amber-600 dark:text-amber-400">−{row.penalty} penalty</span>
           )}
           {row.totalRequests !== undefined && row.totalRequests > 0 && (
-            <span className="text-[10px] text-muted-foreground/60 tabular-nums">{row.totalRequests} obs</span>
+            <span
+              title="Total requests observed for this model"
+              className="text-[10px] text-muted-foreground/60 tabular-nums"
+            >
+              {row.totalRequests} obs
+            </span>
           )}
         </div>
         <div className="text-[11px] text-muted-foreground/70 tabular-nums mt-0.5">
@@ -609,6 +646,11 @@ export default function FallbackPage() {
     mutationFn: (payload: { strategy: RoutingStrategy; weights?: RoutingWeights }) =>
       apiFetch('/api/fallback/routing', { method: 'PUT', body: JSON.stringify(payload) }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] }),
+    // Without this, a failed save left the chip highlighted as if applied.
+    onError: (err) => {
+      addToast({ kind: 'warning', title: 'Strategy not saved', description: (err as Error).message });
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] });
+    },
   })
 
   const { data: retryLimitData } = useQuery<{ limit: number }>({
@@ -616,11 +658,12 @@ export default function FallbackPage() {
     queryFn: () => apiFetch('/api/fallback/retry-limit'),
   })
 
-  const globalRetryLimit = retryLimitData?.limit ?? 5
+  // Undefined until the queries resolve — the UI guards on this instead of
+  // flashing defaults (5 / balanced) that can contradict the saved config.
+  const globalRetryLimit = retryLimitData?.limit
 
-  const strategy: RoutingStrategy = routing?.strategy ?? 'balanced'
+  const strategy: RoutingStrategy | undefined = routing?.strategy
   const isManual = strategy === 'priority'
-
   const allEntries = localEntries ?? entries
   // Merge fallback metadata with live scores, keyed by model.
   const scoreById = new Map((routing?.scores ?? []).map(s => [s.modelDbId, s]))
@@ -688,7 +731,6 @@ export default function FallbackPage() {
     setLocalEntries(allEntries.map(e => (e.keyCount > 0 ? { ...e, enabled } : e)))
   }
 
-  const activeRetryLimit = pendingRetryLimit ?? globalRetryLimit
   const hasChanges = localEntries !== null || pendingModelEdits.size > 0 || pendingRetryLimit !== null
 
   async function handleSaveAll() {
@@ -831,7 +873,7 @@ export default function FallbackPage() {
             {STRATEGIES.map(s => (
               <Tooltip key={s.key} text={s.blurb}>
                 <button
-                  disabled={strategyMutation.isPending}
+                  disabled={strategyMutation.isPending || strategy === undefined}
                   onClick={() => strategyMutation.mutate({ strategy: s.key })}
                   className={`px-3 py-1.5 text-xs rounded-lg transition-colors ${
                     s.key === strategy
@@ -851,12 +893,13 @@ export default function FallbackPage() {
               />
             )}
           </div>
-
-          <p className="mt-2 text-xs text-muted-foreground">
-            {isManual
-              ? 'Manual mode: requests follow the order below, top-to-bottom. Drag to reorder.'
-              : 'Scores update from live traffic. The order below is how requests are routed right now.'}
-          </p>
+          {strategy !== undefined && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              {isManual
+                ? 'Manual mode: requests follow the order below, top-to-bottom. Drag to reorder.'
+                : 'Scores update from live traffic. The order below is how requests are routed right now.'}
+            </p>
+          )}
         </section>
 
         {/* Global retry limit */}
@@ -864,34 +907,47 @@ export default function FallbackPage() {
           <div className="flex items-baseline justify-between mb-2">
             <h2 className="text-sm font-medium">Exhaustion recovery</h2>
             <span className="text-xs text-muted-foreground">
-              {globalRetryLimit === 0 ? '∞ infinite' : `${globalRetryLimit} cycle${globalRetryLimit > 1 ? 's' : ''}`}
+              {globalRetryLimit === undefined
+                ? '…'
+                : globalRetryLimit === 0
+                  ? '∞'
+                  : `${globalRetryLimit} cycle${globalRetryLimit > 1 ? 's' : ''}`}
             </span>
           </div>
           <p className="text-xs text-muted-foreground mb-3">
             When all keys for all enabled models are rate-limited, the proxy enters 1 RPM recovery mode.
             Set how many recovery cycles before giving up (1–100), or 0 to keep retrying forever.
           </p>
-          <div className="flex items-center gap-3">
-            <input
-              type="range"
-              min={0}
-              max={100}
-              value={activeRetryLimit}
-              onChange={e => setPendingRetryLimit(parseInt(e.target.value, 10))}
-              className="flex-1 h-1.5 rounded-full appearance-none bg-muted cursor-pointer accent-foreground"
-            />
-            <Input
-              type="number"
-              min={0}
-              max={100}
-              value={activeRetryLimit}
-              onChange={e => {
-                const v = parseInt(e.target.value, 10)
-                if (Number.isFinite(v) && v >= 0 && v <= 100) setPendingRetryLimit(v)
-              }}
-              className="w-20 text-center text-sm"
-            />
-          </div>
+          {globalRetryLimit === undefined ? (
+            // Skeleton while the saved limit is in flight — the slider would
+            // otherwise flash the default 5 before snapping to the real value.
+            <div className="flex items-center gap-3" aria-hidden="true">
+              <div className="flex-1 h-1.5 rounded-full bg-muted animate-pulse" />
+              <div className="w-20 h-9 rounded-md bg-muted animate-pulse" />
+            </div>
+          ) : (
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={pendingRetryLimit ?? globalRetryLimit}
+                onChange={e => setPendingRetryLimit(parseInt(e.target.value, 10))}
+                className="flex-1 h-1.5 rounded-full appearance-none bg-muted cursor-pointer accent-foreground"
+              />
+              <Input
+                type="number"
+                min={0}
+                max={100}
+                value={pendingRetryLimit ?? globalRetryLimit}
+                onChange={e => {
+                  const v = parseInt(e.target.value, 10)
+                  if (Number.isFinite(v) && v >= 0 && v <= 100) setPendingRetryLimit(v)
+                }}
+                className="w-20 text-center text-sm"
+              />
+            </div>
+          )}
         </section>
 
         {/* Unified routing / fallback table */}
@@ -900,7 +956,7 @@ export default function FallbackPage() {
         ) : ordered.length === 0 && query === '' ? (
           <div className="rounded-3xl border border-dashed p-8 text-center">
             <p className="text-sm text-muted-foreground">
-              No models available. Add API keys on the <a href="/keys" className="underline text-foreground">Keys page</a> first.
+              No models available. Add API keys on the <Link to="/keys" className="underline text-foreground">Keys page</Link> first.
             </p>
           </div>
         ) : (

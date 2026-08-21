@@ -10,7 +10,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { PageHeader } from '@/components/page-header'
 import { LiveEvents } from '@/components/live-events';
 import { Tooltip as HoverTooltip } from '@/components/tooltip'
-import { formatSqliteUtcToLocalTime, formatIsoUtcToLocalChart } from '@/lib/utils'
+import { formatSqliteUtcToLocalTime, formatIsoUtcToLocalChart, sqliteUtcToIso } from '@/lib/utils'
 import type {
   AnalyticsSummary, PlatformStats, TimelinePoint, ModelStats,
   ErrorLogEntry, ErrorDistribution,
@@ -115,8 +115,8 @@ export default function AnalyticsPage() {
   const firstRequestAt = summary30?.firstRequestAt
   const spanDays = useMemo(() => {
     if (!firstRequestAt) return 30
-    // SQLite stores UTC "YYYY-MM-DD HH:MM:SS"
-    const first = new Date(firstRequestAt.replace(' ', 'T') + 'Z').getTime()
+    // SQLite stores UTC "YYYY-MM-DD HH:MM:SS" — tag it as UTC via the shared helper.
+    const first = new Date(sqliteUtcToIso(firstRequestAt)).getTime()
     const days = (mountNow - first) / 86_400_000
     if (!Number.isFinite(days)) return 30
     return Math.min(Math.max(days, 1 / 24), 30)
@@ -124,7 +124,8 @@ export default function AnalyticsPage() {
   const extrapolated = spanDays < 29.5
   const savings30d = extrapolated ? baseSavings * (30 / spanDays) : baseSavings
   const rangeLabel = range === '24h' ? '24 hours' : range === '7d' ? '7 days' : '30 days'
-  const spanLabel = spanDays >= 2 ? `${Math.round(spanDays)} days` : `${Math.max(1, Math.round(spanDays * 24))} hours`
+  const spanHours = Math.max(1, Math.round(spanDays * 24))
+  const spanLabel = spanDays >= 2 ? `${Math.round(spanDays)} days` : spanHours === 1 ? '1 hour' : `${spanHours} hours`
   const savingsHint =
     `You actually saved $${actualSavings.toFixed(2)} over the last ${rangeLabel}. That is what the same tokens would have cost on paid APIs, priced per model. ` +
     (extrapolated
@@ -161,7 +162,7 @@ export default function AnalyticsPage() {
       />
       {summaryError && (
         <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-          Can&apos;t reach the server — analytics are unavailable until the connection is restored.
+          Can't reach the server — analytics are unavailable until the connection is restored.
         </div>
       )}
       <div className="space-y-6">
@@ -256,8 +257,8 @@ export default function AnalyticsPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {byModel.map((m, i) => (
-                        <TableRow key={i}>
+                      {byModel.map((m) => (
+                        <TableRow key={`${m.platform}/${m.modelId}`}>
                           <TableCell className="pl-4 text-sm font-medium">{m.displayName}</TableCell>
                           <TableCell className="text-xs text-muted-foreground">{m.platform}</TableCell>
                           <TableCell className="text-right tabular-nums">{m.requests}</TableCell>

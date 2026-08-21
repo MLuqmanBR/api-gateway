@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 
 // Hover tooltip rendered through a portal to document.body, so it's never
@@ -12,30 +12,49 @@ export function Tooltip({ text, children, side = 'top', className }: {
   className?: string
 }) {
   const ref = useRef<HTMLSpanElement>(null)
+  const [open, setOpen] = useState(false)
   const [coords, setCoords] = useState<{ x: number; y: number } | null>(null)
+  const id = useId()
 
-  function show() {
+  const measure = useCallback(() => {
     const el = ref.current
     if (!el) return
     const r = el.getBoundingClientRect()
-    const half = 116 // ~half of the w-56 tooltip
+    const half = 112 // half of the w-56 (224 px) tooltip
     const x = Math.min(Math.max(r.left + r.width / 2, half + 8), window.innerWidth - half - 8)
     setCoords({ x, y: side === 'top' ? r.top : r.bottom })
-  }
-  const hide = () => setCoords(null)
+  }, [side])
 
+  function show() {
+    setOpen(true)
+    measure()
+  }
+
+  // Stay anchored while open: scrolling ANY container moves the trigger, and
+  // scroll events don't bubble — hence capture. Resize changes the clamp too.
+  useEffect(() => {
+    if (!open) return
+    window.addEventListener('scroll', measure, { capture: true })
+    window.addEventListener('resize', measure)
+    return () => {
+      window.removeEventListener('scroll', measure, { capture: true })
+      window.removeEventListener('resize', measure)
+    }
+  }, [open, measure])
   return (
     <span
       ref={ref}
       className={className ?? 'inline-flex'}
       onMouseEnter={show}
-      onMouseLeave={hide}
+      onMouseLeave={() => setOpen(false)}
       onFocus={show}
-      onBlur={hide}
+      onBlur={() => setOpen(false)}
+      aria-describedby={open ? id : undefined}
     >
       {children}
-      {coords && createPortal(
+      {open && coords && createPortal(
         <span
+          id={id}
           role="tooltip"
           style={{
             position: 'fixed',

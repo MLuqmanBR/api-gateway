@@ -1,14 +1,6 @@
-const BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
+export const BASE = import.meta.env.BASE_URL.replace(/\/$/, '');
 export const UNAUTHORIZED_EVENT = 'api-gateway:unauthorized';
 
-export const TOKEN_KEY = 'api-gateway_dashboard_token';
-
-/** Read the dashboard auth token from localStorage. Used by non-apiFetch
- *  callers (SettingsPage export, Playground) that need to set Authorization
- *  on a raw fetch. apiFetch itself relies on the HttpOnly session cookie. */
-export function getToken(): string | null {
-  try { return localStorage.getItem(TOKEN_KEY); } catch { return null; }
-}
 
 export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
@@ -19,13 +11,20 @@ export async function apiFetch<T>(path: string, options?: RequestInit): Promise<
     ...options,
     credentials: 'same-origin',
     headers: {
-      'Content-Type': 'application/json',
+      // Content-Type only matters when a body travels; stamping bodiless
+      // GETs with application/json is noise. An explicit options header
+      // still wins via the spread below.
+      ...(options?.body != null && { 'Content-Type': 'application/json' }),
       ...options?.headers,
     },
   });
   if (res.status === 401) {
-    // Session missing/expired — let the AuthGate re-render.
-    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    // Session missing/expired — let the AuthGate re-render. Auth endpoints
+    // are excluded: a failed LOGIN is a wrong password, not a lost session,
+    // and re-running the gate handler on every typo is noise.
+    if (!path.startsWith('/api/auth/')) {
+      window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
+    }
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: { message: res.statusText } }));

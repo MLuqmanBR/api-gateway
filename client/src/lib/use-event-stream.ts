@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { BASE } from '@/lib/api'
 
 interface StreamEvent { type: string; [key: string]: unknown }
 
@@ -22,7 +23,9 @@ export function useEventStream(onEvent: (event: StreamEvent) => void, enabled = 
         cbRef.current(parsed as StreamEvent)
       } catch { /* ignore malformed */ }
     }
-    const es = new EventSource('/api/events')
+    // Same BASE as apiFetch — a sub-path deploy (VITE_BASE) must not lose
+    // its event stream to a hardcoded root-relative URL.
+    const es = new EventSource(`${BASE}/api/events`)
     es.onmessage = onMessage
     es.onerror = () => { /* EventSource auto-reconnects */ }
     return () => { es.close() }

@@ -18,6 +18,8 @@ interface FallbackEntry {
 }
 
 interface ChatMessage {
+  /** Stable identity for React keys — the list mutates while streaming. */
+  id: string
   role: 'user' | 'assistant'
   content: string
   meta?: {
@@ -46,6 +48,14 @@ interface ChatRequestBody {
   stream: boolean
   model?: string
 }
+
+// Mirrors the id generator in lib/toast.ts: crypto.randomUUID where the
+// context is secure (it is not on plain-HTTP LAN deployments), else a
+// timestamp+random composite.
+const newMessageId = (): string =>
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `m_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 
 export default function PlaygroundPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -100,8 +110,8 @@ export default function PlaygroundPage() {
     const text = input.trim()
     if (!text || loading) return
 
-    const userMsg: ChatMessage = { role: 'user', content: text }
-    const assistantMsg: ChatMessage = { role: 'assistant', content: '' }
+    const userMsg: ChatMessage = { id: newMessageId(), role: 'user', content: text }
+    const assistantMsg: ChatMessage = { id: newMessageId(), role: 'assistant', content: '' }
     setMessages(prev => [...prev, userMsg, assistantMsg])
     setInput('')
     setLoading(true)
@@ -357,8 +367,8 @@ export default function PlaygroundPage() {
             </div>
           ) : (
             <>
-              {messages.map((msg, i) => (
-                <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+              {messages.map((msg) => (
+                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                   <div
                     className={`max-w-[78%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
                       msg.role === 'user'

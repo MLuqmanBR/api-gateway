@@ -1,19 +1,21 @@
-import { useEffect, useState, Suspense, lazy } from 'react'
+import { useCallback, useEffect, useState, Suspense, lazy } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { Menu, Moon, Sun, Loader2 } from 'lucide-react'
+import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
+import { CircleUserRound, LogOut, Menu, Moon, Sun, Loader2 } from 'lucide-react'
 import { Button, buttonVariants } from '@/components/ui/button'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { AuthGate } from '@/components/auth-gate'
 import { Toaster } from '@/components/toaster'
 import { drainPersisted } from '@/lib/toast'
+import { apiFetch, UNAUTHORIZED_EVENT } from '@/lib/api'
 import { ErrorBoundary } from '@/components/error-boundary'
 
 
@@ -102,23 +104,6 @@ function Brand() {
   )
 }
 
-// True when the dashboard runs inside the desktop shell (Electron preload
-// sets this). The navbar then doubles as the window title bar: draggable,
-// padded for the macOS traffic lights, and the page background is glass.
-// Set by the desktop app's preload script (desktop/src/preload.ts).
-interface ApiGatewayWindow { __API_GATEWAY_DESKTOP__?: boolean }
-const isDesktopApp = typeof window !== 'undefined'
-  && (window as ApiGatewayWindow).__API_GATEWAY_DESKTOP__ === true
-
-// The preload's own early classList.add can be lost (it may run before this
-// document exists), so the client claims the class itself at module load —
-// before the first React paint — keeping html.desktop CSS (transparent body,
-// glass backdrop) reliable.
-if (isDesktopApp) {
-  document.documentElement.classList.add('desktop')
-}
-
-
 function PageLoader() {
   return (
     <div className="flex items-center justify-center h-64">
@@ -127,42 +112,79 @@ function PageLoader() {
   )
 }
 
+// Subset of AuthGate's /api/auth/status payload — only what the menu label needs.
+interface AuthStatus { email: string | null }
+
+// Mirrors the desktop app's logout: best-effort revoke of the session, then
+// drop all cached data and force the AuthGate back to the login form via the
+// same UNAUTHORIZED_EVENT path a 401 takes.
+function useLogout() {
+  const queryClient = useQueryClient()
+  return useCallback(async () => {
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' })
+    } catch {
+      // Session may already be gone or the server unreachable — clearing the
+      // local state below is what actually logs the UI out.
+    }
+    queryClient.clear()
+    window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT))
+  }, [queryClient])
+}
+
+function UserMenu() {
+  const logout = useLogout()
+  // Reads the status AuthGate already fetched (same query key); never refetches.
+  const { data: authStatus } = useQuery<AuthStatus>({
+    queryKey: ['auth-status'],
+    queryFn: () => apiFetch('/api/auth/status'),
+    enabled: false,
+    retry: false,
+  })
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        className={buttonVariants({ variant: 'ghost', size: 'icon' })}
+        aria-label="Account menu"
+      >
+        <CircleUserRound />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-52">
+        <DropdownMenuLabel className="font-normal">
+          {authStatus?.email ?? 'Signed in'}
+        </DropdownMenuLabel>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onClick={logout}>
+          <LogOut /> Log out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 function Navbar() {
   const { dark, toggle } = useDarkMode()
   const location = useLocation()
   const navigate = useNavigate()
-
+  const logout = useLogout()
   function isActiveRoute(to: string) {
     return location.pathname === to
   }
 
   return (
-    <header
-      // In the desktop shell the body backdrop is already translucent glass;
-      // a lighter wash keeps the title bar from looking more solid than the page.
-      className={`sticky top-0 z-40 border-b backdrop-blur ${isDesktopApp ? 'bg-background/45' : 'bg-background/80'}`}
-      style={isDesktopApp ? ({ WebkitAppRegion: 'drag' } as React.CSSProperties) : undefined}
-    >
-      <div
-        className={`mx-auto flex max-w-6xl items-center px-4 sm:px-6 ${isDesktopApp ? 'pl-20 sm:pl-20' : ''}`}
-        style={isDesktopApp ? { minHeight: 52 } : undefined}
-      >
+    <header className="sticky top-0 z-40 border-b backdrop-blur bg-background/80">
+      <div className="mx-auto flex max-w-6xl items-center px-4 sm:px-6">
         <Brand />
-        <nav
-          className="ml-10 hidden items-center gap-6 md:flex"
-          style={isDesktopApp ? ({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) : undefined}
-        >
+        <nav className="ml-10 hidden items-center gap-6 md:flex">
           {navItems.map((item) => (
             <NavItem key={item.to} to={item.to}>
               {item.label}
             </NavItem>
           ))}
         </nav>
-        <div
-          className="ml-auto hidden items-center gap-1 md:flex"
-          style={isDesktopApp ? ({ WebkitAppRegion: 'no-drag' } as React.CSSProperties) : undefined}
-        >
+        <div className="ml-auto hidden items-center gap-1 md:flex">
           <DarkModeToggle dark={dark} onToggle={toggle} />
+          <UserMenu />
         </div>
         <div className="ml-auto md:hidden">
           <DropdownMenu>
@@ -189,6 +211,12 @@ function Navbar() {
                 <DropdownMenuItem onClick={toggle} className="justify-between">
                   <span>Theme</span>
                   {dark ? <Sun /> : <Moon />}
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+              <DropdownMenuSeparator />
+              <DropdownMenuGroup>
+                <DropdownMenuItem onClick={logout}>
+                  <LogOut /> Log out
                 </DropdownMenuItem>
               </DropdownMenuGroup>
             </DropdownMenuContent>
@@ -221,9 +249,9 @@ function App() {
       <BrowserRouter basename={import.meta.env.BASE_URL}>
         <AuthGate>
           <Toaster />
-          <div className={`min-h-screen ${isDesktopApp ? 'desktop-backdrop' : 'bg-background'}`}>
+          <div className="min-h-screen bg-background">
             <Navbar />
-            <main className="max-w-6xl mx-auto px-6 py-8">
+            <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
               <Suspense fallback={<PageLoader />}>
                 <ErrorBoundary>
                   <Routes>
@@ -235,7 +263,7 @@ function App() {
                     <Route path="/analytics" element={<AnalyticsPage />} />
                     <Route path="/keys" element={<KeysPage />} />
                     <Route path="/middle" element={<MiddlePage />} />
-                  <Route path="/budgets" element={<BudgetPage />} />
+                    <Route path="/budgets" element={<BudgetPage />} />
                     <Route path="/settings" element={<SettingsPage />} />
                     <Route path="/test" element={<Navigate to="/playground" replace />} />
                     <Route path="/health" element={<Navigate to="/keys" replace />} />

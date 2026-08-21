@@ -1,7 +1,11 @@
 // ---- Platform & Model Types ----
 
-// Active platforms — must match server/src/providers/index.ts and
-// server/src/routes/keys.ts PLATFORMS allowlist.
+// Active platforms — hand-maintained here, but must match the runtime
+// registry `BUILTIN_PLATFORM_SLUGS` in server/src/providers/index.ts (derived
+// from the providers Map) and the PLATFORMS allowlist in
+// server/src/routes/keys.ts. When adding/removing a provider, update all
+// three; there is no build-time codegen between this union and the runtime
+// list (deliberate — see audit L52), so drift is caught only by review.
 // Moonshot and MiniMax direct integrations were dropped in migrateModelsV4
 // (see server/src/db/index.ts). HuggingFace was dropped in V4 and re-added
 // in V13 via the router.huggingface.co Inference Providers meta-router.
@@ -178,7 +182,9 @@ export interface ApiKeyCreate {
 
 export interface FallbackEntry {
   modelId: number;
-  platform: Platform;
+  // Free-form platform slug: custom-provider slugs are legal here exactly
+  // as in Model.platform. Built-in slugs are the Platform union below.
+  platform: string;
   displayName: string;
   intelligenceRank: number;
   speedRank: number;
@@ -256,7 +262,7 @@ export type ThinkingEffort = 'max' | 'xhigh' | 'high' | 'medium' | 'low' | 'mini
 
 // Reasoning trace replay hint. `enabled` carries Anthropic's `budget_tokens`
 // (and can coexist with `effort` for the newer Opus 4.6 / Sonnet 4.6 adaptive
-// mode). `adaptive` is Anthropic's newer mood; `disabled` is honored where the
+// mode). `adaptive` is Anthropic's newer mode; `disabled` is honored where the
 // model supports it. Providers that don't understand a given variant drop it.
 export interface ThinkingConfig {
   // Anthropic-style: 'enabled' | 'adaptive' | 'disabled'.
@@ -431,8 +437,6 @@ export interface RequestLog {
   createdAt: string;
 }
 
-// ---- Rate Limit Types ----
-
 // ──── Configuration Export / Import ─────────────────────────────────────────
 
 // Versioned, portable snapshot of the user's gateway configuration. Each
@@ -523,9 +527,9 @@ export interface ConfigApiKey {
    * import time — in that case the import server unwraps keys into this
    * field during ingest. */
   key?: string;
-  /** When set, the import server treats `key` as already encrypted under
-   * the destination's AES key and skips re-encryption. Used when both the
-   * source and destination share the same ENCRYPTION_KEY. */
+  /** When set, the import server treats `encryptedKey` as already encrypted
+   * under the destination's AES key and skips re-encryption. Used when both
+   * the source and destination share the same ENCRYPTION_KEY. */
   encryptedKey?: string;
   iv?: string;
   authTag?: string;
@@ -555,6 +559,9 @@ export interface ConfigSettings {
   routingStrategy?: 'priority' | 'balanced' | 'smartest' | 'fastest' | 'reliable' | 'custom';
   globalRetryLimit?: number;
   customWeights?: { reliability: number; speed: number; intelligence: number };
+  /** L30: the export inventory counts this settings key; the settings
+   * section carries it so export/import round-trips stay aligned. */
+  embeddingsDefaultFamily?: string;
 }
 
 export interface ConfigQuirk {
@@ -605,7 +612,10 @@ export interface ConfigEnvelope {
    * from this blob. Always present when the export was created with a
    * passphrase. */
   keysCipher?: {
-    kdf: 'pbkdf2-sha256-310000';
+    // Versioned KDF identifier — the iteration count is encoded in the
+    // string. Legacy envelopes (310k) stay importable; new exports use 600k
+    // (current OWASP guidance for PBKDF2-HMAC-SHA256).
+    kdf: 'pbkdf2-sha256-600000' | 'pbkdf2-sha256-310000';
     salt: string;
     iv: string;
     authTag: string;
@@ -703,11 +713,4 @@ export interface ConfigExportRequest {
    * plaintext api_keys are included directly. */
   passphrase?: string;
   label?: string;
-  platform: Platform;
-  modelId: string;
-  rpm: { used: number; limit: number | null };
-  rpd: { used: number; limit: number | null };
-  tpm: { used: number; limit: number | null };
-  available: boolean;
-  nextResetAt: string | null;
 }

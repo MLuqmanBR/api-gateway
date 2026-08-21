@@ -11,7 +11,9 @@ import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import type { ApiKey, Platform, CustomProvider, Model } from '../../../shared/types'
 import { Pencil, ExternalLink, Plus, X } from 'lucide-react'
-import { formatSqliteUtcToLocalTime } from '@/lib/utils'
+import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { useDiscardGuard } from '@/lib/use-discard-guard'
+import { formatSqliteUtcToLocalTime, maskKey } from '@/lib/utils'
 
 // Small "Get API key" external link shown next to a provider (#137).
 function GetKeyLink({ url }: { url: string }) {
@@ -28,11 +30,39 @@ function GetKeyLink({ url }: { url: string }) {
     </a>
   )
 }
+// Clipboard helper that works on non-secure origins (plain-http LAN access,
+// e.g. the dashboard's own dev:lan mode): navigator.clipboard is undefined
+// there and writeText() rejects, so fall back to the execCommand textarea
+// trick. Returns true only when the text actually landed on the clipboard.
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // fall through to the legacy path below
+    }
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.setAttribute('readonly', '')
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
+}
 
 // `url` points to each provider's key-management / signup page so the Keys page
 // can show a "Get API key" shortcut (#137). OpenCode Zen's key is free from
 // opencode.ai/auth — no card needed; billing only applies to paid models (#128).
-// `keyless: true` providers (Kilo's anonymous free tier) need no API key — the
+// `keyless: true` providers (Kilo/Pollinations/OVH/LLM7 anonymous tiers) need no API key — the
 // form disables the key field and submits a sentinel the backend stores so
 // routing treats the platform as configured.
 const PLATFORMS: { value: Platform; label: string; url: string; keyless?: boolean }[] = [
@@ -50,7 +80,7 @@ const PLATFORMS: { value: Platform; label: string; url: string; keyless?: boolea
   { value: 'kilo', label: 'Kilo Gateway (no key needed)', url: 'https://app.kilo.ai', keyless: true },
   { value: 'pollinations', label: 'Pollinations (no key needed)', url: 'https://pollinations.ai', keyless: true },
   { value: 'ovh', label: 'OVH AI Endpoints (no key needed)', url: 'https://endpoints.ai.cloud.ovh.net', keyless: true },
-  { value: 'llm7', label: 'LLM7 (anon ok)', url: 'https://llm7.io' },
+  { value: 'llm7', label: 'LLM7 (no key needed)', url: 'https://llm7.io', keyless: true },
   { value: 'opencode', label: 'OpenCode Zen (free key)', url: 'https://opencode.ai/auth' },
   { value: 'commandcode', label: 'CommandCode', url: '' },
 ];
@@ -94,6 +124,7 @@ function UnifiedKeySection() {
   const queryClient = useQueryClient()
   const [showKey, setShowKey] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [confirmRegen, setConfirmRegen] = useState(false)
 
   const { data, isError } = useQuery<{ apiKey: string }>({
     queryKey: ['unified-key'],
@@ -106,13 +137,16 @@ function UnifiedKeySection() {
   })
 
   const apiKey = data?.apiKey ?? ''
-  const masked = apiKey ? apiKey.slice(0, 6) + '•'.repeat(32) : '…'
+  const masked = apiKey ? maskKey(apiKey) : '…'
   const baseUrl = import.meta.env.DEV
     ? `http://${window.location.hostname}:${__SERVER_PORT__}/v1`
     : `${window.location.origin}/v1`
 
-  function copy() {
-    navigator.clipboard.writeText(apiKey)
+  async function copy() {
+    if (!(await copyToClipboard(apiKey))) {
+      addToast({ kind: 'warning', title: 'Copy failed', description: 'Clipboard is unavailable on this connection.', sticky: false })
+      return
+    }
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }
@@ -129,7 +163,7 @@ function UnifiedKeySection() {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => regenerate.mutate()}
+          onClick={() => setConfirmRegen(true)}
           disabled={regenerate.isPending || isError}
         >
           Regenerate
@@ -166,6 +200,15 @@ function UnifiedKeySection() {
         <span className="text-muted-foreground">Embeddings</span>
         <code className="font-mono">/v1/embeddings <span className="text-muted-foreground">(model: "auto" or a family from the Embeddings tab)</span></code>
       </div>
+      <ConfirmDialog
+        open={confirmRegen}
+        onOpenChange={setConfirmRegen}
+        title="Regenerate unified API key?"
+        description="Regenerating invalidates every existing client using the current key."
+        confirmLabel="Regenerate"
+        pending={regenerate.isPending}
+        onConfirm={() => { setConfirmRegen(false); regenerate.mutate() }}
+      />
     </section>
   )
 }
@@ -173,12 +216,12 @@ function UnifiedKeySection() {
 // ── F3: Client keys section ──────────────────────────────────────────────
 // Per-deployment / per-script API keys with model allowlists + expiry. The
 // secret <key_id>:<secret> is shown ONCE on mint. Uses the same masked-display
-// pattern as UnifiedKeySection (apiKey.slice(0, 6) + '•'.repeat(32)).
+// pattern as UnifiedKeySection (lib/utils maskKey: '****' + last 3 chars).
 
 interface ClientKey {
   id: string
   label: string
-  enabled: number
+  enabled: boolean
   expires_at_ms: number | null
   model_allowlist: string[] | null
   rpm_override: number | null
@@ -193,7 +236,13 @@ function ClientKeysSection() {
 
   const { data: keys = [] } = useQuery<ClientKey[]>({
     queryKey: ['client-keys'],
-    queryFn: () => apiFetch('/api/keys/client'),
+    queryFn: async () => {
+      // SQLite stores this column as INTEGER 0/1; coerce to boolean here so
+      // everything below treats `enabled` as a plain flag while toggles keep
+      // sending real booleans over PATCH.
+      const rows = await apiFetch<(Omit<ClientKey, 'enabled'> & { enabled: number })[]>('/api/keys/client')
+      return rows.map(k => ({ ...k, enabled: k.enabled === 1 }))
+    },
   })
 
   const mint = useMutation({
@@ -223,9 +272,12 @@ function ClientKeysSection() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-keys'] }),
   })
 
-  function copyMinted() {
+  async function copyMinted() {
     if (!mintedKey) return
-    navigator.clipboard.writeText(mintedKey)
+    if (!(await copyToClipboard(mintedKey))) {
+      addToast({ kind: 'warning', title: 'Copy failed', description: 'Clipboard is unavailable on this connection.', sticky: false })
+      return
+    }
     setCopied(true)
     setTimeout(() => setCopied(false), 1500)
   }
@@ -341,8 +393,25 @@ function AddPlatformModal({
   const [apiFormat, setApiFormat] = useState<'openai' | 'anthropic'>('openai')
   const [keyFormat, setKeyFormat] = useState<'simple' | 'colon'>('simple')
 
+  // N55: Escape/backdrop must not silently discard typed input — anything
+  // deviating from the pristine defaults routes a close through a confirm.
+  const hasInput =
+    slug !== '' ||
+    displayName !== '' ||
+    baseUrl !== '' ||
+    rpmLimit !== '' ||
+    rpdLimit !== '' ||
+    tpmLimit !== '' ||
+    tpdLimit !== '' ||
+    parallelEnabled ||
+    stickySessionsEnabled ||
+    keyless ||
+    apiFormat !== 'openai' ||
+    keyFormat !== 'simple'
+  const { confirming, setConfirming, requestClose } = useDiscardGuard(hasInput, onClose)
+
   const create = useMutation<{ slug: string }, Error, Record<string, unknown>>({
-    mutationFn: (body) => apiFetch('/api/custom-providers', { method: 'POST', body: JSON.stringify(body) }) as Promise<{ slug: string }>,
+    mutationFn: (body) => apiFetch('/api/custom-providers', { method: 'POST', body: JSON.stringify(body) }),
     onSuccess: (data: { slug: string }) => {
       queryClient.invalidateQueries({ queryKey: ['custom-providers'] })
       queryClient.invalidateQueries({ queryKey: ['models'] })
@@ -367,7 +436,7 @@ function AddPlatformModal({
   return (
     <div
       className="fixed inset-0 z-50 bg-background/60 backdrop-blur-sm flex items-center justify-center p-4"
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
         className="w-full max-w-md rounded-3xl border bg-card p-5 shadow-lg"
@@ -381,7 +450,7 @@ function AddPlatformModal({
               Models are added separately once the provider exists.
             </p>
           </div>
-          <Button variant="ghost" size="xs" onClick={onClose}>
+          <Button variant="ghost" size="xs" onClick={requestClose}>
             <X className="size-4" />
           </Button>
         </div>
@@ -430,14 +499,7 @@ function AddPlatformModal({
               placeholder="http://192.168.1.10:11434/v1"
               className="font-mono text-xs"
             />
-</div>
-{keyFormat === 'colon' && (
-  <p className="text-[11px] text-muted-foreground mt-1">
-    Use {'{account_id}'} as a placeholder — it will be replaced with each key's
-    account ID at request time. Example:{' '}
-    <code className="text-xs">https://{'{account_id}'}.api.example.com/v1</code>
-  </p>
-)}
+          </div>
           <button
             type="button"
             onClick={() => setShowAdvanced(s => !s)}
@@ -511,6 +573,13 @@ function AddPlatformModal({
                 <Switch checked={keyFormat === 'colon'} onCheckedChange={c => setKeyFormat(c ? 'colon' : 'simple')} />
                 <span className={keyFormat === 'colon' ? '' : 'text-muted-foreground'}>Account ID + API key</span>
               </label>
+              {keyFormat === 'colon' && (
+                <p className="text-[11px] text-muted-foreground mt-1">
+                  Use {'{account_id}'} as a placeholder — it will be replaced with each key's
+                  account ID at request time. Example:{' '}
+                  <code className="text-xs">https://{'{account_id}'}.api.example.com/v1</code>
+                </p>
+              )}
             </div>
             <div className="border-t pt-3 mt-1">
               <Label className="text-xs">Sticky keys (cache affinity)</Label>
@@ -539,6 +608,14 @@ function AddPlatformModal({
           </div>
         </form>
       </div>
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={(o) => { if (!o) setConfirming(false) }}
+        title="Discard changes?"
+        description="You've started entering a platform. Close without saving it?"
+        confirmLabel="Discard"
+        onConfirm={onClose}
+      />
     </div>
   )
 }
@@ -607,6 +684,59 @@ function EditPlatformModal({
   )
   const [showAdvanced, setShowAdvanced] = useState(false)
 
+  // Built-in settings load asynchronously: seeding the inputs once at mount
+  // raced the query (inputs rendered empty, and the save diff then sent
+  // `null` for every limit — wiping them). Sync once when the data lands,
+  // and block saving until then; the one-shot ref keeps a mid-edit refetch
+  // from clobbering what the user has typed.
+  const settingsLoaded = isCustom || builtInSettings !== undefined;
+  const limitsSyncedRef = useRef(false);
+  useEffect(() => {
+    if (limitsSyncedRef.current || builtInSettings == null) return;
+    limitsSyncedRef.current = true;
+    setRpmLimit(builtInSettings.rpmLimit?.toString() ?? '');
+    setRpdLimit(builtInSettings.rpdLimit?.toString() ?? '');
+    setTpmLimit(builtInSettings.tpmLimit?.toString() ?? '');
+    setTpdLimit(builtInSettings.tpdLimit?.toString() ?? '');
+    setStickySessionsEnabled(builtInSettings.stickySessionsEnabled ?? false);
+  }, [builtInSettings])
+
+  // Same field-diff the submit sends: nonzero ⇒ there is edited input that a
+  // backdrop click or Escape would silently throw away (N55).
+  function buildBody(): Record<string, unknown> {
+    const body: Record<string, unknown> = {};
+    if (isCustom) {
+      // Custom-only editable fields: slug, displayName, baseUrl,
+      // parallelRequests, keyless, apiFormat.
+      if (newSlug.trim() !== slug) body.slug = newSlug.trim();
+      if (displayName.trim() !== provider.displayName) body.displayName = displayName.trim();
+      if (baseUrl.trim() !== provider.baseUrl) body.baseUrl = baseUrl.trim();
+      const newMax = parallelEnabled ? maxParallelRequests : null;
+      if (newMax !== provider.maxParallelRequests) body.maxParallelRequests = newMax;
+      if (keyless !== provider.keyless) body.keyless = keyless;
+      if (apiFormat !== (provider.apiFormat ?? 'openai')) body.apiFormat = apiFormat;
+      if (keyFormat !== ((provider.keyFormat ?? 'simple') as string)) body.keyFormat = keyFormat;
+    }
+    // Common fields: limits + sticky toggle.
+    const oldRpm = initRpm ?? null;
+    const newRpm = rpmLimit ? parseInt(rpmLimit, 10) : null;
+    if (newRpm !== oldRpm) body.rpmLimit = newRpm;
+    const oldRpd = initRpd ?? null;
+    const newRpd = rpdLimit ? parseInt(rpdLimit, 10) : null;
+    if (newRpd !== oldRpd) body.rpdLimit = newRpd;
+    const oldTpm = initTpm ?? null;
+    const newTpm = tpmLimit ? parseInt(tpmLimit, 10) : null;
+    if (newTpm !== oldTpm) body.tpmLimit = newTpm;
+    const oldTpd = initTpd ?? null;
+    const newTpd = tpdLimit ? parseInt(tpdLimit, 10) : null;
+    if (newTpd !== oldTpd) body.tpdLimit = newTpd;
+    if (stickySessionsEnabled !== initSticky) body.stickySessionsEnabled = stickySessionsEnabled;
+    return body;
+  }
+
+  const dirty = settingsLoaded && Object.keys(buildBody()).length > 0;
+  const { confirming, setConfirming, requestClose } = useDiscardGuard(dirty, onClose);
+
   const save = useMutation({
     mutationFn: (body: Record<string, unknown>) => {
       const endpoint = isCustom
@@ -626,7 +756,7 @@ function EditPlatformModal({
   return (
     <div
       className="fixed inset-0 z-50 bg-background/60 backdrop-blur-sm flex items-center justify-center p-4"
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
         className="w-full max-w-md rounded-3xl border bg-card p-5 shadow-lg"
@@ -637,38 +767,12 @@ function EditPlatformModal({
             <h3 className="text-sm font-medium">Edit platform</h3>
             <p className="text-xs text-muted-foreground mt-0.5 font-mono">{slug}</p>
           </div>
-          <Button variant="ghost" size="xs" onClick={onClose}><X className="size-4" /></Button>
+          <Button variant="ghost" size="xs" onClick={requestClose}><X className="size-4" /></Button>
         </div>
         <form
           onSubmit={e => {
             e.preventDefault();
-            const body: Record<string, unknown> = {};
-            if (isCustom) {
-              // Custom-only editable fields: slug, displayName, baseUrl,
-              // parallelRequests, keyless, apiFormat.
-              if (newSlug.trim() !== slug) body.slug = newSlug.trim();
-              if (displayName.trim() !== provider.displayName) body.displayName = displayName.trim();
-              if (baseUrl.trim() !== provider.baseUrl) body.baseUrl = baseUrl.trim();
-              const newMax = parallelEnabled ? maxParallelRequests : null;
-              if (newMax !== provider.maxParallelRequests) body.maxParallelRequests = newMax;
-              if (keyless !== provider.keyless) body.keyless = keyless;
-              if (apiFormat !== (provider.apiFormat ?? 'openai')) body.apiFormat = apiFormat;
-              if (keyFormat !== ((provider.keyFormat ?? 'simple') as string)) body.keyFormat = keyFormat;
-            }
-            // Common fields: limits + sticky toggle.
-            const oldRpm = initRpm ?? null;
-            const newRpm = rpmLimit ? parseInt(rpmLimit, 10) : null;
-            if (newRpm !== oldRpm) body.rpmLimit = newRpm;
-            const oldRpd = initRpd ?? null;
-            const newRpd = rpdLimit ? parseInt(rpdLimit, 10) : null;
-            if (newRpd !== oldRpd) body.rpdLimit = newRpd;
-            const oldTpm = initTpm ?? null;
-            const newTpm = tpmLimit ? parseInt(tpmLimit, 10) : null;
-            if (newTpm !== oldTpm) body.tpmLimit = newTpm;
-            const oldTpd = initTpd ?? null;
-            const newTpd = tpdLimit ? parseInt(tpdLimit, 10) : null;
-            if (newTpd !== oldTpd) body.tpdLimit = newTpd;
-            if (stickySessionsEnabled !== initSticky) body.stickySessionsEnabled = stickySessionsEnabled;
+            const body = buildBody();
             if (Object.keys(body).length === 0) { onClose(); return; }
             save.mutate(body);
           }}
@@ -688,13 +792,6 @@ function EditPlatformModal({
                 <Label className="text-xs">Base URL</Label>
                 <Input value={baseUrl} onChange={e => setBaseUrl(e.target.value)} className="font-mono text-xs" />
               </div>
-{keyFormat === 'colon' && (
-  <p className="text-[11px] text-muted-foreground mt-1">
-    Use {'{account_id}'} as a placeholder — it will be replaced with each key's
-    account ID at request time. Example:{' '}
-    <code className="text-xs">https://{'{account_id}'}.api.example.com/v1</code>
-  </p>
-)}
             </>
           )}
           <button type="button" onClick={() => setShowAdvanced(s => !s)} className="text-xs text-muted-foreground hover:text-foreground">
@@ -741,6 +838,13 @@ function EditPlatformModal({
                       <Switch checked={keyFormat === 'colon'} onCheckedChange={c => setKeyFormat(c ? 'colon' : 'simple')} />
                       <span className={keyFormat === 'colon' ? '' : 'text-muted-foreground'}>Account ID + API key</span>
                     </label>
+                    {keyFormat === 'colon' && (
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        Use {'{account_id}'} as a placeholder — it will be replaced with each key's
+                        account ID at request time. Example:{' '}
+                        <code className="text-xs">https://{'{account_id}'}.api.example.com/v1</code>
+                      </p>
+                    )}
                   </div>
                   <div className="flex items-center gap-2 pt-1">
                     <Switch checked={keyless} onCheckedChange={setKeyless} />
@@ -763,10 +867,20 @@ function EditPlatformModal({
           {save.isError && <p className="text-destructive text-xs">{(save.error as Error).message}</p>}
           <div className="flex justify-end gap-2 pt-1">
             <Button type="button" variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
-            <Button type="submit" size="sm" disabled={save.isPending}>{save.isPending ? 'Saving…' : 'Save'}</Button>
+            <Button type="submit" size="sm" disabled={save.isPending || !settingsLoaded}>
+              {!settingsLoaded ? 'Loading…' : save.isPending ? 'Saving…' : 'Save'}
+            </Button>
           </div>
         </form>
       </div>
+      <ConfirmDialog
+        open={confirming}
+        onOpenChange={(o) => { if (!o) setConfirming(false) }}
+        title="Discard changes?"
+        description="You have unsaved edits to this platform. Close without saving?"
+        confirmLabel="Discard"
+        onConfirm={onClose}
+      />
     </div>
   )
 }
@@ -793,6 +907,8 @@ function CustomModelsSection() {
   })
   const [provider, setProvider] = useState<string | null>(null)
   const [modelId, setModelId] = useState('')
+  // L61: model archive is destructive — confirmed via ConfirmDialog.
+  const [archiveModelTarget, setArchiveModelTarget] = useState<{ id: number; modelId: string } | null>(null)
   const [displayName, setDisplayName] = useState('')
   const [contextWindow, setContextWindow] = useState(128000)
   const [maxOutputTokens, setMaxOutputTokens] = useState(null as number | null)
@@ -1069,7 +1185,7 @@ function CustomModelsSection() {
                   {m.enabled ? 'active' : 'archived'}
                 </span>
                 <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
-                  onClick={() => { if (confirm(`Archive model '${m.modelId}'? Re-add it to restore.`)) deleteModel.mutate(m.id) }}
+                  onClick={() => setArchiveModelTarget({ id: m.id, modelId: m.modelId })}
                   disabled={!m.enabled || deleteModel.isPending}>
                   Archive
                 </Button>
@@ -1077,9 +1193,18 @@ function CustomModelsSection() {
             ))}
         </div>
       )}
-    </section>
-  )
-}
+      <ConfirmDialog
+        open={archiveModelTarget !== null}
+        onOpenChange={(open) => { if (!open) setArchiveModelTarget(null) }}
+        title={`Archive model '${archiveModelTarget?.modelId ?? ''}'?`}
+        description="The model leaves routing and the fallback chain. Re-add it to restore."
+        confirmLabel="Archive"
+        pending={deleteModel.isPending}
+        onConfirm={() => { if (archiveModelTarget) deleteModel.mutate(archiveModelTarget.id); setArchiveModelTarget(null) }}
+      />
+     </section>
+   )
+ }
 
 // Main Keys page. Renders the unified key section, the platform grid, the
 // add-key form (which now lists custom slugs too), the per-platform key
@@ -1090,11 +1215,15 @@ export default function KeysPage() {
   const [apiKey, setApiKey] = useState('')
   const [accountId, setAccountId] = useState('')
   const [label, setLabel] = useState('')
+  const [accountIdMissing, setAccountIdMissing] = useState(false)
   const [editingKeyId, setEditingKeyId] = useState<number | null>(null)
   const [editingLabel, setEditingLabel] = useState('')
   const editInputRef = useRef<HTMLInputElement>(null)
   const [addOpen, setAddOpen] = useState(false)
   const [editingProviderSlug, setEditingProviderSlug] = useState<string | null>(null)
+  // L61: archive is destructive (removes provider + its models) — confirmed
+  // via ConfirmDialog like every other destructive action on this page.
+  const [archiveTarget, setArchiveTarget] = useState<{ slug: string; label: string } | null>(null)
   const { data: keys = [], isLoading } = useQuery<ApiKey[]>({
     queryKey: ['keys'],
     queryFn: () => apiFetch('/api/keys'),
@@ -1119,6 +1248,7 @@ export default function KeysPage() {
       setApiKey('')
       setAccountId('')
       setLabel('')
+      setAccountIdMissing(false)
     },
   })
   const deleteKey = useMutation({
@@ -1166,6 +1296,10 @@ export default function KeysPage() {
   // during progress events, plus once on done. Without this, a large fleet
   // triggers ~N invalidations (one per key), causing a refetch storm.
   const lastHealthInvalidate = useRef(0)
+  // The reset timer below fires ~1.5s after 'health.check.done'; guard it so
+  // it never touches state once the page has unmounted.
+  const mountedRef = useRef(true)
+  useEffect(() => () => { mountedRef.current = false }, [])
   useEventStream((e) => {
     if (e?.type === 'health.check.start') {
       setCheckProgress({ completed: 0, total: e.total as number })
@@ -1179,7 +1313,7 @@ export default function KeysPage() {
     } else if (e?.type === 'health.check.done') {
       queryClient.invalidateQueries({ queryKey: ['health'] })
       lastHealthInvalidate.current = Date.now()
-      window.setTimeout(() => setCheckProgress(null), 1500)
+      window.setTimeout(() => { if (mountedRef.current) setCheckProgress(null) }, 1500)
     }
   }, checkAll.isPending)
   const checkKey = useMutation({
@@ -1222,7 +1356,7 @@ export default function KeysPage() {
     setEditingLabel('')
   }
   function saveEditing(id: number) {
-    if (editingKeyId === null || editingLabel === undefined) return;
+    if (editingKeyId === null) return;
     updateKey.mutate({ id, label: editingLabel });
   }
   useEffect(() => {
@@ -1247,7 +1381,7 @@ export default function KeysPage() {
     e.preventDefault()
     if (!platform) return
     if (!isKeyless && !apiKey) return
-    if (needsAccountId && !accountId) return
+    if (needsAccountId && !accountId.trim()) { setAccountIdMissing(true); return }
     const key = isKeyless ? '' : (needsAccountId ? `${accountId}:${apiKey}` : apiKey)
     addKey.mutate({ platform, key, label: label || undefined })
   }
@@ -1274,6 +1408,54 @@ export default function KeysPage() {
         return null;
       })()
     : null;
+  // Shared per-key row used by both active groups and the archived-providers
+  // section so their look and actions stay identical.
+  const renderKeyRow = (k: ApiKey) => {
+    const h = healthKeyMap.get(k.id)
+    const status = h?.status ?? k.status
+    const lastChecked = h?.lastCheckedAt
+    const isEditing = editingKeyId === k.id
+    return (
+      <div key={k.id} className="flex items-center gap-3 px-4 py-3 hover:bg-muted/40 transition-colors">
+        <span className={`size-1.5 rounded-full shrink-0 ${statusDot[status] ?? statusDot.unknown}`} />
+        <code className="text-xs font-mono shrink-0">{k.maskedKey}</code>
+        {isEditing ? (
+          <Input
+            ref={editInputRef}
+            value={editingLabel}
+            onChange={e => setEditingLabel(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') { setEditingKeyId(null); saveEditing(k.id); }
+              if (e.key === 'Escape') cancelEditing()
+            }}
+            onBlur={() => saveEditing(k.id)}
+            className="h-6 w-[160px] text-xs"
+            disabled={updateKey.isPending}
+          />
+        ) : (
+          <>{k.label && <span className="text-xs text-muted-foreground">{k.label}</span>}</>
+        )}
+        <span className="text-xs text-muted-foreground">{statusLabel[status] ?? status}</span>
+        <div className="flex-1" />
+        {lastChecked && (
+          <span className="text-[11px] text-muted-foreground tabular-nums">
+            {formatSqliteUtcToLocalTime(lastChecked, { hour: '2-digit', minute: '2-digit' })}
+          </span>
+        )}
+        {!isEditing && (
+          <Button variant="ghost" size="xs" onClick={() => startEditing(k)}>
+            <Pencil className="size-3" />
+          </Button>
+        )}
+        <Button variant="ghost" size="xs" onClick={() => checkKey.mutate(k.id)} disabled={checkKey.isPending && checkKey.variables === k.id}>
+          Check
+        </Button>
+        <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => deleteKey.mutate(k.id)} disabled={deleteKey.isPending && deleteKey.variables === k.id}>
+          Remove
+        </Button>
+      </div>
+    )
+  }
   return (
     <div>
       <PageHeader
@@ -1291,7 +1473,7 @@ export default function KeysPage() {
                   <div className="w-32 h-1.5 rounded-full bg-muted overflow-hidden">
                     <div
                       className="h-full bg-primary transition-[width] duration-150"
-                      style={{ width: `${Math.min(100, (checkProgress.completed / checkProgress.total) * 100)}%` }}
+                      style={{ width: `${checkProgress.total > 0 ? Math.min(100, (checkProgress.completed / checkProgress.total) * 100) : 0}%` }}
                     />
                   </div>
                   <span className="font-mono tabular-nums">{checkProgress.completed}/{checkProgress.total}</span>
@@ -1350,10 +1532,13 @@ export default function KeysPage() {
                 <Label className="text-xs">Account ID</Label>
                 <Input
                   value={accountId}
-                  onChange={e => setAccountId(e.target.value)}
+                  onChange={e => { setAccountId(e.target.value); setAccountIdMissing(false) }}
                   placeholder="a1b2c3d4…"
                   className="w-[200px] font-mono text-xs"
                 />
+                {accountIdMissing && (
+                  <p className="text-[11px] text-destructive">Account ID is required for this provider.</p>
+                )}
               </div>
             )}
             <div className="space-y-1.5 flex-1 min-w-[240px]">
@@ -1381,7 +1566,7 @@ export default function KeysPage() {
                   placeholder="e.g. My production key"
                   className="w-[160px]"
                 />
-                <Button type="submit" size="sm" disabled={addKey.isPending || (!isKeyless && (!platform || !apiKey))}>
+                <Button type="submit" size="sm" disabled={addKey.isPending || (!isKeyless && (!platform || !apiKey)) || (needsAccountId && !accountId.trim())}>
                   {isKeyless ? 'Enable' : addKey.isPending ? 'Adding…' : 'Add key'}
                 </Button>
               </div>
@@ -1404,16 +1589,25 @@ export default function KeysPage() {
             </div>
           ) : (
             <div className="space-y-6">
-              {grouped.map(group => (
+              {grouped.map(group => {
+                // L63: a group where SOME keys are on must not render its
+                // master toggle as fully ON. Base UI's Switch has no
+                // indeterminate state, so the header uses an indeterminate-
+                // capable checkbox (same pattern as the known-secrets
+                // select-all on MiddlePage).
+                const enabledCount = group.keys.filter(k => k.enabled).length
+                return (
                 <div key={group.value}>
                   <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
-                      <Switch
-                        checked={group.keys.some(k => k.enabled)}
-                        onCheckedChange={(checked) =>
-                          togglePlatform.mutate({ platform: group.value, enabled: checked })
-                        }
+                      <input
+                        type="checkbox"
+                        ref={(el) => { if (el) el.indeterminate = enabledCount > 0 && enabledCount < group.keys.length }}
+                        checked={enabledCount === group.keys.length}
+                        onChange={(e) => togglePlatform.mutate({ platform: group.value, enabled: e.target.checked })}
                         disabled={togglePlatform.isPending}
+                        className="size-4 accent-primary cursor-pointer"
+                        aria-label={`Toggle all ${group.label} keys`}
                       />
                       <h3 className="text-sm font-medium">{group.label}</h3>
                       <GetKeyLink url={group.url} />
@@ -1430,7 +1624,7 @@ export default function KeysPage() {
                       )}
                       {customProviders.some(cp => cp.slug === group.value) && (
                         <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive"
-                          onClick={() => { if (confirm(`Archive provider '${group.label}' and all its models? This can be undone by re-adding.`)) deleteProvider.mutate(group.value) }}
+                        onClick={() => setArchiveTarget({ slug: group.value, label: group.label })}
                           disabled={deleteProvider.isPending}>
                           Archive
                         </Button>
@@ -1438,55 +1632,11 @@ export default function KeysPage() {
                     </div>
                   </div>
                   <div className="rounded-2xl border divide-y bg-card overflow-hidden">
-                    {group.keys.map(k => {
-                      const h = healthKeyMap.get(k.id)
-                      const status = h?.status ?? k.status
-                      const lastChecked = h?.lastCheckedAt
-                      const isEditing = editingKeyId === k.id
-                      return (
-                        <div key={k.id} className="flex items-center gap-3 px-4 py-3 hover:bg-muted/40 transition-colors">
-                          <span className={`size-1.5 rounded-full flex-shrink-0 ${statusDot[status] ?? statusDot.unknown}`} />
-                          <code className="text-xs font-mono flex-shrink-0">{k.maskedKey}</code>
-                          {isEditing ? (
-                            <Input
-                              ref={editInputRef}
-                              value={editingLabel}
-                              onChange={e => setEditingLabel(e.target.value)}
-                              onKeyDown={e => {
-                                if (e.key === 'Enter') { setEditingKeyId(null); saveEditing(k.id); }
-                                if (e.key === 'Escape') cancelEditing()
-                              }}
-                              onBlur={() => saveEditing(k.id)}
-                              className="h-6 w-[160px] text-xs"
-                              disabled={updateKey.isPending}
-                            />
-                          ) : (
-                            <>{k.label && <span className="text-xs text-muted-foreground">{k.label}</span>}</>
-                          )}
-                          <span className="text-xs text-muted-foreground">{statusLabel[status] ?? status}</span>
-                          <div className="flex-1" />
-                          {lastChecked && (
-                            <span className="text-[11px] text-muted-foreground tabular-nums">
-                              {formatSqliteUtcToLocalTime(lastChecked, { hour: '2-digit', minute: '2-digit' })}
-                            </span>
-                          )}
-                          {!isEditing && (
-                            <Button variant="ghost" size="xs" onClick={() => startEditing(k)}>
-                              <Pencil className="size-3" />
-                            </Button>
-                          )}
-                          <Button variant="ghost" size="xs" onClick={() => checkKey.mutate(k.id)} disabled={checkKey.isPending}>
-                            Check
-                          </Button>
-                          <Button variant="ghost" size="xs" className="text-muted-foreground hover:text-destructive" onClick={() => deleteKey.mutate(k.id)} disabled={deleteKey.isPending}>
-                            Remove
-                          </Button>
-                        </div>
-                      )
-                    })}
+                    {group.keys.map(renderKeyRow)}
                   </div>
                 </div>
-              ))}
+                )
+              })}
             </div>
           )}
         </section>
@@ -1494,22 +1644,40 @@ export default function KeysPage() {
           <section>
             <h2 className="text-sm font-medium mb-2 text-muted-foreground">Archived providers</h2>
             <div className="rounded-2xl border divide-y bg-card overflow-hidden">
-              {archivedCustom.map(cp => (
-                <div key={cp.slug} className="flex items-center gap-3 px-4 py-3">
-                  <div className="flex-1">
-                    <p className="text-sm font-medium text-muted-foreground">{cp.displayName}</p>
-                    <p className="text-[11px] text-muted-foreground font-mono">{cp.slug}</p>
+              {archivedCustom.map(cp => {
+                // Keys on archived providers stay listed here so they can
+                // still be audited or removed; Restore re-enables the
+                // provider and returns its keys to the main list.
+                const cpKeys = keys.filter(k => k.platform === cp.slug)
+                return (
+                  <div key={cp.slug} className="px-4 py-3">
+                    <div className="flex items-center gap-3">
+                      <div className="flex-1">
+                        <p className="text-sm font-medium text-muted-foreground">{cp.displayName}</p>
+                        <p className="text-[11px] text-muted-foreground font-mono">{cp.slug}</p>
+                      </div>
+                      {cpKeys.length > 0 && (
+                        <span className="text-xs text-muted-foreground tabular-nums">
+                          {cpKeys.length} key{cpKeys.length === 1 ? '' : 's'}
+                        </span>
+                      )}
+                      <Button
+                        variant="outline"
+                        size="xs"
+                        onClick={() => restoreProvider.mutate(cp.slug)}
+                        disabled={restoreProvider.isPending}
+                      >
+                        {restoreProvider.isPending ? 'Restoring…' : 'Restore'}
+                      </Button>
+                    </div>
+                    {cpKeys.length > 0 && (
+                      <div className="mt-2 rounded-xl border divide-y overflow-hidden">
+                        {cpKeys.map(renderKeyRow)}
+                      </div>
+                    )}
                   </div>
-                  <Button
-                    variant="outline"
-                    size="xs"
-                    onClick={() => restoreProvider.mutate(cp.slug)}
-                    disabled={restoreProvider.isPending}
-                  >
-                    {restoreProvider.isPending ? 'Restoring…' : 'Restore'}
-                  </Button>
-                </div>
-              ))}
+                )
+              })}
             </div>
           </section>
         )}
@@ -1528,6 +1696,15 @@ export default function KeysPage() {
           onSaved={() => setEditingProviderSlug(null)}
         />
       )}
-    </div>
-  )
-}
+      <ConfirmDialog
+        open={archiveTarget !== null}
+        onOpenChange={(open) => { if (!open) setArchiveTarget(null) }}
+        title={`Archive provider '${archiveTarget?.label ?? ''}'?`}
+        description="Archiving removes the provider and all its models. It can be undone by re-adding the provider."
+        confirmLabel="Archive"
+        pending={deleteProvider.isPending}
+        onConfirm={() => { if (archiveTarget) deleteProvider.mutate(archiveTarget.slug); setArchiveTarget(null) }}
+      />
+     </div>
+   )
+ }

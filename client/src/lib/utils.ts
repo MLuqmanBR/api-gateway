@@ -5,6 +5,17 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
 
+/**
+ * Mask a secret for display. Mirrors the server's maskKey() (server/src/lib/
+ * crypto.ts) so a masked key renders identically on the web dashboard and the
+ * desktop app: short values are fully hidden (revealing a tail of a ≤6-char
+ * secret would expose too much), longer ones reveal only the last 3 chars.
+ */
+export function maskKey(key: string): string {
+  if (key.length <= 6) return '****'
+  return '****' + key.slice(-3)
+}
+
 // SQLite stores timestamps as `YYYY-MM-DD HH:MM:SS` with no timezone marker, so
 // passing them straight to `new Date(...)` makes the browser read them as LOCAL
 // time when they are actually UTC — shifting every displayed time by the

@@ -18,7 +18,6 @@ interface Budget {
   daily_limit_cents: number | null
   weekly_limit_cents: number | null
   monthly_limit_cents: number | null
-  weekly_reset_day: number
   daily_used_cents: number
   weekly_used_cents: number
   monthly_used_cents: number
@@ -31,7 +30,7 @@ function formatCents(cents: number): string {
 function ProgressBar({ used, limit }: { used: number; limit: number | null }) {
   if (!limit) return <span className="text-xs text-muted-foreground">no limit</span>
   const pct = Math.min(100, (used / limit) * 100)
-  const color = pct >= 90 ? 'bg-red-500' : pct >= 75 ? 'bg-yellow-500' : 'bg-green-500'
+  const color = pct >= 90 ? 'bg-rose-500' : pct >= 75 ? 'bg-amber-500' : 'bg-emerald-500'
   return (
     <div className="flex items-center gap-2">
       <div className="h-2 w-20 rounded-full bg-muted overflow-hidden">
@@ -91,8 +90,13 @@ export default function BudgetPage() {
     onError: (e: Error) => addToast({ kind: 'warning', title: e.message, sticky: false }),
   })
 
-  function handleSubmit(e: React.FormEvent) {
-    e.preventDefault()
+  const hasLimits = !!(dailyLimit || weeklyLimit || monthlyLimit)
+  const canSave = hasLimits && (scope === 'client_key' ? !!scopeId : true)
+
+  // Single save path shared by the form submit and the floating-bar button.
+  function saveBudget(e?: React.SyntheticEvent) {
+    e?.preventDefault()
+    if (!canSave) return
     createMutation.mutate({
       scope,
       scope_id: scope === 'client_key' ? scopeId : null,
@@ -101,8 +105,6 @@ export default function BudgetPage() {
       monthly_limit_cents: monthlyLimit ? Math.round(parseFloat(monthlyLimit) * 100) : null,
     })
   }
-
-  const hasChanges = (scope === 'client_key' ? !!scopeId : false) || !!(dailyLimit || weeklyLimit || monthlyLimit)
 
   function handleDiscard() {
     setScope('global')
@@ -112,27 +114,17 @@ export default function BudgetPage() {
     setMonthlyLimit('')
   }
 
-  function handleSaveClick() {
-    createMutation.mutate({
-      scope,
-      scope_id: scope === 'client_key' ? scopeId : null,
-      daily_limit_cents: dailyLimit ? Math.round(parseFloat(dailyLimit) * 100) : null,
-      weekly_limit_cents: weeklyLimit ? Math.round(parseFloat(weeklyLimit) * 100) : null,
-      monthly_limit_cents: monthlyLimit ? Math.round(parseFloat(monthlyLimit) * 100) : null,
-    })
-  }
-
   return (
     <div className="space-y-6">
       <PageHeader title="Budgets" description="Set $-spend caps per client key or globally. Requests are rejected with HTTP 402 when a limit is exceeded." />
 
       <Card>
         <CardHeader>
-          <CardTitle>New Budget</CardTitle>
+          <CardTitle>New budget</CardTitle>
           <CardDescription>Create a spending cap. Global budgets apply to all requests; client-key budgets apply to a specific API key.</CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={handleSubmit} className="space-y-4">
+          <form onSubmit={saveBudget} className="space-y-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               <div className="space-y-1.5">
                 <Label className="text-xs">Scope</Label>
@@ -140,32 +132,37 @@ export default function BudgetPage() {
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
                     <SelectItem value="global">Global</SelectItem>
-                    <SelectItem value="client_key">Client Key</SelectItem>
+                    <SelectItem value="client_key">Client key</SelectItem>
                   </SelectContent>
                 </Select>
               </div>
               {scope === 'client_key' && (
                 <div className="space-y-1.5">
-                  <Label className="text-xs">Client Key ID</Label>
+                  <Label className="text-xs">Client key ID</Label>
                   <Input value={scopeId} onChange={e => setScopeId(e.target.value)} placeholder="ck_..." className="font-mono text-xs" />
                 </div>
               )}
               <div className="space-y-1.5">
-                <Label className="text-xs">Daily Limit ($)</Label>
+                <Label className="text-xs">Daily limit ($)</Label>
                 <Input type="number" step="0.01" min="0" value={dailyLimit} onChange={e => setDailyLimit(e.target.value)} placeholder="10.00" className="font-mono text-xs" />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs">Weekly Limit ($)</Label>
+                <Label className="text-xs">Weekly limit ($)</Label>
                 <Input type="number" step="0.01" min="0" value={weeklyLimit} onChange={e => setWeeklyLimit(e.target.value)} placeholder="50.00" className="font-mono text-xs" />
               </div>
               <div className="space-y-1.5">
-                <Label className="text-xs">Monthly Limit ($)</Label>
+                <Label className="text-xs">Monthly limit ($)</Label>
                 <Input type="number" step="0.01" min="0" value={monthlyLimit} onChange={e => setMonthlyLimit(e.target.value)} placeholder="200.00" className="font-mono text-xs" />
               </div>
             </div>
-            <Button type="submit" disabled={createMutation.isPending}>
-              {createMutation.isPending ? 'Saving…' : 'Save Budget'}
-            </Button>
+            <div className="flex items-center gap-3">
+              <Button type="submit" disabled={!canSave || createMutation.isPending}>
+                {createMutation.isPending ? 'Saving…' : 'Save budget'}
+              </Button>
+              {!hasLimits && (
+                <span className="text-xs text-muted-foreground">Enter at least one limit (daily, weekly or monthly).</span>
+              )}
+            </div>
           </form>
         </CardContent>
       </Card>
@@ -182,7 +179,7 @@ export default function BudgetPage() {
       ) : (
         <Card>
           <CardHeader>
-            <CardTitle>Active Budgets</CardTitle>
+            <CardTitle>Active budgets</CardTitle>
             <CardDescription>Spending caps and current usage. Requests exceeding a limit are rejected with HTTP 402.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
@@ -227,10 +224,10 @@ export default function BudgetPage() {
           </CardContent>
         </Card>
       )}
-      <FloatingBar show={hasChanges}>
+      <FloatingBar show={canSave}>
         <span className="text-xs text-muted-foreground">Unsaved changes</span>
         <Button variant="outline" size="sm" onClick={handleDiscard}>Discard</Button>
-        <Button size="sm" onClick={handleSaveClick} disabled={createMutation.isPending}>
+        <Button size="sm" onClick={saveBudget} disabled={createMutation.isPending}>
           {createMutation.isPending ? 'Saving…' : 'Save changes'}
         </Button>
       </FloatingBar>
