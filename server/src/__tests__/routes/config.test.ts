@@ -662,6 +662,7 @@ describe('Config API', () => {
     const env = exp.body as ConfigEnvelope;
     expect(env.keysCipher).toBeDefined();
     expect(env.sections.apiKeys?.[0]?.key).toBeUndefined();
+    expect(env.sections.apiKeys?.[0]?.label).toBeDefined();
 
     const db = getDb();
     db.prepare(`DELETE FROM api_keys`).run();
@@ -679,12 +680,147 @@ describe('Config API', () => {
     expect(stored.encrypted_key.length).toBeGreaterThan(0);
   });
 
+  it('multi-account same-platform passphrase round-trip preserves per-account keys', async () => {
+    // Regression for the keysByPlatform collapse: several API keys on ONE
+    // platform (one per account) used to be lost on import — every row got
+    // the same (last) account's key. Export with a passphrase, wipe,
+    // re-import, and prove each account keeps its own key exactly.
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+    const accounts: Array<[string, string, string]> = [
+      ['acct-a', 'sk-a-111', 'groq'],
+      ['acct-b', 'sk-b-222', 'groq'],
+      ['acct-c', 'sk-c-333', 'groq'],
+    ];
+    for (const [label, plain, platform] of accounts) {
+      const k = encrypt(plain);
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+        VALUES (?, ?, ?, ?, ?, 'unknown', 1)
+      `).run(platform, label, k.encrypted, k.iv, k.authTag);
+    }
+
+    const exp = await request(app, 'POST', '/api/config/export', { passphrase: 'roundtrip' });
+    expect(exp.status).toBe(200);
+    const env = exp.body as ConfigEnvelope;
+
+    db.prepare('DELETE FROM api_keys').run();
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'overwrite', dryRun: false, passphrase: 'roundtrip' },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.api_keys?.added).toBe(3);
+    expect(imp.body.sections.api_keys?.errors ?? []).toEqual([]);
+
+    for (const [label, plain] of accounts.map(([l, p]) => [l ?? '', p ?? ''] as [string, string])) {
+      const row = db.prepare(
+        `SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform='groq' AND label=?`,
+      ).get(label) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+      expect(row).toBeDefined();
+      expect(decrypt(row!.encrypted_key, row!.iv, row!.auth_tag)).toBe(plain);
+    }
+  });
+
+  it('legacy unlabeled payload (single key per platform) maps that one key to the platform row', async () => {
+    // Legacy passphrase exports (created before per-row `label`) have no
+    // account labels in their keysCipher payload. A platform with one key is
+    // unambiguous — that key goes to the (single) row. This used to be the
+    // old importer's path for every backup, and it must still work.
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+
+    const cipher = encryptKeysWithPassphrase(
+      [{ platform: 'groq', key: 'sk-legacy-x' }],
+      'legacy',
+    );
+
+    // Per-row ciphertext must be decodable under THIS gateway's key so the
+    // import schema accepts the envelope; the legacy-key fallback then
+    // decides which key material actually lands in the row.
+    const rowCipher = encrypt('sk-legacy-x');
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [{
+          platform: 'groq', label: 'a1', enabled: true,
+          encryptedKey: rowCipher.encrypted, iv: rowCipher.iv, authTag: rowCipher.authTag,
+        }],
+      },
+      keysCipher: cipher,
+    };
+
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'overwrite', dryRun: false, passphrase: 'legacy' },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.api_keys?.added).toBe(1);
+    expect(imp.body.sections.api_keys?.errors ?? []).toEqual([]);
+
+    const stored = db.prepare(
+      `SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform='groq' AND label='a1' LIMIT 1`,
+    ).get() as { encrypted_key: string; iv: string; auth_tag: string };
+    expect(decrypt(stored.encrypted_key, stored.iv, stored.auth_tag)).toBe('sk-legacy-x');
+  });
+
+  it('legacy multi-key platform payload falls back to per-row ciphertext, never duplicates one key', async () => {
+    // Legacy passphrase exports carry one entry per key but no labels — when a
+    // platform has 2+ keys the (platform -> last-key) collapse would assign
+    // every account the same key. The fix refuses to guess: rows fall through
+    // to their own encryptedKey branch instead of being silently overwritten.
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+
+    const cipher = encryptKeysWithPassphrase(
+      [
+        { platform: 'groq', key: 'legacy-1' },
+        { platform: 'groq', key: 'legacy-2' },
+      ],
+      'legacy-multi',
+    );
+
+    const r1 = encrypt('sk-row-1');
+    const r2 = encrypt('sk-row-2');
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        apiKeys: [
+          { platform: 'groq', label: 'x1', enabled: true,
+            encryptedKey: r1.encrypted, iv: r1.iv, authTag: r1.authTag },
+          { platform: 'groq', label: 'x2', enabled: true,
+            encryptedKey: r2.encrypted, iv: r2.iv, authTag: r2.authTag },
+        ],
+      },
+      keysCipher: cipher,
+    };
+
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'overwrite', dryRun: false, passphrase: 'legacy-multi' },
+    });
+    expect(imp.status).toBe(200);
+
+    // Neither row may hold someone else's key: each keeps its own per-row value.
+    for (const [label, plain] of [['x1', 'sk-row-1'], ['x2', 'sk-row-2']] as const) {
+      const row = db.prepare(
+        `SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform='groq' AND label=?`,
+      ).get(label) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+      expect(row).toBeDefined();
+      expect(decrypt(row!.encrypted_key, row!.iv, row!.auth_tag)).toBe(plain);
+    }
+  });
+
   it('cross-machine restore: keysCipher plaintext wins over source-encrypted row ciphertext', async () => {
     // Reproduce the "backup imported from another machine" scenario:
     // the envelope's apiKeys rows carry ciphertext produced under a
     // DIFFERENT ENCRYPTION_KEY than the one running on this gateway.
     // When the operator supplies the correct passphrase, the import
-    // MUST honour the keysByPlatform path and re-encrypt with the
+    // MUST honour the keysCipher lookup path and re-encrypt with the
     // destination's key, rather than copying the source ciphertext
     // straight into the DB. Otherwise every health check fails with
     // "Unsupported state or unable to authenticate data".

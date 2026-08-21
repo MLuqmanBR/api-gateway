@@ -460,8 +460,8 @@ function applyModels(
 function applyApiKeys(
   db: DatabasePort,
   list: ConfigApiKey[],
-  keysByPlatform: Map<string, string> | null,
-  legacyKeysByPlatform: Map<string, string> | null,
+  keyLookup: Map<string, string> | null,
+  legacyPlatformKeys: Map<string, string[]> | null,
   mode: ConfigImportOptions['mode'],
   summary: Record<string, SectionDiff>,
 ): Array<{ platform: string; label: string; message: string }> {
@@ -533,22 +533,32 @@ function applyApiKeys(
         let encryptedKey: string;
         let iv: string;
         let authTag: string;
-        // Composite `platform\0label` lookup first (each key of a platform
-        // restores its OWN value — C14); the platform-only legacy map only
-        // serves envelopes exported before labels were carried in the blob.
-        const blobKey = keysByPlatform?.get(`${k.platform}\u0000${k.label}`);
-        const blobValue = blobKey ?? legacyKeysByPlatform?.get(k.platform);
-        if (blobValue !== undefined) {
+        // Resolve this row's plaintext from a passphrase-protected keysCipher
+        // when present. The labeled path keys by (platform, label) so each
+        // account gets its own key; a multi-key platform is never collapsed
+        // to a single shared key the way the old platform-only lookup did.
+        let plaintext: string | null = null;
+        if (keyLookup) {
+          const hit = keyLookup.get(`${k.platform}\u0000${k.label}`);
+          if (hit !== undefined) plaintext = hit;
+        } else if (legacyPlatformKeys) {
+          // Legacy passphrase exports (pre-label payload) cannot map N keys
+          // of one platform to their accounts — using any single key for
+          // every row is exactly the corruption this fixes — so multi-key
+          // legacy platforms fall through to per-row ciphertext instead of
+          // guessing. Only a single-key platform is unambiguous.
+          const hits = legacyPlatformKeys.get(k.platform);
+          if (hits && hits.length === 1) plaintext = hits[0];
+        }
+        if (plaintext !== null) {
           // The envelope carried a `keysCipher` blob that we successfully
           // decrypted — the operator opted into passphrase-protected
-          // transport. The plaintext for THIS row is the canonical,
-          // transport-independent value; the `encryptedKey / iv / authTag`
-          // fields on this row were produced by the source machine's
-          // ENCRYPTION_KEY and will silently rot on the destination unless
-          // the keys happen to match. Always prefer the decrypted plaintext
-          // here so cross-machine restores work as long as the operator
-          // passed the correct passphrase.
-          const enc = encrypt(blobValue);
+          // transport. The decrypted plaintext is the canonical,
+          // transport-independent value for this row; the row's own
+          // `encryptedKey / iv / authTag` fields were produced by the source
+          // machine's ENCRYPTION_KEY and would silently rot on the
+          // destination unless the keys happen to match.
+          const enc = encrypt(plaintext);
           encryptedKey = enc.encrypted;
           iv = enc.iv;
           authTag = enc.authTag;
@@ -899,12 +909,9 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
   // Decrypt the keysCipher blob up-front (if any) — outside the
   // transaction because PBKDF2 is slow and we want any wrong-passphrase
   // error surfaced before we start mutating.
-  // The blob is keyed `platform\0label` so multiple keys per platform each
-  // restore their own value (C14). Envelopes from older exports carry no
-  // label on cipher items — those fall back to a platform-only map, which
-  // preserves the historical single-key-per-platform behavior.
-  let keysByPlatform: Map<string, string> | null = null;
-  let legacyKeysByPlatform: Map<string, string> | null = null;
+  // `platform${platform}\u0000${label}` -> plaintext key, or legacy fallback.
+  let keyLookup: Map<string, string> | null = null;         // `${platform}\u0000${label}` -> key
+  let legacyPlatformKeys: Map<string, string[]> | null = null; // legacy: platform -> keys
   if (env.keysCipher) {
     if (!eff.passphrase) {
       throw new ConfigImportError(
@@ -921,16 +928,21 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
         401,
       );
     }
-    keysByPlatform = new Map();
-    for (const d of decrypted) {
-      if (typeof d.label === 'string') {
-        keysByPlatform.set(`${d.platform}\u0000${d.label}`, d.key);
-      } else {
-        legacyKeysByPlatform ??= new Map();
-        legacyKeysByPlatform.set(d.platform, d.key);
+    // An export written by this gateway labels every keysCipher entry, so a
+    // round-trip matches each account row exactly by (platform, label).
+    // Legacy passphrase exports have no labels and can only ever be applied
+    // whole-platform (see applyApiKeys' legacy branch for the multi-key case).
+    const allLabeled = decrypted.length > 0 && decrypted.every((d) => typeof d.label === 'string' && d.label.length > 0);
+    if (allLabeled) {
+      keyLookup = new Map(decrypted.map((d) => [`${d.platform}\u0000${d.label}` , d.key]));
+    } else {
+      legacyPlatformKeys = new Map<string, string[]>();
+      for (const d of decrypted) {
+        const arr = legacyPlatformKeys.get(d.platform) ?? [];
+        arr.push(d.key);
+        legacyPlatformKeys.set(d.platform, arr);
       }
     }
-    if (keysByPlatform.size === 0) keysByPlatform = null;
   }
 
   const db = getDb();
@@ -970,7 +982,7 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
     }
 
     if (sectionAllow.has('api_keys') && env.sections.apiKeys) {
-      apiKeysMismatchRows = applyApiKeys(db, env.sections.apiKeys, keysByPlatform, legacyKeysByPlatform, eff.mode, summary);
+      apiKeysMismatchRows = applyApiKeys(db, env.sections.apiKeys, keyLookup, legacyPlatformKeys, eff.mode, summary);
     }
 
 

@@ -607,10 +607,12 @@ export interface ConfigEnvelope {
     quirks?: ConfigQuirk[];
   };
   /** Passphrase-encrypted blob holding the plaintext API keys (one JSON
-   * array of `{ platform, key }`). When this is set, individual api_keys
-   * entries above should NOT include `key` — the import server pulls them
-   * from this blob. Always present when the export was created with a
-   * passphrase. */
+   * array of `{ platform, label, key }`; `label` is present for exports
+   * produced by released gateways and absent only in legacy passphrase
+   * backups created before per-account labels were recorded). When this is
+   * set, individual api_keys entries above should NOT include `key` — the
+   * import server pulls them from this blob. Always present when the
+   * export was created with a passphrase. */
   keysCipher?: {
     // Versioned KDF identifier — the iteration count is encoded in the
     // string. Legacy envelopes (310k) stay importable; new exports use 600k
