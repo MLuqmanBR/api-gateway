@@ -365,11 +365,25 @@ def hex_to_rgba(color: str, alpha: float) -> str:
     return f"rgba({r}, {g}, {b}, {alpha})"
 
 
+def _ui_font_family() -> str:
+    """First installed family from PREFERRED_UI_FONTS, else '' (Qt resolves an
+    empty family to the platform default UI font). Requesting a family that
+    isn't installed makes Qt substitute unpredictably per widget, so detect
+    via QFontDatabase instead of blindly trusting "Inter" (audit L94)."""
+    from PyQt6.QtGui import QFontDatabase
+
+    installed = set(QFontDatabase.families())
+    for name in ("Inter", "Inter Display", "Roboto", "Cantarell", "DejaVu Sans"):
+        if name in installed:
+            return name
+    return ""
+
+
 def apply(app, dark: bool = True) -> None:
     from PyQt6.QtGui import QFont
 
     global _CURRENT_DARK
     _CURRENT_DARK = dark
     app.setStyleSheet(qss(current_palette(dark)))
-    app.setFont(QFont("Inter", 10))
+    app.setFont(QFont(_ui_font_family(), 10))
     THEME_BUS.changed.emit(dark)

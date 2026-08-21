@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+    # Tests are unittest-style (`make test` uses `unittest discover`), but CI
+    # runs them via pytest (.github/workflows/ci.yml: `pytest tests/`), so the
+    # dependency stays (audit L104).
     "pytest>=8",
     "pyinstaller>=6.0",
 ]

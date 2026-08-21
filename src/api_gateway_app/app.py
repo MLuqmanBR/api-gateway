@@ -4,15 +4,17 @@ Boot order:
 1. Configure the Qt app identity / icon / theme
 2. Ensure the systemd user unit exists and the backend is running
 3. Build the ApiClient, drive the AuthGate if the server demands a session
-4. Show the MainWindow (or start it in the tray with --minimized)
+4. Show the MainWindow (or start it in the tray with --minimized);
+   ``--page=<key>`` (desktop "Open settings" action) opens that page.
 """
 
 from __future__ import annotations
 
 import os
+import signal
 import sys
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSocketNotifier, Qt
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QDialog, QVBoxLayout
 
@@ -29,6 +31,31 @@ def _repo_icon() -> str:
     return str(icon) if icon.exists() else ""
 
 
+def _install_signal_handlers(app: "QApplication") -> None:
+    """Make SIGINT/SIGTERM quit the Qt event loop (audit L102).
+
+    Python defers signal handlers until the interpreter regains control —
+    which never happens while Qt blocks in its C event loop, so a plain
+    ``signal.signal(SIGINT, app.quit)`` appears dead. The wakeup pipe +
+    QSocketNotifier bridge it: the C-level handler writes a byte to the
+    pipe, the notifier fires inside the Qt loop and calls quit()."""
+    if sys.platform == "win32":
+        return  # set_wakeup_fd supports only sockets there; app is Linux-first
+    rfd, wfd = os.pipe()
+    os.set_blocking(rfd, False)
+    os.set_blocking(wfd, False)
+    signal.set_wakeup_fd(wfd)
+
+    notifier = QSocketNotifier(rfd, QSocketNotifier.Type.Read, app)
+    notifier.activated.connect(lambda *_args: app.quit())
+
+    def _handler(signum, _frame):  # noqa: ARG001 - loop exits via the notifier
+        return None
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     app = QApplication(argv)
@@ -41,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     icon_path = _repo_icon()
     if icon_path:
         app.setWindowIcon(QIcon(icon_path))
+    _install_signal_handlers(app)
+
 
     theme.apply(app, dark=app_settings.theme_dark())
 
@@ -103,12 +132,25 @@ def _after_auth(dialog: QDialog, window: MainWindow, argv: list[str]) -> None:
     _show_or_minimize(window, argv)
 
 
+def _requested_page(argv: list[str]) -> str | None:
+    """Value of ``--page=<key>`` if given (e.g. the desktop action's settings)."""
+    for arg in argv:
+        if arg.startswith("--page="):
+            return arg.split("=", 1)[1].strip() or None
+    return None
+
+
 def _show_or_minimize(window: MainWindow, argv: list[str]) -> None:
     minimized = app_settings.start_minimized() or "--minimized" in argv
     if minimized and window._tray is not None:
         window.hide()
     else:
         window.show()
+    # M82: honor --page=<key> now that the window exists; unknown keys are
+    # ignored (MainWindow.open_page just falls through).
+    page_key = _requested_page(argv)
+    if page_key:
+        window.open_page(page_key)
 
 
 def _requires_auth(api: ApiClient) -> bool:

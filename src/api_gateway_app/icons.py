@@ -45,7 +45,7 @@ def _pen(color: str, width: float = 2.0) -> QPen:
 # ---------------------------------------------------------------------------
 # Individual renderers.  Each takes (painter, w, h) and paints a 24x24 design
 # scaled to w×h.  They're simple enough to fit in a few statements; the goal
-# is recognisability at small sizes, not illustration.
+# is recognizability at small sizes, not illustration.
 # ---------------------------------------------------------------------------
 
 def _i_dashboard(p: QPainter, w, h):

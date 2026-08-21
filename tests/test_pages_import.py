@@ -67,11 +67,14 @@ class ImportTests(unittest.TestCase):
 
         for mod in (dashboard, analytics, keys, budget, playground, fallback, embeddings, middle, settings):
             with self.subTest(module=mod.__name__):
-                assert any(
-                    isinstance(getattr(mod, attr), type)
-                    for attr in dir(mod)
-                    if not attr.startswith("_")
-                ), f"{mod.__name__} has no class"
+                self.assertTrue(
+                    any(
+                        isinstance(getattr(mod, attr), type)
+                        for attr in dir(mod)
+                        if not attr.startswith("_")
+                    ),
+                    f"{mod.__name__} has no class",
+                )
 
 
 if __name__ == "__main__":

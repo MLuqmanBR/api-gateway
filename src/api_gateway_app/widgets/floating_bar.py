@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation
 from PyQt6.QtWidgets import QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QPushButton, QWidget
 
 
@@ -18,9 +18,6 @@ class FloatingBar(QFrame):
         self.setFixedHeight(52)
         self.setVisible(False)
 
-        # Backdrop glow
-        shadow = self.graphicsEffect_drop_shadow()
-        self.setGraphicsEffect(shadow)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 8, 12, 8)
@@ -41,13 +38,16 @@ class FloatingBar(QFrame):
 
         layout.addWidget(self.discard_button)
         layout.addWidget(self.save_button)
-
-        # Simple fade-in animation
+        # Fade in/out. A QWidget can carry only ONE graphics effect — the
+        # opacity effect owns rendering, so no separate drop-shadow glow.
         self._opacity = QGraphicsOpacityEffect(self)
         self.setGraphicsEffect(self._opacity)
         self._anim = QPropertyAnimation(self._opacity, b"opacity", self)
         self._anim.setDuration(160)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        # Connected ONCE here — connecting per hide() accumulated handlers
+        # and re-ran them on every later animation tick.
+        self._anim.finished.connect(self._on_anim_finished)
 
         self._apply_style()
         THEME_BUS.changed.connect(lambda _d: self._apply_style())
@@ -64,16 +64,6 @@ class FloatingBar(QFrame):
         self.dot.setStyleSheet(f"background: {p['yellow']}; border-radius: 4px;")
         self.message.setStyleSheet(f"font-weight: 600; color: {p['text']};")
 
-    @staticmethod
-    def graphicsEffect_drop_shadow():
-        from PyQt6.QtWidgets import QGraphicsDropShadowEffect
-        from PyQt6.QtGui import QColor
-
-        e = QGraphicsDropShadowEffect()
-        e.setBlurRadius(28)
-        e.setColor(QColor(0, 0, 0, 120))
-        e.setOffset(0, 4)
-        return e
 
     def show_bar(self) -> None:
         if not self.isVisible():
@@ -89,10 +79,8 @@ class FloatingBar(QFrame):
             self._anim.setStartValue(self._opacity.opacity())
             self._anim.setEndValue(0.0)
             self._anim.start()
-            # hide at end
-            def _hide():
-                if abs(self._opacity.opacity() - 1.0) < 0.01:
-                    pass
-                else:
-                    self.setVisible(False)
-            self._anim.finished.connect(_hide)
+
+    def _on_anim_finished(self) -> None:
+        # Hide only after a fade-OUT completes; a fade-in ends at opacity 1.
+        if self._anim.endValue() == 0.0:
+            self.setVisible(False)

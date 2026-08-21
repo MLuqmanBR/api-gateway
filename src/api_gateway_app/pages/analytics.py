@@ -71,9 +71,6 @@ class AnalyticsPage(BasePage):
     def __init__(self, api, parent=None):
         super().__init__(api, parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(14)
-
         layout.setContentsMargins(28, 26, 28, 24)
         layout.setSpacing(14)
 
@@ -87,7 +84,7 @@ class AnalyticsPage(BasePage):
         title_block.addWidget(title)
         title_block.addWidget(subtitle)
         header.addLayout(title_block)
-        
+
         # Style the hero block palette-aware
         from ..widgets.styled import style_hero_title, style_page_subtitle, watch_style
         watch_style(lambda: style_hero_title(title))
@@ -96,7 +93,9 @@ class AnalyticsPage(BasePage):
         style_page_subtitle(subtitle)
         header.addStretch()
         self.range_box = QComboBox()
-        self.range_box.addItems(["24h", "7d", "30d", "all"])
+        # H27: the server's TimeRange enum is exactly 24h|7d|30d — "all"
+        # failed the whole fetch with a 400.
+        self.range_box.addItems(["24h", "7d", "30d"])
         self.range_box.setCurrentText("7d")
         self.range_box.currentTextChanged.connect(lambda _: self.refresh())
         header.addWidget(QLabel("Range:"))
@@ -144,9 +143,7 @@ class AnalyticsPage(BasePage):
 
     def refresh(self):
         rng = self.range_box.currentText()
-        self.set_loading(True)
         self.call_in_background(lambda: self._fetch(rng), on_success=self._apply)
-        self.set_loading(False)
 
     # -- data --------------------------------------------------------------
 
@@ -168,39 +165,57 @@ class AnalyticsPage(BasePage):
         self._apply_list(self.by_model, by_model, kind="model")
         self._apply_list(self.by_platform, by_platform, kind="platform")
         self._apply_errors(errors)
-        points = [(str(t.get("bucket", t.get("time", ""))), int(t.get("requests", t.get("count", 0)))) for t in timeline] if isinstance(timeline, list) else []
+        # H27: TimelinePoint = { timestamp, requests, successCount, failureCount }.
+        points = []
+        if isinstance(timeline, list):
+            for t in timeline:
+                if not isinstance(t, dict):
+                    continue
+                stamp = str(t.get("timestamp", ""))
+                # SQLite UTC "YYYY-MM-DD HH:MM:SS" → short local label.
+                label = stamp[11:16] if len(stamp) >= 16 else stamp
+                points.append((label, int(t.get("requests", 0) or 0)))
         self.timeline.set_points(points)
 
     def _apply_summary(self, s: dict):
-        self.card_requests.set_value(str(s.get("totalRequests", s.get("requests", 0))))
-        cost = s.get("totalCost", s.get("cost", 0)) or 0
-        try:
-            self.card_cost.set_value(f"${float(cost):.4f}")
-        except (TypeError, ValueError):
-            self.card_cost.set_value("$0.0000")
-        tokens = s.get("totalTokens", s.get("tokens", 0)) or 0
-        self.card_tokens.set_value(str(tokens))
-        self.card_errors.set_value(str(s.get("failedRequests", s.get("errors", 0))))
+        # H27: AnalyticsSummary fields — totalRequests, totalInputTokens,
+        # totalOutputTokens, avgLatencyMs, successRate… (shared/types.ts).
+        s = s or {}
+        self.card_requests.set_value(str(s.get("totalRequests", 0) or 0))
+        self.card_tokens.set_value(str((s.get("totalInputTokens", 0) or 0) + (s.get("totalOutputTokens", 0) or 0)))
+        self.card_errors.set_value(str(round((s.get("totalRequests", 0) or 0) * (1 - (s.get("successRate", 1) or 1)))))
+        self.card_cost.set_value(f"{s.get('avgLatencyMs', 0) or 0} ms")
 
     def _apply_list(self, table: QTableWidget, rows, kind: str):
         rows = rows if isinstance(rows, list) else []
         data = []
         for r in rows:
-            name = r.get("model") or r.get("platform") or r.get("name", "")
-            req = r.get("requests", r.get("count", 0))
-            tok = r.get("tokens", 0)
-            cost = r.get("cost", 0)
+            if not isinstance(r, dict):
+                continue
+            if kind == "model":
+                # ModelStats: displayName, requests, total{In,Out}putTokens,
+                # estimatedCost (dollars), avgLatencyMs, successRate.
+                name = r.get("displayName") or r.get("modelId", "")
+                tok = (r.get("totalInputTokens", 0) or 0) + (r.get("totalOutputTokens", 0) or 0)
+                extra = f"{r.get('avgLatencyMs', 0) or 0}"
+            else:
+                # PlatformStats: platform, requests, successRate, avgLatencyMs.
+                name = r.get("platform", "")
+                tok = (r.get("totalInputTokens", 0) or 0) + (r.get("totalOutputTokens", 0) or 0)
+                rate = r.get("successRate", 0) or 0
+                extra = f"{round(rate * 100)}%"
+            cost = r.get("estimatedCost", 0) or 0
             try:
                 cost_str = f"${float(cost):.4f}"
             except (TypeError, ValueError):
                 cost_str = "$0.00"
-            extra = r.get("avgLatencyMs", r.get("successRate", ""))
-            data.append([name, req, tok, cost_str, extra])
+            data.append([name, r.get("requests", 0) or 0, tok, cost_str, extra])
         fill_table(table, data)
 
     def _apply_errors(self, errors):
         errors = errors if isinstance(errors, list) else []
+        # H27: ErrorLogEntry = { createdAt, modelId, platform, error, … }.
         fill_table(self.errors, [
-            [e.get("time", e.get("createdAt", "")), e.get("model", ""), e.get("platform", ""), e.get("error", e.get("message", ""))]
-            for e in errors
+            [e.get("createdAt", ""), e.get("modelId", ""), e.get("platform", ""), e.get("error", "")]
+            for e in errors if isinstance(e, dict)
         ])

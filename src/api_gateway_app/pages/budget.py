@@ -20,7 +20,9 @@ from ..widgets.floating_bar import FloatingBar
 from ..widgets.toast import Toaster
 from .base import BasePage
 
-SCOPES = ["global", "client_key", "platform", "model"]
+# H26: the server's budget scope enum is ONLY ['client_key', 'global']
+# (routes/budgets.ts) — 'platform'/'model' were rejected with 400.
+SCOPES = ["global", "client_key"]
 
 
 class BudgetPage(BasePage):
@@ -139,31 +141,33 @@ class BudgetPage(BasePage):
         w = QWidget()
         row = QHBoxLayout(w)
         row.setContentsMargins(4, 4, 4, 4)
-        label = QLabel(f"{b.get('scope', 'global')} — {b.get('scopeId') or ''}")
+        # H26: the server sends snake_case integer CENTS
+        # (scope_id / {period}_limit_cents / {period}_used_cents).
+        label = QLabel(f"{b.get('scope', 'global')} — {b.get('scope_id') or ''}")
         label.setFixedWidth(260)
         row.addWidget(label)
         for period in ("daily", "weekly", "monthly"):
-            limit = b.get(f"{period}Limit") if isinstance(b.get(f"{period}Limit"), (int, float)) else None
-            used = b.get(f"{period}Used", b.get(period, 0)) or 0
+            limit = b.get(f"{period}_limit_cents") if isinstance(b.get(f"{period}_limit_cents"), int) else None
+            used = b.get(f"{period}_used_cents") or 0
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(int(min(100, (used / limit * 100) if limit else 0)) if limit else 0)
-            bar.setFormat(f"{period}: {used:.4f}" + (f" / {limit:.2f}" if limit else ""))
+            bar.setFormat(f"{period}: ${used / 100:.2f}" + (f" / ${limit / 100:.2f}" if limit else ""))
             row.addWidget(bar, 1)
         reset = QPushButton("Reset")
-        reset.clicked.connect(lambda _=False, s=b.get("scope"), sid=b.get("scopeId"): self._reset(s, sid))
+        reset.clicked.connect(lambda _=False, s=b.get("scope"), sid=b.get("scope_id"): self._reset(s, sid))
         row.addWidget(reset)
         return w
 
     # ------------------------------------------------------------------
 
     def _payload(self) -> dict[str, Any]:
-        def _num(edit: QLineEdit):
+        def _cents(edit: QLineEdit):
             text = edit.text().strip()
             if not text:
                 return None
             try:
-                return float(text)
+                return int(round(float(text) * 100))  # H26: server wants integer cents
             except ValueError as exc:
                 raise ValueError(f"'{text}' is not a number") from exc
 
@@ -172,9 +176,13 @@ class BudgetPage(BasePage):
             sid = self.scope_id.text().strip()
             if not sid:
                 raise ValueError("Scope ID is required for this scope")
-            body["scopeId"] = sid
-        for key, edit in (("dailyLimit", self.daily), ("weeklyLimit", self.weekly), ("monthlyLimit", self.monthly)):
-            value = _num(edit)
+            body["scope_id"] = sid
+        for key, edit in (
+            ("daily_limit_cents", self.daily),
+            ("weekly_limit_cents", self.weekly),
+            ("monthly_limit_cents", self.monthly),
+        ):
+            value = _cents(edit)
             if value is not None:
                 body[key] = value
         return body

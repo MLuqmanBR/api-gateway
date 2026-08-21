@@ -13,7 +13,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from .. import systemd
+from .. import systemd_gui
+from ..systemd_gui import run_in_background, service_status_poller
 from ..widgets.live_events import LiveEvents
 from ..widgets.statscard import StatsCard
 from ..widgets.toast import Toaster
@@ -122,18 +123,14 @@ class DashboardPage(BasePage):
         self.events = LiveEvents()
         root.addWidget(self.events, 1)
 
-        self._timer = QTimer(self)
-        self._timer.setInterval(10_000)
-        self._timer.timeout.connect(self._refresh_status_only)
+        # M79: service status arrives from the ONE process-wide poller
+        # (systemd_gui.service_status_poller); no page-local systemctl runs.
+        service_status_poller().status_ready.connect(self._on_service_status)
 
     # ------------------------------------------------------------------ lifecycle
 
     def on_show(self):
         self.refresh()
-        self._timer.start()
-
-    def on_hide(self):
-        self._timer.stop()
 
     def add_event(self, event: dict) -> None:
         self.events.add_event(event)
@@ -142,14 +139,8 @@ class DashboardPage(BasePage):
 
     def refresh(self):
         self.call_in_background(self._fetch, on_success=self._apply)
-        self._refresh_status_only()
 
-    def _refresh_status_only(self):
-        try:
-            status = systemd.service_status()
-        except systemd.SystemdError:
-            self._apply_status(False, None, None, None)
-            return
+    def _on_service_status(self, status) -> None:
         self._apply_status(status.active, status.pid, status.memory_bytes, status.uptime_s)
 
     def _style_pill(self, running: bool):
@@ -207,26 +198,25 @@ class DashboardPage(BasePage):
     # ------------------------------------------------------------------ actions
 
     def _restart_service(self):
-        try:
-            systemd.restart_service()
-            Toaster.success("Service is restarting")
-        except systemd.SystemdError as exc:
-            Toaster.error(str(exc))
-        QTimer.singleShot(1400, self._refresh_status_only)
+        run_in_background(
+            systemd_gui.restart_service,
+            on_success=lambda _r: Toaster.success("Service is restarting"),
+            on_error=Toaster.error,
+        )
+        QTimer.singleShot(1400, service_status_poller().refresh)
 
     def _stop_service(self):
-        try:
-            systemd.stop_service()
-            Toaster.info("Service stopped — /v1 traffic will fail until started again.")
-        except systemd.SystemdError as exc:
-            Toaster.error(str(exc))
-        QTimer.singleShot(800, self._refresh_status_only)
+        run_in_background(
+            systemd_gui.stop_service,
+            on_success=lambda _r: Toaster.info("Service stopped — /v1 traffic will fail until started again."),
+            on_error=Toaster.error,
+        )
+        QTimer.singleShot(800, service_status_poller().refresh)
 
     def _start_service(self):
-        try:
-            systemd.ensure_service_installed()
-            systemd.start_service()
-            Toaster.success("Service started")
-        except systemd.SystemdError as exc:
-            Toaster.error(str(exc))
-        QTimer.singleShot(1200, self._refresh_status_only)
+        run_in_background(
+            systemd_gui.start_service,
+            on_success=lambda _r: Toaster.success("Service started"),
+            on_error=Toaster.error,
+        )
+        QTimer.singleShot(1200, service_status_poller().refresh)

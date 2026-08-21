@@ -98,7 +98,10 @@ class FallbackPage(BasePage):
             entry = {"modelDbId": meta.get("id"), "priority": i + 1, "enabled": meta.get("enabled", True)}
             payload.append(entry)
         self.call_in_background(
-            lambda: self.api.put("/api/fallback", json={"models": payload}),
+            # The server's PUT /api/fallback schema is a bare JSON ARRAY of
+            # chain entries — an object wrapper fails validation and the
+            # drag-ordered chain could never be saved.
+            lambda: self.api.put("/api/fallback", json=payload),
             on_success=lambda _r: (Toaster.show("Fallback chain saved", "success"), self.refresh()),
             on_error=lambda e: Toaster.show(str(e), "error"),
         )

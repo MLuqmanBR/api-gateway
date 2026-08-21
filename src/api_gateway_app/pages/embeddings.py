@@ -32,7 +32,8 @@ class EmbeddingsPage(BasePage):
         style_page_subtitle(subtitle)
 
         self.chains = QTableWidget()
-        configure_table(self.chains, ["Family", "Providers", "Keys", "Monthly tokens"])
+        # H27: real columns from the server's EmbeddingsData/UsageData shapes.
+        configure_table(self.chains, ["Family", "Providers", "Monthly tokens", "Requests today"])
         layout.addWidget(self.chains, 1)
 
         row = QHBoxLayout()
@@ -60,23 +61,36 @@ class EmbeddingsPage(BasePage):
     def _apply(self, result):
         self.set_loading(False)
         chains, usage = result
-        usage_map = usage if isinstance(usage, dict) else {}
+        # H27: real shapes — GET /api/embeddings →
+        # { defaultFamily, families: [{ family, isDefault, providers: [...] }] };
+        # GET /api/embeddings/usage → { families: [{ family, requestsToday,
+        # tokensMonth }] } (the old code read nonexistent `keys` /
+        # top-level-map fields — every cell was empty or 0).
+        usage_map: dict = {}
+        if isinstance(usage, dict) and isinstance(usage.get("families"), list):
+            for u in usage["families"]:
+                if isinstance(u, dict):
+                    usage_map[u.get("family")] = u
+        families = chains.get("families", []) if isinstance(chains, dict) else (chains if isinstance(chains, list) else [])
         data = []
-        families = chains.get("families") if isinstance(chains, dict) else chains
-        if not isinstance(families, list):
-            families = []
         for fam in families:
-            name = fam.get("family", "")
-            providers = ", ".join(p.get("platform", str(p)) for p in fam.get("providers", fam.get("chain", []))) if isinstance(fam, dict) else str(fam)
-            keys = fam.get("keys", "") if isinstance(fam, dict) else ""
-            tokens = usage_map.get(name, {})
-            tokens_str = f"{tokens.get('tokens', 0):,}" if isinstance(tokens, dict) else str(tokens)
-            data.append([name, providers, keys, tokens_str])
+            if not isinstance(fam, dict):
+                continue
+            name = fam.get("family", "") + ("  (default)" if fam.get("isDefault") else "")
+            providers = ", ".join(
+                p.get("displayName") or p.get("modelId", "")
+                for p in fam.get("providers", []) if isinstance(p, dict)
+            )
+            u = usage_map.get(fam.get("family")) or {}
+            data.append([name, providers, f"{u.get('tokensMonth', 0):,}", f"{u.get('requestsToday', 0):,}"])
         fill_table(self.chains, data)
 
     def _sync(self):
+        # M81: "Re-sync models" is the model catalog sync (POST
+        # /api/models/sync-all) — the old empty-body PUT to /api/embeddings
+        # was the family-CONFIG save route and risked wiping it.
         self.call_in_background(
-            lambda: self.api.put("/api/embeddings", json={}),
-            on_success=lambda _r: (Toaster.show("Embeddings refreshed", "success"), self.refresh()),
+            lambda: self.api.post("/api/models/sync-all"),
+            on_success=lambda _r: (Toaster.show("Model catalog re-synced", "success"), self.refresh()),
             on_error=lambda e: Toaster.show(str(e), "error"),
         )

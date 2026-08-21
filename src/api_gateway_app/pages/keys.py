@@ -27,13 +27,18 @@ from ..widgets.table import configure_table, fill_table
 from ..widgets.toast import Toaster
 from .base import BasePage
 
-
 def _mask(value: str | None) -> str:
-    if not value:
-        return "••••••••"
-    if len(value) <= 8:
-        return "••••••••"
-    return f"{value[:6]}{'•' * 20}{value[-4:]}"
+    """Mask a secret for display.
+
+    Matches the server's maskKey() (server/src/lib/crypto.ts) and the web
+    client's lib/utils maskKey(): values of ≤6 chars are fully hidden
+    (a tail would reveal too much), longer ones keep only the last 3 chars.
+    N37: previously this rendered a different format than the web dashboard,
+    so the same key looked different depending on which front end showed it.
+    """
+    if not value or len(value) <= 6:
+        return "****"
+    return f"****{value[-3:]}"
 
 
 class AddKeyDialog(QDialog):
@@ -58,8 +63,11 @@ class AddKeyDialog(QDialog):
 
     def payload(self) -> dict:
         return {
+            # The server's add-key schema (routes/keys.ts) expects `key` —
+            # a mismatched field name is silently stripped by zod and the
+            # secret never reaches the database.
             "platform": self.platform.currentText().strip(),
-            "apiKey": self.key_edit.text().strip(),
+            "key": self.key_edit.text().strip(),
             "label": self.label_edit.text().strip() or None,
         }
 
@@ -148,7 +156,6 @@ class KeysPage(BasePage):
         layout.addWidget(keys_title)
         self.keys_table = QTableWidget()
         configure_table(self.keys_table, ["ID", "Platform", "Key", "Label", "Status", "Enabled", "Actions"])
-        self.keys_table.cellClicked.connect(self._noop)
         layout.addWidget(self.keys_table, 1)
 
         # Client keys ----------------------------------------------------------
@@ -162,7 +169,10 @@ class KeysPage(BasePage):
         ck_row.addStretch()
         layout.addLayout(ck_row)
         self.client_keys_table = QTableWidget()
-        configure_table(self.client_keys_table, ["ID", "Label", "Key", "Enabled", "Expires", "RPM"])
+        # H27: the server's ClientKey list exposes no key preview (the secret
+        # is shown ONCE at mint time) — drop the phantom column and use the
+        # real field names (expires_at_ms, rpm_override).
+        configure_table(self.client_keys_table, ["ID", "Label", "Enabled", "Expires", "RPM override"])
         layout.addWidget(self.client_keys_table, 1)
 
         layout.addStretch()
@@ -170,9 +180,7 @@ class KeysPage(BasePage):
     # -- refresh ----------------------------------------------------------
 
     def refresh(self):
-        self.set_loading(True)
         self.call_in_background(self._fetch_all, on_success=self._apply_all)
-        self.set_loading(False)
 
     def _fetch_all(self):
         data = {}
@@ -201,11 +209,15 @@ class KeysPage(BasePage):
         if platforms:
             bits = []
             for p in platforms:
+                # H27: HealthPlatform has totalKeys/healthyKeys — there is no
+                # "enabledKeys" field (every platform showed "0 enabled").
                 name = p.get("platform", "?")
                 healthy = p.get("healthyKeys", 0)
                 total = p.get("totalKeys", 0)
-                enabled = p.get("enabledKeys", 0)
-                bits.append(f"{name}: {healthy}/{total} healthy, {enabled} enabled")
+                rate_limited = p.get("rateLimitedKeys", 0)
+                invalid = p.get("invalidKeys", 0)
+                extra = f", {rate_limited} limited" if rate_limited else (f", {invalid} invalid" if invalid else "")
+                bits.append(f"{name}: {healthy}/{total} healthy{extra}")
             self.health_label.setText("   •   ".join(bits))
 
         keys = data.get("keys") or []
@@ -214,16 +226,21 @@ class KeysPage(BasePage):
 
         cks = data.get("client_keys") or []
         ck_rows = cks if isinstance(cks, list) else []
+        # H27: ClientKey = { id, label, enabled, expires_at_ms, rpm_override }
+        def _fmt_expiry(ms):
+            if not ms:
+                return "—"
+            from datetime import datetime
+            return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d")
         fill_table(self.client_keys_table, [
             [
                 c.get("id", ""),
                 c.get("label", ""),
-                c.get("keyPreview") or _mask(c.get("keyId", "") + ":" + "••••"),
-                "yes" if c.get("enabled", True) else "no",
-                c.get("expiresAt", "") or "—",
-                c.get("rpmLimit", "—"),
+                "yes" if c.get("enabled", 1) else "no",
+                _fmt_expiry(c.get("expires_at_ms")),
+                c.get("rpm_override") if c.get("rpm_override") is not None else "—",
             ]
-            for c in ck_rows
+            for c in ck_rows if isinstance(c, dict)
         ])
 
     def _populate_keys(self, rows: list[dict]):
@@ -232,11 +249,12 @@ class KeysPage(BasePage):
         for i, k in enumerate(rows):
             kid = k.get("id", "")
             platform = k.get("platform", "")
-            masked = k.get("masked") or k.get("maskedKey") or _mask(k.get("apiKey"))
+            masked = k.get("maskedKey") or k.get("masked") or ""
             label = k.get("label", "") or "—"
             status = k.get("status", "unknown")
-            enabled = bool(k.get("enabled", True))
-            for col, val in enumerate([kid, platform, masked, label, status]):
+            enabled = bool(k.get("enabled", 1))
+            # H27: populate the Enabled column (was always blank).
+            for col, val in enumerate([kid, platform, masked, label, status, "yes" if enabled else "no"]):
                 item = QTableWidgetItem(str(val))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 self.keys_table.setItem(i, col, item)
@@ -244,10 +262,11 @@ class KeysPage(BasePage):
             toggle = QPushButton("Disable" if enabled else "Enable")
             toggle.setCheckable(True)
             toggle.setChecked(enabled)
-            toggle.clicked.connect(lambda checked, _id=kid, _en=enabled: self._toggle_key(_id, _en))
-            delete = QPushButton("Delete")
-            delete.setObjectName("danger")
-            delete.clicked.connect(lambda _=False, _id=kid, _p=platform: self._delete_key(_id, _p))
+            # The clicked signal carries the NEW checked state — don't rely
+            # on the `enabled` captured at row-build time (stale after any
+            # refresh-less change). On PATCH failure the button is reverted
+            # so the visual state never lies (audit L98).
+            toggle.clicked.connect(lambda checked, _id=kid, _btn=toggle: self._toggle_key(_id, checked, _btn))
             actions = QWidget()
             hl = QHBoxLayout(actions)
             hl.setContentsMargins(4, 2, 4, 2)
@@ -283,6 +302,11 @@ class KeysPage(BasePage):
         )
 
     def _add_key(self):
+        # M79: the platform lists come from the network — fetch them on a
+        # worker thread and open the dialog only when the result is back.
+        self.call_in_background(self._fetch_platforms, on_success=self._open_add_key_dialog)
+
+    def _fetch_platforms(self) -> list[str]:
         platforms: list[str] = []
         try:
             health = self.api.get("/api/health") or {}
@@ -294,12 +318,14 @@ class KeysPage(BasePage):
             platforms += [c.get("slug", "") for c in customs if isinstance(c, dict)]
         except ApiError:
             pass
-        platforms = sorted({p for p in platforms if p})
+        return sorted({p for p in platforms if p})
+
+    def _open_add_key_dialog(self, platforms: list[str]):
         dialog = AddKeyDialog(platforms, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         payload = dialog.payload()
-        if not payload["platform"] or not payload["apiKey"]:
+        if not payload["platform"] or not payload["key"]:
             Toaster.show("Platform and key are required", "error")
             return
         self.call_in_background(
@@ -308,13 +334,19 @@ class KeysPage(BasePage):
             on_error=lambda e: Toaster.show(str(e), "error"),
         )
 
-    def _toggle_key(self, key_id, currently_enabled: bool):
+    def _toggle_key(self, key_id, new_enabled: bool, button: QPushButton) -> None:
         if key_id in (None, ""):
             return
+
+        def _on_error(e: Exception) -> None:
+            # Revert the checkable button so the UI matches the server again.
+            button.setChecked(not new_enabled)
+            Toaster.show(str(e), "error")
+
         self.call_in_background(
-            lambda: self.api.patch(f"/api/keys/{key_id}", json={"enabled": not currently_enabled}),
+            lambda: self.api.patch(f"/api/keys/{key_id}", json={"enabled": new_enabled}),
             on_success=lambda _r: self.refresh(),
-            on_error=lambda e: Toaster.show(str(e), "error"),
+            on_error=_on_error,
         )
 
     def _delete_key(self, key_id, platform: str):
@@ -352,9 +384,6 @@ class KeysPage(BasePage):
         msg.exec()
         self.refresh()
 
-    @staticmethod
-    def _noop(*_args):
-        return None
 
 
 def _prompt_text(parent, label: str) -> tuple[str, bool]:

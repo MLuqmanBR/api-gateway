@@ -10,13 +10,18 @@ from PyQt6.QtWidgets import QHBoxLayout, QLabel, QListWidget, QListWidgetItem, Q
 from ..icons import icon
 from ..theme import THEME_BUS, palette
 
+# H28: these are the event types the SERVER actually publishes
+# (services/events.ts): request.start/done/error/aborted, routing.*,
+# health.check.*, interceptor.* — the previous map keyed on types that
+# never occur, so every entry fell through to the gray default.
 _KINDS = {
-    "routing.*":           ("#89b4fa", "↔", "Routing"),
-    "auth.*":              ("#cba6f7", "●", "Auth"),
-    "provider.*":          ("#f9e2af", "●", "Provider"),
-    "interceptor.*":       ("#f38ba8", "●", "Privacy"),
-    "request.failed":      ("#f38ba8", "✕", "Failed"),
-    "request.succeeded":   ("#a6e3a1", "✓", "OK"),
+    "request.start":   ("#89b4fa", "→", "Request"),
+    "request.done":    ("#a6e3a1", "✓", "Done"),
+    "request.error":   ("#f38ba8", "✕", "Failed"),
+    "request.aborted": ("#fab387", "⊘", "Aborted"),
+    "routing.*":       ("#89b4fa", "↔", "Routing"),
+    "health.check.*":  ("#cba6f7", "♥", "Health"),
+    "interceptor.*":   ("#f38ba8", "●", "Privacy"),
 }
 _MAX = 240
 
@@ -29,6 +34,21 @@ def _style_for(event: dict):
         if kind == pattern:
             return meta
     return "#a6adc8", "•", "Event"
+
+
+def _summarize(event: dict) -> str:
+    """Readable one-liner from the REAL event payload: the server sends
+    `type` plus contextual fields (platform/modelId/reason/error/…) — not
+    `message`/`detail`."""
+    kind = str(event.get("type", ""))
+    bits: list[str] = []
+    for key in ("platform", "modelId", "model", "reason", "error", "provider"):
+        v = event.get(key)
+        if isinstance(v, (str, int, float)) and str(v):
+            bits.append(str(v))
+            if len(bits) >= 2:
+                break
+    return kind + ("  ·  " + "  ".join(bits) if bits else "")
 
 
 class LiveEvents(QWidget):
@@ -70,11 +90,12 @@ class LiveEvents(QWidget):
 
     def add_event(self, event: dict) -> None:
         color, dot, source = _style_for(event)
-        ts = event.get("ts") or event.get("timestamp") or event.get("time")
+        # H28: the server stamps events with `at` (epoch ms).
+        ts = event.get("at") or event.get("ts") or event.get("timestamp")
         stamp = ""
         if isinstance(ts, (int, float)):
             stamp = datetime.fromtimestamp(ts / 1000 if ts > 1e12 else ts).strftime("%H:%M:%S")
-        message = event.get("message") or event.get("detail") or event.get("type", "")
+        message = _summarize(event)
         summary = f"{stamp}  {dot} {source}  {message}"
         item = QListWidgetItem(summary)
         item.setForeground(self._qcolor(color))

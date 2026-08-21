@@ -209,21 +209,23 @@ class PrivacyPage(BasePage):
             ]
             for s in (secrets or [])
         ])
-        # Stash the raw id for later actions.
+        # Stash the raw id + enabled flag for later actions.
         for i, s in enumerate(secrets or []):
             item = self.secrets_table.item(i, 0)
             if item:
                 item.setData(0x0100, s.get("id"))
+                item.setData(0x0101, bool(s.get("enabled", True)))
 
-    def _selected_secret_ids(self) -> list[int | str]:
-        ids = []
+    def _selected_rows(self) -> list[tuple[int | str, bool]]:
+        """(secret_id, currently_enabled) pairs for the selected rows."""
+        rows = []
         for index in self.secrets_table.selectionModel().selectedRows():
             item = self.secrets_table.item(index.row(), 0)
             if item is not None:
                 sid = item.data(0x0100) or item.text()
                 if sid not in ("", None):
-                    ids.append(sid)
-        return ids
+                    rows.append((sid, bool(item.data(0x0101))))
+        return rows
 
     def _add_bulk(self):
         secrets = []
@@ -249,16 +251,24 @@ class PrivacyPage(BasePage):
         )
 
     def _toggle_selected(self):
-        ids = self._selected_secret_ids()
-        for sid in ids:
+        # M80: PATCH /api/middle/secrets requires {enabled: <new boolean>}
+        # per secret (the server rejects an empty body), so flip each
+        # selected secret from its own current state.
+        rows = self._selected_rows()
+        if not rows:
+            return
+        for sid, enabled in rows:
+            target = not enabled
             self.call_in_background(
-                lambda s=sid: self.api.patch("/api/middle/secrets", params={"id": s}),
+                lambda s=sid, t=target: self.api.patch(
+                    "/api/middle/secrets", params={"id": s}, json={"enabled": t}
+                ),
                 on_success=lambda _r: self._refresh_secrets(),
                 on_error=lambda e: Toaster.show(str(e), "error"),
             )
 
     def _delete_selected(self):
-        ids = self._selected_secret_ids()
+        ids = [sid for sid, _enabled in self._selected_rows()]
         if not ids:
             return
         self.call_in_background(

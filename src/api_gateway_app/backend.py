@@ -84,10 +84,9 @@ class ApiClient:
     # -- low-level ---------------------------------------------------------
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
-        url = path if path.startswith("http") else path
         headers = self.auth_headers()
         try:
-            response = self._client.request(method, url, headers=headers, **kwargs)
+            response = self._client.request(method, path, headers=headers, **kwargs)
         except httpx.RequestError as exc:
             raise ApiError(f"Cannot reach the server at {self.base_url}: {exc}") from exc
         if response.status_code == 401:
@@ -109,10 +108,8 @@ class ApiClient:
             raise ApiError(f"Expected JSON from {path} but got non-JSON") from exc
 
     def _request_unchecked(self, method: str, path: str, **kwargs: Any) -> Any:
-        """Like ``_request`` but never fires the unauthorized gate (logout)."""
-        url = path if path.startswith("http") else path
         try:
-            response = self._client.request(method, url, headers=self.auth_headers(), **kwargs)
+            response = self._client.request(method, path, headers=self.auth_headers(), **kwargs)
         except httpx.RequestError:
             return None
         if not response.content:
@@ -188,15 +185,20 @@ class EventStream(QThread):
         super().__init__(parent)
         self._client = client
         self._stop = False
+        self._response: httpx.Response | None = None
 
     def run(self) -> None:  # noqa: D401 - Qt thread entry
         backoff = 1.0
         while not self._stop:
             try:
                 headers = {"Accept": "text/event-stream", **self._client.auth_headers()}
+                # H29: a FINITE read timeout (not None) so a quiet stream can
+                # still observe _stop periodically instead of blocking in C
+                # forever; stop() closes the response to break out early.
                 with self._client.stream(
-                    "GET", "/api/events", headers=headers, timeout=None,
+                    "GET", "/api/events", headers=headers, timeout=httpx.Timeout(10.0, read=5.0),
                 ) as response:
+                    self._response = response
                     if response.status_code != 200:
                         raise ApiError(f"events stream HTTP {response.status_code}")
                     backoff = 1.0
@@ -205,10 +207,16 @@ class EventStream(QThread):
             except Exception as exc:  # noqa: BLE001 - keep the stream alive
                 if self._stop:
                     break
+                # A read timeout while idle is EXPECTED with the finite
+                # timeout above — reconnect silently without signaling loss.
+                if isinstance(exc, httpx.TimeoutException):
+                    continue
                 self.connection_lost.emit(str(exc))
                 # Exponential backoff capped at 30 s.
                 time.sleep(backoff)
                 backoff = min(30.0, backoff * 2)
+            finally:
+                self._response = None
 
     def _read_sse(self, response: httpx.Response) -> None:
         buffer = ""
@@ -234,7 +242,14 @@ class EventStream(QThread):
                     self.event_received.emit(message)
 
     def stop(self) -> None:
+        # H29: actually BREAK the blocking read — closing the response
+        # unblocks iter_text; without this the thread outlived the app and
+        # Qt aborted with "QThread destroyed while thread is still running".
         self._stop = True
-        # Closing the response is enough to break iter_text; waiting keeps
-        # the GUI responsive on quit.
-        self.wait(2000)
+        response = self._response
+        if response is not None:
+            try:
+                response.close()
+            except Exception:  # noqa: BLE001 - socket may already be gone
+                pass
+        self.wait(3000)

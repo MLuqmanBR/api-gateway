@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QThread, pyqtSignal
+import json
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QCheckBox,
@@ -26,41 +27,66 @@ from .base import BasePage
 
 class _ChatWorker(QThread):
     chunk = pyqtSignal(str)
+    raw = pyqtSignal(str)
     done = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, api: ApiClient, body: dict, parent=None):
+    def __init__(self, api: ApiClient, body: dict, unified_key: str | None, parent=None):
         super().__init__(parent)
         self.api = api
         self.body = body
+        self._stop = False
+        self._response = None
+        # H24: /v1 endpoints authenticate with the unified API key — the
+        # dashboard token the ApiClient sends by default is NOT accepted
+        # there (every request 401'd without this header).
+        self.auth_headers = {"Authorization": f"Bearer {unified_key}"} if unified_key else {}
+
+    def stop(self) -> None:
+        """Abort the stream: flip the flag AND force-close the HTTP response
+        so a blocked iter_lines() wakes immediately (audit L101)."""
+        self._stop = True
+        resp = self._response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:  # noqa: BLE001 - best-effort abort
+                pass
 
     def run(self):
         try:
             if self.body.get("stream"):
                 self._stream()
             else:
-                result = self.api.post("/v1/chat/completions", json={**self.body, "stream": False})
+                result = self.api.post("/v1/chat/completions", json={**self.body, "stream": False}, headers=self.auth_headers)
+                if isinstance(result, dict):
+                    self.raw.emit(json.dumps(result, indent=2))
                 content = (
                     result.get("choices", [{}])[0].get("message", {}).get("content")
                     if isinstance(result, dict) else None
                 )
                 self.chunk.emit(content or "(empty response)")
             self.done.emit()
-        except ApiError as exc:
-            self.failed.emit(str(exc))
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+            if self._stop:
+                # User-requested abort — a forced-close surfaces as an IO
+                # error here; finish cleanly instead of toasting it.
+                self.done.emit()
+            else:
+                self.failed.emit(str(exc))
 
     def _stream(self):
-        import json
-
-        with self.api.stream("POST", "/v1/chat/completions", json=self.body, timeout=None) as resp:
+        with self.api.stream("POST", "/v1/chat/completions", json=self.body, headers=self.auth_headers, timeout=None) as resp:
+            self._response = resp
             if resp.status_code != 200:
                 self.failed.emit(f"stream HTTP {resp.status_code}")
                 return
             for line in resp.iter_lines():
+                if self._stop:
+                    break
                 if not line or line.startswith(":"):
                     continue
+                self.raw.emit(line)
                 if line.startswith("data:"):
                     payload = line[5:].strip()
                 else:
@@ -101,7 +127,10 @@ class PlaygroundPage(BasePage):
         controls.setSpacing(10)
         self.model = QComboBox()
         self.model.setEditable(False)
-        self.model.addItem("auto (let gateway route)")
+        # H25: the sentinel VALUE must be exactly "auto" — the label's human
+        # text previously leaked into the request as a model id (400).
+        self.model.addItem("auto")
+        self.model.setItemData(0, "auto (let gateway route)", Qt.ItemDataRole.ToolTipRole)
         self.model.setFixedHeight(38)
         controls.addWidget(QLabel("Model"))
         controls.addWidget(self.model, 1)
@@ -153,6 +182,13 @@ class PlaygroundPage(BasePage):
         self.send_btn.setMinimumWidth(100)
         self.send_btn.clicked.connect(self._send)
         input_row.addWidget(self.send_btn)
+        # Abort control for streams (audit L101) — enabled only while a
+        # request is in flight.
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setFixedHeight(42)
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._stop_stream)
+        input_row.addWidget(self.stop_btn)
         layout.addLayout(input_row)
         layout.addWidget(self.error_label)
 
@@ -213,18 +249,23 @@ class PlaygroundPage(BasePage):
         if self.model.currentText() != "auto":
             body["model"] = self.model.currentText()
 
-        import json as _json
-        self.raw.setPlainText(_json.dumps(body, indent=2))
+        self.raw.setPlainText(json.dumps(body, indent=2))
         self._append("user", text)
         self._messages.append({"role": "user", "content": text})
 
         self.send_btn.setEnabled(False)
-        self._worker = _ChatWorker(self.api, body, self)
+        self.stop_btn.setEnabled(True)
+        self._worker = _ChatWorker(self.api, body, self._unified_key, self)
         self._assistant_buffer = ""
         self._worker.chunk.connect(self._append_chunk)
+        self._worker.raw.connect(self._append_raw)
         self._worker.done.connect(self._finish)
         self._worker.failed.connect(self._failed)
         self._worker.start()
+
+    def _stop_stream(self) -> None:
+        if self._worker is not None:
+            self._worker.stop()
 
     # -- rendering -----------------------------------------------------------
 
@@ -239,17 +280,23 @@ class PlaygroundPage(BasePage):
         cursor.movePosition(cursor.MoveOperation.End)
         cursor.insertHtml(self._escape(chunk))
 
+    def _append_raw(self, line: str) -> None:
+        """Feed the response pane — SSE events as they arrive (audit L101)."""
+        self.raw.appendPlainText(line)
+
     def _finish(self):
         text = self._assistant_buffer
         if text:
             self._messages.append({"role": "assistant", "content": text})
             self.history.append("<br>")
         self.send_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
         self._assistant_buffer = ""
 
     def _failed(self, message: str):
         Toaster.show(message, "error")
         self.send_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     @staticmethod
     def _escape(text: str) -> str:

@@ -53,6 +53,12 @@ def set_start_minimized(value: bool) -> None:
     set_bool("app/start_minimized", value)
 
 
+# SECURITY (audit L95): the dashboard session token is stored in PLAINTEXT in
+# the QSettings backend (~/.config/ApiGateway/API Gateway.conf). It grants
+# full dashboard access, so protection here is only as good as the file's
+# permissions (assume 0600 home dir). Future work: move to libsecret/KWallet
+# via a keyring backend once a dependency-free path exists across all distros
+# this installer supports (apt/dnf/pacman have no common keyring Python dep).
 def dashboard_token() -> str | None:
     """Persisted dashboard session token (`x-dashboard-token` / bearer)."""
     value = settings().value("auth/dashboard_token")
@@ -81,10 +87,21 @@ def set_notify_on_error(value: bool) -> None:
 
 def _desktop_exec_line() -> str:
     exe = shutil.which("api-gateway")
+    if not exe:
+        # install.sh registers ~/.local/bin/api-gateway even on the no-pip
+        # path (a bash wrapper exporting PYTHONPATH=<repo>/src). A login
+        # shell's PATH may not include ~/.local/bin inside the autostart
+        # environment, so probe that location directly.
+        local = Path.home() / ".local" / "bin" / "api-gateway"
+        if local.is_file() and os.access(local, os.X_OK):
+            exe = str(local)
     if exe:
         return f"{exe} --minimized"
-    # Fallback to running the module directly from the repo checkout.
-    return f"/usr/bin/env python3 -m api_gateway_app --minimized"
+    # Repo-checkout fallback: make the module importable explicitly instead
+    # of relying on PYTHONPATH/CWD luck — a no-pip install never puts
+    # api_gateway_app on sys.path (audit L96).
+    src = repo_root() / "src"
+    return f'/usr/bin/env PYTHONPATH="{src}" python3 -m api_gateway_app --minimized'
 
 
 def set_autostart(enabled: bool) -> None:

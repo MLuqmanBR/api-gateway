@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem
 
@@ -21,13 +22,21 @@ def _table_qss() -> str:
     )
 
 
-_themed_tables: list = []
+# Weak refs: tables live and die with their pages; holding strong refs here
+# pinned every table (and its whole page) for the process lifetime.
+_themed_tables: "weakref.WeakSet[QTableWidget]" = weakref.WeakSet()
 
 
 def _register_for_theme(table: QTableWidget) -> None:
-    if table not in _themed_tables:
-        _themed_tables.append(table)
-        THEME_BUS.changed.connect(lambda _d, t=table: t.isWidgetType() and t.setStyleSheet(_table_qss()))
+    _themed_tables.add(table)
+
+
+def _restyle_all_tables(*_args) -> None:
+    for t in list(_themed_tables):
+        t.setStyleSheet(_table_qss())
+
+
+THEME_BUS.changed.connect(_restyle_all_tables)
 
 
 def configure_table(table: QTableWidget, headers: list[str]) -> None:

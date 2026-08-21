@@ -23,13 +23,17 @@ from .. import settings as app_settings
 from ..widgets.toast import Toaster
 from .base import BasePage
 
+# Must mirror the server's ConfigSection enum exactly
+# (server/src/lib/config/schema.ts). 'fallback' (not 'fallback_chain') and
+# 'budgets' were invalid names that made every desktop export fail with 400.
 EXPORT_SECTIONS = [
-    ("api_keys", "API keys (unified + provider + client)"),
+    ("models", "Models (catalog, pricing, capabilities)"),
+    ("fallback_chain", "Fallback chain + retry + routing weights"),
     ("custom_providers", "Custom providers and their models"),
-    ("fallback", "Fallback chain + retry + routing weights"),
+    ("api_keys", "API keys (unified + provider + client)"),
     ("embeddings", "Embeddings family chains"),
-    ("budgets", "Budgets"),
     ("settings", "Server settings (middle config, etc.)"),
+    ("quirks", "Provider quirks"),
 ]
 
 
@@ -179,8 +183,13 @@ class SettingsPage(BasePage):
         except (OSError, json.JSONDecodeError) as exc:
             Toaster.show(f"Cannot read file: {exc}", "error")
             return
+
+        # The server's /api/config/import route expects
+        # {"envelope": ..., "options": {mode, dryRun, passphrase}} — the
+        # passphrase belongs in options, never inside the envelope.
+        options: dict = {"mode": "overwrite", "dryRun": False}
         if self.import_pass.text():
-            envelope["passphrase"] = self.import_pass.text()
+            options["passphrase"] = self.import_pass.text()
 
         if self.dry_run.isChecked():
             self.call_in_background(
@@ -196,7 +205,7 @@ class SettingsPage(BasePage):
             if confirm != QMessageBox.StandardButton.Yes:
                 return
             self.call_in_background(
-                lambda: self.api.post("/api/config/import", json=envelope),
+                lambda: self.api.post("/api/config/import", json={"envelope": envelope, "options": options}),
                 on_success=self._show_import_done,
                 on_error=lambda e: Toaster.show(str(e), "error"),
             )
@@ -249,7 +258,9 @@ class SettingsPage(BasePage):
         self.autostart.blockSignals(True)
         self.autostart.setChecked(app_settings.autostart_enabled())
         self.autostart.blockSignals(False)
+        self.minimized.blockSignals(True)
         self.minimized.setChecked(app_settings.start_minimized())
+        self.minimized.blockSignals(False)
         self.dark.blockSignals(True)
         self.dark.setChecked(app_settings.theme_dark())
         self.dark.blockSignals(False)

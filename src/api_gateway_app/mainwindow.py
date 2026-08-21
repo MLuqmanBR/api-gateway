@@ -20,9 +20,11 @@ from PyQt6.QtWidgets import (
 )
 
 from . import settings as app_settings
-from . import systemd, theme
+from . import systemd_gui
+from . import theme
 from .backend import ApiClient, EventStream
 from .icons import icon
+from .systemd_gui import run_in_background, service_status_poller
 from .widgets.nav import Sidebar
 from .pages.analytics import AnalyticsPage
 from .pages.base import BasePage
@@ -63,6 +65,8 @@ class MainWindow(QMainWindow):
         self.event_stream: EventStream | None = None
         self._drag_pos = None
         self._theme_dark = app_settings.theme_dark()
+        # None = still waiting for the first poll result ("checking" state).
+        self._service_ok: bool | None = None
 
         self._restore_geometry()
         self._build_ui(start_minimized)
@@ -131,7 +135,9 @@ class MainWindow(QMainWindow):
         h.addWidget(title)
 
         self.page_title = QLabel("Dashboard")
-        self.page_title.setStyleSheet("color: #a6adc8;")
+        # Palette-driven (audit L93): hardcoded MOCHA hexes turned illegible
+        # under the LATTE light palette.
+        self.page_title.setStyleSheet(f"color: {theme.palette()['subtext']};")
         h.addWidget(self.page_title)
 
         h.addStretch()
@@ -139,7 +145,7 @@ class MainWindow(QMainWindow):
         self.service_pill = QPushButton("●  Service: checking")
         self.service_pill.setFlat(True)
         self.service_pill.setStyleSheet(
-            "padding: 6px 12px; border-radius: 14px; color: #cdd6f4; font-weight: 600;")
+            f"padding: 6px 12px; border-radius: 14px; color: {theme.palette()['text']}; font-weight: 600;")
         self.service_pill.clicked.connect(self._restart_service_click)
         h.addWidget(self.service_pill)
 
@@ -150,24 +156,34 @@ class MainWindow(QMainWindow):
         self.theme_btn.clicked.connect(self._toggle_theme)
         h.addWidget(self.theme_btn)
 
-        self._poll_service_status()
+        poller = service_status_poller()
+        # The poller is a process-wide singleton (not parented here) so it
+        # survives window teardown; both the pill and the dashboard subscribe.
+        poller.status_ready.connect(self._apply_service_status)
+        # Re-render the pill when the palette flips so its accent follows
+        # MOCHA/LATTE instead of staying on hardcoded dark-theme hexes.
+        theme.THEME_BUS.changed.connect(lambda _dark: self._render_service_pill())
+        poller.start()
         return bar
 
-    def _poll_service_status(self):
-        try:
-            status = systemd.service_status()
-            ok = status.active
-        except systemd.SystemdError:
-            ok = False
-        if ok:
-            self.service_pill.setText("●  Service running")
+    def _apply_service_status(self, status) -> None:
+        self._service_ok = bool(status.active)
+        self._render_service_pill()
+
+    def _render_service_pill(self) -> None:
+        """(Re)paint the service pill from the live palette + last status."""
+        p = theme.palette()
+        if self._service_ok is None:
+            self.service_pill.setText("●  Service: checking")
             self.service_pill.setStyleSheet(
-                "padding: 6px 12px; border-radius: 14px; background: #a6e3a120; color: #a6e3a1; font-weight: 700;")
-        else:
-            self.service_pill.setText("●  Service stopped")
-            self.service_pill.setStyleSheet(
-                "padding: 6px 12px; border-radius: 14px; background: #f38ba820; color: #f38ba8; font-weight: 700;")
-        QTimer.singleShot(5000, self._poll_service_status)
+                f"padding: 6px 12px; border-radius: 14px; color: {p['subtext']}; font-weight: 600;")
+            return
+        accent = p["green"] if self._service_ok else p["red"]
+        self.service_pill.setText("●  Service running" if self._service_ok else "●  Service stopped")
+        # 0.125 ≈ the old '#a6e3a120' alpha byte (0x20 / 0xff).
+        self.service_pill.setStyleSheet(
+            "padding: 6px 12px; border-radius: 14px; "
+            f"background: {theme.hex_to_rgba(accent, 0.125)}; color: {accent}; font-weight: 700;")
 
     def _toggle_theme(self):
         self._theme_dark = not self._theme_dark
@@ -180,15 +196,16 @@ class MainWindow(QMainWindow):
         Toaster.success(f"{'Dark' if self._theme_dark else 'Light'} theme applied")
 
     def _restart_service_click(self):
-        try:
-            if "stopped" in self.service_pill.text().lower():
-                systemd.start_service()
-            else:
-                systemd.restart_service()
-        except systemd.SystemdError as exc:
-            from .widgets.toast import Toaster
-            Toaster.show(str(exc), kind="error")
-        QTimer.singleShot(1500, self._poll_service_status)
+        if "stopped" in self.service_pill.text().lower():
+            action = systemd_gui.start_service
+        else:
+            action = systemd_gui.restart_service
+        run_in_background(action, on_error=self._service_action_error)
+        QTimer.singleShot(1500, service_status_poller().refresh)
+
+    def _service_action_error(self, exc: Exception) -> None:
+        from .widgets.toast import Toaster
+        Toaster.show(str(exc), kind="error")
 
     # ------------------------------------------------------------------ Pages
 
@@ -215,11 +232,8 @@ class MainWindow(QMainWindow):
                 self.show_and_raise()
 
     def _restart_service(self):
-        try:
-            systemd.restart_service()
-        except systemd.SystemdError:
-            pass
-        QTimer.singleShot(1200, self._poll_service_status)
+        run_in_background(systemd_gui.restart_service)
+        QTimer.singleShot(1200, service_status_poller().refresh)
 
     def _open_page(self, index: int) -> None:
         if not (0 <= index < self._stack.count()):
@@ -233,6 +247,14 @@ class MainWindow(QMainWindow):
         if isinstance(page, BasePage):
             page.on_show()
         self._sidebar.set_current(index)
+
+    def open_page(self, key: str) -> None:
+        """Open a page by slug or title (e.g. ``--page=settings``)."""
+        wanted = key.strip().lower()
+        for index, (name, _cls, slug) in enumerate(PAGE_ORDER):
+            if wanted in (slug, name.lower()):
+                self._open_page(index)
+                return
 
     def _on_event(self, event: dict) -> None:
         if self._pages and isinstance(self._pages[0], DashboardPage):

@@ -66,6 +66,13 @@ class Toast(QFrame):
         Toaster._unregister(self)
 
     def _position_in_stack(self):
+        # Coordinate assumption: the overlay parent is the active TOP-LEVEL
+        # window (see _overlay_parent). For a frameless Qt window (our
+        # Hyprland/CSD case) geometry() and move() share one coordinate space;
+        # on a decorated window, geometry() is client-area-in-screen coords
+        # while move() is relative to the frame origin, so toasts would drift
+        # by the title-bar height. If we ever parent to child widgets, this
+        # needs real mapping via mapTo()/mapFromGlobal().
         parent = self.parentWidget()
         if parent is None:
             return
@@ -93,6 +100,10 @@ class Toaster:
     @classmethod
     def success(cls, message: str) -> None:
         cls.show(message, "success")
+
+    @classmethod
+    def warning(cls, message: str) -> None:
+        cls.show(message, "warning")
 
     @classmethod
     def error(cls, message: str) -> None:

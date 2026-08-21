@@ -126,31 +126,31 @@ class ApiClientTests(unittest.TestCase):
     def test_get_ping(self):
         with _ServerFixture() as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             self.assertEqual(client.get("/api/ping"), {"status": "ok"})
-            client.close()
 
     def test_get_config_map(self):
         with _ServerFixture() as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             cfg = client.get("/api/middle/config")
             self.assertEqual(cfg["middle_redaction_enabled"], "1")
-            client.close()
 
     def test_post_and_cookie_persist(self):
         with _ServerFixture() as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             client.post("/api/auth/login", json={"email": "a@b.c", "password": "x"})
             self.assertTrue(any(c.name == "sg_session" for c in client.cookies.jar))
-            client.close()
 
     def test_error_propagates_message(self):
         with _ServerFixture() as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             with self.assertRaises(ApiError) as ctx:
                 client.delete("/api/middle/secrets")
             self.assertEqual(ctx.exception.status, 400)
             self.assertIn("id query parameter", str(ctx.exception))
-            client.close()
 
     def test_base_url_is_localhost_3001(self):
         self.assertEqual(DEFAULT_BASE_URL, "http://127.0.0.1:3001")
@@ -160,18 +160,18 @@ class ApiClientTests(unittest.TestCase):
     def test_login_captures_token(self):
         with _ServerFixture(_AuthHandler) as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             token = client.login("a@b.c", "correct-horse")
             self.assertEqual(token, _AuthHandler.SERVICE_TOKEN)
             self.assertEqual(client.auth_token, _AuthHandler.SERVICE_TOKEN)
-            client.close()
 
     def test_gated_endpoint_returns_401_without_token(self):
         with _ServerFixture(_AuthHandler) as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             with self.assertRaises(ApiError) as ctx:
                 client.get("/api/settings/api-key")
             self.assertEqual(ctx.exception.status, 401)
-            client.close()
 
     def test_logged_in_client_sends_token_header(self):
         # The unified API key endpoint only answers when the client presents
@@ -179,10 +179,10 @@ class ApiClientTests(unittest.TestCase):
         # unified-key flow that previously 401'd in the app.
         with _ServerFixture(_AuthHandler) as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             client.login("a@b.c", "correct-horse")
             payload = client.get("/api/settings/api-key")
             self.assertEqual(payload, {"apiKey": "api-gateway-unified123"})
-            client.close()
 
     def test_401_fires_unauthorized_signal(self):
         from PyQt6.QtCore import Qt
@@ -190,11 +190,11 @@ class ApiClientTests(unittest.TestCase):
         fired = []
         with _ServerFixture(_AuthHandler) as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             client._auth_events.unauthorized.connect(
                 lambda: fired.append(True), Qt.ConnectionType.DirectConnection)
             with self.assertRaises(ApiError):
                 client.get("/api/settings/api-key")
-            client.close()
         self.assertEqual(fired, [True], "a 401 on a gated endpoint must fire the unauthorized gate")
 
     def test_bad_login_does_not_fire_unauthorized(self):
@@ -203,6 +203,7 @@ class ApiClientTests(unittest.TestCase):
         fired = []
         with _ServerFixture(_AuthHandler) as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             client._auth_events.unauthorized.connect(
                 lambda: fired.append(True), Qt.ConnectionType.DirectConnection)
             # Bad credentials → 401 on /api/auth/login: the login dialog shows
@@ -210,17 +211,16 @@ class ApiClientTests(unittest.TestCase):
             with self.assertRaises(ApiError) as ctx:
                 client.login("a@b.c", "wrongpass")
             self.assertEqual(ctx.exception.status, 401)
-            client.close()
         self.assertEqual(fired, [], "a 401 from an /api/auth/* route must not fire the gate")
 
     def test_logout_clears_token(self):
         with _ServerFixture(_AuthHandler) as base:
             client = ApiClient(base_url=base)
+            self.addCleanup(client.close)
             client.login("a@b.c", "correct-horse")
             client.auth_token = None
             client.logout()
             self.assertIsNone(client.auth_token)
-            client.close()
 
 
 class SystemdUnitTemplateTests(unittest.TestCase):
