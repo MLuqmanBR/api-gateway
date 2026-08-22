@@ -369,24 +369,6 @@ flowchart LR
 - Need a managed cloud service — it's self-hosted only
 - Need an admin dashboard for multiple operators — the gateway has one admin; multiple apps and clients can connect through it, but there's no multi-operator RBAC
 
-## Desktop app (Linux)
-
-A native PyQt6/Qt-Widgets client ships alongside the web dashboard. It turns
-the gateway into a real Linux app — native window, system tray, autostart,
-and a `systemd --user` service for the backend — without changing how the
-web UI works.
-
-```bash
-make setup         # venv + editable install of the Python app
-make install-app   # pipx install + launcher entry + icon + systemd unit
-api-gateway        # launch the native app (or use your app grid)
-```
-
-Close the window to minimize to the tray; the `api-gateway.service` keeps
-serving `/v1` requests in the background. See [README-app.md](README-app.md)
-for full details. The web dashboard at `http://localhost:3001` stays exactly
-as it is.
-
 ## Contributing
 
 ```bash
