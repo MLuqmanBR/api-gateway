@@ -13,7 +13,7 @@ import type { ApiKey, Platform, CustomProvider, Model } from '../../../shared/ty
 import { Pencil, ExternalLink, Plus, X } from 'lucide-react'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { useDiscardGuard } from '@/lib/use-discard-guard'
-import { formatSqliteUtcToLocalTime, maskKey } from '@/lib/utils'
+import { formatSqliteUtcToLocalTime, maskKey, cn } from '@/lib/utils'
 
 // Small "Get API key" external link shown next to a provider (#137).
 function GetKeyLink({ url }: { url: string }) {
@@ -1592,21 +1592,24 @@ export default function KeysPage() {
               {grouped.map(group => {
                 // L63: a group where SOME keys are on must not render its
                 // master toggle as fully ON. Base UI's Switch has no
-                // indeterminate state, so the header uses an indeterminate-
-                // capable checkbox (same pattern as the known-secrets
-                // select-all on MiddlePage).
+                // indeterminate state, so the mixed case gets a distinct
+                // partial appearance (half-width thumb, amber track) while
+                // the all-on/all-off cases keep the regular toggle look.
                 const enabledCount = group.keys.filter(k => k.enabled).length
+                const allOn = enabledCount === group.keys.length
+                const partial = enabledCount > 0 && enabledCount < group.keys.length
                 return (
                 <div key={group.value}>
                   <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-2">
-                      <input
-                        type="checkbox"
-                        ref={(el) => { if (el) el.indeterminate = enabledCount > 0 && enabledCount < group.keys.length }}
-                        checked={enabledCount === group.keys.length}
-                        onChange={(e) => togglePlatform.mutate({ platform: group.value, enabled: e.target.checked })}
+                      <Switch
+                        checked={allOn}
+                        data-partial={partial || undefined}
+                        onCheckedChange={(c) => togglePlatform.mutate({ platform: group.value, enabled: c })}
                         disabled={togglePlatform.isPending}
-                        className="size-4 accent-primary cursor-pointer"
+                        className={cn(
+                          partial && "data-[partial]:bg-amber-500/60 data-[partial]:data-unchecked:bg-amber-500/60",
+                        )}
                         aria-label={`Toggle all ${group.label} keys`}
                       />
                       <h3 className="text-sm font-medium">{group.label}</h3>
