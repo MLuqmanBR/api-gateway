@@ -72,7 +72,6 @@ const MODEL_DEFAULTS = {
   rpdLimit: null,
   tpmLimit: null,
   tpdLimit: null,
-  supportsTools: true,
   supportsVision: false,
 };
 
@@ -83,7 +82,6 @@ const createModelSchema = z.object({
   intelligenceRank: z.number().int().min(1).max(100).optional(),
   speedRank: z.number().int().min(1).max(100).optional(),
   sizeLabel: z.string().max(40).optional(),
-  supportsTools: z.boolean().optional(),
   supportsVision: z.boolean().optional(),
   monthlyTokenBudget: z.string().max(40).optional(),
   rpmLimit: z.number().int().positive().nullable().optional(),
@@ -234,8 +232,8 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools, max_output_tokens, key_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
+         enabled, supports_vision, max_output_tokens, key_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL)
     `);
     const insertFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
 
@@ -259,7 +257,7 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
           MODEL_DEFAULTS.intelligenceRank, MODEL_DEFAULTS.speedRank, MODEL_DEFAULTS.sizeLabel,
           MODEL_DEFAULTS.rpmLimit, MODEL_DEFAULTS.rpdLimit, MODEL_DEFAULTS.tpmLimit, MODEL_DEFAULTS.tpdLimit,
           MODEL_DEFAULTS.monthlyTokenBudget, null, // context_window = unknown
-          MODEL_DEFAULTS.supportsVision ? 1 : 0, MODEL_DEFAULTS.supportsTools ? 1 : 0,
+          MODEL_DEFAULTS.supportsVision ? 1 : 0,
         );
         insertFb.run(Number(result.lastInsertRowid), maxPriority + added.length + 1);
         added.push(modelId);
@@ -677,7 +675,6 @@ customRouter.get('/api/custom-providers/:slug/models', (req: Request, res: Respo
     maxOutputTokens: m.max_output_tokens,
     enabled: m.enabled === 1,
     supportsVision: m.supports_vision === 1,
-    supportsTools: m.supports_tools === 1,
     priority: m.priority,
     fallbackEnabled: m.fallback_enabled === 1,
   })));
@@ -738,8 +735,8 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools, max_output_tokens, key_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, NULL, NULL)
+         enabled, supports_vision, max_output_tokens, key_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL)
     `).run(
       slug, modelId, displayName,
       d.intelligenceRank ?? MODEL_DEFAULTS.intelligenceRank,
@@ -752,7 +749,6 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       d.monthlyTokenBudget ?? MODEL_DEFAULTS.monthlyTokenBudget,
       d.contextWindow ?? null,
       d.supportsVision ?? MODEL_DEFAULTS.supportsVision ? 1 : 0,
-      d.supportsTools ?? MODEL_DEFAULTS.supportsTools ? 1 : 0,
     );
     const modelDbId = Number(result.lastInsertRowid);
     // Append to the fallback chain if not already present.
@@ -803,7 +799,6 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   if (d.intelligenceRank !== undefined) { updates.push('intelligence_rank = ?'); values.push(d.intelligenceRank); }
   if (d.speedRank !== undefined) { updates.push('speed_rank = ?'); values.push(d.speedRank); }
   if (d.sizeLabel !== undefined) { updates.push('size_label = ?'); values.push(d.sizeLabel); }
-  if (d.supportsTools !== undefined) { updates.push('supports_tools = ?'); values.push(d.supportsTools ? 1 : 0); }
   if (d.supportsVision !== undefined) { updates.push('supports_vision = ?'); values.push(d.supportsVision ? 1 : 0); }
   if (d.monthlyTokenBudget !== undefined) { updates.push('monthly_token_budget = ?'); values.push(d.monthlyTokenBudget); }
   if (d.rpmLimit !== undefined) { updates.push('rpm_limit = ?'); values.push(d.rpmLimit); }

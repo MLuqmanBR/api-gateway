@@ -284,7 +284,6 @@ describe('Custom providers (#230)', () => {
     expect(model.display_name).toBe('Qwen3 4B');
     expect(model.context_window).toBe(128000);
     expect(model.size_label).toBe('Custom');
-    expect(model.supports_tools).toBe(1); // default true
     expect(model.supports_vision).toBe(0); // default false
 
     const fc = db.prepare('SELECT * FROM fallback_config WHERE model_db_id = ?').get(model.id) as any;
@@ -334,13 +333,11 @@ describe('Custom providers (#230)', () => {
     const { status } = await request(app, 'PATCH', `/api/custom-models/${created.id}`, {
       displayName: 'X (edited)',
       contextWindow: 65536,
-      supportsTools: false,
     });
     expect(status).toBe(200);
-    const model = getDb().prepare('SELECT * FROM models WHERE id = ?').get(created.id) as any;
-    expect(model.display_name).toBe('X (edited)');
-    expect(model.context_window).toBe(65536);
-    expect(model.supports_tools).toBe(0);
+    const model = getDb().prepare('SELECT * FROM models WHERE id = ?').get(created.id) as { display_name: string; context_window: number } | undefined;
+    expect(model?.display_name).toBe('X (edited)');
+    expect(model?.context_window).toBe(65536);
   });
 
   it('DELETE /api/custom-models/:id archives the model and removes its fallback entry', async () => {
@@ -373,9 +370,7 @@ describe('Custom providers (#230)', () => {
     const db = getDb();
     const model = db.prepare("SELECT * FROM models WHERE platform = 'cloudflare' AND model_id = 'custom-cloudflare-model'").get() as any;
     expect(model).toBeDefined();
-    expect(model.supports_tools).toBe(1);
   });
-
   it('GET /api/custom-providers/:slug/models works for built-in providers', async () => {
     // cloudflare already has a model from the test above, plus built-in catalog rows
     const { status, body } = await request(app, 'GET', '/api/custom-providers/cloudflare/models');

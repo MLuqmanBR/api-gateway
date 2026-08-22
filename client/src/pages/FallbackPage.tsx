@@ -56,7 +56,6 @@ interface FallbackEntry {
   contextWindow: number | null
   maxOutputTokens: number | null
   supportsVision: boolean
-  supportsTools: boolean
   keyCount: number
 }
 
@@ -355,7 +354,6 @@ function EditModelModal({
   const [intelligenceRank, setIntelligenceRank] = useState(model.intelligenceRank)
   const [speedRank, setSpeedRank] = useState(model.speedRank)
   const [sizeLabel, setSizeLabel] = useState(model.sizeLabel)
-  const [supportsTools, setSupportsTools] = useState(model.supportsTools)
   const [supportsVision, setSupportsVision] = useState(model.supportsVision)
   const [monthlyTokenBudget, setMonthlyTokenBudget] = useState(model.monthlyTokenBudget)
   const [rpmLimit, setRpmLimit] = useState(model.rpmLimit ?? null)
@@ -372,7 +370,6 @@ function EditModelModal({
     intelligenceRank !== model.intelligenceRank ||
     speedRank !== model.speedRank ||
     sizeLabel !== model.sizeLabel ||
-    supportsTools !== model.supportsTools ||
     supportsVision !== model.supportsVision ||
     monthlyTokenBudget !== model.monthlyTokenBudget ||
     rpmLimit !== (model.rpmLimit ?? null) ||
@@ -390,7 +387,6 @@ function EditModelModal({
       intelligenceRank,
       speedRank,
       sizeLabel,
-      supportsTools,
       supportsVision,
       monthlyTokenBudget,
       rpmLimit,
@@ -448,10 +444,6 @@ function EditModelModal({
             </div>
           </div>
           <div className="flex items-center gap-6 text-xs">
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <Switch checked={supportsTools} onCheckedChange={setSupportsTools} />
-              Supports tools
-            </label>
             <label className="flex items-center gap-1.5 cursor-pointer">
               <Switch checked={supportsVision} onCheckedChange={setSupportsVision} />
               Supports vision
@@ -529,14 +521,6 @@ function RowContent({
               className="text-[10px] rounded-full px-1.5 py-0.5 bg-cyan-600/15 text-cyan-700 dark:bg-cyan-400/15 dark:text-cyan-400"
             >
               Vision
-            </span>
-          )}
-          {row.supportsTools && (
-            <span
-              title="Emits structured tool calls, so it is eligible for tool-bearing requests"
-              className="text-[10px] rounded-full px-1.5 py-0.5 bg-violet-600/15 text-violet-700 dark:bg-violet-400/15 dark:text-violet-400"
-            >
-              Tools
             </span>
           )}
           {(row.penalty ?? 0) > 0 && (

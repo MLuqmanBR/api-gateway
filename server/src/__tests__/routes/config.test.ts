@@ -79,10 +79,10 @@ function seedModels(): void {
   db.prepare(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
       size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
-      context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+      context_window, enabled, supports_vision, max_output_tokens,
       paid_input_per_m, paid_output_per_m)
     VALUES ('groq', 'llama-3.3-70b', 'Llama 3.3 70B', 12, 8, 'Large', 30, 14400, NULL, NULL,
-        '', 131072, 1, 0, 1, NULL, NULL, NULL)
+        '', 131072, 1, 0, NULL, NULL, NULL)
   `).run();
 
   db.prepare(`INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES
@@ -247,7 +247,7 @@ describe('Config API', () => {
           displayName: 'X', intelligenceRank: 1, speedRank: 1,
           sizeLabel: '', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: null,
-          enabled: true, supportsVision: false, supportsTools: true,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
       },
@@ -303,26 +303,26 @@ describe('Config API', () => {
     db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
         size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
-        context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+        context_window, enabled, supports_vision, max_output_tokens,
         paid_input_per_m, paid_output_per_m)
       VALUES ('fallbacktest', 'alpha', 'Alpha', 10, 5, 'Medium', NULL, NULL, NULL, NULL,
-              '', NULL, 1, 0, 0, NULL, NULL, NULL)
+              '', NULL, 1, 0, NULL, NULL, NULL)
     `).run();
     db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
         size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
-        context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+        context_window, enabled, supports_vision, max_output_tokens,
         paid_input_per_m, paid_output_per_m)
       VALUES ('fallbacktest', 'bravo', 'Bravo', 11, 6, 'Medium', NULL, NULL, NULL, NULL,
-              '', NULL, 1, 0, 0, NULL, NULL, NULL)
+              '', NULL, 1, 0, NULL, NULL, NULL)
     `).run();
     db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
         size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
-        context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+        context_window, enabled, supports_vision, max_output_tokens,
         paid_input_per_m, paid_output_per_m)
       VALUES ('fallbacktest', 'charlie', 'Charlie', 12, 7, 'Large', NULL, NULL, NULL, NULL,
-              '', NULL, 1, 0, 0, NULL, NULL, NULL)
+              '', NULL, 1, 0, NULL, NULL, NULL)
     `).run();
     db.prepare(`INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES
       ((SELECT id FROM models WHERE platform='fallbacktest' AND model_id='alpha'),   1, 1),
@@ -383,7 +383,7 @@ describe('Config API', () => {
           intelligenceRank: 12, speedRank: 8,
           sizeLabel: 'Large', rpmLimit: 30, rpdLimit: 14400, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: 131072,
-          enabled: true, supportsVision: false, supportsTools: true,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
           overwriteBuiltin: true,
         }],
@@ -413,7 +413,7 @@ describe('Config API', () => {
           intelligenceRank: 12, speedRank: 8,
           sizeLabel: 'Large', rpmLimit: 30, rpdLimit: 14400, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: 131072,
-          enabled: true, supportsVision: false, supportsTools: true,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
       },
@@ -443,7 +443,7 @@ describe('Config API', () => {
           displayName: 'Test Model', intelligenceRank: 12, speedRank: 8,
           sizeLabel: 'Large', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: null,
-          enabled: true, supportsVision: false, supportsTools: true,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
         fallbackChain: [{
@@ -474,9 +474,9 @@ describe('Config API', () => {
     const insModel = getDb().prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
         size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
-        context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+        context_window, enabled, supports_vision, max_output_tokens,
         paid_input_per_m, paid_output_per_m)
-      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '', NULL, 1, 0, 0, NULL, NULL, NULL)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '', NULL, 1, 0, NULL, NULL, NULL)
     `);
     insModel.run('replaceA', 'a-model', 'A Model', 10, 5, 'Medium');
     insModel.run('replaceB', 'b-model', 'B Model', 11, 6, 'Medium');
@@ -495,7 +495,7 @@ describe('Config API', () => {
           displayName: 'A Model', intelligenceRank: 10, speedRank: 5,
           sizeLabel: 'Medium', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: null,
-          enabled: true, supportsVision: false, supportsTools: false,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
         fallbackChain: [{
@@ -594,9 +594,9 @@ describe('Config API', () => {
     const insModel = db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
         size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget,
-        context_window, enabled, supports_vision, supports_tools, max_output_tokens,
+        context_window, enabled, supports_vision, max_output_tokens,
         paid_input_per_m, paid_output_per_m)
-      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '', NULL, 1, 0, 0, NULL, NULL, NULL)
+      VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, '', NULL, 1, 0, NULL, NULL, NULL)
     `);
     insModel.run('cp-dest', 'a-model', 'A Model', 10, 5, 'Medium');
     insModel.run('cp-only', 'b-model', 'B Model', 11, 6, 'Medium');
@@ -626,7 +626,7 @@ describe('Config API', () => {
           displayName: 'A Model', intelligenceRank: 10, speedRank: 5,
           sizeLabel: 'Medium', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: null,
-          enabled: true, supportsVision: false, supportsTools: false,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
       },
@@ -986,7 +986,7 @@ describe('Config API', () => {
           intelligenceRank: 1, speedRank: 1, sizeLabel: '',
           rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: null,
-          enabled: true, supportsVision: false, supportsTools: false,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
       },
@@ -1062,7 +1062,7 @@ describe('Config API', () => {
         intelligenceRank: 1, speedRank: 1, sizeLabel: '',
         rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
         monthlyTokenBudget: '', contextWindow: null,
-        enabled: true, supportsVision: false, supportsTools: true,
+        enabled: true, supportsVision: false,
         maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
       }] },
     };
@@ -1236,8 +1236,8 @@ describe('Config API', () => {
     const db = getDb();
     const r = db.prepare(
       `INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank,
-         size_label, monthly_token_budget, enabled, supports_vision, supports_tools)
-       VALUES ('groq', 'mixtral-8x7b', 'Mixtral 8x7B', 10, 7, 'Large', '', 1, 0, 1)`,
+         size_label, monthly_token_budget, enabled, supports_vision)
+       VALUES ('groq', 'mixtral-8x7b', 'Mixtral 8x7B', 10, 7, 'Large', '', 1, 0)`,
     ).run();
     const modelId = Number(r.lastInsertRowid);
     db.prepare(`INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 1, 1)`).run(modelId);
@@ -1252,7 +1252,7 @@ describe('Config API', () => {
           displayName: 'Mixtral 8x7B', intelligenceRank: 10, speedRank: 7,
           sizeLabel: 'Large', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: null,
-          enabled: true, supportsVision: false, supportsTools: true,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
         fallbackChain: [{ platform: 'groq', modelId: 'mixtral-8x7b', priority: 1, enabled: true }],
@@ -1292,7 +1292,7 @@ describe('Config API', () => {
           displayName: 'Fresh', intelligenceRank: 10, speedRank: 5,
           sizeLabel: 'Small', rpmLimit: null, rpdLimit: null, tpmLimit: null, tpdLimit: null,
           monthlyTokenBudget: '', contextWindow: null,
-          enabled: true, supportsVision: false, supportsTools: true,
+          enabled: true, supportsVision: false,
           maxOutputTokens: null, paidInputPerM: null, paidOutputPerM: null,
         }],
         fallbackChain: [{ platform: 'acme', modelId: 'fresh', priority: 1, enabled: true }],

@@ -224,10 +224,10 @@ describe('Migration idempotency', () => {
     ).get() as { n: number };
     expect(deadKeys.n).toBe(0);
 
-    // Additions, with the flags the live probe verified (vision/tools come
-    // from the V16/V22 rules, so they must hold on a fresh seed too).
+    // Additions, with the flags the live probe verified (vision comes
+    // from the V16 rule, so it must hold on a fresh seed too).
     const added = db.prepare(`
-      SELECT platform, model_id, enabled, supports_vision, supports_tools FROM models
+      SELECT platform, model_id, enabled, supports_vision FROM models
        WHERE (platform = 'openrouter' AND model_id IN (
                'moonshotai/kimi-k2.6:free',
                'nvidia/nemotron-3-ultra-550b-a55b:free',
@@ -236,14 +236,14 @@ describe('Migration idempotency', () => {
                'cognitivecomputations/dolphin-mistral-24b-venice-edition:free'))
           OR (platform = 'zhipu' AND model_id = 'glm-4.6v-flash')
        ORDER BY platform, model_id
-    `).all() as { model_id: string; enabled: number; supports_vision: number; supports_tools: number }[];
-    expect(added.map(r => [r.model_id, r.enabled, r.supports_vision, r.supports_tools])).toEqual([
-      ['cognitivecomputations/dolphin-mistral-24b-venice-edition:free', 1, 0, 0],
-      ['meta-llama/llama-3.2-3b-instruct:free',                         1, 0, 0],
-      ['moonshotai/kimi-k2.6:free',                                     1, 0, 1],
-      ['nvidia/nemotron-3-ultra-550b-a55b:free',                        0, 0, 1], // hangs 180s+; seeded disabled (tools verified via Zen in V24)
-      ['nvidia/nemotron-nano-12b-v2-vl:free',                           1, 1, 1],
-      ['glm-4.6v-flash',                                                1, 1, 1],
+    `).all() as { model_id: string; enabled: number; supports_vision: number }[];
+    expect(added.map(r => [r.model_id, r.enabled, r.supports_vision])).toEqual([
+      ['cognitivecomputations/dolphin-mistral-24b-venice-edition:free', 1, 0],
+      ['meta-llama/llama-3.2-3b-instruct:free',                         1, 0],
+      ['moonshotai/kimi-k2.6:free',                                     1, 0],
+      ['nvidia/nemotron-3-ultra-550b-a55b:free',                        0, 0], // hangs 180s+; seeded disabled
+      ['nvidia/nemotron-nano-12b-v2-vl:free',                           1, 1],
+      ['glm-4.6v-flash',                                                1, 1],
     ]);
   });
 
@@ -252,15 +252,15 @@ describe('Migration idempotency', () => {
     const db = initDb(':memory:');
 
     const zen = db.prepare(`
-      SELECT model_id, enabled, supports_tools FROM models
+      SELECT model_id, enabled FROM models
        WHERE platform = 'opencode' AND model_id IN ('nemotron-3-ultra-free', 'minimax-m3-free')
        ORDER BY model_id
-    `).all() as { model_id: string; enabled: number; supports_tools: number }[];
-    expect(zen.map(r => [r.model_id, r.enabled, r.supports_tools])).toEqual([
+    `).all() as { model_id: string; enabled: number }[];
+    expect(zen.map(r => [r.model_id, r.enabled])).toEqual([
       // minimax-m3-free was seeded enabled here in V24, then retired in V25 when
       // its free promo ended (now enabled=0). nemotron-3-ultra-free is still live.
-      ['minimax-m3-free',       0, 1],
-      ['nemotron-3-ultra-free', 1, 1],
+      ['minimax-m3-free',       0],
+      ['nemotron-3-ultra-free', 1],
     ]);
 
     // The hung NIM gemma route is paused (row kept, enabled=0, re-asserted

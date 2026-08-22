@@ -42,7 +42,6 @@ interface ChainRow {
   tpm_limit: number | null;
   tpd_limit: number | null;
   supports_vision: number;
-  supports_tools: number;
   context_window: number | null;
   /** Hard upper bound on output tokens the provider/upstream enforces. Used
    * as the default `max_tokens` when the caller doesn't supply one — some
@@ -567,7 +566,7 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy): ChainRow[] {
  * @param skipKeys - set of "platform:modelId:keyId" to skip (failed on this request)
  * @param preferredModelDbId - try this model first (sticky session)
  * @param requireVision - only consider models that accept image input (#118)
- * @param requireTools - only consider models that emit structured tool_calls
+ * @param skipModels - models the caller has ruled out for this request
  */
 export interface RouteOptions {
   /** Don't fall through to other models when the preferred model's keys are exhausted. */
@@ -599,9 +598,8 @@ export interface RouteOptions {
   reqTags?: Set<string>;
 }
 
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
   const db = getDb();
-
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
 
@@ -611,7 +609,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.max_output_tokens, m.key_id, m.tags
+           m.context_window, m.max_output_tokens, m.key_id, m.tags
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     WHERE fc.enabled = 1
@@ -642,12 +640,6 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // which is correct: don't pin an image turn to a model that can't see it.
     if (requireVision && !entry.supports_vision) continue;
 
-    // Tool-bearing requests skip models that can't emit structured tool_calls.
-    // A model that "answers" a tool request with the call serialized as text
-    // looks successful at the transport level while the client's harness sees
-    // nothing — worse than a failover. Applies to sticky models too, same
-    // reasoning as vision above.
-    if (requireTools && !entry.supports_tools) continue;
 
     // C3: tag/metadata-based filtering. When reqTags is non-empty, skip
     // models whose tags don't intersect — UNLESS the model has the 'default'
@@ -993,13 +985,11 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.max_output_tokens
+           m.context_window, m.max_output_tokens
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     WHERE m.enabled = 1
   `).all() as ChainPreviewRow[];
-
-  // For display we score under 'balanced' weights when in priority mode, so the
   // table still shows a meaningful ranking even with the bandit turned off.
   const weights = weightsFor(strategy) ?? BANDIT_PRESETS.balanced;
   const composites = chain.map(e => intelligenceComposite(e.size_label, e.intelligence_rank));
@@ -1042,16 +1032,3 @@ export function hasEnabledVisionModel(): boolean {
   return row.cnt > 0;
 }
 
-// Whether at least one tool-capable model is enabled in the fallback chain.
-// Same role as hasEnabledVisionModel: a clear up-front error for tool-bearing
-// requests beats routing them to a model that mangles the tool call.
-export function hasEnabledToolsModel(): boolean {
-  const db = getDb();
-  const row = db.prepare(`
-    SELECT COUNT(*) as cnt
-    FROM fallback_config fc
-    JOIN models m ON m.id = fc.model_db_id
-    WHERE fc.enabled = 1 AND m.enabled = 1 AND m.supports_tools = 1
-  `).get() as { cnt: number };
-  return row.cnt > 0;
-}

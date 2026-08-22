@@ -889,7 +889,6 @@ function EditPlatformModal({
 // the model id and display name; the rest of the form's "advanced" fields
 // take sensible defaults and can be edited later from the Fallback page.
 //   contextWindow = 128_000  (matches the modern LLM ceiling)
-//   supportsTools = true     (most OpenAI-compat endpoints do)
 //   supportsVision = false   (text-only is the safe default)
 //   ranks = 50 / 50          (middle of the bandit scoring range)
 //   sizeLabel = 'Custom'     (sorts below named tiers)
@@ -912,7 +911,6 @@ function CustomModelsSection() {
   const [displayName, setDisplayName] = useState('')
   const [contextWindow, setContextWindow] = useState(128000)
   const [maxOutputTokens, setMaxOutputTokens] = useState(null as number | null)
-  const [supportsTools, setSupportsTools] = useState(true)
   const [supportsVision, setSupportsVision] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [intelligenceRank, setIntelligenceRank] = useState(50)
@@ -1018,7 +1016,6 @@ function CustomModelsSection() {
       displayName: displayName.trim(),
       contextWindow: contextWindow || null,
       maxOutputTokens: maxOutputTokens,
-      supportsTools,
       supportsVision,
     }
     if (showAdvanced) {
@@ -1125,10 +1122,6 @@ function CustomModelsSection() {
           </div>
         </div>
         <div className="flex items-center gap-6 text-xs">
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <Switch checked={supportsTools} onCheckedChange={setSupportsTools} />
-            Supports tools
-          </label>
           <label className="flex items-center gap-1.5 cursor-pointer">
             <Switch checked={supportsVision} onCheckedChange={setSupportsVision} />
             Supports vision

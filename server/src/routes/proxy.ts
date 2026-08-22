@@ -4,7 +4,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { classifyError, type ErrorClass } from '../lib/error-class.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
@@ -202,7 +202,8 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
 //   - `modalities.output`      ["text"] — none of the catalog models emit
 //                              image/audio, so clients only need image-input
 //                              awareness, not image-generation output flags.
-//   - `capabilities.tool_calls` mirrors `supports_tools` rule-based flag.
+//   - `capabilities.tool_calls` is always true: tool calling is assumed
+//                              for every catalog model.
 //   - `capabilities.vision`    mirrors `supports_vision` rule-based flag.
 //   - `capabilities.json_mode` true: every chat-completions model here
 //                              accepts OpenAI `response_format` (the proxy
@@ -211,11 +212,11 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
 //   - `capabilities.streaming` true: every chat model here supports SSE
 //                              through `/v1/chat/completions?stream=true`.
 //   - `capabilities.reasoning` derived from model_id patterns (mirrors the
-//                              rule-based V16/V22 family detector). True
+//                              rule-based V16 family detector). True
 //                              for chat-tuned CoT families only — we never
 //                              claim reasoning capability on bare base
 //                              models. Heuristic, not a probe.
-function buildModelCapabilities(modelId: string, maxOutputTokens: number | null, supportsVision: boolean, supportsTools: boolean) {
+function buildModelCapabilities(modelId: string, maxOutputTokens: number | null, supportsVision: boolean) {
   const reasoningFamily = isReasoningModelId(modelId);
 
   const modalities: { input: string[]; output: string[] } = {
@@ -229,7 +230,7 @@ function buildModelCapabilities(modelId: string, maxOutputTokens: number | null,
     max_tokens: maxOutputTokens ?? null,
     modalities: modalities,
     capabilities: {
-      tool_calls: supportsTools,
+      tool_calls: true,
       vision: supportsVision,
       json_mode: true,
       streaming: true,
@@ -252,7 +253,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   const models = db.prepare(`
     SELECT
       m.id, m.platform, m.model_id, m.display_name, m.context_window,
-      m.max_output_tokens, m.supports_vision, m.supports_tools,
+      m.max_output_tokens, m.supports_vision,
       m.intelligence_rank
     FROM models m
     WHERE m.enabled = 1
@@ -279,7 +280,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         context_window: null,
       },
       ...models.map(m => {
-        const caps = buildModelCapabilities(m.model_id, m.max_output_tokens, m.supports_vision === 1, m.supports_tools === 1);
+        const caps = buildModelCapabilities(m.model_id, m.max_output_tokens, m.supports_vision === 1);
         return {
           id: `${m.platform}/${m.model_id}`,
           object: 'model',
@@ -785,22 +786,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
   const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + (max_tokens ?? 1000);
 
-  // Tool-bearing requests must route to a model that emits STRUCTURED
-  // tool_calls. A model without real function-calling support serializes the
-  // call into its text answer — the request "succeeds" but the client's tool
-  // loop sees nothing, which is strictly worse than an error. Same up-front
-  // gate pattern as vision above.
-  const wantsTools = (tools?.length ?? 0) > 0;
-  if (wantsTools && !hasEnabledToolsModel()) {
-    res.status(422).json({
-      error: {
-        message: 'This request includes tools, but no tool-capable model is enabled. Enable a tool-calling model (e.g. GPT-OSS 120B, Gemini 3.5 Flash, GLM-4.7) in the Fallback Chain.',
-        type: 'invalid_request_error',
-        code: 'no_tools_model',
-      },
-    });
-    return;
-  }
+
 
   // Optional client-managed session affinity (see getSessionKey). Express
   // lower-cases header names; a repeated header arrives as an array — take
@@ -1049,7 +1035,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         skipKeys.size > 0 ? skipKeys : undefined,
         preferredModel,
         hasImage,
-        wantsTools,
         skipModels.size > 0 ? skipModels : undefined,
         { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId, clientKeyId: auth.clientKey?.id ?? null, clientModelAllowlist: auth.clientKey?.modelAllowlist ?? null, reqTags },
       );
@@ -1615,7 +1600,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             reasoning: respMsg.reasoning_content ?? '',
             toolNames: new Set((tools ?? []).map(t => t.function.name)),
             isReasoningModel,
-            wantsTools,
+            wantsTools: (tools?.length ?? 0) > 0,
             hasExistingToolCalls: (respMsg.tool_calls?.length ?? 0) > 0,
           });
           // Apply tool-rescue result (structured tool_calls).

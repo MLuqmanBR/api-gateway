@@ -67,7 +67,7 @@ describe('Provider config cache invalidation', () => {
     // We don't assert on the route result itself (it depends on keys/models);
     // we just warm the cache by calling routeRequest.
     clearProviderConfigCache('google'); // ensure clean state
-    try { routeRequest(100, undefined, undefined, false, false); } catch { /* no keys — expected */ }
+    try { routeRequest(100); } catch { /* no keys — expected */ }
 
     // Step 3: PATCH to a new rpm_limit=50. Without the cache-clear fix, the
     // cache would still hold the old value (rpm_limit=5) for up to 30s.

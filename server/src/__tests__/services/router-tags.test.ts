@@ -29,14 +29,14 @@ describe('C3: Tag/metadata-based filtering', () => {
   });
 
   it('no reqTags = today\'s behavior (all models eligible)', () => {
-    const route = routeRequest(100, undefined, undefined, false, false, undefined, {});
+    const route = routeRequest(100, undefined, undefined, false, undefined, {});
     expect(route).toBeDefined();
     expect(route.modelId).toBeDefined();
     route.release();
   });
 
   it('empty reqTags set = today\'s behavior', () => {
-    const route = routeRequest(100, undefined, undefined, false, false, undefined, { reqTags: new Set() });
+    const route = routeRequest(100, undefined, undefined, false, undefined, { reqTags: new Set() });
     expect(route).toBeDefined();
     route.release();
   });
@@ -51,7 +51,7 @@ describe('C3: Tag/metadata-based filtering', () => {
     getDb().prepare("UPDATE models SET tags = '[\"fast\"]' WHERE id = ?").run(firstModel.id);
     getDb().prepare("UPDATE models SET enabled = 0 WHERE id != ?").run(firstModel.id);
 
-    const route = routeRequest(100, undefined, undefined, false, false, undefined, { reqTags: new Set(['fast']) });
+    const route = routeRequest(100, undefined, undefined, false, undefined, { reqTags: new Set(['fast']) });
     expect(route).toBeDefined();
     expect(route.modelDbId).toBe(firstModel.id);
     route.release();
@@ -75,7 +75,7 @@ describe('C3: Tag/metadata-based filtering', () => {
     // model is ALSO eligible (default tag is always eligible), so the router
     // may legitimately pick either. The balanced strategy scores the two and
     // may prefer either; the C3 contract is eligibility, not precedence.
-    const route = routeRequest(100, undefined, undefined, false, false, undefined, { reqTags: new Set(['premium']) });
+    const route = routeRequest(100, undefined, undefined, false, undefined, { reqTags: new Set(['premium']) });
     expect(route).toBeDefined();
     expect([models[0].id, models[1].id]).toContain(route.modelDbId);
     route.release();
@@ -83,7 +83,7 @@ describe('C3: Tag/metadata-based filtering', () => {
     // Deterministic precedence: when the default-tagged model is skipped, the
     // premium-tagged model must be selected — proves the exact-tag match is
     // reachable independent of score ordering.
-    const premiumRoute = routeRequest(100, undefined, undefined, false, false, new Set([models[0].id]), { reqTags: new Set(['premium']) });
+    const premiumRoute = routeRequest(100, undefined, undefined, false, new Set([models[0].id]), { reqTags: new Set(['premium']) });
     expect(premiumRoute).toBeDefined();
     expect(premiumRoute.modelDbId).toBe(models[1].id);
     premiumRoute.release();
@@ -93,7 +93,7 @@ describe('C3: Tag/metadata-based filtering', () => {
     getDb().prepare("UPDATE models SET tags = '[\"slow\"]'").run();
 
     expect(() => {
-      const r = routeRequest(100, undefined, undefined, false, false, undefined, { reqTags: new Set(['fast']) });
+      const r = routeRequest(100, undefined, undefined, false, undefined, { reqTags: new Set(['fast']) });
       r.release();
     }).toThrow();
   });
