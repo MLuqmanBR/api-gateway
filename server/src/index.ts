@@ -1,4 +1,6 @@
 import './env.js';
+import { appendFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createApp } from './app.js';
 import { initDb, getDb } from './db/index.js';
 import { pruneSessions } from './services/auth.js';
@@ -9,6 +11,7 @@ import { attachRealtimeServer } from './services/realtime.js';
 import { setMessagesHttpServer } from './routes/messages.js';
 import { initSecretsStore } from './middle/redaction/store.js';
 import { initWebhooks } from './services/webhooks.js';
+import { getDataDir } from './lib/data-dir.js';
 
 const PORT = process.env.PORT ?? 3001;
 // Dual-stack ('::') by default so the dashboard is reachable over both IPv4
@@ -16,21 +19,35 @@ const PORT = process.env.PORT ?? 3001;
 // the default outright.
 const HOST = process.env.HOST ?? '::';
 
+// A fatal error must be recorded even when stderr is unreachable (e.g. the
+// process was spawned with a piped stderr whose reader already exited).
+// stderr write plus a synchronous append to <dataDir>/server-crash.log —
+// one of the two always survives.
+function recordFatal(label: string, detail: unknown): void {
+  const text = `\n[server] ${label} @ ${new Date().toISOString()}\n  ${detail instanceof Error ? (detail.stack ?? detail.message) : detail}\n`;
+  console.error(text);
+  try { appendFileSync(join(getDataDir(), 'server-crash.log'), text); } catch { /* logging must never crash the crash handler */ }
+}
+
 process.on('unhandledRejection', (reason: unknown) => {
-  console.error('\n[server] Unhandled rejection:\n  ' + (reason instanceof Error ? reason.stack : reason) + '\n');
+  recordFatal('Unhandled rejection:', reason);
   process.exit(1);
 });
 process.on('uncaughtException', (err: Error) => {
-  console.error('\n[server] Uncaught exception:\n  ' + (err?.stack ?? err) + '\n');
+  recordFatal('Uncaught exception:', err);
   process.exit(1);
 });
 async function main() {
   initDb();
   initSecretsStore(); // B2-7: initialize encrypted known-secrets store
   initWebhooks();
-  pruneSessions();
+  // Session pruning is best-effort: a transient DB failure must not abort
+  // startup or become a fatal uncaughtException from a timer callback.
+  try { pruneSessions(); } catch (err) { console.error('[Auth] Session prune failed:', err); }
   // Re-prune hourly so expired/stale sessions don't accumulate between boots.
-  setInterval(() => pruneSessions(), 60 * 60 * 1000).unref();
+  setInterval(() => {
+    try { pruneSessions(); } catch (err) { console.error('[Auth] Session prune failed:', err); }
+  }, 60 * 60 * 1000).unref();
   rebuildExhaustionFromDB();
   startRequestRetentionPruner();
   const app = createApp();
@@ -89,6 +106,6 @@ main().catch((err) => {
   // non-zero rather than leaving a half-initialized process that never starts
   // listening — that silent state is what surfaces in the client as
   // "Can't reach the server".
-  console.error('\n[server] Failed to start:\n  ' + (err?.message ?? err) + '\n');
+  recordFatal('Failed to start:', err);
   process.exit(1);
 });

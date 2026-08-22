@@ -126,6 +126,12 @@ export function subscribeSse(res: Response): () => void {
     cleanupSub();
   });
 
+  // A dashboard client resetting mid-event raises ECONNRESET as an 'error'
+  // event on the response. Without a listener, Node escalates that to a fatal
+  // uncaughtException — the same class guarded in attachClientAbort. The
+  // writes above already have their own try/catch; this covers the async event.
+  res.on('error', () => {});
+
   return () => {
     clearInterval(heartbeat);
     cleanupSub();

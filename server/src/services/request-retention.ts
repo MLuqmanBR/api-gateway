@@ -10,11 +10,13 @@ let pruneTimer: ReturnType<typeof setInterval> | null = null;
 export function startRequestRetentionPruner(): void {
   if (pruneTimer) return;
   console.log('[Retention] Starting request analytics pruner (every 10m)');
-  pruneRequestAnalytics({ force: true });
+  // Pruning is best-effort background work: a transient DB failure (BUSY,
+  // FULL, …) must not become a fatal uncaughtException from a timer callback.
+  try { pruneRequestAnalytics({ force: true }); } catch (err) { console.error('[Retention] Prune failed:', err); }
   // L20: no force here — the 60 s throttle in pruneRequestAnalytics stays
   // meaningful, so an opportunistic prune elsewhere can skip this tick.
   pruneTimer = setInterval(() => {
-    pruneRequestAnalytics();
+    try { pruneRequestAnalytics(); } catch (err) { console.error('[Retention] Prune failed:', err); }
   }, PRUNE_TIMER_MS);
 }
 

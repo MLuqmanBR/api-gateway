@@ -158,8 +158,10 @@ class WasmDatabase implements DatabasePort {
       } else {
         this.db = new SQL.Database();
       }
+      // Flush is best-effort background work: a throw from a timer callback
+      // would surface as a fatal uncaughtException.
       this.flushTimer = setInterval(() => {
-        if (this.dirty) this.flush();
+        try { if (this.dirty) this.flush(); } catch (err) { console.error('[DB] WASM flush failed:', err); }
       }, FLUSH_INTERVAL_MS);
       this.flushTimer.unref();
     } else {
