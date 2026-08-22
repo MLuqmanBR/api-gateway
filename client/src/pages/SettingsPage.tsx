@@ -47,6 +47,9 @@ const SECTIONS: { value: ConfigSection; label: string; description: string }[] =
   { value: 'fallback_chain', label: 'Fallback chain', description: 'Order + enabled state of every model.' },
   { value: 'custom_providers', label: 'Custom providers', description: 'OpenAI-compatible endpoints you registered.' },
   { value: 'api_keys', label: 'API keys', description: 'Encrypted at rest; plaintext if no passphrase.' },
+  { value: 'client_keys', label: 'Client keys', description: 'Restored credentials accept the same secrets — hashes travel, raw secrets never do.' },
+  { value: 'budgets', label: 'Budgets', description: 'Spend limits per client key and global; usage starts fresh at zero.' },
+  { value: 'webhooks', label: 'Webhooks', description: 'Notification URLs with their signing secrets.' },
   { value: 'embeddings', label: 'Embeddings', description: 'Family configuration + default family.' },
   { value: 'settings', label: 'Routing settings', description: 'Strategy, retry limit, custom weights.' },
   { value: 'quirks', label: 'Quirks', description: 'Provider/model notes you authored.' },
@@ -73,6 +76,9 @@ export default function SettingsPage() {
     fallback_chain: true,
     custom_providers: true,
     api_keys: true,
+    client_keys: true,
+    budgets: true,
+    webhooks: true,
     embeddings: true,
     settings: true,
     quirks: true,
@@ -80,10 +86,6 @@ export default function SettingsPage() {
   const [exportPassphrase, setExportPassphrase] = useState('')
   const [exportLabel, setExportLabel] = useState('')
   const [showExportPassphrase, setShowExportPassphrase] = useState(false)
-  // M38: plaintext keys are opt-in — the server strips `key` fields unless
-  // this is set (or a passphrase is supplied, which routes keys through
-  // keysCipher instead).
-  const [includePlaintextKeys, setIncludePlaintextKeys] = useState(false)
 
   const sectionsParam = useMemo<ConfigSection[]>(() => {
     const out: ConfigSection[] = []
@@ -119,7 +121,6 @@ export default function SettingsPage() {
         headers: authHeaders(),
         body: JSON.stringify({
           passphrase: exportPassphrase || undefined,
-          includePlaintextKeys: !exportPassphrase && includePlaintextKeys ? true : undefined,
           label: exportLabel.trim() || undefined,
           download: opts.download,
         }),
@@ -363,23 +364,20 @@ export default function SettingsPage() {
                   <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-2.5 py-1.5 text-[11px] text-amber-900 dark:text-amber-200 flex items-start gap-1.5">
                     <AlertTriangle className="size-3 mt-0.5 shrink-0" />
                     <div>
-                      Without a passphrase, API keys are exported as ciphertext only (M38: never plaintext
-                      unless you tick the box below). The backup can only be restored on a gateway using the
-                      same <code className="font-mono mx-1">ENCRYPTION_KEY</code>. Add a passphrase if you're
-                      moving the file between machines.
+                      Without a passphrase, API keys are written to the backup file as readable
+                      plain text — anyone who gets the file can read them. Store it somewhere
+                      secure (encrypted volume, password manager) and delete stray copies.
                     </div>
                   </div>
                 )}
-                {exportSections.api_keys && exportPassphrase.length === 0 && (
-                  <label className="mt-2 flex items-center gap-2 text-xs text-muted-foreground">
-                    <input
-                      type="checkbox"
-                      checked={includePlaintextKeys}
-                      onChange={(e) => setIncludePlaintextKeys(e.target.checked)}
-                      className="size-3.5 accent-primary"
-                    />
-                    Include plaintext API keys (readable by anyone with the file)
-                  </label>
+                {exportSections.api_keys && exportPassphrase.length > 0 && (
+                  <div className="mt-2 rounded-md border border-sky-500/40 bg-sky-500/10 px-2.5 py-1.5 text-[11px] text-sky-900 dark:text-sky-200 flex items-start gap-1.5">
+                    <KeyRound className="size-3 mt-0.5 shrink-0" />
+                    <div>
+                      Passphrase set — API keys travel encrypted inside the file. Restoring on any
+                      machine only needs this passphrase; no shared ENCRYPTION_KEY required.
+                    </div>
+                  </div>
                 )}
               </div>
             </div>
@@ -598,6 +596,9 @@ function ExportPreviewModal({
       fallback_chain: envelope.sections.fallbackChain?.length ?? 0,
       custom_providers: envelope.sections.customProviders?.length ?? 0,
       api_keys: envelope.sections.apiKeys?.length ?? 0,
+      client_keys: envelope.sections.clientKeys?.length ?? 0,
+      budgets: envelope.sections.budgets?.length ?? 0,
+      webhooks: envelope.sections.webhooks?.length ?? 0,
       embeddings: envelope.sections.embeddings?.families.length ?? 0,
       settings: envelope.sections.settings ? 1 : 0,
       quirks: envelope.sections.quirks?.length ?? 0,

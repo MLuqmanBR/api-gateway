@@ -11,8 +11,12 @@
 //                                 merge modes, and a passphrase for
 //                                 passphrase-encrypted keys blobs.
 //
-// All three are gated by requireAuth via the app-level mount. The export
-// endpoint never includes server-side secrets beyond the user's own API
+// All three are gated by requireSession via the app-level mount. Export
+// key-transport policy: without a passphrase every decryptable provider
+// API key is embedded in cleartext by design (machine-independent
+// backups); a passphrase moves keys into keysCipher instead. Webhook
+// signing secrets travel verbatim; client-key raw secrets are never
+// stored anywhere and never exported.
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 
@@ -43,11 +47,10 @@ configRouter.get('/inventory', (_req: Request, res: Response) => {
 const exportRequestSchema = z.object({
   sections: z.array(z.enum([
     'models', 'fallback_chain', 'custom_providers', 'api_keys',
+    'client_keys', 'budgets', 'webhooks',
     'embeddings', 'settings', 'quirks',
   ])).max(16).optional(),
   passphrase: z.string().min(1).max(1024).optional(),
-  // M38: plaintext keys are opt-in. Default exports carry ciphertext only.
-  includePlaintextKeys: z.boolean().optional(),
   label: z.string().max(120).optional(),
   // When `true`, set the Content-Disposition to attachment so the browser
   // downloads a file. Otherwise the JSON is returned inline (used by the

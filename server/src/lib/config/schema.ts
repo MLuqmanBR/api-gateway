@@ -157,6 +157,44 @@ const keysCipherSchema = z.object({
   ciphertext: z.string().min(1).max(131072), // 64 KB ciphertext cap
 });
 
+// ── Backup/restore sections (F3/F4/F8) ───────────────────────────────────
+// Mirrors ConfigClientKey / ConfigBudget / ConfigWebhook in
+// @api-gateway/shared. Client-key rows carry the scrypt hash + salt so a
+// restored row verifies the same bearer secrets; raw secrets never travel.
+const clientKeySchema = z.object({
+  id: z.string().min(1).max(64),
+  secretHash: z.string().min(1).max(256),
+  salt: z.string().min(1).max(128),
+  label: z.string().max(200),
+  enabled: z.boolean(),
+  expiresAtMs: z.number().int().nonnegative().nullable().optional(),
+  modelAllowlist: z.array(z.string().min(1).max(256)).max(512).nullable().optional(),
+  rpmOverride: z.number().int().min(1).nullable().optional(),
+  createdAtMs: z.number().int().nonnegative(),
+});
+
+// Spend LIMITS only — used/reset counters are runtime state and are never
+// accepted (or exported), so a restored budget starts at zero usage.
+const budgetSchema = z.object({
+  scope: z.enum(['client_key', 'global']),
+  scopeId: z.string().max(64).nullable().optional(),
+  dailyLimitCents: z.number().int().min(0).nullable().optional(),
+  weeklyLimitCents: z.number().int().min(0).nullable().optional(),
+  monthlyLimitCents: z.number().int().min(0).nullable().optional(),
+  weeklyResetDay: z.number().int().min(1).max(7).nullable().optional(),
+});
+
+// Webhook signing secrets travel verbatim (HMAC must keep verifying against
+// the receiver's expectation); created_at is optional metadata.
+const webhookSchema = z.object({
+  url,
+  secret: z.string().min(1).max(512),
+  eventsFilter: z.string().min(1).max(1024),
+  enabled: z.boolean(),
+  createdAtMs: z.number().int().nonnegative().nullable().optional(),
+});
+
+
 // ── Envelope ──────────────────────────────────────────────────────────────
 
 
@@ -174,6 +212,9 @@ export const configEnvelopeSchema = z.object({
     fallbackChain: z.array(fallbackEntrySchema).max(2000).optional(),
     customProviders: z.array(customProviderSchema).max(64).optional(),
     apiKeys: z.array(apiKeySchema).max(256).optional(),
+    clientKeys: z.array(clientKeySchema).max(512).optional(),
+    budgets: z.array(budgetSchema).max(512).optional(),
+    webhooks: z.array(webhookSchema).max(128).optional(),
     embeddings: embeddingsSectionSchema.optional(),
     settings: settingsSchema.optional(),
     quirks: z.array(quirkSchema).max(256).optional(),
@@ -191,7 +232,9 @@ export const configImportOptionsSchema = z.object({
   dryRun: z.boolean().default(false),
   passphrase: z.string().min(1).max(1024).optional(),
   sections: z.array(z.enum([
-    'models', 'fallback_chain', 'custom_providers', 'api_keys', 'embeddings', 'settings', 'quirks',
+    'models', 'fallback_chain', 'custom_providers', 'api_keys',
+    'client_keys', 'budgets', 'webhooks',
+    'embeddings', 'settings', 'quirks',
   ])).min(1).max(16).optional(),
 });
 

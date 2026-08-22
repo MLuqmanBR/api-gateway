@@ -5,9 +5,10 @@
 // race against a concurrent write.
 //
 // The optional `passphrase` encrypts the api_keys payload (only) into a
-// self-describing cipher blob. Without a passphrase the api_keys section
-// is included in plaintext — fine for offline backups, but the UI nudges
-// the user toward providing one.
+// self-describing cipher blob. Without a passphrase every DECRYPTABLE key
+// is embedded in cleartext by design — the backup restores on any host,
+// with no ENCRYPTION_KEY dependency — while rows whose ciphertext failed
+// to decrypt keep their ciphertext fields only.
 import type { DatabasePort } from '../../db/types.js';
 import { getDb } from '../../db/index.js';
 import { decrypt } from '../crypto.js';
@@ -20,9 +21,12 @@ import {
   type ConfigFallbackEntry,
   type ConfigCustomProvider,
   type ConfigApiKey,
-  type ConfigEmbeddingFamily,
+  type ConfigClientKey,
+  type ConfigBudget,
+  type ConfigWebhook,
   type ConfigSettings,
   type ConfigQuirk,
+  type ConfigEmbeddingFamily,
   type ConfigExportRequest,
 } from '@api-gateway/shared';
 import { encryptKeysWithPassphrase } from './passphrase-crypto.js';
@@ -31,14 +35,11 @@ export interface BuildExportOptions {
   sections?: ConfigSection[];
   passphrase?: string;
   label?: string;
-  /** M38: plain exports embed every decryptable key in cleartext ONLY when
-   * explicitly requested. Default (false) yields a ciphertext-only
-   * envelope; `passphrase` implies key transport via keysCipher instead. */
-  includePlaintextKeys?: boolean;
 }
 
 const ALL_SECTIONS: ConfigSection[] = [
   'models', 'fallback_chain', 'custom_providers', 'api_keys',
+  'client_keys', 'budgets', 'webhooks',
   'embeddings', 'settings', 'quirks',
 ];
 
@@ -161,9 +162,11 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
         platform: string; label: string; encrypted_key: string; iv: string;
         auth_tag: string; enabled: number; base_url: string | null;
       }>;
-      // Always include both plaintext (key) and ciphertext shape. The
-      // caller decides whether to wrap the plaintext in a passphrase
-      // cipher. When a passphrase is requested, `key` is stripped below.
+      // Policy: every DECRYPTABLE key carries its plaintext `key` in the
+      // envelope (machine-independent backups). With a passphrase,
+      // buildExport moves the plaintext into keysCipher and strips the
+      // row-level key fields below. Rows whose ciphertext failed to
+      // decrypt keep only their encryptedKey/iv/authTag fields.
       out.apiKeys = rows.map<ConfigApiKey>((r) => {
         let plaintext: string | null = null;
         try {
@@ -186,6 +189,84 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
           baseUrl: r.base_url,
         };
       });
+    }
+
+    if (sections.client_keys) {
+      // created_at_ms ordering (id as deterministic tie-break) keeps
+      // repeated exports of unchanged rows byte-identical.
+      const rows = db.prepare(`
+        SELECT id, secret_hash, salt, label, enabled, expires_at_ms,
+               model_allowlist, rpm_override, created_at_ms
+        FROM client_keys
+        ORDER BY created_at_ms ASC, id ASC
+      `).all() as Array<{
+        id: string; secret_hash: string; salt: string; label: string;
+        enabled: number; expires_at_ms: number | null;
+        model_allowlist: string | null; rpm_override: number | null;
+        created_at_ms: number;
+      }>;
+      out.clientKeys = rows.map<ConfigClientKey>((r) => {
+        let modelAllowlist: string[] | null = null;
+        if (r.model_allowlist !== null) {
+          try {
+            modelAllowlist = JSON.parse(r.model_allowlist);
+          } catch {
+            modelAllowlist = null;
+          }
+        }
+        return {
+          id: r.id,
+          secretHash: r.secret_hash,
+          salt: r.salt,
+          label: r.label,
+          enabled: r.enabled === 1,
+          expiresAtMs: r.expires_at_ms,
+          modelAllowlist,
+          rpmOverride: r.rpm_override,
+          createdAtMs: r.created_at_ms,
+        };
+      });
+    }
+
+    if (sections.budgets) {
+      // Limits only — daily/weekly/monthly used counters and reset
+      // timestamps are runtime state and never exported.
+      const rows = db.prepare(`
+        SELECT scope, scope_id, daily_limit_cents, weekly_limit_cents,
+               monthly_limit_cents, weekly_reset_day
+        FROM budgets
+        ORDER BY scope ASC, scope_id ASC
+      `).all() as Array<{
+        scope: string; scope_id: string | null;
+        daily_limit_cents: number | null; weekly_limit_cents: number | null;
+        monthly_limit_cents: number | null; weekly_reset_day: number | null;
+      }>;
+      out.budgets = rows.map<ConfigBudget>((r) => ({
+        scope: r.scope as ConfigBudget['scope'],
+        scopeId: r.scope_id,
+        dailyLimitCents: r.daily_limit_cents,
+        weeklyLimitCents: r.weekly_limit_cents,
+        monthlyLimitCents: r.monthly_limit_cents,
+        weeklyResetDay: r.weekly_reset_day,
+      }));
+    }
+
+    if (sections.webhooks) {
+      const rows = db.prepare(`
+        SELECT url, secret, events_filter, enabled, created_at
+        FROM webhooks
+        ORDER BY created_at ASC, id ASC
+      `).all() as Array<{
+        url: string; secret: string; events_filter: string;
+        enabled: number; created_at: number;
+      }>;
+      out.webhooks = rows.map<ConfigWebhook>((r) => ({
+        url: r.url,
+        secret: r.secret,
+        eventsFilter: r.events_filter,
+        enabled: r.enabled === 1,
+        createdAtMs: r.created_at,
+      }));
     }
 
     if (sections.embeddings) {
@@ -289,11 +370,14 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
 }
 
 /**
- * Build a full export envelope. The optional `passphrase` causes the
- * api_keys section's plaintext to be encrypted into a self-describing
- * `keysCipher` blob and stripped from `sections.apiKeys` — so even a
- * malicious actor with the file but not the passphrase cannot recover the
- * keys.
+ * Build a full export envelope. Key-transport policy: without a
+ * `passphrase`, every decryptable API key is embedded in cleartext in
+ * `sections.apiKeys` by design — the backup restores on any host with no
+ * ENCRYPTION_KEY dependency; rows whose ciphertext failed to decrypt at
+ * export time keep only their encryptedKey/iv/authTag fields. With a
+ * `passphrase`, that plaintext moves into a self-describing `keysCipher`
+ * blob and row-level key fields are stripped — so even a malicious actor
+ * with the file but not the passphrase cannot recover the keys.
  */
 export function buildExport(opts: BuildExportOptions = {}): ConfigEnvelope {
   const requested = sectionSet(opts.sections);
@@ -325,17 +409,6 @@ export function buildExport(opts: BuildExportOptions = {}): ConfigEnvelope {
     });
   }
 
-  if (!opts.passphrase && !opts.includePlaintextKeys && sections.apiKeys) {
-    // M38: a plain export used to embed every decryptable API key in
-    // cleartext by default. Require explicit opt-in (includePlaintextKeys)
-    // or a passphrase; the default envelope carries ciphertext only, so an
-    // exported file is inert on any host with a different ENCRYPTION_KEY.
-    sections.apiKeys = sections.apiKeys.map((k) => {
-      const { key: _omit, ...rest } = k;
-      return rest;
-    });
-  }
-
   return {
     schemaVersion: CONFIG_SCHEMA_VERSION,
     generator: CONFIG_GENERATOR,
@@ -357,6 +430,9 @@ export function getExportInventory(): Record<ConfigSection, number> {
     fallback_chain: (db.prepare('SELECT COUNT(*) AS n FROM fallback_config').get() as { n: number }).n,
     custom_providers: (db.prepare('SELECT COUNT(*) AS n FROM custom_providers').get() as { n: number }).n,
     api_keys: (db.prepare('SELECT COUNT(*) AS n FROM api_keys').get() as { n: number }).n,
+    client_keys: (db.prepare('SELECT COUNT(*) AS n FROM client_keys').get() as { n: number }).n,
+    budgets: (db.prepare('SELECT COUNT(*) AS n FROM budgets').get() as { n: number }).n,
+    webhooks: (db.prepare('SELECT COUNT(*) AS n FROM webhooks').get() as { n: number }).n,
     embeddings: (db.prepare('SELECT COUNT(*) AS n FROM embedding_models').get() as { n: number }).n,
     settings: (db.prepare("SELECT COUNT(*) AS n FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family')").get() as { n: number }).n,
     quirks: (db.prepare('SELECT COUNT(*) AS n FROM quirks').get() as { n: number }).n,

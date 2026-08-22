@@ -28,3 +28,6 @@
 - [x] Full vitest suite
 - [x] Live E2E HIGH verification + ledger update
 - [x] Final smoke test
+
+# Backlog
+- [ ] Webhooks have no dashboard management UI — CRUD exists only via /api/webhooks (user couldn't find any place to manage them). Build a Webhooks page or panel.

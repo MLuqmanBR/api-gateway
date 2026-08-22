@@ -452,6 +452,9 @@ export type ConfigSection =
   | 'fallback_chain'
   | 'custom_providers'
   | 'api_keys'
+  | 'client_keys'
+  | 'budgets'
+  | 'webhooks'
   | 'embeddings'
   | 'settings'
   | 'quirks';
@@ -538,6 +541,43 @@ export interface ConfigApiKey {
   baseUrl?: string | null;
 }
 
+/** A restored client credential. `secretHash`/`salt` are the portable
+ * proof of the original secret — scrypt params are code constants, so a
+ * restored row validates exactly the same bearer secrets as before.
+ * Raw secrets are never stored and never exported. */
+export interface ConfigClientKey {
+  id: string;
+  secretHash: string;
+  salt: string;
+  label: string;
+  enabled: boolean;
+  expiresAtMs?: number | null;
+  /** JSON-decoded allowlist of model ids; null/undefined = no restriction. */
+  modelAllowlist?: string[] | null;
+  rpmOverride?: number | null;
+  createdAtMs: number;
+}
+
+export interface ConfigBudget {
+  scope: 'client_key' | 'global';
+  /** The client key id this budget caps; null for 'global' scope. */
+  scopeId?: string | null;
+  dailyLimitCents?: number | null;
+  weeklyLimitCents?: number | null;
+  monthlyLimitCents?: number | null;
+  weeklyResetDay?: number | null;
+}
+
+export interface ConfigWebhook {
+  url: string;
+  /** HMAC signing secret, stored plaintext in the DB — carried verbatim so
+   * a restored webhook keeps verifying against the receiver's expectation. */
+  secret: string;
+  eventsFilter: string;
+  enabled: boolean;
+  createdAtMs?: number | null;
+}
+
 export interface ConfigEmbeddingFamily {
   family: string;
   /** Ordered list of (platform, modelId, priority, enabled) entries.
@@ -599,6 +639,15 @@ export interface ConfigEnvelope {
     fallbackChain?: ConfigFallbackEntry[];
     customProviders?: ConfigCustomProvider[];
     apiKeys?: ConfigApiKey[];
+    /** Restored client credentials carry their scrypt hash + salt, so
+     * clients keep authenticating with their existing secrets after a
+     * restore — raw secrets are never stored anywhere and never exported. */
+    clientKeys?: ConfigClientKey[];
+    /** Spend limits only. Used/reset counters are runtime state — a
+     * restored budget starts at zero usage with lazy-reset timestamps
+     * recomputed on first check. */
+    budgets?: ConfigBudget[];
+    webhooks?: ConfigWebhook[];
     embeddings?: {
       defaultFamily?: string;
       families: ConfigEmbeddingFamily[];

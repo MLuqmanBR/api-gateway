@@ -34,6 +34,9 @@ import {
   type ConfigEmbeddingFamily,
   type ConfigSettings,
   type ConfigQuirk,
+  type ConfigClientKey,
+  type ConfigBudget,
+  type ConfigWebhook,
 } from '@api-gateway/shared';
 import { normalizeOpenAiBaseUrl } from '../base-url.js';
 import { configEnvelopeSchema, configImportOptionsSchema } from './schema.js';
@@ -829,6 +832,207 @@ function quirkTargetsEqual(
   return true;
 }
 
+// ── Client keys ───────────────────────────────────────────────────────────
+
+function applyClientKeys(
+  db: DatabasePort,
+  list: ConfigClientKey[],
+  mode: ConfigImportOptions['mode'],
+  summary: Record<string, SectionDiff>,
+): void {
+  const diff = summary.client_keys ?? emptyDiff();
+  if (mode === 'replace') {
+    // Wipe first so every envelope row takes the fresh-insert path with
+    // its exported id preserved verbatim — existing bearer tokens keep
+    // authenticating after a restore, and budgets scoped to these ids
+    // stay resolvable (budgets are applied after this section).
+    db.prepare('DELETE FROM client_keys').run();
+  }
+  for (const ck of list) {
+    try {
+      const enabledNext = ck.enabled ? 1 : 0;
+      const expiresNext = ck.expiresAtMs ?? null;
+      // Stored exactly like the live /api/keys/client writers: the
+      // JSON-encoded array, or NULL when unrestricted.
+      const allowlistNext =
+        ck.modelAllowlist === null || ck.modelAllowlist === undefined
+          ? null
+          : JSON.stringify(ck.modelAllowlist);
+      const rpmNext = ck.rpmOverride ?? null;
+      const existing = db.prepare(`
+        SELECT secret_hash, salt, label, enabled, expires_at_ms,
+               model_allowlist, rpm_override, created_at_ms
+        FROM client_keys WHERE id = ?
+      `).get(ck.id) as {
+        secret_hash: string; salt: string; label: string; enabled: number;
+        expires_at_ms: number | null; model_allowlist: string | null;
+        rpm_override: number | null; created_at_ms: number;
+      } | undefined;
+      if (existing) {
+        if (mode === 'skip-existing') { diff.skipped++; continue; }
+        const identical =
+          existing.secret_hash === ck.secretHash &&
+          existing.salt === ck.salt &&
+          existing.label === ck.label &&
+          existing.enabled === enabledNext &&
+          (existing.expires_at_ms ?? null) === expiresNext &&
+          (existing.model_allowlist ?? null) === allowlistNext &&
+          (existing.rpm_override ?? null) === rpmNext &&
+          existing.created_at_ms === ck.createdAtMs;
+        if (identical) { diff.skipped++; continue; }
+        db.prepare(`
+          UPDATE client_keys SET secret_hash = ?, salt = ?, label = ?, enabled = ?,
+            expires_at_ms = ?, model_allowlist = ?, rpm_override = ?, created_at_ms = ?
+          WHERE id = ?
+        `).run(ck.secretHash, ck.salt, ck.label, enabledNext, expiresNext,
+          allowlistNext, rpmNext, ck.createdAtMs, ck.id);
+        diff.updated++;
+        continue;
+      }
+      db.prepare(`
+        INSERT INTO client_keys (id, secret_hash, salt, label, enabled,
+          expires_at_ms, model_allowlist, rpm_override, created_at_ms)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(ck.id, ck.secretHash, ck.salt, ck.label, enabledNext,
+        expiresNext, allowlistNext, rpmNext, ck.createdAtMs);
+      diff.added++;
+    } catch (err) {
+      diff.errors.push(`${ck.id}: ${(err as Error).message}`);
+    }
+  }
+  summary.client_keys = diff;
+}
+
+// ── Budgets ───────────────────────────────────────────────────────────────
+
+function applyBudgets(
+  db: DatabasePort,
+  list: ConfigBudget[],
+  mode: ConfigImportOptions['mode'],
+  summary: Record<string, SectionDiff>,
+): void {
+  const diff = summary.budgets ?? emptyDiff();
+  if (mode === 'replace') {
+    // Limits only — used counters land at their DEFAULT 0 and reset
+    // timestamps at NULL, so every restored budget behaves like a fresh
+    // one (lazy reset recomputes the windows on first checkAndReserve).
+    db.prepare('DELETE FROM budgets').run();
+  }
+  for (const b of list) {
+    try {
+      // Normalize the natural key: global budgets always carry NULL
+      // scope_id; client_key budgets must reference a key that exists in
+      // client_keys AFTER the client-keys section applied (apply()
+      // ordering guarantees it ran first). Violations are per-row errors
+      // that skip the row without aborting the transaction.
+      let scopeId = b.scopeId ?? null;
+      if (b.scope === 'client_key') {
+        if (!scopeId || !db.prepare('SELECT 1 FROM client_keys WHERE id = ?').get(scopeId)) {
+          diff.errors.push(`${b.scope}/${scopeId ?? ''}: scope_id must reference a client key `
+            + `defined by this envelope's client_keys section or already present on this gateway`);
+          continue;
+        }
+      } else {
+        scopeId = null;
+      }
+      const dailyNext = b.dailyLimitCents ?? null;
+      const weeklyNext = b.weeklyLimitCents ?? null;
+      const monthlyNext = b.monthlyLimitCents ?? null;
+      const resetDayNext = b.weeklyResetDay ?? 1;
+      // UNIQUE(scope, scope_id) cannot dedupe ('global', NULL) rows —
+      // SQLite treats NULLs as distinct — so resolve the natural key
+      // explicitly with an IS predicate (same as services/budgets.ts).
+      // Going through this lookup in EVERY mode (including replace, where
+      // any hit is a same-envelope repeat) keeps repeated imports
+      // duplicate-free despite the constraint's NULL blind spot.
+      const existing = db.prepare(`
+        SELECT id, daily_limit_cents, weekly_limit_cents, monthly_limit_cents,
+               weekly_reset_day
+        FROM budgets WHERE scope = ? AND scope_id IS ?
+      `).get(b.scope, scopeId) as {
+        id: number; daily_limit_cents: number | null; weekly_limit_cents: number | null;
+        monthly_limit_cents: number | null; weekly_reset_day: number | null;
+      } | undefined;
+      if (existing) {
+        if (mode === 'skip-existing') { diff.skipped++; continue; }
+        const identical =
+          (existing.daily_limit_cents ?? null) === dailyNext &&
+          (existing.weekly_limit_cents ?? null) === weeklyNext &&
+          (existing.monthly_limit_cents ?? null) === monthlyNext &&
+          (existing.weekly_reset_day ?? 1) === resetDayNext;
+        if (identical) { diff.skipped++; continue; }
+        db.prepare(`
+          UPDATE budgets SET daily_limit_cents = ?, weekly_limit_cents = ?,
+            monthly_limit_cents = ?, weekly_reset_day = ?
+          WHERE id = ?
+        `).run(dailyNext, weeklyNext, monthlyNext, resetDayNext, existing.id);
+        diff.updated++;
+        continue;
+      }
+      db.prepare(`
+        INSERT INTO budgets (scope, scope_id, daily_limit_cents, weekly_limit_cents,
+          monthly_limit_cents, weekly_reset_day)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(b.scope, scopeId, dailyNext, weeklyNext, monthlyNext, resetDayNext);
+      diff.added++;
+    } catch (err) {
+      diff.errors.push(`${b.scope}/${b.scopeId ?? ''}: ${(err as Error).message}`);
+    }
+  }
+  summary.budgets = diff;
+}
+
+// ── Webhooks ──────────────────────────────────────────────────────────────
+
+function applyWebhooks(
+  db: DatabasePort,
+  list: ConfigWebhook[],
+  mode: ConfigImportOptions['mode'],
+  summary: Record<string, SectionDiff>,
+): void {
+  const diff = summary.webhooks ?? emptyDiff();
+  if (mode === 'replace') {
+    db.prepare('DELETE FROM webhooks').run();
+  }
+  for (const wh of list) {
+    try {
+      const enabledNext = wh.enabled ? 1 : 0;
+      // url carries no UNIQUE constraint on the table, so existence — not
+      // the schema — defines the natural key. Resolving it in EVERY mode
+      // (in replace mode a hit is a same-envelope repeat) keeps repeated
+      // imports duplicate-free; AUTOINCREMENT assigns fresh ids because
+      // the envelope doesn't carry any.
+      const existing = db.prepare(
+        'SELECT id, secret, events_filter, enabled FROM webhooks WHERE url = ?',
+      ).get(wh.url) as {
+        id: number; secret: string; events_filter: string; enabled: number;
+      } | undefined;
+      if (existing) {
+        if (mode === 'skip-existing') { diff.skipped++; continue; }
+        const identical =
+          existing.secret === wh.secret &&
+          existing.events_filter === wh.eventsFilter &&
+          existing.enabled === enabledNext;
+        if (identical) { diff.skipped++; continue; }
+        // created_at stays untouched on update — creation metadata, the
+        // same way quirks preserve created_at_ms.
+        db.prepare('UPDATE webhooks SET secret = ?, events_filter = ?, enabled = ? WHERE id = ?')
+          .run(wh.secret, wh.eventsFilter, enabledNext, existing.id);
+        diff.updated++;
+        continue;
+      }
+      db.prepare(`
+        INSERT INTO webhooks (url, secret, events_filter, enabled, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(wh.url, wh.secret, wh.eventsFilter, enabledNext, wh.createdAtMs ?? Date.now());
+      diff.added++;
+    } catch (err) {
+      diff.errors.push(`${wh.url}: ${(err as Error).message}`);
+    }
+  }
+  summary.webhooks = diff;
+}
+
 // L45: per-version migration table — each entry upgrades an envelope FROM
 // the keyed version TO key+1, and importing walks forward until it reaches
 // CONFIG_SCHEMA_VERSION. Only `current` and `current-1` are supported
@@ -903,7 +1107,8 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
   }
   const eff: ConfigImportOptions = parsedOptions.data;
   const sectionAllow = new Set(eff.sections ?? [
-    'models', 'fallback_chain', 'custom_providers', 'api_keys', 'embeddings', 'settings', 'quirks',
+    'models', 'fallback_chain', 'custom_providers', 'api_keys',
+    'client_keys', 'budgets', 'webhooks', 'embeddings', 'settings', 'quirks',
   ]);
 
   // Decrypt the keysCipher blob up-front (if any) — outside the
@@ -984,6 +1189,22 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
     if (sectionAllow.has('api_keys') && env.sections.apiKeys) {
       apiKeysMismatchRows = applyApiKeys(db, env.sections.apiKeys, keyLookup, legacyPlatformKeys, eff.mode, summary);
     }
+
+    // F3/F4/F8 backup-restore sections. client_keys MUST precede budgets —
+    // budget rows scoped to a key validate scope_id against the
+    // post-import client_keys table.
+    if (sectionAllow.has('client_keys') && env.sections.clientKeys) {
+      applyClientKeys(db, env.sections.clientKeys, eff.mode, summary);
+    }
+
+    if (sectionAllow.has('budgets') && env.sections.budgets) {
+      applyBudgets(db, env.sections.budgets, eff.mode, summary);
+    }
+
+    if (sectionAllow.has('webhooks') && env.sections.webhooks) {
+      applyWebhooks(db, env.sections.webhooks, eff.mode, summary);
+    }
+
 
 
     if (sectionAllow.has('embeddings') && env.sections.embeddings) {
@@ -1089,6 +1310,9 @@ export function previewEnvelope(envelope: unknown): {
     fallback_chain: env.sections.fallbackChain?.length ?? 0,
     custom_providers: env.sections.customProviders?.length ?? 0,
     api_keys: env.sections.apiKeys?.length ?? 0,
+    client_keys: env.sections.clientKeys?.length ?? 0,
+    budgets: env.sections.budgets?.length ?? 0,
+    webhooks: env.sections.webhooks?.length ?? 0,
     embeddings: env.sections.embeddings?.families.length ?? 0,
     settings: env.sections.settings ? 1 : 0,
     quirks: env.sections.quirks?.length ?? 0,

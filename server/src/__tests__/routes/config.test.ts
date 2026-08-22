@@ -117,6 +117,9 @@ describe('Config API', () => {
     expect(body.fallback_chain).toBeGreaterThanOrEqual(1);
     expect(body.custom_providers).toBe(0);
     expect(body.api_keys).toBe(1);
+    expect(body.client_keys).toBe(0);
+    expect(body.budgets).toBe(0);
+    expect(body.webhooks).toBe(0);
   });
 
   // ── Export ────────────────────────────────────────────────────────────
@@ -130,15 +133,10 @@ describe('Config API', () => {
     expect(Array.isArray(body.sections.models)).toBe(true);
     expect(body.sections.fallbackChain).toHaveLength(1);
     expect(body.sections.apiKeys).toHaveLength(1);
-    // M38: plaintext keys are opt-in — a plain export carries ciphertext only.
-    expect(body.sections.apiKeys[0].key).toBeUndefined();
-  });
-
-  it('M38: export includes plaintext keys only on explicit opt-in', async () => {
-    const optIn = await request(app, 'POST', '/api/config/export', { includePlaintextKeys: true });
-    expect(optIn.status).toBe(200);
-    expect(optIn.body.sections.apiKeys[0].key).toBe('sk-test-1234567890');
-    expect(optIn.body.keysCipher).toBeUndefined();
+    // Plaintext-by-default policy: every decryptable key travels in
+    // cleartext so the backup restores on any host (no ENCRYPTION_KEY
+    // dependency). Passphrase exports move keys into keysCipher instead.
+    expect(body.sections.apiKeys[0].key).toBe('sk-test-1234567890');
   });
 
   it('POST /api/config/export with passphrase produces a keysCipher blob', async () => {
