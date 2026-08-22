@@ -11,7 +11,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: sync-main-to-dev
@@ -44,5 +44,3 @@ jobs:
 
       - name: Push synced dev
         run: git push origin dev
-        env:
-          GITHUB_TOKEN: ${{ secrets.SYNC_DEV_PAT }}
