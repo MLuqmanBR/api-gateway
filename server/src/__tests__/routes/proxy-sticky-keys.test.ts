@@ -111,9 +111,9 @@ describe('sticky-keys routing (per-key session isolation)', () => {
       `INSERT INTO models
        (platform, model_id, display_name, intelligence_rank, speed_rank,
         size_label, monthly_token_budget, context_window, enabled,
-        supports_vision, supports_tools, max_output_tokens)
+        supports_vision, max_output_tokens)
        VALUES ('stickyprov', 'sticky-model', 'Sticky Model', 10, 10,
-               'Medium', '~100K', 128000, 1, 0, 1, 8192)`,
+               'Medium', '~100K', 128000, 1, 0, 8192)`,
     ).run();
     const modelRow = db.prepare(
       `SELECT id FROM models WHERE platform = 'stickyprov' AND model_id = 'sticky-model'`,

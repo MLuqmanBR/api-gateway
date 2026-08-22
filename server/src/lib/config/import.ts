@@ -371,7 +371,7 @@ function applyModels(
           `SELECT display_name, intelligence_rank, speed_rank, size_label,
                   rpm_limit, rpd_limit, tpm_limit, tpd_limit,
                   monthly_token_budget, context_window, enabled,
-                  supports_vision, supports_tools, max_output_tokens,
+                  supports_vision, max_output_tokens,
                   paid_input_per_m, paid_output_per_m
            FROM models WHERE id = ?`,
         ).get(existing.id) as {
@@ -379,7 +379,7 @@ function applyModels(
           size_label: string; rpm_limit: number | null; rpd_limit: number | null;
           tpm_limit: number | null; tpd_limit: number | null;
           monthly_token_budget: string; context_window: number | null;
-          enabled: number; supports_vision: number; supports_tools: number;
+          enabled: number; supports_vision: number;
           max_output_tokens: number | null; paid_input_per_m: number | null;
           paid_output_per_m: number | null;
         };
@@ -403,7 +403,6 @@ function applyModels(
           sameAsRow(current.context_window, m.contextWindow) &&
           current.enabled === (m.enabled ? 1 : 0) &&
           current.supports_vision === (m.supportsVision ? 1 : 0) &&
-          current.supports_tools === (m.supportsTools ? 1 : 0) &&
           sameAsRow(current.max_output_tokens, m.maxOutputTokens) &&
           sameAsRow(current.paid_input_per_m, m.paidInputPerM) &&
           sameAsRow(current.paid_output_per_m, m.paidOutputPerM);
@@ -418,14 +417,14 @@ function applyModels(
             display_name = ?, intelligence_rank = ?, speed_rank = ?,
             size_label = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?,
             monthly_token_budget = ?, context_window = ?, enabled = ?,
-            supports_vision = ?, supports_tools = ?, max_output_tokens = ?,
+            supports_vision = ?, max_output_tokens = ?,
             paid_input_per_m = ?, paid_output_per_m = ?
           WHERE id = ?
         `).run(
           m.displayName, m.intelligenceRank, m.speedRank,
           m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,
           m.monthlyTokenBudget, m.contextWindow, m.enabled ? 1 : 0,
-          m.supportsVision ? 1 : 0, m.supportsTools ? 1 : 0, m.maxOutputTokens,
+          m.supportsVision ? 1 : 0, m.maxOutputTokens,
           m.paidInputPerM, m.paidOutputPerM,
           existing.id,
         );
@@ -437,13 +436,13 @@ function applyModels(
           INSERT INTO models (platform, model_id, display_name, intelligence_rank,
             speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit,
             monthly_token_budget, context_window, enabled, supports_vision,
-            supports_tools, max_output_tokens, paid_input_per_m, paid_output_per_m)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_output_tokens, paid_input_per_m, paid_output_per_m)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           m.platform, m.modelId, m.displayName, m.intelligenceRank,
           m.speedRank, m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,
           m.monthlyTokenBudget, m.contextWindow, m.enabled ? 1 : 0,
-          m.supportsVision ? 1 : 0, m.supportsTools ? 1 : 0, m.maxOutputTokens,
+          m.supportsVision ? 1 : 0, m.maxOutputTokens,
           m.paidInputPerM, m.paidOutputPerM,
         );
         diff.added++;

@@ -128,7 +128,7 @@ describe('Routing Key Exhaustion', () => {
       (ratelimit.canMakeRequest as any).mockReturnValue(true);
       (ratelimit.canUseTokens as any).mockReturnValue(true);
 
-      const result = routeRequest(100, undefined, undefined, false, false, new Set([proId]));
+      const result = routeRequest(100, undefined, undefined, false, new Set([proId]));
       expect(result.modelId).toBe('gemini-1.5-flash');
     });
 
@@ -139,7 +139,7 @@ describe('Routing Key Exhaustion', () => {
       (ratelimit.canMakeRequest as any).mockReturnValue(true);
       (ratelimit.canUseTokens as any).mockReturnValue(true);
 
-      expect(() => routeRequest(100, undefined, undefined, false, false, new Set(ids))).toThrow();
+      expect(() => routeRequest(100, undefined, undefined, false, new Set(ids))).toThrow();
     });
 
     it('overrides a sticky/preferred model that has been skipped', () => {
@@ -150,7 +150,7 @@ describe('Routing Key Exhaustion', () => {
       (ratelimit.canUseTokens as any).mockReturnValue(true);
 
       // Sticky session prefers Pro, but Pro 404ed earlier in this request.
-      const result = routeRequest(100, undefined, proId, false, false, new Set([proId]));
+      const result = routeRequest(100, undefined, proId, false, new Set([proId]));
       expect(result.modelId).toBe('gemini-1.5-flash');
     });
   });
@@ -256,7 +256,7 @@ describe('Routing Key Exhaustion', () => {
       // specific key picked depends on the round-robin index — the main
       // pass starts at the round-robin cursor and increments it even when
       // no key passes, so the fallback starts at the next position.
-      const result = routeRequest(100, undefined, proId, false, false, undefined, { pinMode: true });
+      const result = routeRequest(100, undefined, proId, false, undefined, { pinMode: true });
       expect(result.modelId).toBe('gemini-1.5-pro');
       expect(keys.map(k => k.id)).toContain(result.keyId);
     });
@@ -274,7 +274,7 @@ describe('Routing Key Exhaustion', () => {
       // keys.length === 0 → throws PINNED_MODEL_EXHAUSTED at line 545-553,
       // before the fallback even runs. This is the correct behavior — if
       // there are literally no keys to try, there's nothing to fall back to.
-      expect(() => routeRequest(100, undefined, proId, false, false, undefined, { pinMode: true }))
+      expect(() => routeRequest(100, undefined, proId, false, undefined, { pinMode: true }))
         .toThrow(/Pinned model exhausted/);
     });
 
@@ -295,7 +295,7 @@ describe('Routing Key Exhaustion', () => {
         skipKeys.add(`google:gemini-1.5-pro:${k.id}`);
       }
 
-      expect(() => routeRequest(100, skipKeys, proId, false, false, undefined, { pinMode: true }))
+      expect(() => routeRequest(100, skipKeys, proId, false, undefined, { pinMode: true }))
         .toThrow(/Pinned model exhausted/);
     });
   });

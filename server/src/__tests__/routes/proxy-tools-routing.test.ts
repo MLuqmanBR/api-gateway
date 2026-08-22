@@ -1,13 +1,24 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { routeRequest, setRoutingStrategy } from '../../services/router.js';
 import { encrypt } from '../../lib/crypto.js';
 
-async function post(app: Express, path: string, body: any, key: string) {
+interface PostResult {
+  status: number;
+  body: {
+    choices?: Array<{ message?: { content?: string | null } }>;
+    error?: { code?: string; message?: string };
+    output_text?: string;
+  };
+  headers: Record<string, string>;
+}
+
+async function post(app: Express, path: string, body: unknown, key: string): Promise<PostResult> {
   const server = app.listen(0);
-  const addr = server.address() as any;
+  const addr = server.address();
+  if (!addr || typeof addr === 'string') throw new Error('no listen address');
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
@@ -15,9 +26,9 @@ async function post(app: Express, path: string, body: any, key: string) {
   });
   const text = await res.text();
   server.close();
-  let json: any = null;
-  try { json = JSON.parse(text); } catch {}
-  return { status: res.status, body: json };
+  let json: PostResult['body'] | null = null;
+  try { json = JSON.parse(text) as PostResult['body']; } catch {}
+  return { status: res.status, body: json ?? {}, headers: Object.fromEntries(res.headers) };
 }
 
 const WEATHER_TOOL = {
@@ -44,107 +55,116 @@ const TOOLS_RESPONSES = {
   }],
 };
 
-describe('Tools-aware routing', () => {
+// The supports_tools capability system was REMOVED (2026-08-23): every model
+// is treated as tool-capable and the router has no tools filter. Its only
+// real-world effect was the bug this suite now guards against — tool-bearing
+// requests pinned to a formerly "non-tool" model were silently rerouted to a
+// different model (594/594 off-pin responses in the live audit). These tests
+// pin the replacement contract: a pinned model ALWAYS serves its own request,
+// tool-bearing or not.
+describe('tools requests respect strict pinning (supports_tools removed)', () => {
   let app: Express;
   let key: string;
+  let pinnedDbId: number;
+  let pinnedModelId: string;
 
   beforeAll(() => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
     initDb(':memory:');
     app = createApp();
     key = getUnifiedApiKey();
-  });
-
-  it('flags tool-capable families and leaves the known-bad ones unflagged', () => {
-    const db = getDb();
-    const flag = (modelId: string) =>
-      (db.prepare('SELECT supports_tools FROM models WHERE model_id = ?').get(modelId) as { supports_tools: number } | undefined)?.supports_tools;
-
-    // Verified tool-callers from the live benchmark stay eligible.
-    expect(flag('openai/gpt-oss-120b')).toBe(1);
-    expect(flag('gemini-2.5-flash')).toBe(1);
-    expect(flag('llama-3.3-70b-versatile')).toBe(1);
-
-    // hermes-3 emits tool calls as text — must NOT ride the llama-3 rule.
-    const hermes = db.prepare("SELECT supports_tools FROM models WHERE model_id LIKE '%hermes-3%'").all() as { supports_tools: number }[];
-    for (const h of hermes) expect(h.supports_tools).toBe(0);
-
-    // gemma must NOT ride the gemini rule.
-    const gemma = db.prepare("SELECT supports_tools FROM models WHERE LOWER(model_id) LIKE '%gemma%'").all() as { supports_tools: number }[];
-    for (const g of gemma) expect(g.supports_tools).toBe(0);
-
-    // Sanity: the flag splits the catalog (some 1s, some 0s).
-    const on = (db.prepare('SELECT COUNT(*) c FROM models WHERE supports_tools = 1').get() as { c: number }).c;
-    const off = (db.prepare('SELECT COUNT(*) c FROM models WHERE supports_tools = 0').get() as { c: number }).c;
-    expect(on).toBeGreaterThanOrEqual(5);
-    expect(off).toBeGreaterThan(0);
-  });
-
-  it('routeRequest skips non-tool models when requireTools is set', () => {
-    const db = getDb();
     setRoutingStrategy('priority');
+    // big-pickle is seeded by V18 on the opencode platform; historically it
+    // carried supports_tools = 0 (stealth/unknown family), i.e. exactly the
+    // class of pin the old filter silently abandoned.
+    const pin = getDb().prepare(`
+      SELECT m.id, m.model_id FROM models m
+      JOIN fallback_config fc ON fc.model_db_id = m.id AND fc.enabled = 1
+      WHERE m.platform = 'opencode' AND m.model_id = 'big-pickle' AND m.enabled = 1
+    `).get() as { id: number; model_id: string } | undefined;
+    expect(pin).toBeDefined();
+    pinnedDbId = pin!.id;
+    pinnedModelId = `opencode/${pin!.model_id}`;
+  });
 
-    // One key for google, whose catalog holds both a non-tool model (gemma)
-    // and tool-capable ones (gemini). Put gemma at the top of the chain.
-    const { encrypted, iv, authTag } = encrypt('test-google-key');
+  beforeEach(() => {
+    const db = getDb();
+    db.prepare('DELETE FROM api_keys').run();
+    db.prepare('DELETE FROM requests').run();
+    // One healthy key for the pinned platform only — any fallthrough finds no
+    // other platform with keys and fails loudly instead of serving off-pin.
+    const { encrypted, iv, authTag } = encrypt('test-opencode-key');
     db.prepare(`
       INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
-      VALUES ('google', 'test', ?, ?, ?, 'healthy', 1)
+      VALUES ('opencode', 'pin-test', ?, ?, ?, 'healthy', 1)
     `).run(encrypted, iv, authTag);
-
-    const gemma = db.prepare("SELECT id FROM models WHERE platform = 'google' AND LOWER(model_id) LIKE '%gemma%' AND enabled = 1").get() as { id: number } | undefined;
-    expect(gemma).toBeDefined();
-    db.prepare('UPDATE fallback_config SET priority = 0, enabled = 1 WHERE model_db_id = ?').run(gemma!.id);
-
-    // Plain request takes the chain head: gemma.
-    const plain = routeRequest(1000);
-    expect(plain.modelId.toLowerCase()).toContain('gemma');
-
-    // Tool-bearing request must skip past gemma to a tool-capable model.
-    const tooled = routeRequest(1000, undefined, undefined, false, true);
-    expect(tooled.modelId.toLowerCase()).not.toContain('gemma');
-    const flag = db.prepare('SELECT supports_tools FROM models WHERE id = ?').get(tooled.modelDbId) as { supports_tools: number };
-    expect(flag.supports_tools).toBe(1);
-
-    db.prepare('DELETE FROM api_keys').run();
   });
 
-  it('lets a tool request through routing when a tool-capable model is enabled (no 422)', async () => {
-    // No provider keys exist, so routing exhausts → 429/503. The point: it is
-    // NOT the 422 "no tools model" error, proving the precheck passed.
-    const { status, body } = await post(app, '/v1/chat/completions', TOOLS_CHAT, key);
-    expect(status).not.toBe(422);
-    expect(body?.error?.code).not.toBe('no_tools_model');
+  afterEach(() => {
+    vi.restoreAllMocks();
+    getDb().prepare('DELETE FROM api_keys').run();
   });
 
-  it('rejects a tool request with a clear 422 when no tool-capable model is enabled', async () => {
-    getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_tools = 1').run();
+  function mockUpstream(content: string): void {
+    const origFetch = global.fetch;
+    // NOTE: both args must be forwarded. Dropping `init` turns the client's
+    // own POST into a bare GET (Express then 404s the POST-only route).
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('opencode.ai')) {
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-pin-tools', object: 'chat.completion', created: 1, model: pinnedModelId,
+            choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 },
+          }),
+        } as unknown as Response;
+      }
+      return origFetch(url, init);
+    });
+  }
 
-    const { status, body } = await post(app, '/v1/chat/completions', TOOLS_CHAT, key);
-    expect(status).toBe(422);
-    expect(body.error.code).toBe('no_tools_model');
-    expect(body.error.type).toBe('invalid_request_error');
-
-    getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_tools = 1').run();
+  it('router-level: pinMode keeps the route on the pinned model for a tool-bearing request', () => {
+    const route = routeRequest(1000, undefined, pinnedDbId, false, undefined, { pinMode: true });
+    expect(route.modelDbId).toBe(pinnedDbId);
+    expect(`${route.platform}/${route.modelId}`).toBe(pinnedModelId);
   });
 
-  it('applies the same gate on /v1/responses (Codex path)', async () => {
-    getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_tools = 1').run();
-
-    const { status, body } = await post(app, '/v1/responses', TOOLS_RESPONSES, key);
-    expect(status).toBe(422);
-    expect(body.error.code).toBe('no_tools_model');
-
-    getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_tools = 1').run();
-  });
-
-  it('does not apply the tools gate to a plain chat request', async () => {
-    getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_tools = 1').run();
-    const { status, body } = await post(app, '/v1/chat/completions', {
-      messages: [{ role: 'user', content: 'hello' }],
+  it('route-level: pinned chat completion with tools is served by the pinned model', async () => {
+    mockUpstream('sunny');
+    const { status, headers, body } = await post(app, '/v1/chat/completions', {
+      model: pinnedModelId,
+      ...TOOLS_CHAT,
     }, key);
+    expect(status).toBe(200);
+    expect(body.choices?.[0]?.message?.content).toBe('sunny');
+    // X-Routed-Via proves WHICH model answered — the reported bug was this
+    // header naming a different platform/model than the pin.
+    expect(headers['x-routed-via']).toBe(pinnedModelId);
+
+    const row = getDb().prepare('SELECT requested_model, model_id FROM requests ORDER BY id DESC LIMIT 1').get() as { requested_model: string | null; model_id: string } | undefined;
+    expect(row?.requested_model).toBe(pinnedModelId);
+    // requests.model_id stores the catalog model_id (no platform prefix);
+    // the pin held because it equals the pinned row's id, not a failover target.
+    expect(row?.model_id).toBe('big-pickle'); // pin honored end-to-end
+  });
+
+  it('route-level: pinned /v1/responses run with tools stays on the pinned model', async () => {
+    mockUpstream('raining');
+    const { status, headers } = await post(app, '/v1/responses', {
+      model: pinnedModelId,
+      ...TOOLS_RESPONSES,
+    }, key);
+    expect(status).toBe(200);
+    expect(headers['x-routed-via']).toBe(pinnedModelId);
+  });
+
+  it('plain tool-bearing auto request routes normally (no 422 gate anywhere)', async () => {
+    mockUpstream('ok');
+    const { status, body } = await post(app, '/v1/chat/completions', TOOLS_CHAT, key);
     expect(status).not.toBe(422);
-    expect(body?.error?.code).not.toBe('no_tools_model');
-    getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_tools = 1').run();
+    expect(body.error?.code).toBeUndefined();
+    expect(body.choices?.[0]?.message?.content).toBe('ok');
   });
 });

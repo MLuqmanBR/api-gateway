@@ -94,7 +94,6 @@ export interface CustomModelCreate {
   intelligenceRank?: number;
   speedRank?: number;
   sizeLabel?: string;
-  supportsTools?: boolean;
   supportsVision?: boolean;
   monthlyTokenBudget?: string;
   rpmLimit?: number | null;
@@ -109,7 +108,6 @@ export interface CustomModelUpdate {
   intelligenceRank?: number;
   speedRank?: number;
   sizeLabel?: string;
-  supportsTools?: boolean;
   supportsVision?: boolean;
   monthlyTokenBudget?: string;
   rpmLimit?: number | null;
@@ -138,7 +136,6 @@ export interface Model {
   contextWindow: number | null;
   enabled: boolean;
   supportsVision: boolean;
-  supportsTools: boolean;
 }
 
 export interface ModelListRow {
@@ -155,8 +152,6 @@ export interface ModelListRow {
   // OpenAI-completions-compatible capabilities payload.
   max_output_tokens: number | null;
   supports_vision: number;
-  supports_tools: number;
-  intelligence_rank: number;
 }
 
 export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unknown';
@@ -478,7 +473,6 @@ export interface ConfigModel {
   contextWindow: number | null;
   enabled: boolean;
   supportsVision: boolean;
-  supportsTools: boolean;
   maxOutputTokens: number | null;
   paidInputPerM: number | null;
   paidOutputPerM: number | null;

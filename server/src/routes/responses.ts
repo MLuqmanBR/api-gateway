@@ -8,7 +8,7 @@ import type {
   ChatToolDefinition,
   ChatToolChoice,
 } from '@api-gateway/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { clearExhausted } from '../services/key-exhaustion.js';
 import { recordCircuitSuccess } from '../services/circuit-breaker.js';
@@ -383,21 +383,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     preferredModel = getStickyModel(token, messages, sessionIdHeader); // N3: reuse the token extracted at auth
   }
 
-  // Tool-bearing requests (the normal case for Codex/agent clients on this
-  // endpoint) must stay on models that emit structured tool_calls — a model
-  // that serializes the call into text strands the agent harness with a
-  // "successful" run it can't act on. Mirrors the /chat/completions gate.
-  const wantsTools = (tools?.length ?? 0) > 0;
-  if (wantsTools && !hasEnabledToolsModel()) {
-    res.status(422).json({
-      error: {
-        message: 'This request includes tools, but no tool-capable model is enabled. Enable a tool-calling model (e.g. GPT-OSS 120B, Gemini 3.5 Flash, GLM-4.7) in the Fallback Chain.',
-        type: 'invalid_request_error',
-        code: 'no_tools_model',
-      },
-    });
-    return;
-  }
+
 
   // Client-disconnect abort wiring — mirrors /chat/completions. A Stop /
   // session-close cancels the in-flight upstream call and breaks out of the
@@ -434,7 +420,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     if (upstreamAttempts >= attemptLimit) break;
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined, { pinMode: isPinned });
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, skipModels.size > 0 ? skipModels : undefined, { pinMode: isPinned });
     } catch (err: unknown) {
       // routeRequest throws Error with { status?, code? } — see router.ts
       const routingErr = err as Error & { status?: number };
@@ -785,7 +771,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         }));
 
         // Inline tool-call dialect rescue (#231) — see /chat/completions.
-        if (wantsTools && toolCalls.length === 0 && text) {
+        if ((tools?.length ?? 0) > 0 && toolCalls.length === 0 && text) {
           const rescue = rescueInlineToolCalls(text, new Set((tools ?? []).map(t => t.function.name)));
           if (rescue.detected) {
             if (!rescue.calls) {

@@ -44,7 +44,6 @@ const modelSchema = z.object({
   contextWindow: z.number().int().nullable(),
   enabled: z.boolean(),
   supportsVision: z.boolean(),
-  supportsTools: z.boolean(),
   maxOutputTokens: z.number().int().nullable(),
   paidInputPerM: z.number().nullable(),
   paidOutputPerM: z.number().nullable(),

@@ -42,7 +42,7 @@ export function migrateDbSchema(db: DatabasePort) {
       migrateModelsV13(db);
       migrateModelsV14(db);
       migrateModelsV15(db);
-      // V16Vision/V17IntelligenceTiers/V22Tools moved OUT of this one-time
+      // V16Vision/V17IntelligenceTiers moved OUT of this one-time
       // transaction to the per-boot section below (M15) — they are rule-based
       // LIKE-pattern UPDATEs that must re-assert on every boot so models added
       // AFTER first boot are also flagged/tiered. Keeping them inside this
@@ -63,14 +63,13 @@ export function migrateDbSchema(db: DatabasePort) {
   }
 
   // Non-destructive refreshes that should run every boot (updates, not resets).
-  // M15: V16Vision/V17IntelligenceTiers/V22Tools are rule-based UPDATEs
+  // M15: V16Vision/V17IntelligenceTiers are rule-based UPDATEs
   // (LIKE … SET …) that must re-assert on every boot so models added after
   // first boot (via sync or new provider catalogs) are flagged/tiered
   // immediately. They were previously inside the one-time migration block
   // and ran exactly once — models synced later never got flagged.
   migrateModelsV16Vision(db);
   migrateModelsV17IntelligenceTiers(db);
-  migrateModelsV22Tools(db);
   applyModelPricing(db);
   applyActualCostPricing(db);
   migrateQuirksV1(db);
@@ -88,6 +87,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV43LatencyPerToken(db);
   migrateSchemaV44ModelTags(db);
   migrateSchemaV45MiddleRedaction(db);
+  migrateSchemaV46DropSupportsTools(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -1761,75 +1761,9 @@ function migrateModelsV21PruneDead(db: DatabasePort) {
   apply();
 }
 
-// ── V22: tools-aware routing (2026-06-04) ──
-// Adds the supports_tools column and flags the models that reliably emit
-// STRUCTURED tool_calls. Motivation: an OpenAI-compatible agent client
-// (Paperclip/Codex via /v1/responses) sent tool-bearing requests that the
-// chain cascaded down to models with no real function-calling support —
-// nemotron-3-nano answered 72 requests averaging ~38 output tokens, and the
-// tool call leaked into chat text as literal `</tool_call>` XML, so the agent
-// harness never saw a status update and every issue dead-ended in manual
-// recovery. The router now keeps tool-bearing requests on this flagged subset
-// (see routeRequest's requireTools).
-//
-// Rule-based by model family rather than a hardcoded id list, same reasoning
-// as V16Vision: the catalog churns through migrations and LIKE rules survive
-// renames. A family is flagged only when (a) it has native, documented
-// function calling AND (b) we've seen structured tool_calls from it through
-// this gateway (the 2026-06-01 live tool-calling benchmark, V4's probe pass,
-// or production traffic). Conservative on purpose: a false negative just
-// narrows the pool, while a false positive reproduces the silent-garbage
-// failure above. Deliberately NOT flagged: gemma (weak at tools — V4),
-// nemotron nano/9b (the incident model), poolside laguna (returns ~2 tokens),
-// hermes-3 (emits tool calls as text — V4), groq compound (built-in tools
-// only, rejects user functions), r1-distills, and the small/stealth/unknown
-// tail (granite, lfm, stepfun, big-pickle, mimo, owl-alpha, cogito,
-// pollinations). Idempotent — reset-then-set, safe on fresh seeds and
-// upgrades alike.
-function migrateModelsV22Tools(db: DatabasePort) {
-  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'supports_tools')) {
-    db.prepare('ALTER TABLE models ADD COLUMN supports_tools INTEGER NOT NULL DEFAULT 0').run();
-  }
-  const apply = db.transaction(() => {
-    // Reset first so a de-flagged model doesn't keep a stale flag across re-runs.
-    db.prepare('UPDATE models SET supports_tools = 0').run();
-    db.prepare(`
-      UPDATE models SET supports_tools = 1
-      WHERE (
-           LOWER(model_id) LIKE '%gpt-oss%'        -- groq/OR/cerebras/CF/sambanova/ollama; incl. safeguard (tool-tuned)
-        OR ((LOWER(model_id) LIKE '%llama-3%' OR LOWER(model_id) LIKE '%llama-4%')
-            AND LOWER(model_id) NOT LIKE '%hermes%'   -- hermes-3-llama emits text tool calls
-            AND LOWER(model_id) NOT LIKE '%llama-3.2%') -- 3B route declares no tool support (V23)
-        OR LOWER(model_id) LIKE '%gemini-%'        -- every Gemini; gemma intentionally NOT matched
-        OR LOWER(model_id) LIKE '%glm-%'           -- GLM 4.5+/5.x are agentic-tuned (zai/zhipu/CF/ollama)
-        OR LOWER(model_id) LIKE '%qwen3%'
-        OR LOWER(model_id) LIKE '%qwen-3%'         -- Qwen3 incl. coder/next variants
-        OR LOWER(model_id) LIKE '%deepseek-v%'     -- V3.x/V4 function calling; excludes r1-distill
-        OR LOWER(model_id) LIKE '%kimi-k2%'        -- K2 family is tool-native
-        OR LOWER(model_id) LIKE '%minimax-m2%'     -- M2.x is agent-focused
-        OR LOWER(model_id) LIKE '%mistral-large%'  -- Mistral API function calling (whole family)
-        OR LOWER(model_id) LIKE '%mistral-medium%'
-        OR LOWER(model_id) LIKE '%mistral-small%'
-        OR LOWER(model_id) LIKE '%magistral%'
-        OR LOWER(model_id) LIKE '%codestral%'
-        OR LOWER(model_id) LIKE '%devstral%'
-        OR LOWER(model_id) LIKE '%ministral%'
-        OR LOWER(model_id) LIKE '%command-a%'      -- Cohere native tool use (benchmarked top-20)
-        OR LOWER(model_id) LIKE '%command-r%'
-        OR LOWER(model_id) LIKE '%gpt-4o%'         -- GitHub's OpenAI models
-        OR LOWER(model_id) LIKE '%gpt-4.1%'
-        OR LOWER(model_id) LIKE '%gpt-5%'
-        OR LOWER(model_id) LIKE '%nemotron-3-super%' -- benchmarked #8 with real tool calls; nano stays excluded
-        OR LOWER(model_id) LIKE '%nemotron-nano-12b-v2-vl%' -- unlike the 30B nano: live-probed structured tool_calls (V23, 2026-06-07)
-        OR LOWER(model_id) LIKE '%nemotron-3-ultra%' -- structured tool_calls live-verified via Zen's dedicated endpoint (V24, 2026-06-07); covers the disabled OR row too
-        OR LOWER(model_id) LIKE '%minimax-m3%'       -- finish_reason:tool_calls live-verified on Zen (V24)
-        OR LOWER(model_id) LIKE '%north-mini-code%'  -- structured tool_calls + reasoning_content live-verified on Zen (V26, 2026-06-10)
-      )
-    `).run();
-  });
-  apply();
-}
+// ── V22 (tools-aware routing) REMOVED 2026-08-23: the supports_tools
+// capability system is gone — every model is treated as tool-capable.
+// migrateSchemaV46DropSupportsTools below physically drops the column.
 
 /**
  * V23 (June 2026): recurring-free audit — drop SambaNova + Chutes, add
@@ -1878,15 +1812,6 @@ function migrateModelsV22Tools(db: DatabasePort) {
  * tiers match V17's bands.
  */
 function migrateModelsV23FreeTierAudit(db: DatabasePort) {
-  // M15 exposed a latent ordering bug: the INSERT below references
-  // supports_tools, which V22Tools normally adds first — but V23 runs inside
-  // its own transaction, and if V22 is deferred (now: moved to per-boot by
-  // M15) nothing guarantees the column when this INSERT prepares. Create it
-  // when missing, same guard idiom V16/V22 use.
-  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'supports_tools')) {
-    db.prepare('ALTER TABLE models ADD COLUMN supports_tools INTEGER NOT NULL DEFAULT 0').run();
-  }
   const apply = db.transaction(() => {
     for (const platform of ['sambanova', 'chutes']) {
       db.prepare(`
@@ -1899,16 +1824,16 @@ function migrateModelsV23FreeTierAudit(db: DatabasePort) {
     }
 
     const insert = db.prepare(`
-      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null, number, number, number]> = [
-      ['openrouter', 'moonshotai/kimi-k2.6:free',                                     'Kimi K2.6 (OR free)',                 3, 9,  'Frontier', 20, 200, null, null, '~6M',  262144,  1, 0, 1],
-      ['openrouter', 'nvidia/nemotron-3-ultra-550b-a55b:free',                        'Nemotron 3 Ultra 550B (free, slow)',  7, 11, 'Frontier', 20, 200, null, null, '~6M',  1000000, 0, 0, 1],
-      ['openrouter', 'nvidia/nemotron-nano-12b-v2-vl:free',                           'Nemotron Nano 12B VL (free)',        26, 9,  'Medium',   20, 200, null, null, '~6M',  128000,  1, 1, 1],
-      ['openrouter', 'meta-llama/llama-3.2-3b-instruct:free',                         'Llama 3.2 3B (free)',                30, 9,  'Small',    20, 200, null, null, '~6M',  131072,  1, 0, 0],
-      ['openrouter', 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free', 'Dolphin Mistral 24B Venice (free)',  25, 9,  'Medium',   20, 200, null, null, '~6M',  32768,   1, 0, 0],
-      ['zhipu',      'glm-4.6v-flash',                                                'GLM-4.6V Flash',                     21, 4,  'Large',    null, null, null, null, '~30M', 131072,  1, 1, 1],
+    const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null, number, number]> = [
+      ['openrouter', 'moonshotai/kimi-k2.6:free',                                     'Kimi K2.6 (OR free)',                 3, 9,  'Frontier', 20, 200, null, null, '~6M',  262144,  1, 0],
+      ['openrouter', 'nvidia/nemotron-3-ultra-550b-a55b:free',                        'Nemotron 3 Ultra 550B (free, slow)',  7, 11, 'Frontier', 20, 200, null, null, '~6M',  1000000, 0, 0],
+      ['openrouter', 'nvidia/nemotron-nano-12b-v2-vl:free',                           'Nemotron Nano 12B VL (free)',        26, 9,  'Medium',   20, 200, null, null, '~6M',  128000,  1, 1],
+      ['openrouter', 'meta-llama/llama-3.2-3b-instruct:free',                         'Llama 3.2 3B (free)',                30, 9,  'Small',    20, 200, null, null, '~6M',  131072,  1, 0],
+      ['openrouter', 'cognitivecomputations/dolphin-mistral-24b-venice-edition:free', 'Dolphin Mistral 24B Venice (free)',  25, 9,  'Medium',   20, 200, null, null, '~6M',  32768,   1, 0],
+      ['zhipu',      'glm-4.6v-flash',                                                'GLM-4.6V Flash',                     21, 4,  'Large',    null, null, null, null, '~30M', 131072,  1, 1],
     ];
     for (const a of additions) insert.run(...a);
     backfillFallback(db);
@@ -1949,12 +1874,12 @@ function migrateModelsV23FreeTierAudit(db: DatabasePort) {
 function migrateModelsV24ZenRefresh(db: DatabasePort) {
   const apply = db.transaction(() => {
     const insert = db.prepare(`
-      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision, supports_tools)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR IGNORE INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, supports_vision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-    const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null, number, number, number]> = [
-      ['opencode', 'nemotron-3-ultra-free', 'Nemotron 3 Ultra Free (OpenCode Zen)',  7, 4, 'Frontier', 20, 200, null, null, 'promo (trial)', 131072, 1, 0, 1],
-      ['opencode', 'minimax-m3-free',       'MiniMax M3 Free (OpenCode Zen)',        4, 4, 'Frontier', 20, 200, null, null, 'promo (trial)', 131072, 1, 0, 1],
+    const additions: Array<[string, string, string, number, number, string, number | null, number | null, number | null, number | null, string, number | null, number, number]> = [
+      ['opencode', 'nemotron-3-ultra-free', 'Nemotron 3 Ultra Free (OpenCode Zen)',  7, 4, 'Frontier', 20, 200, null, null, 'promo (trial)', 131072, 1, 0],
+      ['opencode', 'minimax-m3-free',       'MiniMax M3 Free (OpenCode Zen)',        4, 4, 'Frontier', 20, 200, null, null, 'promo (trial)', 131072, 1, 0],
     ];
     for (const a of additions) insert.run(...a);
     backfillFallback(db);
@@ -2057,8 +1982,8 @@ function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
     const insModel = db.prepare(`
       INSERT OR IGNORE INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
-         context_window, max_output_tokens, enabled, supports_vision, supports_tools)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0, 1)
+         context_window, max_output_tokens, enabled, supports_vision)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 0)
     `);
     for (const m of models) {
       insModel.run(m.provider, m.id, m.name, m.intel, m.speed, m.size, m.context, m.maxOut);
@@ -2703,4 +2628,20 @@ function migrateSchemaV45MiddleRedaction(db: DatabasePort) {
     enabled INTEGER NOT NULL DEFAULT 1,
     masked_preview TEXT NOT NULL DEFAULT ''
   )`);
+}
+
+// V46 (2026-08-23): remove the supports_tools capability system. Every model
+// is treated as tool-capable; the router no longer filters on this flag and
+// no code reads the column, so it is physically dropped from existing DBs.
+// The base CREATE TABLE never had the column, so fresh databases no-op here.
+// Older SQLite engines (< 3.35) lack DROP COLUMN — in that case log and leave
+// the column dormant (zero readers, zero behavioral impact).
+function migrateSchemaV46DropSupportsTools(db: DatabasePort) {
+  const cols = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (!cols.some(c => c.name === 'supports_tools')) return;
+  try {
+    db.exec('ALTER TABLE models DROP COLUMN supports_tools');
+  } catch (e) {
+    console.error('[migrate] could not drop models.supports_tools; leaving it dormant:', e);
+  }
 }
