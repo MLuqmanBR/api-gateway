@@ -56,7 +56,17 @@ export function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> 
  *  when the socket tears down, and `res.writableEnded` tells us whether we
  *  finished writing (normal completion) or not (client gone). */
 export function attachClientAbort(
-  res: { on: (e: 'close', fn: () => void) => void; removeListener: (e: 'close', fn: () => void) => void; writableEnded: boolean },
+  res: {
+    on: (e: 'close', fn: () => void) => void;
+    removeListener: (e: 'close', fn: () => void) => void;
+    writableEnded: boolean;
+    // Optional: real ServerResponse emits 'error' (e.g. ECONNRESET from a
+    // reset socket). Without a listener, Node turns that event into a fatal
+    // uncaughtException — thrown AFTER the route's try/catch is gone, so it
+    // crashes the whole process on a mere client disconnect. Swallow it here;
+    // the 'close' handler above already drives the abort semantics.
+    once?: (e: 'error', fn: (err: unknown) => void) => void;
+  },
 ): { controller: AbortController; detach: () => void } {
   const controller = new AbortController();
   const onClose = () => {
@@ -68,6 +78,7 @@ export function attachClientAbort(
     controller.abort();
   };
   res.on('close', onClose);
+  res.once?.('error', () => {});
   const detach = () => {
     try { res.removeListener('close', onClose); } catch { /* already gone */ }
   };

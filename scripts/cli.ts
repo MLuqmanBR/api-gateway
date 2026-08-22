@@ -267,8 +267,11 @@ async function startServer(port) {
   let out;
   try { out = openSync(LOG_FILE, 'a'); } catch { out = 'ignore'; }
 
+  // stderr is bound to the log fd for the child's whole lifetime: with a
+  // 'pipe' the stream dies when this CLI exits, and every post-startup crash
+  // message (uncaughtException/unhandledRejection handlers) was silently lost.
   const child = spawn('node', ['server/dist/index.js'], {
-    cwd: ROOT, detached: true, stdio: ['ignore', out, 'pipe'],
+    cwd: ROOT, detached: true, stdio: ['ignore', out, out],
     env: { ...process.env, PORT: String(port) },
   });
 
@@ -291,6 +294,12 @@ async function startServer(port) {
   return waitForReady(port, child, out).then(() => {
     console.log('Server is ready.\n');
     printInfo(port);
+    // Explicit exit. child.unref() + closing child.stderr / the log fd is
+    // not enough on its own: other inherited fds (the `time` wrapper's
+    // pipe, TTY stdio, future code paths) can still keep the event loop
+    // alive. The CLI's job is done once the server is ready — leave no
+    // ambiguity. The detached child is unaffected.
+    process.exit(0);
   }).catch((err) => {
     // Same single reconciliation every command uses: drop the child's stale
     // registry entry if it died mid-startup. On a slow-start timeout the PID
@@ -299,27 +308,29 @@ async function startServer(port) {
     console.error(err.message);
     process.exit(1);
   });
-}
+ }
 
 function waitForReady(port, child, logFd) {
   const start = Date.now();
   const timeout = 30000;
-  const stderrChunks: Buffer[] = [];
-  if (child.stderr) {
-    child.stderr.on('data', (chunk) => {
-      stderrChunks.push(chunk);
-      // Tee to the log file so the on-disk log also captures why it crashed
-      // (previously stderr was an unpiped dead end).
-      if (typeof logFd === 'number') { try { writeSync(logFd, chunk); } catch { /* ignore */ } }
-    });
-  }
+  // stderr is no longer piped (it writes straight into the log fd for the
+  // child's whole life).
   return new Promise<void>((resolve, reject) => {
     let settled = false;
     const once = (fn) => (v?) => { if (!settled) { settled = true; fn(v); } };
 
     child.on('exit', (code) => {
       if (code !== 0 && code !== null) {
-        const stderrMsg = Buffer.concat(stderrChunks).toString().trim();
+        // Startup failure detail comes from the tail of the log file.
+        let stderrMsg = '';
+        try {
+          const fd = openSync(LOG_FILE, 'r');
+          const sz = statSync(LOG_FILE).size;
+          const buf = Buffer.alloc(Math.min(4096, sz));
+          readSync(fd, buf, 0, buf.length, Math.max(0, sz - buf.length));
+          stderrMsg = buf.toString('utf8').trim();
+          closeSync(fd);
+        } catch { /* ignore */ }
         const msg = stderrMsg
           ? `Server exited with code ${code}: ${stderrMsg}`
           : `Server exited with code ${code} before becoming ready`;
