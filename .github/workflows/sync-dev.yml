@@ -1,0 +1,48 @@
+name: Sync main to dev
+
+# Auto-sync: every push to `main` is merged into `dev`, preserving the
+# native Linux desktop app that only `dev` carries (see scripts/sync-dev.sh).
+# This workflow lives on `dev` (not on `main`), so it is only active while
+# the dev branch carries it — it runs whenever main advances, using dev's
+# own sync script.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-main-to-dev
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge main into dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout dev
+        uses: actions/checkout@v4
+        with:
+          ref: dev
+          # Need full history so `git merge-base` / `git rev-list` work.
+          fetch-depth: 0
+
+      # The sync script merges a local `main` ref; checkout only fetched
+      # dev. Fetch main explicitly and expose it as a local `main` for git.
+      - name: Fetch main
+        run: git fetch origin main:main
+
+      - name: Configure git identity
+        run: |
+          git config user.name "api-gateway-bot"
+          git config user.email "bot@users.noreply.github.com"
+
+      - name: Run sync script
+        run: bash scripts/sync-dev.sh
+
+      - name: Push synced dev
+        run: git push origin dev
+        env:
+          GITHUB_TOKEN: ${{ secrets.SYNC_DEV_PAT }}
