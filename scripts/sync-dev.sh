@@ -46,12 +46,9 @@ if ! git merge main --no-ff --no-commit >/dev/null 2>&1; then
   echo
   warn "Merge produced conflicts git could not resolve automatically:"
   git diff --name-only --diff-filter=U | sed 's/^/    CONFLICT: /'
-  cat >&8 <<'EOF'
-
-Resolve each conflicted file, KEEPING the native-app content where relevant,
-then finish with:  git add -A && git commit
-(Or abort with:    git merge --abort)
-EOF
+  warn "Resolve each conflicted file, KEEPING the native-app content where relevant,"
+  warn "then finish with:  git add -A && git commit"
+  warn "(Or abort with:    git merge --abort)"
   exit 1
 fi
 
