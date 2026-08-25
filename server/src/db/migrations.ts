@@ -42,12 +42,13 @@ export function migrateDbSchema(db: DatabasePort) {
       migrateModelsV13(db);
       migrateModelsV14(db);
       migrateModelsV15(db);
-      // V16Vision/V17IntelligenceTiers moved OUT of this one-time
-      // transaction to the per-boot section below (M15) — they are rule-based
-      // LIKE-pattern UPDATEs that must re-assert on every boot so models added
-      // AFTER first boot are also flagged/tiered. Keeping them inside this
-      // block means a model added post-first-boot never gets flagged/tiered
-      // until a new data-migration version is introduced.
+      // Catalog rules (vision flags, intelligence tiers) run ONCE here at seed
+      // time. Runtime ingest re-applies them SCOPED to newly inserted rows
+      // (routes/custom.ts) so late-synced models are still flagged/tiered.
+      // Per-boot migrations NEVER modify operator-editable model fields — a
+      // dashboard toggle or config import wins permanently, both directions.
+      applyVisionRules(db);
+      applyTierRules(db);
       migrateModelsV18OpenCodeZen(db);
       migrateModelsV19Gemma4(db);
       migrateModelsV20KiloFree(db);
@@ -62,14 +63,6 @@ export function migrateDbSchema(db: DatabasePort) {
     apply();
   }
 
-  // Non-destructive refreshes that should run every boot (updates, not resets).
-  // M15: V16Vision/V17IntelligenceTiers are rule-based UPDATEs
-  // (LIKE … SET …) that must re-assert on every boot so models added after
-  // first boot (via sync or new provider catalogs) are flagged/tiered
-  // immediately. They were previously inside the one-time migration block
-  // and ran exactly once — models synced later never got flagged.
-  migrateModelsV16Vision(db);
-  migrateModelsV17IntelligenceTiers(db);
   applyModelPricing(db);
   applyActualCostPricing(db);
   migrateQuirksV1(db);
@@ -1458,10 +1451,9 @@ function migrateModelsV15(db: DatabasePort) {
   db.prepare(`DELETE FROM models WHERE platform = 'siliconflow'`).run();
 }
 
-// Adds the supports_vision column to existing DBs and (re)applies the vision
-// flags by rule. Rule-based rather than a hardcoded id list because the catalog
-// churns through migrations (model ids get renamed/replaced) — rules survive
-// that. Two constraints decide a model can accept images:
+// Applies the vision flags by rule. Rule-based rather than a hardcoded id list
+// because the catalog churns through migrations (model ids get renamed/replaced)
+// — rules survive that. Two constraints decide a model can accept images:
 //   1. The model is genuinely multimodal (every Gemini is; Llama 4 Scout/
 //      Maverick are; GitHub's GPT-4o/4.1/5 are).
 //   2. Its provider adapter forwards image content. OpenAICompat and Google do;
@@ -1470,43 +1462,39 @@ function migrateModelsV15(db: DatabasePort) {
 // Conservative on purpose: with hard-fail routing a false negative is just a
 // clear "no vision model" error, while a false positive routes an image to a
 // model that chokes. Idempotent — safe on fresh seeds and upgrades alike.
-function migrateModelsV16Vision(db: DatabasePort) {
-  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
-  if (!columns.some(col => col.name === 'supports_vision')) {
-    db.prepare('ALTER TABLE models ADD COLUMN supports_vision INTEGER NOT NULL DEFAULT 0').run();
-  }
+export function applyVisionRules(db: DatabasePort, ids?: number[]): void {
+  // Optional id scope: when provided, rules touch ONLY those rows — runtime
+  // ingest passes exactly the ids it just inserted so operator edits on
+  // existing rows are never revisited. Omitted = whole table (seed time only).
+  const scope = ids && ids.length > 0 ? ` AND id IN (${ids.map(() => '?').join(',')})` : '';
+  const params: number[] = scope && ids ? ids : [];
   const apply = db.transaction(() => {
-    // Reset first so de-flagged models (e.g. an id that moved to Cloudflare)
-    // don't keep a stale flag across re-runs.
-    db.prepare('UPDATE models SET supports_vision = 0').run();
     // Every Gemini is multimodal (the 'google' platform is all Gemini).
-    db.prepare("UPDATE models SET supports_vision = 1 WHERE platform = 'google'").run();
+    db.prepare(`UPDATE models SET supports_vision = 1 WHERE platform = 'google'${scope}`).run(...params);
     // Llama 4 (Scout/Maverick) is natively multimodal — but only where the
     // adapter forwards images (exclude the text-flattening providers).
     db.prepare(`
       UPDATE models SET supports_vision = 1
       WHERE LOWER(model_id) LIKE '%llama-4%'
-        AND platform NOT IN ('cloudflare', 'cohere')
-    `).run();
+        AND platform NOT IN ('cloudflare', 'cohere')${scope}
+    `).run(...params);
     // GitHub's OpenAI vision models.
     db.prepare(`
       UPDATE models SET supports_vision = 1
       WHERE platform = 'github'
-        AND (model_id LIKE '%gpt-4o%' OR model_id LIKE '%gpt-4.1%' OR model_id LIKE '%gpt-5%')
-    `).run();
+        AND (model_id LIKE '%gpt-4o%' OR model_id LIKE '%gpt-4.1%' OR model_id LIKE '%gpt-5%')${scope}
+    `).run(...params);
     // V23 vision additions, both live-probed 2026-06-07 (answered a color
     // question about an inline data-URL PNG): Zhipu's free GLM-4.6V Flash and
     // NVIDIA's Nemotron Nano 12B v2 VL (via OpenRouter).
     db.prepare(`
       UPDATE models SET supports_vision = 1
       WHERE LOWER(model_id) LIKE '%glm-4.6v%'
-         OR LOWER(model_id) LIKE '%nemotron-nano-12b-v2-vl%'
-    `).run();
+         OR LOWER(model_id) LIKE '%nemotron-nano-12b-v2-vl%'${scope}
+    `).run(...params);
   });
   apply();
 }
-
-// ── V17: intelligence tier audit (2026-06) ──
 // `size_label` is the cross-provider capability tier that DOMINATES the router's
 // intelligence axis (intelligenceComposite = tier*1000 - intelligence_rank in
 // services/router.ts), so it must track real benchmarks rather than the
@@ -1523,8 +1511,13 @@ function migrateModelsV16Vision(db: DatabasePort) {
 // their seeded tier (Cogito 2.1, Owl Alpha, Poolside Laguna, Hermes 3 405B,
 // Baidu CoBuddy, Groq Compound, GLM-4.6V Flash, GLM-4.5 Flash, Mistral Small 4,
 // Devstral). intelligence_rank (the within-tier tiebreak, low impact) is left
-// untouched. Idempotent — every statement is an absolute SET, safe to re-run.
-function migrateModelsV17IntelligenceTiers(db: DatabasePort) {
+// untouched. Runtime ingest re-applies these SCOPED to newly inserted row ids
+// (routes/custom.ts); seed time runs them over the whole table once.
+export function applyTierRules(db: DatabasePort, ids?: number[]): void {
+  // Optional id scope: when provided, rules touch ONLY those rows so operator
+  // size-label edits on existing rows are never revisited.
+  const scope = ids && ids.length > 0 ? ` AND id IN (${ids.map(() => '?').join(',')})` : '';
+  const params: number[] = scope && ids ? ids : [];
   const apply = db.transaction(() => {
     // Frontier (AA ≥ 45): genuine frontier-class. Promotes Gemini 3.5 Flash (55)
     // and Gemini 3 Flash Preview (46) up from Large.
@@ -1538,8 +1531,8 @@ function migrateModelsV17IntelligenceTiers(db: DatabasePort) {
         OR LOWER(model_id) LIKE '%deepseek-v4-pro%'
         OR LOWER(model_id) LIKE '%deepseek-v4-flash%'
         OR LOWER(model_id) LIKE '%glm-5.1%'
-        OR LOWER(model_id) LIKE '%minimax-m2.7%'
-    `).run();
+        OR LOWER(model_id) LIKE '%minimax-m2.7%'${scope}
+    `).run(...params);
 
     // Large (AA 26–44). Demotes Gemini 2.5 Pro (35), Nemotron 3 Super/120B (36),
     // GLM-4.7 (42), DeepSeek V3.1/V3.2 (28/32), Trinity (32) down from Frontier;
@@ -1561,8 +1554,8 @@ function migrateModelsV17IntelligenceTiers(db: DatabasePort) {
         OR LOWER(model_id) LIKE '%gpt-4.1%'
         OR LOWER(model_id) LIKE '%gemma-4-31b%' OR LOWER(model_id) LIKE '%gemma4:31b%'
         OR LOWER(model_id) LIKE '%gemma-4-26b%'
-        OR LOWER(model_id) LIKE '%gemini-3.1-flash-lite%'
-    `).run();
+        OR LOWER(model_id) LIKE '%gemini-3.1-flash-lite%'${scope}
+    `).run(...params);
 
     // Medium (AA 13–25). Demotes Qwen3-Coder 480B (25) and Mistral Large 3 (23)
     // down from Frontier; Llama 4 Maverick (18), GPT-4o (17), Gemini 2.5 Flash
@@ -1590,8 +1583,8 @@ function migrateModelsV17IntelligenceTiers(db: DatabasePort) {
         OR LOWER(model_id) LIKE '%command-a-03-2025%'
         OR LOWER(model_id) LIKE '%command-r-plus%'
         OR LOWER(model_id) LIKE '%nemotron-3-nano%'
-        OR LOWER(model_id) LIKE '%nemotron-nano-9b%'
-    `).run();
+        OR LOWER(model_id) LIKE '%nemotron-nano-9b%'${scope}
+    `).run(...params);
 
     // Small (AA ≤ 12). Demotes Gemma 3 12B (9), Command R 08-2024 (legacy ~7),
     // and Codestral (8) down from Medium.
@@ -1604,8 +1597,8 @@ function migrateModelsV17IntelligenceTiers(db: DatabasePort) {
         OR LOWER(model_id) LIKE '%meta-llama-3.1-8b%'
         OR LOWER(model_id) LIKE '%ministral-8b%'
         OR LOWER(model_id) LIKE '%granite-4.0-h-micro%'
-        OR LOWER(model_id) LIKE '%lfm-2.5-1.2b%'
-    `).run();
+        OR LOWER(model_id) LIKE '%lfm-2.5-1.2b%'${scope}
+    `).run(...params);
   });
   apply();
 }

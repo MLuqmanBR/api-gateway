@@ -190,6 +190,9 @@ export const FALLBACK_OUTPUT_PER_M = 0.80;
  * Adds the pricing columns (idempotent) and refreshes prices for every
  * known model. Runs on every boot — it's ~100 UPDATEs in one transaction
  * and keeps prices current when this map is updated in a release.
+ *
+ * Rows with `pricing_manual = 1` are operator-set (config import) and are
+ * never touched — an imported envelope wins over release map updates.
  */
 export function applyModelPricing(db: DatabasePort): void {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
@@ -199,10 +202,13 @@ export function applyModelPricing(db: DatabasePort): void {
   if (!columns.some(c => c.name === 'paid_output_per_m')) {
     db.prepare('ALTER TABLE models ADD COLUMN paid_output_per_m REAL').run();
   }
+  if (!columns.some(c => c.name === 'pricing_manual')) {
+    db.prepare('ALTER TABLE models ADD COLUMN pricing_manual INTEGER NOT NULL DEFAULT 0').run();
+  }
 
   const update = db.prepare(`
     UPDATE models SET paid_input_per_m = ?, paid_output_per_m = ?
-    WHERE platform = ? AND model_id = ?
+    WHERE platform = ? AND model_id = ? AND pricing_manual = 0
   `);
   const applyAll = db.transaction(() => {
     for (const [platform, modelId, input, output] of MODEL_PRICING) {

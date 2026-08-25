@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { initDb } from '../../db/index.js';
+import { applyTierRules, applyVisionRules, migrateDbSchema } from '../../db/migrations.js';
+import { MODEL_PRICING } from '../../db/model-pricing.js';
 
 /**
  * All migrations must be idempotent: running initDb twice on the same
@@ -297,5 +299,69 @@ describe('Migration idempotency', () => {
 
     const missing = platforms.filter(p => !hasProvider(p));
     expect(missing).toEqual([]);
+  });
+
+  it('catalog rules seed fresh families but never revisit operator-edited rows', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-rules-${Date.now()}.db`;
+    const db = initDb(tmpPath);
+
+    // Seeded families are flagged/tiered by the one-time rule pass.
+    const gemini = db.prepare(
+      "SELECT id, supports_vision FROM models WHERE platform = 'google' LIMIT 1",
+    ).get() as { id: number; supports_vision: number };
+    expect(gemini.supports_vision).toBe(1);
+
+    // Scoping guard: a scoped helper call touches ONLY the given ids.
+    db.prepare('UPDATE models SET supports_vision = 0 WHERE id = ?').run(gemini.id);
+    const ins = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('google', 'gemini-9.9-test', 'Gemini 9.9 Test', 10, 10, '', 1)
+    `).run();
+    const newId = Number(ins.lastInsertRowid);
+    applyVisionRules(db, [newId]);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(newId) as { v: number }).v).toBe(1);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(gemini.id) as { v: number }).v).toBe(0);
+
+    // Restart path: migrateDbSchema re-run (one-time block skipped at
+    // user_version = CURRENT_DATA_VERSION) must not touch operator edits.
+    const tiered = db.prepare(
+      "SELECT id FROM models WHERE LOWER(model_id) LIKE '%llama-3.3-70b%' LIMIT 1",
+    ).get() as { id: number };
+    db.prepare("UPDATE models SET size_label = 'Small' WHERE id = ?").run(tiered.id);
+    migrateDbSchema(db);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(gemini.id) as { v: number }).v).toBe(0);
+    expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(tiered.id) as { s: string }).s).toBe('Small');
+    // ...while a scoped tier pass still flags brand-new rows.
+    const ins2 = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('groq', 'llama-3.3-70b-versatile-new', 'Llama New', 10, 10, '', 1)
+    `).run();
+    const newTierId = Number(ins2.lastInsertRowid);
+    applyTierRules(db, [newTierId]);
+    expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(newTierId) as { s: string }).s).toBe('Medium');
+    db.close();
+  });
+
+  it('applyModelPricing refreshes mapped prices but respects pricing_manual', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-pricing-${Date.now()}.db`;
+    const db = initDb(tmpPath);
+
+    const [pPlatform, pModelId, pIn, pOut] = MODEL_PRICING[0];
+    const marked = db.prepare(
+      'SELECT id FROM models WHERE platform = ? AND model_id = ?',
+    ).get(pPlatform, pModelId) as { id: number };
+    db.prepare('UPDATE models SET paid_input_per_m = 9.99, pricing_manual = 1 WHERE id = ?').run(marked.id);
+
+    const other = MODEL_PRICING.find(([pl, mid]) => !(pl === pPlatform && mid === pModelId) && pl === pPlatform)!;
+    const unmarked = db.prepare(
+      'SELECT id, paid_input_per_m FROM models WHERE platform = ? AND model_id = ?',
+    ).get(other[0], other[1]) as { id: number; paid_input_per_m: number | null };
+
+    migrateDbSchema(db);
+    expect((db.prepare('SELECT paid_input_per_m AS p FROM models WHERE id = ?').get(marked.id) as { p: number }).p).toBe(9.99);
+    expect((db.prepare('SELECT paid_input_per_m AS p FROM models WHERE id = ?').get(unmarked.id) as { p: number }).p).toBe(other[2]);
+    db.close();
   });
 });
