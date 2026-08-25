@@ -8,7 +8,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { listWebhooks, createWebhook, deleteWebhook, toggleWebhook } from '../services/webhooks.js';
+import { listWebhooks, createWebhook, deleteWebhook, toggleWebhook, sendTestDelivery } from '../services/webhooks.js';
 import { getSetting } from '../db/index.js';
 import { assertPublicHttpUrl } from '../lib/url-guard.js';
 
@@ -71,6 +71,20 @@ webhooksRouter.patch('/', (req: Request, res: Response) => {
     return;
   }
   if (!toggleWebhook(id, enabled)) {
+    res.status(404).json({ error: { message: 'Webhook not found' } });
+    return;
+  }
+  res.json({ ok: true });
+});
+
+// Queue a signed test delivery to one webhook, ignoring its events_filter.
+webhooksRouter.post('/test', (req: Request, res: Response) => {
+  const id = parseInt(req.query.id as string, 10);
+  if (isNaN(id)) {
+    res.status(400).json({ error: { message: 'id query param required' } });
+    return;
+  }
+  if (!sendTestDelivery(id)) {
     res.status(404).json({ error: { message: 'Webhook not found' } });
     return;
   }

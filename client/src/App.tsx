@@ -27,11 +27,13 @@ const FallbackPage = lazy(() => import('@/pages/FallbackPage'))
 const EmbeddingsPage = lazy(() => import('@/pages/EmbeddingsPage'))
 const AnalyticsPage = lazy(() => import('@/pages/AnalyticsPage'))
 const SettingsPage = lazy(() => import('@/pages/SettingsPage'))
+const WebhooksPage = lazy(() => import('@/pages/WebhooksPage'))
 const queryClient = new QueryClient()
 const navItems = [
   { to: '/models', label: 'Models' },
   { to: '/playground', label: 'Playground' },
   { to: '/keys', label: 'Keys' },
+  { to: '/webhooks', label: 'Webhooks' },
   { to: '/budgets', label: 'Budgets' },
   { to: '/analytics', label: 'Analytics' },
   { to: '/middle', label: 'Middle' },
@@ -262,6 +264,7 @@ function App() {
                     <Route path="/playground" element={<PlaygroundPage />} />
                     <Route path="/analytics" element={<AnalyticsPage />} />
                     <Route path="/keys" element={<KeysPage />} />
+                    <Route path="/webhooks" element={<WebhooksPage />} />
                     <Route path="/middle" element={<MiddlePage />} />
                     <Route path="/budgets" element={<BudgetPage />} />
                     <Route path="/settings" element={<SettingsPage />} />
