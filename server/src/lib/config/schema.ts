@@ -207,8 +207,8 @@ export const configEnvelopeSchema = z.object({
   exportedAt: z.string().datetime({ offset: true }),
   label: z.string().max(120).optional(),
   sections: z.object({
-    models: z.array(modelSchema).max(2000).optional(),
-    fallbackChain: z.array(fallbackEntrySchema).max(2000).optional(),
+    models: z.array(modelSchema).max(10000).optional(),
+    fallbackChain: z.array(fallbackEntrySchema).max(10000).optional(),
     customProviders: z.array(customProviderSchema).max(64).optional(),
     apiKeys: z.array(apiKeySchema).max(256).optional(),
     clientKeys: z.array(clientKeySchema).max(512).optional(),
