@@ -273,11 +273,11 @@ function ClientKeyEditor({ k, models, onSave, onClose }: {
     byPlatform.set(m.platform, list)
   }
 
-  function toggleModel(bareId: string) {
+  function toggleModel(entryId: string) {
     setSelected((prev) => {
       const next = new Set(prev)
-      if (next.has(bareId)) next.delete(bareId)
-      else next.add(bareId)
+      if (next.has(entryId)) next.delete(entryId)
+      else next.add(entryId)
       return next
     })
   }
@@ -333,17 +333,16 @@ function ClientKeyEditor({ k, models, onSave, onClose }: {
                 {platform}
               </p>
               {list.map((m) => {
-                const bareId = m.modelId.slice(m.platform.length + 1)
                 return (
                   <label key={m.id} className="flex items-center gap-2 px-2 py-1 text-xs cursor-pointer hover:bg-muted/40">
                     <input
                       type="checkbox"
-                      checked={selected.has(bareId)}
-                      onChange={() => toggleModel(bareId)}
+                      checked={selected.has(m.modelId)}
+                      onChange={() => toggleModel(m.modelId)}
                       className="size-3.5"
                     />
-                    <span className="font-mono truncate">{bareId}</span>
-                    {m.displayName !== bareId && (
+                    <span className="font-mono truncate">{m.modelId}</span>
+                    {m.displayName !== m.modelId && (
                       <span className="text-muted-foreground truncate">{m.displayName}</span>
                     )}
                   </label>
@@ -356,7 +355,7 @@ function ClientKeyEditor({ k, models, onSave, onClose }: {
           )}
         </div>
         <p className="text-[11px] text-muted-foreground">
-          Leave everything unchecked for unrestricted access. Restrictions apply to the bare model name across all providers.
+          Leave everything unchecked for unrestricted access. Each entry is provider-specific (platform/model).
         </p>
       </div>
 

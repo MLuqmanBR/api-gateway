@@ -95,6 +95,14 @@ export function authenticateClientKey(token: string): AuthenticatedClientKey | n
   };
 }
 
+/** True when the model is admitted by the allowlist. STRICT qualified
+ *  matching only: an entry must equal `platform/modelId`. Bare entries match
+ *  nothing (they should not exist — normalizeClientKeyAllowlists removes
+ *  them at boot). */
+export function isModelAllowed(allowlist: string[], platform: string, modelId: string): boolean {
+  return allowlist.includes(`${platform}/${modelId}`);
+}
+
 /** Mint a new client key. Returns the full secret string ONCE (the operator
  *  must save it — the secret is never stored in plaintext). Enforces the
  *  100-active-keys soft cap. */

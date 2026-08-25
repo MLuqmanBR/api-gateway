@@ -2,6 +2,8 @@ import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { migrateDbSchema } from '../../db/migrations.js';
+import { isModelAllowed } from '../../lib/client-keys.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 
 let dashToken = '';
@@ -160,5 +162,90 @@ describe('Client keys API (F3)', () => {
     });
     server.close();
     expect(res.status).toBe(401);
+  });
+});
+
+describe('isModelAllowed (strict qualified matching)', () => {
+  it('a qualified entry matches its exact platform only', () => {
+    expect(isModelAllowed(['aggregatore/kimi-k3'], 'aggregatore', 'kimi-k3')).toBe(true);
+    expect(isModelAllowed(['aggregatore/kimi-k3'], 'aggregatorf', 'kimi-k3')).toBe(false);
+  });
+
+  it('a bare entry admits nothing', () => {
+    expect(isModelAllowed(['kimi-k3'], 'aggregatore', 'kimi-k3')).toBe(false);
+    expect(isModelAllowed(['kimi-k3'], 'nvidia', 'moonshotai/kimi-k3')).toBe(false);
+  });
+
+  it('a qualified entry does not match a different model on the same platform', () => {
+    expect(isModelAllowed(['aggregatore/deepseek-v4-pro'], 'aggregatore', 'deepseek-v4-flash')).toBe(false);
+  });
+});
+
+describe('client key allowlist normalization (bare → qualified)', () => {
+  const MODEL_COLS = '(platform, model_id, display_name, intelligence_rank, speed_rank)';
+
+  function insertModel(platform: string, modelId: string) {
+    getDb().prepare(
+      `INSERT INTO models ${MODEL_COLS} VALUES (?, ?, ?, 1, 1)`,
+    ).run(platform, modelId, modelId);
+  }
+
+  function insertKey(id: string, allowlistJson: string) {
+    getDb().prepare(
+      `INSERT INTO client_keys (id, secret_hash, salt, label, enabled, model_allowlist, created_at_ms)
+       VALUES (?, 'x', 'y', ?, 1, ?, ?)`,
+    ).run(id, id, allowlistJson, Date.now());
+  }
+
+  function allowlistOf(id: string): string | null {
+    return (getDb().prepare('SELECT model_allowlist FROM client_keys WHERE id = ?').get(id) as { model_allowlist: string | null }).model_allowlist;
+  }
+  beforeEach(() => {
+    const db = getDb();
+    db.prepare('DELETE FROM client_keys').run();
+    db.prepare('DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform IN (?, ?))').run('normp1', 'normp2');
+    db.prepare("DELETE FROM models WHERE platform IN ('normp1', 'normp2')").run();
+    // normp1 + normp2 both serve bare 'shared-model'; only normp1 serves 'qualified-model'.
+    insertModel('normp1', 'shared-model');
+    insertModel('normp2', 'shared-model');
+    insertModel('normp1', 'qualified-model');
+  });
+  afterEach(() => {
+    getDb().prepare('DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform IN (?, ?))').run('normp1', 'normp2');
+    getDb().prepare("DELETE FROM models WHERE platform IN ('normp1', 'normp2')").run();
+    getDb().prepare('DELETE FROM client_keys').run();
+  });
+
+  it('expands a bare entry to every platform serving that name and preserves qualified entries', () => {
+    insertKey('k1', JSON.stringify(['shared-model', 'normp1/qualified-model']));
+    migrateDbSchema(getDb());
+    expect(JSON.parse(allowlistOf('k1')!)).toEqual([
+      'normp1/shared-model',
+      'normp2/shared-model',
+      'normp1/qualified-model',
+    ]);
+  });
+
+  it('keeps an entry that LOOKS qualified but is actually a bare id with a slash', () => {
+    // 'slashed/model' is a BARE model_id served by normp2 — the qualified-pair
+    // check must not eat it; expansion must target the real platforms.
+    insertModel('normp2', 'slashed/model');
+    insertKey('k2', JSON.stringify(['slashed/model']));
+    migrateDbSchema(getDb());
+    expect(JSON.parse(allowlistOf('k2')!)).toEqual(['normp2/slashed/model']);
+  });
+
+  it('drops entries matching no models row at all', () => {
+    insertKey('k3', JSON.stringify(['no-such-model-anywhere']));
+    migrateDbSchema(getDb());
+    expect(JSON.parse(allowlistOf('k3')!)).toEqual([]);
+  });
+
+  it('is idempotent — second run leaves values byte-identical', () => {
+    insertKey('k4', JSON.stringify(['shared-model', 'normp1/qualified-model']));
+    migrateDbSchema(getDb());
+    const once = allowlistOf('k4');
+    migrateDbSchema(getDb());
+    expect(allowlistOf('k4')).toBe(once);
   });
 });
