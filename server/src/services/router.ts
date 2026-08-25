@@ -14,6 +14,7 @@ import {
 import { parseBudget } from '../lib/budget.js';
 import type { BaseProvider } from '../providers/base.js';
 import type { DatabasePort } from '../db/types.js';
+import { isModelAllowed } from '../lib/client-keys.js';
 
 interface KeyRow {
   id: number;
@@ -682,11 +683,14 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       if (entry.model_db_id === options.failedModelDbId) continue;
     }
 
-    // F3: enforce the authenticated client key's model allowlist. Skip models
-    // whose model_id is NOT in the allowlist. An empty/null allowlist means
-    // no restriction (the unified key or a client key without an allowlist).
+    // F3: enforce the authenticated client key's model allowlist. Entries are
+    // qualified `platform/model_id` strings and matching is strictly
+    // qualified — a model on platform A never satisfies an entry for
+    // platform B, even with identical bare model_id names. An empty/null
+    // allowlist means no restriction (the unified key or a client key
+    // without an allowlist).
     if (options?.clientModelAllowlist && options.clientModelAllowlist.length > 0) {
-      if (!options.clientModelAllowlist.includes(entry.model_id)) continue;
+      if (!isModelAllowed(options.clientModelAllowlist, entry.platform, entry.model_id)) continue;
     }
 
     // Same guard for a model with a small per-minute token budget: a single

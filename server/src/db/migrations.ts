@@ -62,7 +62,6 @@ export function migrateDbSchema(db: DatabasePort) {
     });
     apply();
   }
-
   applyModelPricing(db);
   applyActualCostPricing(db);
   migrateQuirksV1(db);
@@ -81,6 +80,8 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV44ModelTags(db);
   migrateSchemaV45MiddleRedaction(db);
   migrateSchemaV46DropSupportsTools(db);
+  // AFTER all schema migrations — needs client_keys (V39) + final models state.
+  normalizeClientKeyAllowlists(db);
 }
 
 function createTables(db: DatabasePort) {
@@ -219,6 +220,58 @@ function createTables(db: DatabasePort) {
   ensureCustomProvidersMaxParallelColumn(db);
   ensureSessionsLastUsedColumn(db);
   ensureCustomProvidersStickySessionsColumn(db);
+}
+
+
+/** Rewrite legacy bare model_id entries in client_keys.model_allowlist to
+ *  qualified `platform/model_id` entries — one per models row carrying that
+ *  bare name, deduped. Detection order per entry:
+ *   1. Qualified-pair check FIRST (split at the FIRST '/' — many bare ids
+ *      themselves contain slashes, e.g. `deepseek/deepseek-v4-flash` exists
+ *      as a BARE id on kilo/openrouter/etc.): if a models row matches
+ *      (platform, remainder), the entry is already qualified → keep verbatim.
+ *   2. Else bare-name lookup: expand to every models row with that exact
+ *      model_id as `${platform}/${model_id}`.
+ *   3. Else drop — under strict qualified matching such an entry could never
+ *      admit anything.
+ *  Idempotent: after the first pass every surviving entry is a valid
+ *  qualified pair and passes through unchanged. Runs unguarded every boot
+ *  (CURRENT_DATA_VERSION is FROZEN; new data fixes must be idempotent +
+ *  unguarded). */
+function normalizeClientKeyAllowlists(db: DatabasePort) {
+  const rows = db.prepare(
+    'SELECT id, model_allowlist FROM client_keys WHERE model_allowlist IS NOT NULL',
+  ).all() as Array<{ id: string; model_allowlist: string }>;
+  const byName = db.prepare('SELECT platform FROM models WHERE model_id = ?');
+  const byPair = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?');
+  for (const row of rows) {
+    let entries: string[];
+    try {
+      const parsed: unknown = JSON.parse(row.model_allowlist);
+      if (!Array.isArray(parsed) || !parsed.every((e) => typeof e === 'string')) throw new Error('not a string array');
+      entries = parsed as string[];
+    } catch {
+      console.warn(`[Migrations] Corrupt model_allowlist for client key id=${row.id} — leaving untouched`);
+      continue;
+    }
+    const next = new Set<string>();
+    let changed = false;
+    for (const entry of entries) {
+      const slashIdx = entry.indexOf('/');
+      if (slashIdx > 0) {
+        if (byPair.get(entry.slice(0, slashIdx), entry.slice(slashIdx + 1))) {
+          next.add(entry);
+          continue;
+        }
+      }
+      const platforms = byName.all(entry) as Array<{ platform: string }>;
+      changed = true;
+      for (const { platform } of platforms) next.add(`${platform}/${entry}`);
+    }
+    if (!changed) continue;
+    db.prepare('UPDATE client_keys SET model_allowlist = ? WHERE id = ?')
+      .run(JSON.stringify([...next]), row.id);
+  }
 }
 
 // `requested_model` is the model id the CLIENT pinned in the request body.
