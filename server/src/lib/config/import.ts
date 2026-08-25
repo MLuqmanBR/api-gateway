@@ -418,7 +418,7 @@ function applyModels(
             size_label = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?,
             monthly_token_budget = ?, context_window = ?, enabled = ?,
             supports_vision = ?, max_output_tokens = ?,
-            paid_input_per_m = ?, paid_output_per_m = ?
+            paid_input_per_m = ?, paid_output_per_m = ?, pricing_manual = 1
           WHERE id = ?
         `).run(
           m.displayName, m.intelligenceRank, m.speedRank,
@@ -436,8 +436,8 @@ function applyModels(
           INSERT INTO models (platform, model_id, display_name, intelligence_rank,
             speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit,
             monthly_token_budget, context_window, enabled, supports_vision,
-            max_output_tokens, paid_input_per_m, paid_output_per_m)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_output_tokens, paid_input_per_m, paid_output_per_m, pricing_manual)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         `).run(
           m.platform, m.modelId, m.displayName, m.intelligenceRank,
           m.speedRank, m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,

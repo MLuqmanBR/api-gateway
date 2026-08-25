@@ -7,6 +7,7 @@ import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 import { decrypt } from '../lib/crypto.js';
+import { applyTierRules, applyVisionRules } from '../db/migrations.js';
 
 // L11: strict numeric-id guard for :id path params. parseInt('12abc') === 12
 // silently accepted garbage; this accepts only whole numbers ('' and
@@ -226,6 +227,7 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
 
     const db = getDb();
     const added: string[] = [];
+    const addedIds: number[] = [];
     const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
 
     const insertModel = db.prepare(`
@@ -259,11 +261,20 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
           MODEL_DEFAULTS.monthlyTokenBudget, null, // context_window = unknown
           MODEL_DEFAULTS.supportsVision ? 1 : 0,
         );
-        insertFb.run(Number(result.lastInsertRowid), maxPriority + added.length + 1);
+        const newId = Number(result.lastInsertRowid);
+        insertFb.run(newId, maxPriority + added.length + 1);
         added.push(modelId);
+        addedIds.push(newId);
       }
     });
     tx();
+
+    // Flag/tier ONLY the rows this sync inserted — never revisit existing
+    // rows, or operator edits would be clobbered on every sync.
+    if (addedIds.length > 0) {
+      applyVisionRules(db, addedIds);
+      applyTierRules(db, addedIds);
+    }
 
     console.log(`[Custom] ${slug}: discovered ${added.length} models (${models.length} total, skipped ${models.length - added.length} existing)`);
     return { fetched: added.length, added };
@@ -760,6 +771,10 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
     return modelDbId;
   });
   const modelDbId = tx();
+  // Apply catalog rules ONLY for fields the operator left unspecified — an
+  // explicit supportsVision/sizeLabel in the request body wins.
+  if (d.supportsVision === undefined) applyVisionRules(db, [modelDbId]);
+  if (d.sizeLabel === undefined) applyTierRules(db, [modelDbId]);
   res.status(201).json({
     success: true,
     id: modelDbId,
