@@ -163,7 +163,10 @@ describe('Webhooks (F8)', () => {
     // an in-process receiver, so the only available completion signal is the
     // receiver's own callback. A short bounded wait tolerates scheduler lag.
     function waitForDelivery<T>(arr: T[]): Promise<T> {
-      const { promise, resolve } = Promise.withResolvers<T>();
+      // Manual executor form (not Promise.withResolvers): CI's Node 20 job
+      // lacks Promise.withResolvers (Node 22+).
+      let resolve: (v: T) => void;
+      const promise = new Promise<T>((r) => { resolve = r; });
       const deadline = Date.now() + 5000;
       const tick = () => {
         if (arr.length > 0) resolve(arr[0]);
@@ -173,7 +176,6 @@ describe('Webhooks (F8)', () => {
       tick();
       return promise;
     }
-
     it('POST /api/webhooks/test delivers a signed webhook.test event despite non-matching filter', async () => {
       // Allow internal receivers so the test can host one locally.
       getDb().prepare(
