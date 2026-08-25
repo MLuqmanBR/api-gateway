@@ -157,6 +157,31 @@ export function dispatchWebhooks(event: string, payload: unknown): void {
   }
 }
 
+/** Queue a signed test delivery to one webhook, bypassing its events_filter
+ * so a filtered webhook can still be verified end-to-end. Returns false when
+ * the id is unknown. Delivery goes through the normal retry/signing path. */
+export function sendTestDelivery(id: number): boolean {
+  const db = getDb();
+  const webhook = db.prepare('SELECT * FROM webhooks WHERE id = ?').get(id) as Webhook | undefined;
+  if (!webhook) return false;
+  const timestamp = Date.now();
+  // Drop-oldest if channel is full
+  if (channel.length >= CHANNEL_SIZE) {
+    channel.shift();
+  }
+  channel.push({
+    webhook,
+    event: 'webhook.test',
+    payload: { test: true, webhookId: webhook.id, url: webhook.url },
+    timestamp,
+  });
+  if (!workerRunning && channel.length > 0) {
+    workerRunning = true;
+    void runWorker();
+  }
+  return true;
+}
+
 /** Deliver a single webhook with retries + exponential backoff. */
 async function deliverWebhook(webhook: Webhook, event: string, payload: unknown, timestamp: number): Promise<boolean> {
   const body = JSON.stringify({ event, payload, timestamp });

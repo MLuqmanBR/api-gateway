@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import type { IncomingHttpHeaders } from 'node:http';
+import { createServer as createHttpServer } from 'node:http';
+import { createHmac } from 'node:crypto';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb } from '../../db/index.js';
@@ -11,6 +14,7 @@ import {
   dispatchWebhooks,
   matchesFilter,
   isInternalUrl,
+  sendTestDelivery,
 } from '../../services/webhooks.js';
 
 let dashToken = '';
@@ -148,4 +152,77 @@ describe('Webhooks (F8)', () => {
       expect(res.status).toBe(200);
     });
   });
+
+  describe('test delivery', () => {
+    it('POST /api/webhooks/test returns 404 for unknown id', async () => {
+      const res = await request(app, 'POST', '/api/webhooks/test?id=999999');
+      expect(res.status).toBe(404);
+    });
+
+    // Real sockets, not fake timers: delivery is a genuine HTTP round-trip to
+    // an in-process receiver, so the only available completion signal is the
+    // receiver's own callback. A short bounded wait tolerates scheduler lag.
+    function waitForDelivery<T>(arr: T[]): Promise<T> {
+      const { promise, resolve } = Promise.withResolvers<T>();
+      const deadline = Date.now() + 5000;
+      const tick = () => {
+        if (arr.length > 0) resolve(arr[0]);
+        else if (Date.now() >= deadline) resolve(undefined as unknown as T);
+        else setTimeout(tick, 25);
+      };
+      tick();
+      return promise;
+    }
+
+    it('POST /api/webhooks/test delivers a signed webhook.test event despite non-matching filter', async () => {
+      // Allow internal receivers so the test can host one locally.
+      getDb().prepare(
+        "INSERT INTO settings (key, value) VALUES ('allow_internal_webhooks', 'true') " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      ).run();
+      const received: Array<{ headers: IncomingHttpHeaders; body: string }> = [];
+      const receiver = createHttpServer((req, res) => {
+        let body = '';
+        req.on('data', (chunk) => { body += chunk; });
+        req.on('end', () => {
+          received.push({ headers: req.headers, body });
+          res.writeHead(200);
+          res.end('ok');
+        });
+      });
+      await new Promise<void>((resolve) => receiver.listen(0, '127.0.0.1', resolve));
+      const addr = receiver.address() as { port: number };
+      try {
+        const created = await request(app, 'POST', '/api/webhooks', {
+          url: `http://127.0.0.1:${addr.port}/hook`,
+          secret: 'test-secret',
+          // Filter deliberately does NOT match the webhook.test event.
+          events_filter: 'routing.*',
+        });
+        expect(created.status).toBe(201);
+        const res = await request(app, 'POST', `/api/webhooks/test?id=${created.body.id}`);
+        expect(res.status).toBe(200);
+        expect(res.body.ok).toBe(true);
+
+        const delivered = await waitForDelivery(received);
+        expect(delivered).toBeDefined();
+        const parsed = JSON.parse(delivered.body);
+        expect(parsed.event).toBe('webhook.test');
+        expect(parsed.payload.test).toBe(true);
+        expect(parsed.payload.webhookId).toBe(created.body.id);
+        const expectedSig = `sha256=${createHmac('sha256', 'test-secret').update(delivered.body).digest('hex')}`;
+        expect(delivered.headers['x-api-gateway-signature']).toBe(expectedSig);
+      } finally {
+        await new Promise<void>((resolve) => receiver.close(() => resolve()));
+      }
+    });
+
+    it('sendTestDelivery reaches a DISABLED webhook and reports unknown ids', () => {
+      const wh = createWebhook({ url: 'https://example.com/wh', secret: 's', events_filter: '*' });
+      toggleWebhook(wh.id, false);
+      expect(sendTestDelivery(wh.id)).toBe(true);
+      expect(sendTestDelivery(wh.id + 100000)).toBe(false);
+    });
+  });
+
 });

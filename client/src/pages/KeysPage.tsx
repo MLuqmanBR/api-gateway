@@ -228,11 +228,153 @@ interface ClientKey {
   created_at_ms: number
 }
 
+// Convert epoch ms to the value shape <input type="datetime-local"> expects
+// (local wall-clock, no timezone suffix), or '' when unset.
+function toLocalInput(ms: number | null): string {
+  if (!ms) return ''
+  const d = new Date(ms)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+interface ClientKeyPatch {
+  label?: string
+  model_allowlist?: string[] | null
+  rpm_override?: number | null
+  expires_at_ms?: number | null
+}
+
+// Inline per-key editor: label, model allowlist, RPM override, expiry. Saved
+// as ONE PATCH to the existing endpoint. The allowlist holds BARE model_id
+// strings (that is what the router compares); /api/models only returns
+// composite `platform/model_id` values, so each option strips its own
+// platform prefix. Empty selection saves null = unrestricted.
+function ClientKeyEditor({ k, models, onSave, onClose }: {
+  k: ClientKey
+  models: Model[]
+  onSave: (patch: ClientKeyPatch) => Promise<void>
+  onClose: () => void
+}) {
+  const [label, setLabel] = useState(k.label)
+  const [selected, setSelected] = useState<Set<string>>(new Set(k.model_allowlist ?? []))
+  const [search, setSearch] = useState('')
+  const [rpm, setRpm] = useState(k.rpm_override != null ? String(k.rpm_override) : '')
+  const [expires, setExpires] = useState(toLocalInput(k.expires_at_ms))
+  const [saving, setSaving] = useState(false)
+
+  const q = search.trim().toLowerCase()
+  const visibleModels = q
+    ? models.filter((m) => m.modelId.toLowerCase().includes(q) || m.displayName.toLowerCase().includes(q))
+    : models
+  const byPlatform = new Map<string, Model[]>()
+  for (const m of visibleModels) {
+    const list = byPlatform.get(m.platform) ?? []
+    list.push(m)
+    byPlatform.set(m.platform, list)
+  }
+
+  function toggleModel(bareId: string) {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(bareId)) next.delete(bareId)
+      else next.add(bareId)
+      return next
+    })
+  }
+
+  async function save() {
+    setSaving(true)
+    try {
+      await onSave({
+        label: label.trim() || k.label,
+        model_allowlist: selected.size > 0 ? [...selected] : null,
+        rpm_override: rpm.trim() === '' ? null : Math.max(1, Math.floor(Number(rpm))),
+        expires_at_ms: expires === '' ? null : new Date(expires).getTime(),
+      })
+      onClose()
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="mt-2 rounded-lg border bg-background/50 p-3 space-y-3">
+      <div className="grid gap-2 md:grid-cols-[1fr_140px_220px]">
+        <div className="space-y-1">
+          <Label className="text-xs">Label</Label>
+          <Input value={label} onChange={(e) => setLabel(e.target.value)} className="text-xs" />
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs">RPM override</Label>
+          <Input type="number" min={1} value={rpm} onChange={(e) => setRpm(e.target.value)} placeholder="none" className="text-xs" />
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs">Expires at</Label>
+          <Input type="datetime-local" value={expires} onChange={(e) => setExpires(e.target.value)} className="text-xs" />
+        </div>
+      </div>
+
+      <div className="space-y-1">
+        <div className="flex items-center justify-between">
+          <Label className="text-xs">
+            Allowed models ({selected.size > 0 ? `${selected.size} selected` : 'all — unrestricted'})
+          </Label>
+          {q && (
+            <button type="button" className="text-[11px] text-muted-foreground hover:text-foreground" onClick={() => setSearch('')}>
+              Clear search
+            </button>
+          )}
+        </div>
+        <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search models…" className="text-xs mb-1" />
+        <div className="max-h-56 overflow-y-auto rounded border divide-y">
+          {[...byPlatform.entries()].map(([platform, list]) => (
+            <div key={platform}>
+              <p className="sticky top-0 bg-muted/80 px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                {platform}
+              </p>
+              {list.map((m) => {
+                const bareId = m.modelId.slice(m.platform.length + 1)
+                return (
+                  <label key={m.id} className="flex items-center gap-2 px-2 py-1 text-xs cursor-pointer hover:bg-muted/40">
+                    <input
+                      type="checkbox"
+                      checked={selected.has(bareId)}
+                      onChange={() => toggleModel(bareId)}
+                      className="size-3.5"
+                    />
+                    <span className="font-mono truncate">{bareId}</span>
+                    {m.displayName !== bareId && (
+                      <span className="text-muted-foreground truncate">{m.displayName}</span>
+                    )}
+                  </label>
+                )
+              })}
+            </div>
+          ))}
+          {byPlatform.size === 0 && (
+            <p className="px-2 py-3 text-xs text-muted-foreground">No models match “{search}”.</p>
+          )}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          Leave everything unchecked for unrestricted access. Restrictions apply to the bare model name across all providers.
+        </p>
+      </div>
+
+      <div className="flex justify-end gap-2">
+        <Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button>
+        <Button size="sm" onClick={save} disabled={saving || !label.trim()}>
+          {saving ? 'Saving…' : 'Save'}
+        </Button>
+      </div>
+    </div>
+  )
+}
 function ClientKeysSection() {
   const queryClient = useQueryClient()
   const [newLabel, setNewLabel] = useState('')
   const [mintedKey, setMintedKey] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
 
   const { data: keys = [] } = useQuery<ClientKey[]>({
     queryKey: ['client-keys'],
@@ -243,6 +385,11 @@ function ClientKeysSection() {
       const rows = await apiFetch<(Omit<ClientKey, 'enabled'> & { enabled: number })[]>('/api/keys/client')
       return rows.map(k => ({ ...k, enabled: k.enabled === 1 }))
     },
+  })
+
+  const { data: models = [] } = useQuery<Model[]>({
+    queryKey: ['models'],
+    queryFn: () => apiFetch('/api/models'),
   })
 
   const mint = useMutation({
@@ -270,6 +417,20 @@ function ClientKeysSection() {
         body: JSON.stringify({ enabled }),
       }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['client-keys'] }),
+  })
+
+  const update = useMutation({
+    mutationFn: ({ id, patch }: { id: string; patch: ClientKeyPatch }) =>
+      apiFetch(`/api/keys/client/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      }),
+    onSuccess: (_d, v) => {
+      addToast({ kind: 'success', title: `Key “${v.patch.label ?? v.id}” updated` })
+      queryClient.invalidateQueries({ queryKey: ['client-keys'] })
+    },
+    onError: (e: Error) => addToast({ kind: 'warning', title: 'Update failed', description: e.message }),
   })
 
   async function copyMinted() {
@@ -333,28 +494,63 @@ function ClientKeysSection() {
       {keys.length > 0 ? (
         <div className="space-y-2">
           {keys.map((k) => (
-            <div key={k.id} className="flex items-center gap-3 rounded-lg border px-3 py-2 text-xs">
-              <code className="font-mono text-muted-foreground truncate" style={{ maxWidth: 180 }}>{k.id}</code>
-              <span className="font-medium truncate flex-1">{k.label}</span>
-              {k.enabled ? (
-                <span className="text-green-600 dark:text-green-400">active</span>
-              ) : (
-                <span className="text-muted-foreground">disabled</span>
+            <div key={k.id}>
+              <div className="flex items-center gap-2 rounded-lg border px-3 py-2 text-xs">
+                <code className="font-mono text-muted-foreground truncate" style={{ maxWidth: 180 }}>{k.id}</code>
+                <span className="font-medium truncate" style={{ maxWidth: 200 }}>{k.label}</span>
+                {k.model_allowlist && k.model_allowlist.length > 0 ? (
+                  <span className="rounded bg-muted px-1.5 py-0.5 font-mono whitespace-nowrap" title={k.model_allowlist.join(', ')}>
+                    {k.model_allowlist.length} model{k.model_allowlist.length === 1 ? '' : 's'}
+                  </span>
+                ) : (
+                  <span className="rounded bg-muted px-1.5 py-0.5 text-muted-foreground whitespace-nowrap">All models</span>
+                )}
+                {k.rpm_override != null && (
+                  <span className="rounded bg-muted px-1.5 py-0.5 whitespace-nowrap">rpm:{k.rpm_override}</span>
+                )}
+                {k.expires_at_ms != null && (
+                  <span className="whitespace-nowrap text-muted-foreground">
+                    exp {new Date(k.expires_at_ms).toLocaleDateString()}
+                  </span>
+                )}
+                {k.enabled ? (
+                  <span className="text-green-600 dark:text-green-400">active</span>
+                ) : (
+                  <span className="text-muted-foreground">disabled</span>
+                )}
+                <span className="flex-1" />
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setEditingId(editingId === k.id ? null : k.id)}
+                >
+                  {editingId === k.id ? 'Close' : 'Edit'}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => toggle.mutate({ id: k.id, enabled: !k.enabled })}
+                >
+                  {k.enabled ? 'Disable' : 'Enable'}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => remove.mutate(k.id)}
+                >
+                  Revoke
+                </Button>
+              </div>
+              {editingId === k.id && (
+                <ClientKeyEditor
+                  k={k}
+                  models={models}
+                  onSave={async (patch) => {
+                    await update.mutateAsync({ id: k.id, patch })
+                  }}
+                  onClose={() => setEditingId(null)}
+                />
               )}
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => toggle.mutate({ id: k.id, enabled: !k.enabled })}
-              >
-                {k.enabled ? 'Disable' : 'Enable'}
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => remove.mutate(k.id)}
-              >
-                Revoke
-              </Button>
             </div>
           ))}
         </div>
