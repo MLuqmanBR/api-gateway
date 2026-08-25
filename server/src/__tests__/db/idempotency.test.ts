@@ -313,7 +313,12 @@ describe('Migration idempotency', () => {
     expect(gemini.supports_vision).toBe(1);
 
     // Scoping guard: a scoped helper call touches ONLY the given ids.
-    db.prepare('UPDATE models SET supports_vision = 0 WHERE id = ?').run(gemini.id);
+    // The manual row below matches an EARLIER OR branch of its rule chain
+    // than the appended id-IN clause — SQL precedence bugs would clobber it.
+    const glm = db.prepare(
+      "SELECT id FROM models WHERE LOWER(model_id) LIKE '%glm-4.6v%' LIMIT 1",
+    ).get() as { id: number };
+    db.prepare('UPDATE models SET supports_vision = 0 WHERE id IN (?, ?)').run(glm.id, gemini.id);
     const ins = db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
       VALUES ('google', 'gemini-9.9-test', 'Gemini 9.9 Test', 10, 10, '', 1)
@@ -322,6 +327,7 @@ describe('Migration idempotency', () => {
     applyVisionRules(db, [newId]);
     expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(newId) as { v: number }).v).toBe(1);
     expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(gemini.id) as { v: number }).v).toBe(0);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(glm.id) as { v: number }).v).toBe(0);
 
     // Restart path: migrateDbSchema re-run (one-time block skipped at
     // user_version = CURRENT_DATA_VERSION) must not touch operator edits.
@@ -340,6 +346,9 @@ describe('Migration idempotency', () => {
     const newTierId = Number(ins2.lastInsertRowid);
     applyTierRules(db, [newTierId]);
     expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(newTierId) as { s: string }).s).toBe('Medium');
+    // llama-3.3-70b sits in an EARLIER Medium OR branch than the appended
+    // id-IN clause — precedence would revert it to 'Medium' if unscoped.
+    expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(tiered.id) as { s: string }).s).toBe('Small');
     db.close();
   });
 

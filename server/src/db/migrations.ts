@@ -1489,8 +1489,8 @@ export function applyVisionRules(db: DatabasePort, ids?: number[]): void {
     // NVIDIA's Nemotron Nano 12B v2 VL (via OpenRouter).
     db.prepare(`
       UPDATE models SET supports_vision = 1
-      WHERE LOWER(model_id) LIKE '%glm-4.6v%'
-         OR LOWER(model_id) LIKE '%nemotron-nano-12b-v2-vl%'${scope}
+      WHERE (LOWER(model_id) LIKE '%glm-4.6v%'
+         OR LOWER(model_id) LIKE '%nemotron-nano-12b-v2-vl%')${scope}
     `).run(...params);
   });
   apply();
@@ -1522,7 +1522,7 @@ export function applyTierRules(db: DatabasePort, ids?: number[]): void {
     // Frontier (AA ≥ 45): genuine frontier-class. Promotes Gemini 3.5 Flash (55)
     // and Gemini 3 Flash Preview (46) up from Large.
     db.prepare(`
-      UPDATE models SET size_label = 'Frontier' WHERE
+      UPDATE models SET size_label = 'Frontier' WHERE (
            LOWER(model_id) LIKE '%gemini-3.1-pro%'
         OR LOWER(model_id) LIKE '%gemini-3.5-flash%'
         OR LOWER(model_id) LIKE '%gemini-3-flash%'
@@ -1531,14 +1531,15 @@ export function applyTierRules(db: DatabasePort, ids?: number[]): void {
         OR LOWER(model_id) LIKE '%deepseek-v4-pro%'
         OR LOWER(model_id) LIKE '%deepseek-v4-flash%'
         OR LOWER(model_id) LIKE '%glm-5.1%'
-        OR LOWER(model_id) LIKE '%minimax-m2.7%'${scope}
+        OR LOWER(model_id) LIKE '%minimax-m2.7%'
+      )${scope}
     `).run(...params);
 
     // Large (AA 26–44). Demotes Gemini 2.5 Pro (35), Nemotron 3 Super/120B (36),
     // GLM-4.7 (42), DeepSeek V3.1/V3.2 (28/32), Trinity (32) down from Frontier;
     // promotes Gemma 4 31B (39) / 26B (31) and Gemini 3.1 Flash-Lite (34) up.
     db.prepare(`
-      UPDATE models SET size_label = 'Large' WHERE
+      UPDATE models SET size_label = 'Large' WHERE (
            LOWER(model_id) LIKE '%minimax-m2.5%'
         OR LOWER(model_id) LIKE '%qwen3-next%'
         OR LOWER(model_id) LIKE '%qwen3-coder-next%'
@@ -1554,7 +1555,8 @@ export function applyTierRules(db: DatabasePort, ids?: number[]): void {
         OR LOWER(model_id) LIKE '%gpt-4.1%'
         OR LOWER(model_id) LIKE '%gemma-4-31b%' OR LOWER(model_id) LIKE '%gemma4:31b%'
         OR LOWER(model_id) LIKE '%gemma-4-26b%'
-        OR LOWER(model_id) LIKE '%gemini-3.1-flash-lite%'${scope}
+        OR LOWER(model_id) LIKE '%gemini-3.1-flash-lite%'
+      )${scope}
     `).run(...params);
 
     // Medium (AA 13–25). Demotes Qwen3-Coder 480B (25) and Mistral Large 3 (23)
@@ -1562,7 +1564,7 @@ export function applyTierRules(db: DatabasePort, ids?: number[]): void {
     // (21), GLM-4.5 Air (23), DeepSeek R1 Distill (17), Command A/R+ down from
     // Large; unifies Llama 4 Scout (14) and Llama 3.3 70B (14) across providers.
     db.prepare(`
-      UPDATE models SET size_label = 'Medium' WHERE
+      UPDATE models SET size_label = 'Medium' WHERE (
            (LOWER(model_id) LIKE '%qwen3-coder%' AND LOWER(model_id) NOT LIKE '%qwen3-coder-next%')
         OR LOWER(model_id) LIKE '%qwen-3-235b%' OR LOWER(model_id) LIKE '%qwen3-235b%'
         OR LOWER(model_id) LIKE '%mistral-large%'
@@ -1583,13 +1585,14 @@ export function applyTierRules(db: DatabasePort, ids?: number[]): void {
         OR LOWER(model_id) LIKE '%command-a-03-2025%'
         OR LOWER(model_id) LIKE '%command-r-plus%'
         OR LOWER(model_id) LIKE '%nemotron-3-nano%'
-        OR LOWER(model_id) LIKE '%nemotron-nano-9b%'${scope}
+        OR LOWER(model_id) LIKE '%nemotron-nano-9b%'
+      )${scope}
     `).run(...params);
 
     // Small (AA ≤ 12). Demotes Gemma 3 12B (9), Command R 08-2024 (legacy ~7),
     // and Codestral (8) down from Medium.
     db.prepare(`
-      UPDATE models SET size_label = 'Small' WHERE
+      UPDATE models SET size_label = 'Small' WHERE (
            LOWER(model_id) LIKE '%gemma-3-12b%'
         OR LOWER(model_id) LIKE '%command-r-08-2024%'
         OR LOWER(model_id) LIKE '%codestral%'
@@ -1597,7 +1600,8 @@ export function applyTierRules(db: DatabasePort, ids?: number[]): void {
         OR LOWER(model_id) LIKE '%meta-llama-3.1-8b%'
         OR LOWER(model_id) LIKE '%ministral-8b%'
         OR LOWER(model_id) LIKE '%granite-4.0-h-micro%'
-        OR LOWER(model_id) LIKE '%lfm-2.5-1.2b%'${scope}
+        OR LOWER(model_id) LIKE '%lfm-2.5-1.2b%'
+      )${scope}
     `).run(...params);
   });
   apply();
