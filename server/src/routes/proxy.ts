@@ -20,6 +20,7 @@ import { contentToString, messageHasImage, normalizeOutboundContent } from '../l
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
+import { applyThinkingPolicy, resolveThinkingPolicy, parseStoredThinkingLevels, THINKING_LEVELS } from '../lib/thinking.js';
 import { ThinkTagStream } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { pipeline } from '../lib/hook-pipeline.js';
@@ -211,31 +212,56 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
 //                              providers — see `services/responses.ts`).
 //   - `capabilities.streaming` true: every chat model here supports SSE
 //                              through `/v1/chat/completions?stream=true`.
-//   - `capabilities.reasoning` derived from model_id patterns (mirrors the
-//                              rule-based V16 family detector). True
-//                              for chat-tuned CoT families only — we never
-//                              claim reasoning capability on bare base
-//                              models. Heuristic, not a probe.
-function buildModelCapabilities(modelId: string, maxOutputTokens: number | null, supportsVision: boolean) {
-  const reasoningFamily = isReasoningModelId(modelId);
+//   - `capabilities.reasoning` is DATA-DRIVEN from `models.thinking_levels`:
+//                              thinking enabled by default (full six-level
+//                              menu); an operator subset narrows it;
+//                              `["off"]` force-disables (reasoning=false,
+//                              no menu). No id-pattern matching here — the
+//                              dashboard is the single source of truth.
+function buildModelCapabilities(
+  modelId: string,
+  maxOutputTokens: number | null,
+  supportsVision: boolean,
+  thinkingLevelsRaw: string | null,
+) {
+  // Thinking capability is DATA-DRIVEN, never id-pattern-matched: the
+  // dashboard is the single source of truth. Untouched rows (NULL column)
+  // default to thinking ENABLED with the full six-level menu; an explicit
+  // subset narrows it; `["off"]` force-disables (advertised as
+  // non-reasoning, no efforts field).
+  const policy = resolveThinkingPolicy(thinkingLevelsRaw);
 
   const modalities: { input: string[]; output: string[] } = {
     input: supportsVision ? ['text', 'image'] : ['text'],
     output: ['text'],
   };
 
+  const capabilities: {
+    tool_calls: boolean;
+    vision: boolean;
+    json_mode: boolean;
+    streaming: boolean;
+    reasoning: boolean;
+    reasoning_efforts?: string[];
+  } = {
+    tool_calls: true,
+    vision: supportsVision,
+    json_mode: true,
+    streaming: true,
+    reasoning: policy.kind !== 'off',
+  };
+  if (policy.kind === 'levels') {
+    capabilities.reasoning_efforts = [...policy.levels];
+  } else if (policy.kind === 'unrestricted') {
+    capabilities.reasoning_efforts = [...THINKING_LEVELS];
+  }
+
   return {
     // OpenAI-aligned token caps. `max_tokens` is the per-completion output
     // cap a client should send; `context_window` is the input+output cap.
     max_tokens: maxOutputTokens ?? null,
     modalities: modalities,
-    capabilities: {
-      tool_calls: true,
-      vision: supportsVision,
-      json_mode: true,
-      streaming: true,
-      reasoning: reasoningFamily,
-    },
+    capabilities: capabilities,
   };
 }
 
@@ -253,7 +279,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   const models = db.prepare(`
     SELECT
       m.id, m.platform, m.model_id, m.display_name, m.context_window,
-      m.max_output_tokens, m.supports_vision,
+      m.max_output_tokens, m.supports_vision, m.thinking_levels,
       m.intelligence_rank
     FROM models m
     WHERE m.enabled = 1
@@ -280,7 +306,12 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         context_window: null,
       },
       ...models.map(m => {
-        const caps = buildModelCapabilities(m.model_id, m.max_output_tokens, m.supports_vision === 1);
+        const caps = buildModelCapabilities(
+          m.model_id,
+          m.max_output_tokens,
+          m.supports_vision === 1,
+          m.thinking_levels,
+        );
         return {
           id: `${m.platform}/${m.model_id}`,
           object: 'model',
@@ -461,7 +492,10 @@ const chatCompletionSchema = z.object({
   // Thinking controls — either the shorthand `reasoning_effort` or the
   // richer `thinking` object is honored; provider code translates them
   // into the wire shape each upstream accepts. (#290)
-  reasoning_effort: thinkingEffortSchema.nullable().optional(),
+  // The six effort levels, plus the literal 'off' — clients use it to mean
+  // "do not think this turn"; normalized into thinking:{type:'disabled'} at
+  // the destructure site below. (#thinking-off)
+  reasoning_effort: z.union([thinkingEffortSchema, z.literal('off')]).nullable().optional(),
   thinking: thinkingConfigSchema.nullable().optional(),
   // F5: per-request cache control. `cache: {no_cache: true}` bypasses the
   // response cache for this single request (litellm's per-request pattern).
@@ -658,8 +692,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Build the per-call thinking view once; providers receive it through
   // CompletionOptions. Explicit nulls are normalized to undefined so the
   // provider-side `if (options?.reasoning_effort)` pattern works. (#290)
-  const reasoning_effort = inboundReasoningEffort ?? undefined;
-  const thinking = inboundThinking ?? undefined;
+  // The client shorthand 'off' means "do not think this turn": folded into
+  // the existing explicit-disable representation so policy checks, cache
+  // keys, pass-through spreads, and provider emitters all see one shape.
+  // Top-level 'off' wins over any contradictory thinking-object fields.
+  const reasoning_effort = inboundReasoningEffort === 'off'
+    ? undefined
+    : inboundReasoningEffort ?? undefined;
+  const thinking = inboundReasoningEffort === 'off'
+    ? { ...(inboundThinking ?? {}), type: 'disabled' as const, effort: undefined }
+    : inboundThinking ?? undefined;
   // Pairing state for id-less tool calls (#200): every tool_call id (given or
   // synthesized) queues up here; a tool message without a tool_call_id takes
   // the oldest unanswered one, which matches the single-call-per-turn flow
@@ -1285,6 +1327,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           choices: [{ index: 0, delta, finish_reason: finish }],
         });
         const writeChunk = (c: unknown) => res.write(`data: ${JSON.stringify(c)}\n\n`);
+        // Force-off models reject thinking attempts outright (operator
+        // switch, not a redirect); level subsets rewrite; rest pass. This is
+        // a client-contract rejection — respond 400 immediately instead of
+        // entering the failover loop below.
+        const thinkingDecision = applyThinkingPolicy(route.thinkingPolicy, { reasoning_effort, thinking });
+        if (!thinkingDecision.ok) {
+          const msg = sanitizeProviderErrorMessage(thinkingDecision.error);
+          logger.warn(`[Proxy] Rejected thinking attempt on force-disabled model`, { platform: route.platform, model: route.modelId });
+          res.status(400).json({ error: { message: msg, type: 'invalid_request_error' } });
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, msg, null, pinnedModelId, false);
+          return;
+        }
+        const thinkingRewrite = thinkingDecision.rewrite ?? { reasoning_effort, thinking };
 
         try {
           upstreamAttempts++; // counted toward the global recovery limit. (#292)
@@ -1293,7 +1348,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             route.apiKey, outboundMessages, route.modelId,
             {
               temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
-              reasoning_effort, thinking,
+              ...thinkingRewrite,
               abortSignal,
             },
           );
@@ -1570,12 +1625,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           throw streamErr;
         }
       } else {
+        // Same force-off rejection as the streaming path above.
+        const thinkingDecision = applyThinkingPolicy(route.thinkingPolicy, { reasoning_effort, thinking });
+        if (!thinkingDecision.ok) {
+          const msg = sanitizeProviderErrorMessage(thinkingDecision.error);
+          logger.warn(`[Proxy] Rejected thinking attempt on force-disabled model`, { platform: route.platform, model: route.modelId });
+          res.status(400).json({ error: { message: msg, type: 'invalid_request_error' } });
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, msg, null, pinnedModelId, false);
+          return;
+        }
+        const thinkingRewrite = thinkingDecision.rewrite ?? { reasoning_effort, thinking };
         upstreamAttempts++; // counted toward the global recovery limit. (#292)
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
           {
             temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
-            reasoning_effort, thinking,
+            ...thinkingRewrite,
             abortSignal,
           },
         );

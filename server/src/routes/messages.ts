@@ -114,6 +114,14 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
   if (translated.max_tokens !== undefined) openaiBody.max_tokens = translated.max_tokens;
   if (translated.thinking !== undefined) openaiBody.thinking = translated.thinking;
   if (translated.reasoning_effort !== undefined) openaiBody.reasoning_effort = translated.reasoning_effort;
+  // Client shorthand 'off' means "do not think this turn": fold it into the
+  // explicit-disable shape before the internal sub-request, mirroring the
+  // /v1/chat/completions entry point. Top-level 'off' wins over any
+  // translated thinking object.
+  if (anthropicReq.reasoning_effort === 'off') {
+    delete openaiBody.reasoning_effort;
+    openaiBody.thinking = { type: 'disabled' };
+  }
 
   try {
     // Internal sub-request to the existing /v1/chat/completions handler.

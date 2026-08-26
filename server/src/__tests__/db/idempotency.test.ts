@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { initDb } from '../../db/index.js';
-import { applyTierRules, applyVisionRules, migrateDbSchema } from '../../db/migrations.js';
+import { applyTierRules, applyThinkingLevelRules, applyVisionRules, migrateDbSchema } from '../../db/migrations.js';
+import { THINKING_LEVELS } from '../../lib/thinking.js';
 import { MODEL_PRICING } from '../../db/model-pricing.js';
 
 /**
@@ -349,6 +350,68 @@ describe('Migration idempotency', () => {
     // llama-3.3-70b sits in an EARLIER Medium OR branch than the appended
     // id-IN clause — precedence would revert it to 'Medium' if unscoped.
     expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(tiered.id) as { s: string }).s).toBe('Small');
+    db.close();
+  });
+
+  it('thinking levels: boot pass seeds glm_mapped rows and never revisits operator-owned ones', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-thinking-${Date.now()}.db`;
+    const db = initDb(tmpPath);
+    const DEFAULT = JSON.stringify([...THINKING_LEVELS]);
+    const GLM = JSON.stringify(['low', 'medium', 'high']);
+    // Named row shapes (unchecked casts): the SELECT aliases are fixed by the
+    // SQL below, not external input.
+    type LevelRow = { l: string };
+    type FlagRow = { m: number };
+    const levelsOf = (id: number): string => {
+      const row = db.prepare('SELECT thinking_levels AS l FROM models WHERE id = ?').get(id) as LevelRow | undefined;
+      return row?.l ?? '';
+    };
+    const manualFlag = (id: number): number => {
+      const row = db.prepare('SELECT thinking_levels_manual AS m FROM models WHERE id = ?').get(id) as FlagRow | undefined;
+      return row?.m ?? -1;
+    };
+
+    const ins = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES (?, ?, ?, 10, 10, '', 1)
+    `);
+    // Host-based rule match (GLM_HOST_PLATFORMS) and id-based (isGlmModel).
+    const hostRow = Number(ins.run('glmaggregatorb', 'glm-test-host', 'Host Row').lastInsertRowid);
+    const idRow = Number(ins.run('some-platform', 'z-ai/glm-5.1', 'Id Row').lastInsertRowid);
+    const otherRow = Number(ins.run('openrouter', 'deepseek-v4-pro', 'Other').lastInsertRowid);
+
+    // glm-mapped rows get the narrow set, everything else stays at default.
+    applyThinkingLevelRules(db, [hostRow, idRow, otherRow]);
+    expect(levelsOf(hostRow)).toBe(GLM);
+    expect(levelsOf(idRow)).toBe(GLM);
+    expect(levelsOf(otherRow)).toBe(DEFAULT);
+
+    // (a) operator-edited row survives reboots untouched.
+    db.prepare("UPDATE models SET thinking_levels = ?, thinking_levels_manual = 1 WHERE id = ?").run(JSON.stringify(['high']), hostRow);
+    // (b) operator deliberately resetting to all-six keeps it after reboot —
+    // the manual flag, not the value, decides ownership.
+    db.prepare("UPDATE models SET thinking_levels = ?, thinking_levels_manual = 1 WHERE id = ?").run(DEFAULT, idRow);
+    migrateDbSchema(db);
+    expect(levelsOf(hostRow)).toBe(JSON.stringify(['high']));
+    expect(levelsOf(idRow)).toBe(DEFAULT);
+    expect(manualFlag(hostRow)).toBe(1);
+    expect(manualFlag(idRow)).toBe(1);
+
+    // (c) a still-default glm_mapped row IS seeded by the next boot pass,
+    // with the manual flag left at 0 so operators can still claim it later.
+    const freshRow = Number(ins.run('glmaggregatorb', 'glm-fresh-row', 'Fresh').lastInsertRowid);
+    expect(levelsOf(freshRow)).toBe(DEFAULT);
+    migrateDbSchema(db);
+    expect(levelsOf(freshRow)).toBe(GLM);
+    expect(manualFlag(freshRow)).toBe(0);
+
+    // Discovery path: runtime ingest scopes the rule to newly inserted ids
+    // so late-synced models don't wait for a reboot.
+    const lateRow = Number(ins.run('some-platform', 'zai-org/glm_5_2-x', 'Late').lastInsertRowid);
+    applyThinkingLevelRules(db, [lateRow]);
+    expect(levelsOf(lateRow)).toBe(GLM);
+    expect(manualFlag(lateRow)).toBe(0);
     db.close();
   });
 

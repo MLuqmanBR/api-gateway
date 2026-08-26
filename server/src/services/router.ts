@@ -15,6 +15,7 @@ import { parseBudget } from '../lib/budget.js';
 import type { BaseProvider } from '../providers/base.js';
 import type { DatabasePort } from '../db/types.js';
 import { isModelAllowed } from '../lib/client-keys.js';
+import { resolveThinkingPolicy, type ThinkingPolicy } from '../lib/thinking.js';
 
 interface KeyRow {
   id: number;
@@ -56,6 +57,10 @@ interface ChainRow {
   key_id: number | null;
   // C3: JSON string array of tags (default '[]') for tag-based filtering.
   tags: string | null;
+  // Per-model supported thinking levels (JSON string array; NULL/missing =
+  // unrestricted). The proxy redirects unsupported client-requested levels
+  // per attempt, so fallback hops to different models redirect differently.
+  thinking_levels: string | null;
 }
 
 // N6: the preview endpoint selects a narrower column set than ChainRow (no
@@ -85,6 +90,9 @@ export interface RouteResult {
   maxOutputTokens: number | null;
   /** F2 (β): the model's context window, for typed fallback routing. */
   contextWindow: number | null;
+  /** Per-model thinking policy resolved from `models.thinking_levels`:
+   *  unrestricted (NULL column), an operator level subset, or force-off. */
+  thinkingPolicy: ThinkingPolicy;
   // Decrements the in-flight slot for the associated provider.
   // Callers MUST invoke this in a finally block after the request completes.
   release: () => void;
@@ -599,6 +607,7 @@ export interface RouteOptions {
   reqTags?: Set<string>;
 }
 
+
 export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
   const db = getDb();
   const strategy = getRoutingStrategy();
@@ -610,7 +619,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.context_window, m.max_output_tokens, m.key_id, m.tags
+           m.context_window, m.max_output_tokens, m.key_id, m.tags, m.thinking_levels
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     WHERE fc.enabled = 1
@@ -876,6 +885,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
         tpdLimit: limits.tpd,
         maxOutputTokens: entry.max_output_tokens,
         contextWindow: entry.context_window,
+        thinkingPolicy: resolveThinkingPolicy(entry.thinking_levels),
         release,
       };
     }
@@ -927,6 +937,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
           maxOutputTokens: entry.max_output_tokens,
           contextWindow: entry.context_window,
           release,
+          thinkingPolicy: resolveThinkingPolicy(entry.thinking_levels),
         };
       }
     }
