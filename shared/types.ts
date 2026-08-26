@@ -151,6 +151,9 @@ export interface ModelListRow {
   // (vision/tools/output budget) without probing blindly. Added for the
   // OpenAI-completions-compatible capabilities payload.
   max_output_tokens: number | null;
+  // Stored per-model effort restriction (e.g. '["low","high","max"]'), NULL
+  // when never customized; parsed server-side by parseStoredThinkingLevels.
+  thinking_levels: string | null;
   supports_vision: number;
 }
 

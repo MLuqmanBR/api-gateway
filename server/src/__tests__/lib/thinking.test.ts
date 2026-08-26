@@ -7,6 +7,12 @@ import {
   openAiCompatThinkingPolicy,
   isGlmModel,
   isGlmNvidiaThinkingModel,
+  THINKING_LEVELS,
+  redirectEffort,
+  applyThinkingPolicy,
+  resolveThinkingPolicy,
+  parseStoredThinkingLevels,
+  THINKING_OFF,
 } from '../../lib/thinking.js';
 
 // `thinking` is the unified inbound knob. The translators here emit wire-
@@ -222,30 +228,31 @@ describe('openaiCompatThinkingBody', () => {
     expect(out).toEqual({ reasoning_effort: 'high' });
   });
 
-  it('clamps unsupported effort levels into GLM range under "glm_mapped" — never disables thinking (#292)', () => {
-    // GLM accepts ONLY low|medium|high. max/xhigh → high, minimal → low.
-    // Thinking stays ON; the user's more/less intent is preserved.
-    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'max' })).toEqual({ reasoning_effort: 'high' });
-    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'xhigh' })).toEqual({ reasoning_effort: 'high' });
-    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'minimal' })).toEqual({ reasoning_effort: 'low' });
+  it('forwards effort verbatim under "glm_mapped" — the per-model level set is enforced upstream (#292)', () => {
+    // GLM's narrow enum is enforced by redirectThinkingRequest (per-model
+    // `models.thinking_levels`) BEFORE the provider call, so whatever survives
+    // to openaiCompatThinkingBody is in-set and forwarded as-is.
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'max' })).toEqual({ reasoning_effort: 'max' });
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'xhigh' })).toEqual({ reasoning_effort: 'xhigh' });
+    expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'minimal' })).toEqual({ reasoning_effort: 'minimal' });
     expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'low' })).toEqual({ reasoning_effort: 'low' });
     expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'medium' })).toEqual({ reasoning_effort: 'medium' });
     expect(openaiCompatThinkingBody('glm_mapped', { reasoning_effort: 'high' })).toEqual({ reasoning_effort: 'high' });
   });
 
-  it('DROPS the rich thinking object for GLM (glm_mapped) but keeps the mapped effort', () => {
+  it('DROPS the rich thinking object for GLM (glm_mapped) but keeps the effort', () => {
     // The rich `thinking` object (type/effort/budget) is what triggers GLM's
-    // literal_error — it must never be forwarded. The effort is extracted and
-    // mapped to GLM's enum instead. (#292)
+    // literal_error — it must never be forwarded. The effective effort is
+    // extracted and emitted as reasoning_effort. (#292)
     expect(openaiCompatThinkingBody(
       'glm_mapped',
       { reasoning_effort: 'xhigh', thinking: { type: 'enabled', effort: 'xhigh', budget: 4000 } },
-    )).toEqual({ reasoning_effort: 'high' });
+    )).toEqual({ reasoning_effort: 'xhigh' });
     // effort from the rich object alone (no top-level reasoning_effort):
     expect(openaiCompatThinkingBody(
       'glm_mapped',
       { thinking: { type: 'enabled', effort: 'minimal' } },
-    )).toEqual({ reasoning_effort: 'low' });
+    )).toEqual({ reasoning_effort: 'minimal' });
   });
 
   it('emits nothing for GLM when no effort was requested (GLM default = thinking on)', () => {
@@ -325,5 +332,171 @@ describe('openaiCompatThinkingBody — glm52_synthetic (synthesizes thinking to 
 
   it('emits nothing when neither knob is set', () => {
     expect(openaiCompatThinkingBody('glm52_synthetic', undefined)).toEqual({});
+  });
+});
+
+describe('THINKING_LEVELS', () => {
+  it('is the canonical six-level scale in increasing order', () => {
+    expect([...THINKING_LEVELS]).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+  });
+});
+
+describe('redirectEffort', () => {
+  it('passes through when the level set is null/undefined/empty (unrestricted)', () => {
+    expect(redirectEffort(null, 'max')).toBe('max');
+    expect(redirectEffort(undefined, 'max')).toBe('max');
+    expect(redirectEffort([], 'max')).toBe('max');
+  });
+
+  it('passes through an enabled level unchanged', () => {
+    expect(redirectEffort(['low', 'medium', 'high'], 'high')).toBe('high');
+  });
+
+  it('redirects a disabled level to the scale-nearest enabled level (xhigh → high)', () => {
+    expect(redirectEffort(['minimal', 'low', 'medium', 'high'], 'xhigh')).toBe('high');
+    expect(redirectEffort(['low', 'medium', 'high'], 'max')).toBe('high');
+  });
+
+  it('redirects downward across the low edge (minimal → low)', () => {
+    expect(redirectEffort(['low', 'medium', 'high'], 'minimal')).toBe('low');
+  });
+
+  it('resolves two-sided gaps by nearest index; exact ties prefer the HIGHER level', () => {
+    // Not a tie: medium requested — low is distance 1, max is distance 3.
+    expect(redirectEffort(['low', 'max'], 'medium')).toBe('low');
+    // Not a tie: low requested — minimal distance 1, high distance 2.
+    expect(redirectEffort(['minimal', 'high'], 'low')).toBe('minimal');
+    // Exact ties (enabled levels equidistant on both sides of the gap)
+    // resolve to the next-highest level.
+    expect(redirectEffort(['low', 'high'], 'medium')).toBe('high');
+    expect(redirectEffort(['medium', 'xhigh'], 'high')).toBe('xhigh');
+  });
+
+  it('tie-break is independent of the storage order of the enabled array', () => {
+    expect(redirectEffort(['high', 'low'], 'medium')).toBe('high');
+    expect(redirectEffort(['xhigh', 'medium'], 'high')).toBe('xhigh');
+  });
+
+  it('ignores unknown entries and passes through when nothing usable remains', () => {
+    expect(redirectEffort(['bogus', 'levels'], 'max')).toBe('max');
+  });
+
+  it('returns undefined effort untouched (auto passthrough)', () => {
+    expect(redirectEffort(['low'], undefined)).toBeUndefined();
+  });
+});
+
+describe('resolveThinkingPolicy', () => {
+  it('maps NULL/malformed/non-array columns to unrestricted', () => {
+    expect(resolveThinkingPolicy(null)).toEqual({ kind: 'unrestricted' });
+    expect(resolveThinkingPolicy(undefined)).toEqual({ kind: 'unrestricted' });
+    expect(resolveThinkingPolicy('not json')).toEqual({ kind: 'unrestricted' });
+    expect(resolveThinkingPolicy('{"a":1}')).toEqual({ kind: 'unrestricted' });
+  });
+
+  it('resolves a stored subset, dropping unknown tokens', () => {
+    expect(resolveThinkingPolicy('["low","high","max"]')).toEqual({ kind: 'levels', levels: ['low', 'high', 'max'] });
+    expect(resolveThinkingPolicy('["low","bogus"]')).toEqual({ kind: 'levels', levels: ['low'] });
+  });
+
+  it('resolves an explicit off and lets it win over defensively-mixed levels', () => {
+    expect(resolveThinkingPolicy('["off"]')).toEqual({ kind: 'off' });
+    expect(resolveThinkingPolicy('["off","low"]')).toEqual({ kind: 'off' });
+  });
+
+  it('treats an explicit-but-empty array as unrestricted (never silently disabled)', () => {
+    expect(resolveThinkingPolicy('[]')).toEqual({ kind: 'unrestricted' });
+  });
+});
+
+describe('applyThinkingPolicy', () => {
+  const req = { reasoning_effort: 'high' as const };
+
+  it('passes when no thinking surface is present (auto/omitted is never touched)', () => {
+    expect(applyThinkingPolicy({ kind: 'levels', levels: ['low'] }, undefined)).toEqual({ ok: true });
+    expect(applyThinkingPolicy({ kind: 'off' }, {})).toEqual({ ok: true });
+    expect(applyThinkingPolicy({ kind: 'levels', levels: ['low'] }, { thinking: { type: 'disabled' } })).toEqual({ ok: true });
+  });
+
+  it('REJECTS attempts to enable thinking on an off model — effort or enabled-type objects', () => {
+    const out = applyThinkingPolicy({ kind: 'off' }, { reasoning_effort: 'low' });
+    expect(out.ok).toBe(false);
+    if (!out.ok) expect(out.error).toMatch(/thinking disabled/i);
+    const objOnly = applyThinkingPolicy({ kind: 'off' }, { thinking: { type: 'enabled', budget: 4000 } });
+    expect(objOnly.ok).toBe(false);
+  });
+
+  it('ALLOWS an explicit {type:disabled} under an off policy — client asks for what the operator enforced', () => {
+    expect(applyThinkingPolicy({ kind: 'off' }, { thinking: { type: 'disabled' } })).toEqual({ ok: true });
+    // Adaptive/enabled types are enable attempts even without budget/effort.
+    expect(applyThinkingPolicy({ kind: 'off' }, { thinking: { type: 'adaptive' } }).ok).toBe(false);
+  });
+
+  it('passes unrestricted requests through verbatim', () => {
+    expect(applyThinkingPolicy({ kind: 'unrestricted' }, { reasoning_effort: 'max' })).toEqual({ ok: true });
+  });
+
+  it('returns identity when the requested level is already enabled', () => {
+    expect(applyThinkingPolicy({ kind: 'levels', levels: ['low', 'high'] }, req)).toEqual({ ok: true });
+  });
+
+  it('rewrites reasoning_effort when redirected', () => {
+    const out = applyThinkingPolicy({ kind: 'levels', levels: ['low', 'medium', 'high'] }, { reasoning_effort: 'xhigh' });
+    expect(out).toEqual({ ok: true, rewrite: { reasoning_effort: 'high' } });
+  });
+
+  it('rewrites thinking.effort and preserves type/budget verbatim when redirected', () => {
+    const out = applyThinkingPolicy(
+      { kind: 'levels', levels: ['low', 'medium', 'high'] },
+      { thinking: { type: 'enabled', effort: 'xhigh', budget: 4000 } },
+    );
+    expect(out).toEqual({
+      ok: true,
+      rewrite: { reasoning_effort: 'high', thinking: { type: 'enabled', effort: 'high', budget: 4000 } },
+    });
+  });
+
+  it('rewrites BOTH surfaces so no downstream reader sees a divergent value', () => {
+    // openaiCompatThinkingBody prefers reasoning_effort over thinking.effort;
+    // leaving either behind would leak an unsupported level to GLM.
+    const out = applyThinkingPolicy(
+      { kind: 'levels', levels: ['low', 'medium', 'high'] },
+      { reasoning_effort: 'max', thinking: { type: 'enabled', effort: 'max', budget: 1000 } },
+    );
+    expect(out.ok).toBe(true);
+    if (out.ok && out.rewrite) {
+      expect(out.rewrite.reasoning_effort).toBe('high');
+      expect(out.rewrite.thinking).toEqual({ type: 'enabled', effort: 'high', budget: 1000 });
+    }
+  });
+
+  it('leaves a thinking object without its own effort alone but still rewrites reasoning_effort', () => {
+    const out = applyThinkingPolicy(
+      { kind: 'levels', levels: ['low', 'medium', 'high'] },
+      { reasoning_effort: 'minimal', thinking: { type: 'enabled', budget: 512 } },
+    );
+    expect(out).toEqual({
+      ok: true,
+      rewrite: { reasoning_effort: 'low', thinking: { type: 'enabled', budget: 512 } },
+    });
+  });
+});
+
+describe('parseStoredThinkingLevels — off normalization', () => {
+  it('keeps the six-level default for untouched rows', () => {
+    expect(parseStoredThinkingLevels(null)).toEqual([...THINKING_LEVELS]);
+  });
+
+  it('normalizes stored off to [off] alone, mixed input included', () => {
+    expect(parseStoredThinkingLevels('["off"]')).toEqual(['off']);
+    expect(parseStoredThinkingLevels('["off","low"]')).toEqual(['off']);
+  });
+
+  it('still drops unknown tokens from plain subsets', () => {
+    expect(parseStoredThinkingLevels('["low","weird","max"]')).toEqual(['low', 'max']);
+  });
+
+  it('exposes THINKING_OFF as the literal off token', () => {
+    expect(THINKING_OFF).toBe('off');
   });
 });

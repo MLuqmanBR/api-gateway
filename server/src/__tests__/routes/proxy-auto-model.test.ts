@@ -160,11 +160,72 @@ describe('Virtual "auto" model', () => {
       `SELECT model_id FROM models WHERE platform = 'nvidia' AND model_id = 'minimaxai/minimax-m3' AND enabled = 1`,
     ).get();
     expect(m3Row).toBeDefined();
-    const nonReasoning = body.data.find(
-      (m: { id: string; capabilities?: { reasoning?: boolean } }) =>
-        m.id !== 'auto' && m.capabilities && m.capabilities.reasoning === false,
-    );
-    expect(nonReasoning).toBeDefined();
+    // Thinking is data-driven now: every untouched row advertises
+    // reasoning=true with the full six-level menu (no id-pattern gating), so
+    // the universal contract is a non-empty efforts menu on every model.
+    for (const entry of body.data) {
+      if (entry.id === 'auto') continue;
+      expect(entry.capabilities.reasoning).toBe(true);
+      expect(Array.isArray(entry.capabilities.reasoning_efforts)).toBe(true);
+      expect(entry.capabilities.reasoning_efforts.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('advertises per-model reasoning_efforts on /v1/models capabilities', async () => {
+    const db = getDb();
+    const seed = (modelId: string, levelsJson: string | null) => {
+      db.prepare(
+        `INSERT INTO models
+         (platform, model_id, display_name, intelligence_rank, speed_rank,
+          size_label, monthly_token_budget, context_window, enabled,
+          supports_vision, max_output_tokens${levelsJson === null ? '' : ', thinking_levels'})
+         VALUES ('groq', ?, ?, 10, 10, 'Medium', '~100K', 128000, 1, 0, 8192${levelsJson === null ? '' : ', ?'})`,
+      ).run(...(levelsJson === null ? [modelId, modelId] : [modelId, modelId, levelsJson]));
+      const row = db.prepare(
+        `SELECT id FROM models WHERE platform = 'groq' AND model_id = ?`,
+      ).get(modelId) as { id: number };
+      db.prepare(`INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, 1, 1)`).run(row.id);
+    };
+    // Restricted menu survives advertisement verbatim…
+    seed('advrestricted', '["low","high","max"]');
+    // …NULL column defaults to thinking ENABLED with the full scale —
+    // advertisement is purely data-driven, no id-pattern matching…
+    seed('advopen', null);
+    seed('plainchat-advdefault', null);
+    // …and an explicit off force-disables: reasoning=false, no menu.
+    seed('advoff', '["off"]');
+
+    try {
+      const { status, body } = await request(app, 'GET', '/v1/models', undefined, authHeaders());
+      expect(status).toBe(200);
+
+      const restricted = body.data.find((m: { id: string }) => m.id === 'groq/advrestricted');
+      expect(restricted).toBeDefined();
+      expect(restricted.capabilities.reasoning).toBe(true);
+      expect(restricted.capabilities.reasoning_efforts).toEqual(['low', 'high', 'max']);
+
+      for (const id of ['groq/advopen', 'groq/plainchat-advdefault']) {
+        const entry = body.data.find((m: { id: string }) => m.id === id);
+        expect(entry).toBeDefined();
+        expect(entry.capabilities.reasoning).toBe(true);
+        expect(entry.capabilities.reasoning_efforts).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+      }
+
+      const off = body.data.find((m: { id: string }) => m.id === 'groq/advoff');
+      expect(off).toBeDefined();
+      expect(off.capabilities.reasoning).toBe(false);
+      expect(off.capabilities.reasoning_efforts).toBeUndefined();
+    } finally {
+      db.prepare(
+        `DELETE FROM fallback_config WHERE model_db_id IN (
+           SELECT id FROM models WHERE platform = 'groq'
+             AND model_id IN ('advrestricted', 'advopen', 'plainchat-advdefault', 'advoff'))`,
+      ).run();
+      db.prepare(
+        `DELETE FROM models WHERE platform = 'groq'
+           AND model_id IN ('advrestricted', 'advopen', 'plainchat-advdefault', 'advoff')`,
+      ).run();
+    }
   });
 
   it('treats model:"auto" as auto-route instead of a 400', async () => {

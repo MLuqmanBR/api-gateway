@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
 import { hasProvider, getAllProviders } from '../providers/index.js';
 import { syncModelsFromProvider, type ProviderSyncResult } from './custom.js';
+import { parseStoredThinkingLevels } from '../lib/thinking.js';
 
 export const modelsRouter = Router();
 
@@ -48,6 +49,7 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     fallbackEnabled: m.fallback_enabled === 1,
     hasProvider: hasProvider(m.platform),
     keyCount: keyCountMap.get(m.platform) ?? 0,
+    thinkingLevels: parseStoredThinkingLevels(m.thinking_levels),
   }));
 
   res.json(result);

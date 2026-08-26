@@ -244,17 +244,18 @@ export function geminiThinkingConfig(
 //                            string (derived from `reasoning_effort` OR
 //                            `thinking.effort`). Most OpenAI-compat hosts
 //                            (NVIDIA, OpenRouter, Groq, Cerebras, …) accept it.
-//   'glm_mapped'            GLM hosts — MAP effort onto GLM's narrow enum
-//                            (`low|medium|high`, see mapGlmEffort) and emit
-//                            only that. GLM's API rejects the rich
-//                            `thinking` object outright (literal_error on its
-//                            narrower enum), so the rich object is dropped.
+//   'glm_mapped'            GLM hosts — emit ONLY `reasoning_effort`; never
+//                            the rich object (GLM rejects it outright,
+//                            literal_error). The effort arrives already
+//                            redirected to the model's supported level set
+//                            (per-model `models.thinking_levels`) and is
+//                            forwarded verbatim — no mapping here.
 //   'both'                   hosts verified to accept the rich `thinking`
 //                            object alongside `reasoning_effort`. Reserved for
 //                            explicit allowlisting once a host is confirmed.
 export type OpenAiCompatThinkingPolicy =
   | 'reasoning_effort_only'   // default — emit reasoning_effort verbatim
-  | 'glm_mapped'              // GLM — map effort to GLM's narrow enum, drop the rich object
+  | 'glm_mapped'              // GLM — forward the (pre-redirected) effort verbatim, drop the rich object
   | 'glm_nvidia'              // GLM on NVIDIA NIM — needs chat_template_kwargs.enable_thinking; accepts full effort range
   | 'glm52_synthetic'             // gatewaysynth × glm-5.2 — synthesize thinking={type:enabled} so reasoning_content surfaces; forward effort verbatim across the full 7-value enum
   | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only)
@@ -263,8 +264,10 @@ export type OpenAiCompatThinkingPolicy =
 // GLM-family hosts. GLM's OpenAI-compat wrapper accepts ONLY
 // `reasoning_effort` and ONLY the values `none | low | medium | high` — it
 // rejects `max`, `xhigh`, `minimal` with a pydantic literal_error, and rejects
-// the rich Anthropic-style `thinking` object outright. So for GLM we MAP the
-// unified effort onto GLM's allowed enum and never forward the rich object.
+// the rich Anthropic-style `thinking` object outright. Which levels a GLM
+// model accepts is per-model data (`models.thinking_levels`, seeded for
+// glm_mapped rows); the proxy redirects out-of-set requests upstream, so this
+// layer forwards the effort verbatim and never the rich object.
 // (#292 — confirmed live against GlmAggregatorB's zai-org/GLM-5.1-FP8.)
 const GLM_HOST_PLATFORMS = new Set<string>([
   'glmaggregatorb', // zai-org/GLM-5.1-FP8
@@ -292,10 +295,11 @@ export function isGlmModel(modelId: string): boolean {
  *  the `glm_mapped` policy handles), NVIDIA's GLM 5.2 endpoint ignores a bare
  *  `reasoning_effort` — thinking stays OFF unless the request also carries
  *  `chat_template_kwargs.enable_thinking: true`. It also accepts the FULL
- *  effort range (`minimal`…`max`, all HTTP 200), so the narrow GLM enum-clamp
- *  must not apply. Confirmed live against `z-ai/glm-5.2` on NVIDIA NIM (all six
- *  effort levels return a populated `reasoning_content`; `reasoning_effort`
- *  alone returns none). Scoped to 5.2 — GLM 5.1 on NVIDIA keeps `glm_mapped`. */
+ *  effort range (`minimal`…`max`, all HTTP 200), so its rows keep the
+ *  unrestricted default in `models.thinking_levels`. Confirmed live against
+ *  `z-ai/glm-5.2` on NVIDIA NIM (all six effort levels return a populated
+ *  `reasoning_content`; `reasoning_effort` alone returns none). Scoped to
+ *  5.2 — GLM 5.1 on NVIDIA keeps `glm_mapped`. */
 export function isGlmNvidiaThinkingModel(platform: string, modelId?: string): boolean {
   if (platform !== 'nvidia' || !modelId) return false;
   // Match `glm-5.2` (any separator / org prefix / case), e.g. `z-ai/glm-5.2`.
@@ -337,37 +341,6 @@ export function openAiCompatThinkingPolicy(platform: string, modelId?: string): 
   return 'reasoning_effort_only';
 }
 
-/** Exhaustiveness guard: passing a value that isn't `never` is a compile
- *  error, so a switch over a union that handles every member can funnel its
- *  default here — future union members break the build instead of falling
- *  into a silent catch-all. */
-function assertNever(x: never): never {
-  throw new Error(`unreachable: ${String(x)}`);
-}
-
-/** Map a unified effort level onto GLM's accepted wire enum
- *  (`none | low | medium | high`). GLM rejects `max` and `xhigh`
- *  (literal_error) and has no `minimal` slot, so we clamp the out-of-range
- *  levels into GLM's range WITHOUT disabling thinking — `max`/`xhigh` →
- *  `high` (most thinking GLM offers), `minimal` → `low` (least thinking,
- *  but still on). The mapping itself only ever EMITS `low|medium|high` — it
- *  never sends `none`, because mapping must not turn thinking off. The
- *  user's intent (more vs less thinking) is preserved.
- *  Confirmed live against GlmAggregatorB GLM-5.1-FP8. (#292) */
-function mapGlmEffort(effort: ThinkingEffort): 'low' | 'medium' | 'high' {
-  switch (effort) {
-    case 'minimal':
-    case 'low': return 'low';
-    case 'medium': return 'medium';
-    case 'high':
-    case 'xhigh':
-    case 'max': return 'high';
-    // Exhaustive over ThinkingEffort: a future enum member fails to compile
-    // here (never-argument) instead of silently clamping to 'high'.
-    default: return assertNever(effort);
-  }
-}
-
 /** Decide which thinking fields to put on the outbound OpenAI-compat body,
  *  honoring the host's policy. Never forwards a field the host doesn't accept.
  *
@@ -375,7 +348,7 @@ function mapGlmEffort(effort: ThinkingEffort): 'low' | 'medium' | 'high' {
  *    explicit `reasoning_effort` string or, when only a `thinking` object was
  *    sent, from `thinking.effort`. The rich `thinking` object is NEVER
  *    forwarded here — that's the field that triggers literal_errors.
- *  - `glm_mapped`: map the effort onto GLM's narrow enum via mapGlmEffort
+ *  - `glm_mapped`: forward the (already per-model-redirected) effort verbatim
  *    and emit ONLY `reasoning_effort` — never the rich object (GLM).
  *  - `both`: forward `reasoning_effort` and `thinking` verbatim (only for
  *    hosts verified to accept the rich object).
@@ -448,22 +421,190 @@ export function openaiCompatThinkingBody(
     // boolean, {type:enabled}, {type:adaptive}); otherwise synthesize the
     // {type:enabled} switch that surfaces the trace.
     out.thinking = original?.thinking ?? { type: 'enabled' };
-    // Forward effort verbatim (no clamping — gatewaysynth accepts the full 7-value
-    // enum, unlike glm_mapped's low|medium|high).
+    // Forward effort verbatim (gatewaysynth accepts the full 7-value enum; GLM's
+    // narrow-enum restriction is handled per-model upstream, not here).
     if (effort) out.reasoning_effort = effort;
     return out;
   }
 
   if (policy === 'glm_mapped') {
     // GLM accepts ONLY `reasoning_effort` in {none,low,medium,high} and rejects
-    // the rich `thinking` object. Map the unified effort onto GLM's enum; never
-    // forward the rich object. If no effort was requested, send nothing and let
-    // GLM use its default (which is thinking-enabled). (#292)
-    if (effort) out.reasoning_effort = mapGlmEffort(effort);
+    // the rich `thinking` object. Which of the six levels this model accepts is
+    // per-model data (`models.thinking_levels`) enforced by the proxy's
+    // redirectThinkingRequest BEFORE the provider call — so whatever effort
+    // survives to here is already in-set: forward it verbatim. Never forward
+    // the rich object. If no effort was requested, send nothing and let GLM
+    // use its default (which is thinking-enabled). (#292)
+    if (effort) out.reasoning_effort = effort;
     return out;
   }
 
   // policy === 'reasoning_effort_only'
   if (effort) out.reasoning_effort = effort;
   return out;
+}
+
+// ─── Per-model supported-level redirect ───────────────────────────────────
+
+/** The canonical effort scale, in increasing order. `models.thinking_levels`
+ *  rows store a subset of these; redirect distance is measured as index
+ *  distance on this scale. */
+export const THINKING_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+/** Nearest-enabled redirect for a single effort level. null/undefined/empty
+ *  `enabled` => unrestricted, pass through. A requested level that IS enabled
+ *  passes through; otherwise the enabled level with the smallest index
+ *  distance on the THINKING_LEVELS scale wins. Exact ties ARE possible (a
+ *  disabled level with enabled levels on both sides, e.g. medium requested,
+ *  low + high enabled): the tie-break deterministically prefers the
+ *  HIGHER-effort side — "next highest" — so a forced redirect never silently
+ *  undershoots the reasoning depth the client asked for, and is independent
+ *  of the storage order of `enabled`. Unknown entries in `enabled` are
+ *  ignored; if nothing usable remains, the effort passes through unchanged. */
+export function redirectEffort(
+  enabled: string[] | null | undefined,
+  effort?: ThinkingEffort,
+): ThinkingEffort | undefined {
+  if (!effort) return effort;
+  if (!enabled || enabled.length === 0) return effort;
+  if (enabled.includes(effort)) return effort;
+  const requestedIdx = THINKING_LEVELS.indexOf(effort);
+  let best: ThinkingEffort | undefined;
+  let bestDist = Number.POSITIVE_INFINITY;
+  let bestIdx = -1;
+  for (const level of enabled) {
+    const idx = THINKING_LEVELS.indexOf(level as (typeof THINKING_LEVELS)[number]);
+    if (idx === -1) continue;
+    const dist = Math.abs(idx - requestedIdx);
+    // Strictly nearer wins; on an exact tie the higher-effort level wins —
+    // independent of the iteration/storage order of `enabled`.
+    if (dist < bestDist || (dist === bestDist && idx > bestIdx)) {
+      bestDist = dist;
+      bestIdx = idx;
+      best = THINKING_LEVELS[idx];
+    }
+  }
+  return best ?? effort;
+}
+
+/** Force-disable token stored in `models.thinking_levels`. Exclusive by API
+ *  validation (`["off"]` alone) — it is a capability switch, not an effort:
+ *  an off model is advertised as non-reasoning and effort-bearing requests
+ *  are rejected at the gateway instead of redirected. */
+export const THINKING_OFF = 'off';
+
+/** Request-time view of `models.thinking_levels`:
+ *  - `unrestricted`: NULL/malformed column — every level passes through.
+ *  - `levels`: operator-selected subset; out-of-set efforts redirect.
+ *  - `off`: operator force-disabled the model's thinking entirely. */
+export type ThinkingPolicy =
+  | { kind: 'unrestricted' }
+  | { kind: 'levels'; levels: ThinkingEffort[] }
+  | { kind: 'off' };
+
+/** Resolves the stored column into a request-time policy. Unknown tokens are
+ *  dropped; a stored 'off' wins over any levels mixed in defensively (the API
+ *  never writes such rows). Explicit-but-empty arrays cannot be saved via the
+ *  API and resolve to unrestricted rather than silently disabling a model. */
+export function resolveThinkingPolicy(raw: string | null | undefined): ThinkingPolicy {
+  if (!raw) return { kind: 'unrestricted' };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return { kind: 'unrestricted' };
+    const tokens = parsed.filter((l): l is string => typeof l === 'string');
+    if (tokens.includes(THINKING_OFF)) return { kind: 'off' };
+    const levels = tokens.filter((l): l is ThinkingEffort =>
+      (THINKING_LEVELS as readonly string[]).includes(l));
+    if (levels.length === 0) return { kind: 'unrestricted' };
+    return { kind: 'levels', levels };
+  } catch {
+    return { kind: 'unrestricted' };
+  }
+}
+
+/** Replacement thinking fields after a redirect (absent = forward as-is). */
+export type ThinkingRequestRewrite = {
+  reasoning_effort?: ThinkingEffort;
+  thinking?: ThinkingConfig;
+};
+
+/** Outcome of applying a model's {@link ThinkingPolicy} to a request's
+ *  thinking knobs. */
+export type ThinkingRequestDecision =
+  | { ok: true; rewrite?: ThinkingRequestRewrite }
+  | { ok: false; error: string };
+
+/** Applies the policy to the request's thinking surfaces:
+ *  - No thinking surface present (`reasoning_effort` nor `thinking` object)
+ *    → pass; "auto"/omitted is not one of the six levels and is never touched.
+ *  - `off` policy → REJECT whenever the client ATTEMPTS thinking: any effort
+ *    level, or a `thinking` object whose `type !== 'disabled'` (including
+ *    Anthropic-style budget_tokens-only requests). An explicit
+ *    `{type:'disabled'}` passes — the client is asking for exactly what the
+ *    operator already enforced. Force-disabled means unsupported, not
+ *    redirected.
+ *  - `unrestricted` → pass verbatim.
+ *  - `levels` → nearest-enabled redirect (see {@link redirectEffort}); when a
+ *    redirect occurs the effective effort (`thinking.effort` wins over
+ *    `reasoning_effort`, matching normalizeThinking) is rewritten on BOTH
+ *    surfaces so no downstream reader (openaiCompatThinkingBody prefers
+ *    reasoning_effort) sees a stale value; a present `thinking` object is
+ *    shallow-cloned with only its `effort` replaced — type/budget/display
+ *    preserved verbatim. */
+export function applyThinkingPolicy(
+  policy: ThinkingPolicy,
+  req?: { reasoning_effort?: ThinkingEffort; thinking?: ThinkingConfig },
+): ThinkingRequestDecision {
+  if (!req || (!req.reasoning_effort && !req.thinking)) return { ok: true };
+  if (policy.kind === 'off') {
+    // Only an ATTEMPT to enable is a contract violation; an explicit
+    // {type:'disabled'} asks for exactly what the operator already enforced.
+    const triesToEnable =
+      !!req.reasoning_effort || (req.thinking !== undefined && req.thinking.type !== 'disabled');
+    if (triesToEnable) {
+      return {
+        ok: false,
+        error:
+          "This model has thinking disabled by the gateway operator; requests must not include 'reasoning_effort' or 'thinking'.",
+      };
+    }
+    return { ok: true };
+  }
+  if (policy.kind === 'unrestricted') return { ok: true };
+  const requested = req.thinking?.effort ?? req.reasoning_effort;
+  if (!requested) return { ok: true };
+  const redirected = redirectEffort(policy.levels, requested);
+  if (redirected === requested) return { ok: true };
+  if (req.thinking && req.thinking.effort !== undefined) {
+    return {
+      ok: true,
+      rewrite: { reasoning_effort: redirected, thinking: { ...req.thinking, effort: redirected } },
+    };
+  }
+  if (req.thinking) {
+    // Effort came from `reasoning_effort`; the thinking object carries no
+    // level of its own — forward it verbatim alongside the rewritten field.
+    return { ok: true, rewrite: { reasoning_effort: redirected, thinking: req.thinking } };
+  }
+  return { ok: true, rewrite: { reasoning_effort: redirected } };
+}
+
+/** Parses a stored `models.thinking_levels` JSON string for dashboard/API
+ *  responses. Missing/malformed/non-array => full six-level default; unknown
+ *  entries are dropped; a stored 'off' normalizes to ['off'] alone so the UI
+ *  renders exactly the Off toggle selected. An emptied result is returned
+ *  as-is — it renders as zero selected toggles, and the API's min(1)
+ *  validation blocks re-saving that state. */
+export function parseStoredThinkingLevels(raw: string | null | undefined): string[] {
+  if (!raw) return [...THINKING_LEVELS];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [...THINKING_LEVELS];
+    const tokens = parsed.filter((l): l is string => typeof l === 'string');
+    if (tokens.includes(THINKING_OFF)) return [THINKING_OFF];
+    return tokens.filter((l): l is (typeof THINKING_LEVELS)[number] =>
+      (THINKING_LEVELS as readonly string[]).includes(l));
+  } catch {
+    return [...THINKING_LEVELS];
+  }
 }
