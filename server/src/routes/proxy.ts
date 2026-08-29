@@ -523,20 +523,20 @@ export function isRetryableError(err: any): boolean {
   }
   // Fallback: message-based heuristics (legacy path, keeps existing behavior).
   const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
+  return /\b429\b/.test(msg) || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
     || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
     || msg.includes('econnrefused') || msg.includes('econnreset')
-    || msg.includes('503') || msg.includes('unavailable')
-    || msg.includes('500') || msg.includes('internal server error')
+    || /\b503\b/.test(msg) || msg.includes('unavailable')
+    || /\b500\b/.test(msg) || msg.includes('internal server error')
     // 413: this model's payload limit is too small for the request, but another
     // provider in the fallback chain may have a larger limit. Same reasoning as 503.
-    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
+    || /\b413\b/.test(msg) || msg.includes('payload too large') || msg.includes('request body too large')
     || msg.includes('request entity too large') || msg.includes('content too large')
     // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
-    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
+    || /\b404\b/.test(msg) || msg.includes('not found') || msg.includes('no endpoints found')
     // 403: the key is valid (passed validateKey, health checker disables
     // truly-forbidden keys) but this specific model is off-limits to the
     // key's tier. The normal retry path exhausts this key after
@@ -544,7 +544,7 @@ export function isRetryableError(err: any): boolean {
     // on the same model; if no siblings survive, the outer loop moves to
     // the next model. Cooldown uses the standard computeRetryCooldownMs
     // — no special day-long bench. See issue #256.
-    || msg.includes('403') || msg.includes('forbidden') || (err?.status === 403)
+    || /\b403\b/.test(msg) || msg.includes('forbidden') || (err?.status === 403)
     // 400: one provider may reject parameters another accepts (e.g. max_tokens
     // limits, unsupported params). The matching pattern is "api error 400"
     // which comes from the OpenAI-compat provider's error formatting, not
@@ -572,7 +572,7 @@ export function isRetryableError(err: any): boolean {
 // model via isRetryableError) and for C1 cooldown-reason recording.
 export function isPaymentRequiredError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('402') || msg.includes('payment required')
+  return /\b402\b/.test(msg) || msg.includes('payment required')
     || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
     || msg.includes('insufficient balance');
 }
