@@ -26,6 +26,35 @@ except Exception:  # pragma: no cover - depends on environment
     _HAS_CHARTS = False
 
 
+def as_percent(rate) -> float:
+    """Normalize a success rate to the 0-100 percent scale.
+
+    The server sends successRate on the 0-100 scale (e.g. 41.9 for 41.9%).
+    The <=1 guard keeps genuine fractions (0.5 == 50%) correct too.
+    """
+    try:
+        value = float(rate)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if value > 1 else value * 100
+
+
+def errors_count(total, rate) -> int:
+    """Failures implied by a success rate — never negative."""
+    try:
+        return max(0, round(float(total) * (1 - as_percent(rate) / 100)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def fmt_money(value) -> str:
+    """Dollars with 4 decimals — the server's estimatedCost unit."""
+    try:
+        return f"${float(value):.4f}"
+    except (TypeError, ValueError):
+        return "$0.0000"
+
+
 class SimpleTimeline(QWidget):
     """Painted line used when PyQt6-Charts is unavailable."""
 
@@ -109,9 +138,11 @@ class AnalyticsPage(BasePage):
         cards = QHBoxLayout()
         self.card_requests = StatsCard("Total requests")
         self.card_cost = StatsCard("Total cost")
+        self.card_latency = StatsCard("Avg latency")
         self.card_tokens = StatsCard("Tokens")
         self.card_errors = StatsCard("Errors")
-        for c in (self.card_requests, self.card_cost, self.card_tokens, self.card_errors):
+        for c in (self.card_requests, self.card_cost, self.card_latency,
+                  self.card_tokens, self.card_errors):
             cards.addWidget(c)
         layout.addLayout(cards)
 
@@ -161,7 +192,7 @@ class AnalyticsPage(BasePage):
 
     def _apply(self, result):
         summary, by_model, by_platform, errors, timeline = result
-        self._apply_summary(summary)
+        self._apply_summary(summary, by_model)
         self._apply_list(self.by_model, by_model, kind="model")
         self._apply_list(self.by_platform, by_platform, kind="platform")
         self._apply_errors(errors)
@@ -175,16 +206,28 @@ class AnalyticsPage(BasePage):
                 # SQLite UTC "YYYY-MM-DD HH:MM:SS" → short local label.
                 label = stamp[11:16] if len(stamp) >= 16 else stamp
                 points.append((label, int(t.get("requests", 0) or 0)))
-        self.timeline.set_points(points)
-
-    def _apply_summary(self, s: dict):
+    def _apply_summary(self, s: dict, by_model_rows=None):
         # H27: AnalyticsSummary fields — totalRequests, totalInputTokens,
         # totalOutputTokens, avgLatencyMs, successRate… (shared/types.ts).
         s = s or {}
         self.card_requests.set_value(str(s.get("totalRequests", 0) or 0))
         self.card_tokens.set_value(str((s.get("totalInputTokens", 0) or 0) + (s.get("totalOutputTokens", 0) or 0)))
-        self.card_errors.set_value(str(round((s.get("totalRequests", 0) or 0) * (1 - (s.get("successRate", 1) or 1)))))
-        self.card_cost.set_value(f"{s.get('avgLatencyMs', 0) or 0} ms")
+        # successRate arrives 0-100 (e.g. 41.9); errors derive from the
+        # normalized percent so the count is never negative.
+        self.card_errors.set_value(str(errors_count(
+            s.get("totalRequests", 0) or 0, s.get("successRate", 100) or 100
+        )))
+        self.card_latency.set_value(f"{s.get('avgLatencyMs', 0) or 0} ms")
+        # Total cost = Σ estimatedCost across the by-model breakdown (the
+        # summary endpoint has no cost field).
+        total_cost = 0.0
+        for r in (by_model_rows or []):
+            if isinstance(r, dict):
+                try:
+                    total_cost += float(r.get("estimatedCost", 0) or 0)
+                except (TypeError, ValueError):
+                    pass
+        self.card_cost.set_value(fmt_money(total_cost))
 
     def _apply_list(self, table: QTableWidget, rows, kind: str):
         rows = rows if isinstance(rows, list) else []
@@ -196,19 +239,15 @@ class AnalyticsPage(BasePage):
                 # ModelStats: displayName, requests, total{In,Out}putTokens,
                 # estimatedCost (dollars), avgLatencyMs, successRate.
                 name = r.get("displayName") or r.get("modelId", "")
-                tok = (r.get("totalInputTokens", 0) or 0) + (r.get("totalOutputTokens", 0) or 0)
                 extra = f"{r.get('avgLatencyMs', 0) or 0}"
             else:
                 # PlatformStats: platform, requests, successRate, avgLatencyMs.
+                # successRate already arrives 0-100 (41.9 == 41.9%) — the
+                # old *100 turned it into 4190%.
                 name = r.get("platform", "")
-                tok = (r.get("totalInputTokens", 0) or 0) + (r.get("totalOutputTokens", 0) or 0)
-                rate = r.get("successRate", 0) or 0
-                extra = f"{round(rate * 100)}%"
-            cost = r.get("estimatedCost", 0) or 0
-            try:
-                cost_str = f"${float(cost):.4f}"
-            except (TypeError, ValueError):
-                cost_str = "$0.00"
+                extra = f"{as_percent(r.get('successRate', 0)):.1f}%"
+            tok = (r.get("totalInputTokens", 0) or 0) + (r.get("totalOutputTokens", 0) or 0)
+            cost_str = fmt_money(r.get("estimatedCost", 0) or 0)
             data.append([name, r.get("requests", 0) or 0, tok, cost_str, extra])
         fill_table(table, data)
 

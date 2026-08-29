@@ -83,7 +83,7 @@ class DashboardPage(BasePage):
         cards.setSpacing(14)
         self.card_req = StatsCard("Requests (24h)", icon_name="analytics", accent="#89b4fa")
         self.card_success = StatsCard("Success rate", icon_name="check", accent="#a6e3a1")
-        self.card_cost = StatsCard("Spend (24h)", icon_name="budget", accent="#f9e2af")
+        self.card_cost = StatsCard("Est. savings (24h)", icon_name="budget", accent="#f9e2af")
         self.card_active = StatsCard("Active budgets", icon_name="budget", accent="#cba6f7")
         self.card_mem = StatsCard("Server memory", icon_name="server", accent="#74c7ec")
         self.card_up = StatsCard("Server uptime", icon_name="server", accent="#fab387")
@@ -190,19 +190,25 @@ class DashboardPage(BasePage):
 
     def _apply(self, result):
         summary, budgets = result
+        from .analytics import as_percent, fmt_money
         total = summary.get("totalRequests", summary.get("requests", summary.get("total", 0)))
         err = summary.get("failedRequests", summary.get("errors", 0))
-        try:
-            rate = 100.0 * (1 - (err / total)) if total else 100.0
-        except Exception:
-            rate = 0.0
         self.card_req.set_value(str(total))
-        pct = summary.get("successRate", rate)
+        pct = summary.get("successRate")
+        if pct is None:
+            try:
+                pct = 100.0 * (1 - (err / total)) if total else 100.0
+            except Exception:  # noqa: BLE001 — degenerate summary shapes
+                pct = 0.0
+        # successRate arrives 0-100 (41.9 == 41.9%); as_percent guards the
+        # rare 0-1 fraction so we never display 4190%.
         try:
-            self.card_success.set_value(f"{float(pct):.1f}%")
+            self.card_success.set_value(f"{as_percent(pct):.1f}%")
         except (TypeError, ValueError):
             self.card_success.set_value("—")
-        self.card_cost.set_value(_fmt_money(summary.get("totalCost", summary.get("cost", 0))))
+        # The summary has no cost field — the server exposes estimated
+        # SAVINGS instead, which is what this card actually shows.
+        self.card_cost.set_value(fmt_money(summary.get("estimatedCostSavings", 0) or 0))
         if isinstance(budgets, dict):
             budgets = budgets.get("budgets", [])
         self.card_active.set_value(str(len(budgets or [])))
