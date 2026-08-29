@@ -24,13 +24,15 @@ from ..widgets.toast import Toaster
 from .base import BasePage
 
 # Must mirror the server's ConfigSection enum exactly
-# (server/src/lib/config/schema.ts). 'fallback' (not 'fallback_chain') and
-# 'budgets' were invalid names that made every desktop export fail with 400.
+# (server/src/lib/config/schema.ts — 10 sections, verified 2026-08-29).
 EXPORT_SECTIONS = [
     ("models", "Models (catalog, pricing, capabilities)"),
     ("fallback_chain", "Fallback chain + retry + routing weights"),
     ("custom_providers", "Custom providers and their models"),
     ("api_keys", "API keys (unified + provider + client)"),
+    ("client_keys", "Client keys (per-deployment access)"),
+    ("budgets", "Spending limits per scope"),
+    ("webhooks", "Webhook endpoints"),
     ("embeddings", "Embeddings family chains"),
     ("settings", "Server settings (middle config, etc.)"),
     ("quirks", "Provider quirks"),
@@ -93,6 +95,16 @@ class SettingsPage(BasePage):
         row.addWidget(save_btn)
         row.addStretch()
         v.addLayout(row)
+        note = QLabel(
+            "Webhooks can be included in exports, but there is no webhook "
+            "editor yet (the web dashboard doesn't have one either)."
+        )
+        note.setWordWrap(True)
+        from ..widgets.styled import style_page_subtitle as _ps5
+        from ..widgets.styled import watch_style as _ws5
+        _ws5(lambda: _ps5(note))
+        _ps5(note)
+        v.addWidget(note)
         return box
 
     def _do_export(self, preview: bool):

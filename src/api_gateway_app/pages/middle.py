@@ -29,18 +29,17 @@ from ..widgets.table import configure_table, fill_table
 from ..widgets.toast import Toaster
 from .base import BasePage
 
-# Keys mirrored from server/src/routes/middle.ts CONFIG_KEYS / DEFAULTS.
+# Keys mirrored from server/src/routes/middle.ts CONFIG_KEYS / DEFAULTS
+# (verified 2026-08-29 against the live route — 11 keys, exactly these).
 BOOL_KEYS = [
     "middle_redaction_enabled",
     "middle_compression_enabled",
     "middle_compression_smart_crusher",
-    "middle_compression_toon",
     "middle_compression_emit_sentinel",
     "middle_compression_smart_crusher_lossless_only",
     "middle_interceptor_inbound_enabled",
 ]
 TEXT_KEYS = [
-    "middle_compression_min_tokens",
     "middle_compression_protect_recent",
     "middle_compression_min_savings_ratio",
     "middle_interceptor_model",
@@ -204,7 +203,7 @@ class PrivacyPage(BasePage):
                 s.get("id", ""),
                 s.get("kind", ""),
                 s.get("label", ""),
-                s.get("mask") or s.get("maskedValue", "••••"),
+                s.get("maskedPreview") or s.get("mask") or s.get("maskedValue", "••••"),
                 "yes" if s.get("enabled", True) else "no",
             ]
             for s in (secrets or [])

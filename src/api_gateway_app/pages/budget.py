@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QVBoxLayout,
@@ -157,7 +158,29 @@ class BudgetPage(BasePage):
         reset = QPushButton("Reset")
         reset.clicked.connect(lambda _=False, s=b.get("scope"), sid=b.get("scope_id"): self._reset(s, sid))
         row.addWidget(reset)
+        delete = QPushButton("Delete")
+        delete.setObjectName("danger")
+        delete.clicked.connect(
+            lambda _=False, s=b.get("scope"), sid=b.get("scope_id"): self._delete(s, sid)
+        )
+        row.addWidget(delete)
         return w
+
+    def _delete(self, scope, scope_id):
+        confirm = QMessageBox.question(
+            self, "Delete budget",
+            f"Delete the {scope}{f' ({scope_id})' if scope_id else ''} budget?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        params = {"scope": scope}
+        if scope_id:
+            params["scope_id"] = scope_id
+        self.call_in_background(
+            lambda: self.api.delete("/api/budgets", params=params),
+            on_success=lambda _r: (Toaster.show("Budget deleted", "success"), self.refresh()),
+            on_error=lambda e: Toaster.show(str(e), "error"),
+        )
 
     # ------------------------------------------------------------------
 
@@ -192,6 +215,11 @@ class BudgetPage(BasePage):
             body = self._payload()
         except ValueError as exc:
             Toaster.show(str(exc), "error")
+            return
+        # A budget with no limit at all is a no-op upsert — refuse it here
+        # so the user never "saves" a budget that caps nothing.
+        if not any(k.endswith("_limit_cents") for k in body):
+            Toaster.show("Set at least one limit (daily, weekly or monthly)", "error")
             return
         self.call_in_background(
             lambda: self.api.post("/api/budgets", json=body),
