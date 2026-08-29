@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { Express } from 'express';
 
 // Imp 13 regression: 429 burst self-DoS on the Codex path. Before the fix, the
@@ -48,7 +48,7 @@ async function postAndCapture(
   key: string,
   errorForCall: (callIndex: number) => Error,
   stopAfter: number,
-): Promise<number[]> {
+): Promise<{ callTimes: number[]; status?: number; resolvedAt?: number }> {
   const callTimes: number[] = [];
   const server = app.listen(0);
   const addr = server.address() as { port: number };
@@ -65,20 +65,24 @@ async function postAndCapture(
     }
     throw errorForCall(callTimes.length);
   });
+  let status: number | undefined;
+  let resolvedAt: number | undefined;
   try {
-    await fetch(`http://127.0.0.1:${addr.port}/v1/responses`, {
+    const res = await fetch(`http://127.0.0.1:${addr.port}/v1/responses`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
       body: JSON.stringify({ input: 'hi' }),
       signal: ac.signal,
     });
+    status = res.status;
+    resolvedAt = Date.now();
   } catch (e) {
     // Expected: the test aborted the fetch once enough calls were captured.
     if (!(e instanceof Error) || !/aborted/i.test(e.message)) throw e;
   } finally {
     server.close();
   }
-  return callTimes;
+  return { callTimes, status, resolvedAt };
 }
 
 describe('Responses 429 backoff (Imp 13)', () => {
@@ -129,7 +133,7 @@ describe('Responses 429 backoff (Imp 13)', () => {
   it('backs off with escalating sleep (1s then 2s) between 429 attempts', async () => {
     // Capture 3 upstream calls: t1 --1s--> t2 --2s--> t3; the client abort
     // after the 3rd call short-circuits the remaining recovery tail.
-    const callTimes = await postAndCapture(app, key, () => RATE_LIMIT_429, 3);
+    const { callTimes } = await postAndCapture(app, key, () => RATE_LIMIT_429, 3);
 
     expect(callTimes.length).toBeGreaterThanOrEqual(3);
     // First cycle wait ≈ 1s (allow scheduling jitter down to 800ms — the
@@ -142,7 +146,7 @@ describe('Responses 429 backoff (Imp 13)', () => {
   }, 15000);
 
   it('does NOT wait on non-429 retryable errors (immediate key cycle)', async () => {
-    const callTimes = await postAndCapture(app, key, () => SERVER_500, 3);
+    const { callTimes } = await postAndCapture(app, key, () => SERVER_500, 3);
 
     expect(callTimes.length).toBeGreaterThanOrEqual(3);
     // No backoff for 5xx transport-class failures: every gap stays in the
@@ -151,4 +155,45 @@ describe('Responses 429 backoff (Imp 13)', () => {
       expect(callTimes[i] - callTimes[i - 1]).toBeLessThan(400);
     }
   }, 15000);
+
+  afterEach(() => {
+    setGlobalRetryLimit(0);
+  });
+
+  it('does not sleep on the final attempt (nothing follows to protect)', async () => {
+    // attemptLimit 2 with three keys: attempt 0 sleeps ~1s, attempt 1 is the
+    // FINAL attempt — its 429 benches the key and exits the loop with no
+    // sleep, so the 429 response lands right after the 2nd upstream call.
+    setGlobalRetryLimit(2);
+    const { callTimes, status, resolvedAt } = await postAndCapture(app, key, () => RATE_LIMIT_429, 99);
+
+    expect(callTimes.length).toBe(2);
+    expect(callTimes[1] - callTimes[0]).toBeGreaterThanOrEqual(800); // attempt-0 backoff
+    expect(status).toBe(429); // exhausted-all-retries response
+    expect(resolvedAt! - callTimes[1]).toBeLessThan(600); // no final-attempt sleep
+  }, 15000);
+
+  it('caps cumulative backoff at a 10s budget', async () => {
+    // Eleven keys (3 from beforeAll + 8 here) all 429ing with attemptLimit
+    // 20: uncapped escalation would sleep 1+2*10 = 21s; the 10s budget holds
+    // the total down before routeRequest throws (no keys left) and the 429
+    // response returns.
+    const db = getDb();
+    for (let i = 3; i < 11; i++) {
+      const k = encrypt(`groq-key-${i}`);
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+        VALUES ('groq', ?, ?, ?, ?, 'healthy', 1)
+      `).run(`test-${i}`, k.encrypted, k.iv, k.authTag);
+    }
+    const keyCount = (db.prepare(
+      "SELECT COUNT(*) AS c FROM api_keys WHERE platform = 'groq' AND enabled = 1",
+    ).get() as { c: number }).c;
+    const started = Date.now();
+    const { callTimes, status } = await postAndCapture(app, key, () => RATE_LIMIT_429, 99);
+
+    expect(callTimes.length).toBe(keyCount); // every key tried, no recovery tail
+    expect(status).toBe(429);
+    expect(Date.now() - started).toBeLessThan(12500);
+  }, 20000);
 });
