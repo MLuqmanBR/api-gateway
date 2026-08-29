@@ -40,7 +40,7 @@ MODULES = [
     "api_gateway_app.pages.playground",
     "api_gateway_app.pages.fallback",
     "api_gateway_app.pages.embeddings",
-    "api_gateway_app.pages.middle",
+    "api_gateway_app.pages.webhooks",
     "api_gateway_app.pages.settings",
 ]
 

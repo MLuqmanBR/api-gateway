@@ -378,8 +378,19 @@ class KeysPage(BasePage):
                 extra = f", {rate_limited} limited" if rate_limited else (f", {invalid} invalid" if invalid else "")
                 bits.append(f"{name}: {healthy}/{total} healthy{extra}")
             self.health_label.setText("   •   ".join(bits))
+        # Per-platform enable state from the ACTUAL keys list (the health
+        # endpoint has no enabled count) — mirrors the web's allOn/partial.
+        keys_raw = data.get("keys") or []
+        k_rows = keys_raw.get("keys") if isinstance(keys_raw, dict) and "keys" in keys_raw else keys_raw
+        enabled_by_platform: dict[str, tuple[int, int]] = {}
+        for k in (k_rows if isinstance(k_rows, list) else []):
+            if not isinstance(k, dict):
+                continue
+            plat = k.get("platform", "")
+            on, total = enabled_by_platform.get(plat, (0, 0))
+            enabled_by_platform[plat] = (on + (1 if k.get("enabled", 1) else 0), total + 1)
         self._populate_built_ins(
-            [p for p in (platforms or []) if isinstance(p, dict)]
+            [p for p in (platforms or []) if isinstance(p, dict)], enabled_by_platform
         )
 
         keys = data.get("keys") or []
@@ -477,8 +488,9 @@ class KeysPage(BasePage):
             hl.addWidget(delete)
             table.setCellWidget(i, 4, actions)
 
-    def _populate_built_ins(self, platforms: list[dict]) -> None:
-        """Built-in platforms with a Settings button per row."""
+    def _populate_built_ins(self, platforms: list[dict],
+                            enabled_by_platform: dict[str, tuple[int, int]] | None = None) -> None:
+        """Built-in platforms with a master key switch + Settings per row."""
         table = self.built_in_table
         table.setRowCount(0)
         table.setRowCount(len(platforms))
@@ -492,14 +504,64 @@ class KeysPage(BasePage):
                 item = QTableWidgetItem(str(val))
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 table.setItem(i, col, item)
+            # Master switch: enable/disable ALL keys of this platform in one
+            # call (web parity — PATCH /api/keys/platform/:platform). State
+            # comes from the real key rows: all on / partial / all off.
+            on, total = (enabled_by_platform or {}).get(slug, (0, 0))
+            if total and on == total:
+                state_text = "All on"
+            elif on:
+                state_text = f"Partial ({on}/{total})"
+            else:
+                state_text = "All off"
+            master = QPushButton(state_text)
+            master.setToolTip("Enable or disable every key of this platform at once")
+            master.clicked.connect(
+                lambda _=False, _s=slug, _btn=master: self._toggle_platform(_s, _btn)
+            )
             settings_btn = QPushButton("Settings")
             settings_btn.setToolTip("Rate limits and sticky sessions")
             settings_btn.clicked.connect(lambda _=False, _s=slug: self._edit_built_in_settings(_s))
             actions = QWidget()
             hl = QHBoxLayout(actions)
             hl.setContentsMargins(4, 2, 4, 2)
+            hl.addWidget(master)
             hl.addWidget(settings_btn)
             table.setCellWidget(i, 3, actions)
+
+    def _toggle_platform(self, platform: str, button: QPushButton) -> None:
+        """One-click enable/disable of every key on a platform."""
+        turn_on = button.text() == "All off"
+        from PyQt6.QtWidgets import QMessageBox
+        verb = "Enable" if turn_on else "Disable"
+        confirm = QMessageBox.question(
+            self, f"{verb} all keys",
+            f"{verb} every key of '{platform}'?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        def _on_error(e: Exception) -> None:
+            Toaster.show(str(e), "error")
+
+        self.call_in_background(
+            lambda: self.api.patch(f"/api/keys/platform/{platform}", json={"enabled": turn_on}),
+            on_success=lambda r: (
+                Toaster.show(
+                    f"{'Enabled' if turn_on else 'Disabled'} {self._updated_keys(r)} key(s) on {platform}",
+                    "success"),
+                self.refresh(),
+            ),
+            on_error=_on_error,
+        )
+
+    @staticmethod
+    def _updated_keys(result) -> int:
+        if isinstance(result, dict):
+            n = result.get("updatedKeys")
+            if isinstance(n, int):
+                return n
+        return 0
 
     def _add_provider(self):
         dialog = ProviderDialog(parent=self)
@@ -737,6 +799,9 @@ class KeysPage(BasePage):
             # refresh-less change). On PATCH failure the button is reverted
             # so the visual state never lies (audit L98).
             toggle.clicked.connect(lambda checked, _id=kid, _btn=toggle: self._toggle_key(_id, checked, _btn))
+            rename = QPushButton("Rename")
+            rename.setToolTip("Edit this key's label")
+            rename.clicked.connect(lambda _=False, _id=kid, _l=label: self._rename_key(_id, _l))
             check = QPushButton("Check")
             check.setToolTip("Run a health check on this key now")
             check.clicked.connect(lambda _=False, _id=kid: self._check_key(_id))
@@ -748,9 +813,30 @@ class KeysPage(BasePage):
             hl = QHBoxLayout(actions)
             hl.setContentsMargins(4, 2, 4, 2)
             hl.addWidget(toggle)
+            hl.addWidget(rename)
             hl.addWidget(check)
             hl.addWidget(delete)
             self.keys_table.setCellWidget(i, 6, actions)
+
+    def _rename_key(self, key_id, current_label: str):
+        """PATCH /api/keys/:id {label} — inline label rename (web parity)."""
+        if key_id in (None, ""):
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self, "Rename key", "New label:", text="" if current_label == "—" else current_label
+        )
+        if not ok:
+            return
+        new_label = text.strip()
+        if new_label == current_label or (not new_label and current_label == "—"):
+            Toaster.info("Nothing changed")
+            return
+        self.call_in_background(
+            lambda: self.api.patch(f"/api/keys/{key_id}", json={"label": new_label}),
+            on_success=lambda _r: (self.refresh(), Toaster.show("Label updated", "success")),
+            on_error=lambda e: Toaster.show(str(e), "error"),
+        )
 
     # -- actions -----------------------------------------------------------
 

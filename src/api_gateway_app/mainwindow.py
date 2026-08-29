@@ -36,6 +36,7 @@ from .pages.keys import KeysPage
 from .pages.middle import PrivacyPage
 from .pages.playground import PlaygroundPage
 from .pages.settings import SettingsPage
+from .pages.webhooks import WebhooksPage
 
 PAGE_ORDER = [
     ("Dashboard", DashboardPage, "dashboard"),
@@ -46,6 +47,7 @@ PAGE_ORDER = [
     ("Fallback", FallbackPage, "fallback"),
     ("Embeddings", EmbeddingsPage, "embeddings"),
     ("Privacy", PrivacyPage, "privacy"),
+    ("Webhooks", WebhooksPage, "webhooks"),
     ("Settings", SettingsPage, "settings"),
 ]
 

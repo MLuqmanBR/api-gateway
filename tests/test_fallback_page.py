@@ -70,7 +70,7 @@ class FallbackPageTests(unittest.TestCase):
         self.page = FallbackPage(_FakeApi())
 
     def test_apply_populates_and_sets_checkstates(self):
-        self.page._apply((_chain(), {"strategy": "balanced"}, {"limit": 3}))
+        self.page._apply((_chain(), {"strategy": "balanced"}, {"limit": 3}, {}))
         self.assertEqual(self.page.list.count(), 3)
         self.assertEqual(
             self.page.list.item(2).checkState(), Qt.CheckState.Unchecked
@@ -79,7 +79,7 @@ class FallbackPageTests(unittest.TestCase):
         self.assertEqual(self.page.retry_spin.value(), 3)
 
     def test_filter_narrows_list(self):
-        self.page._apply((_chain(), {}, {}))
+        self.page._apply((_chain(), {}, {}, {}))
         self.page.filter_edit.setText("beta")
         hidden = [self.page.list.item(i).isHidden() for i in range(3)]
         self.assertEqual(hidden, [True, False, True])
@@ -88,7 +88,7 @@ class FallbackPageTests(unittest.TestCase):
         self.assertEqual(hidden, [False, False, False])
 
     def test_toggle_then_save_payload_contains_enabled_false(self):
-        self.page._apply((_chain(), {}, {}))
+        self.page._apply((_chain(), {}, {}, {}))
         # Toggle the first row's checkbox off (what a user click does).
         item = self.page.list.item(0)
         item.setCheckState(Qt.CheckState.Unchecked)
@@ -107,7 +107,7 @@ class FallbackPageTests(unittest.TestCase):
         self.assertEqual(payload[1]["enabled"], True)
 
     def test_strategy_change_puts_strategy(self):
-        self.page._apply((_chain(), {"strategy": "priority"}, {}))
+        self.page._apply((_chain(), {"strategy": "priority"}, {}, {}))
         with _inline_bg(self.page)[0]:
             self.page.strategy_box.setCurrentText("balanced")
         api = self.page.api
@@ -116,7 +116,7 @@ class FallbackPageTests(unittest.TestCase):
         self.assertEqual(put_calls[0][2]["json"], {"strategy": "balanced"})
 
     def test_retry_change_puts_limit(self):
-        self.page._apply((_chain(), {}, {"limit": 3}))
+        self.page._apply((_chain(), {}, {"limit": 3}, {}))
         with _inline_bg(self.page)[0]:
             self.page.retry_spin.setValue(7)
         api = self.page.api

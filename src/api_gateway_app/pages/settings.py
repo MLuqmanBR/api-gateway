@@ -250,7 +250,6 @@ class SettingsPage(BasePage):
         self.dark.setChecked(app_settings.theme_dark())
         self.dark.toggled.connect(self._set_theme)
         form.addRow(self.dark)
-
         self.notify = QCheckBox("Notify on errors")
         self.notify.setChecked(app_settings.notify_on_error())
         self.notify.toggled.connect(app_settings.set_notify_on_error)
@@ -282,7 +281,8 @@ class SettingsPage(BasePage):
         return box
 
     def on_show(self):
-        # Sync toggles with the system state every visit.
+        # Sync toggles with the system state every visit + live row counts
+        # for the export sections (web parity — /api/config/inventory).
         self.autostart.blockSignals(True)
         self.autostart.setChecked(app_settings.autostart_enabled())
         self.autostart.blockSignals(False)
@@ -293,6 +293,20 @@ class SettingsPage(BasePage):
         self.dark.setChecked(app_settings.theme_dark())
         self.dark.blockSignals(False)
         self._refresh_boot_label()
+        self.call_in_background(
+            lambda: self.api.get("/api/config/inventory"),
+            on_success=self._apply_inventory,
+            on_error=lambda _e: None,  # counts are optional chrome
+        )
+
+    def _apply_inventory(self, inventory):
+        if not isinstance(inventory, dict):
+            return
+        for slug, cb in self._section_checks.items():
+            count = inventory.get(slug)
+            if isinstance(count, int):
+                label = dict(EXPORT_SECTIONS).get(slug, slug)
+                cb.setText(f"{label} — {count} rows")
 
     def _set_autostart(self, enabled: bool):
         try:

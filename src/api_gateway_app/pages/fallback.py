@@ -20,6 +20,101 @@ from PyQt6.QtWidgets import (
 from ..widgets.toast import Toaster
 from .base import BasePage
 
+def _fmt_tokens(n) -> str:
+    """1250 → '1.3K', 3_500_000 → '3.5M', 1_900_000_000 → '1.9B'."""
+    try:
+        n = float(n or 0)
+    except (TypeError, ValueError):
+        n = 0.0
+    for unit, scale in (("B", 1e9), ("M", 1e6), ("K", 1e3)):
+        if n >= scale:
+            return f"{n / scale:.1f}{unit}".replace(".0", "")
+    return f"{int(n)}"
+
+
+class TokenBudgetBar(QWidget):
+    """Monthly token budget: used chunk + per-model remaining segments.
+
+    Mirrors the web's TokenUsageBar — hidden entirely when no model has a
+    budget (totalBudget <= 0).
+    """
+
+    # Catppuccin-ish accent cycle for per-model segments.
+    COLORS = ["#89b4fa", "#a6e3a1", "#f9e2af", "#cba6f7", "#94e2d5",
+              "#fab387", "#f5c2e7", "#89dceb"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._models: list[dict] = []
+        self._total_budget = 0
+        self._total_used = 0
+        self.setMinimumHeight(86)
+        self.hide()
+
+    def set_data(self, data: dict | None):
+        data = data if isinstance(data, dict) else {}
+        self._total_budget = int(data.get("totalBudget", 0) or 0)
+        self._total_used = int(data.get("totalUsed", 0) or 0)
+        self._models = [m for m in (data.get("models") or []) if isinstance(m, dict)]
+        # Web parity: the bar only appears when a budget exists.
+        self.setVisible(self._total_budget > 0)
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802 - Qt override
+        if self._total_budget <= 0:
+            return
+        from PyQt6.QtGui import QColor, QPainter, QPen
+
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        budget = self._total_budget
+        used = min(self._total_used, budget)
+        remaining = max(0, budget - used)
+
+        # Header: "X remaining · Y% of Z"
+        p.setPen(QPen(QColor("#a6adc8")))
+        p.drawText(4, 16, "Monthly token budget")
+        header = (
+            f"{_fmt_tokens(remaining)} remaining · "
+            f"{round(remaining / budget * 100)}% of {_fmt_tokens(budget)}"
+        )
+        p.drawText(w - 4 - p.fontMetrics().horizontalAdvance(header), 16, header)
+
+        # The bar: per-model remaining segments + used chunk at the end.
+        bar_y, bar_h = 30, 14
+        x = 4.0
+        bar_w = w - 8
+        for i, m in enumerate(self._models):
+            share = (m.get("budget", 0) or 0) / budget
+            seg_w = bar_w * share
+            color = self.COLORS[i % len(self.COLORS)]
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(color))
+            p.drawRect(int(x), bar_y, int(seg_w), bar_h)
+            x += seg_w
+        if used > 0:
+            used_w = bar_w * (used / budget)
+            p.setBrush(QColor("#585b70"))
+            p.drawRect(int(x), bar_y, int(min(used_w, w - 4 - x)), bar_h)
+
+        # Legend: first few models, one per line, colored dot + name.
+        p.setPen(QPen(QColor("#a6adc8")))
+        ly = bar_y + bar_h + 18
+        shown = self._models[:3]
+        more = len(self._models) - len(shown)
+        for i, m in enumerate(shown):
+            color = self.COLORS[i % len(self.COLORS)]
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(color))
+            p.drawEllipse(6, ly - 7 + i * 16, 7, 7)
+            p.setPen(QPen(QColor("#a6adc8")))
+            name = f"{m.get('displayName', '?')} ({m.get('platform', '?')})"
+            line = f"{name} — {_fmt_tokens(m.get('budget', 0))}"
+            if more and i == len(shown) - 1:
+                line += f"  (+{more} more)"
+            p.drawText(20, ly + i * 16, line)
+
+
 STRATEGIES = ["priority", "balanced", "smartest", "fastest", "reliable", "custom"]
 
 
@@ -48,7 +143,8 @@ class FallbackPage(BasePage):
         style_hero_title(title)
         style_page_subtitle(subtitle)
         layout.addLayout(title_block)
-        layout.addWidget(self.error_label)
+        self.budget_bar = TokenBudgetBar()
+        layout.addWidget(self.budget_bar)
 
         # -- Routing controls ------------------------------------------------
         controls = QHBoxLayout()
@@ -117,11 +213,16 @@ class FallbackPage(BasePage):
             retry = self.api.get("/api/fallback/retry-limit") or {}
         except Exception:  # noqa: BLE001
             retry = {}
-        return chain, routing, retry
+        try:
+            token_usage = self.api.get("/api/fallback/token-usage") or {}
+        except Exception:  # noqa: BLE001
+            token_usage = {}
+        return chain, routing, retry, token_usage
 
     def _apply(self, result):
         self.set_loading(False)
-        chain, routing, retry = result
+        chain, routing, retry, token_usage = result
+        self.budget_bar.set_data(token_usage)
         self._block_signals(True)
         strategy = routing.get("strategy") if isinstance(routing, dict) else None
         if strategy in STRATEGIES:

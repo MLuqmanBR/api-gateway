@@ -155,6 +155,19 @@ def _i_settings(p: QPainter, w, h):
         p.drawLine(QPointF(x1 * s, y1 * s), QPointF(x2 * s, y2 * s))
 
 
+def _i_webhooks(p: QPainter, w, h):
+    """A send/arrow shape — events pushed out to a URL."""
+    s = w / 24.0
+    p.setPen(_pen(MAUVE, 2 * s))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    # Envelope-ish body: a rounded rectangle with a chevron fold.
+    p.drawRoundedRect(QRectF(3 * s, 6 * s, 18 * s, 12 * s), 2 * s, 2 * s)
+    p.drawLine(QPointF(4.5 * s, 7.5 * s), QPointF(12 * s, 14 * s))
+    p.drawLine(QPointF(19.5 * s, 7.5 * s), QPointF(12 * s, 14 * s))
+    # Little outbound stub.
+    p.drawLine(QPointF(21 * s, 16 * s), QPointF(21 * s, 19 * s))
+
+
 def _i_check(p: QPainter, w, h):
     s = w / 24.0
     p.setPen(_pen(GREEN, 3 * s))
@@ -205,8 +218,8 @@ _RENDERERS = {
     "budget":     _i_budget,
     "playground": _i_playground,
     "fallback":   _i_fallback,
-    "embeddings": _i_embeddings,
     "privacy":    _i_privacy,
+    "webhooks":   _i_webhooks,
     "settings":   _i_settings,
     "check":      _i_check,
     "error":      _i_error,
