@@ -14,7 +14,7 @@ import { contentToString } from '../lib/content.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 import { geminiThinkingConfig, normalizeThinking } from '../lib/thinking.js';
 import { createAbortRace } from '../lib/abort.js';
-import { assertPublicHttpUrl } from '../lib/url-guard.js';
+import { guardedFetch, type GuardedResponse } from '../lib/url-guard.js';
 // N13: import the runtime crypto API explicitly rather than relying on the
 // globalThis binding — same convention as routes/proxy.ts.
 import { randomUUID } from 'node:crypto';
@@ -208,22 +208,6 @@ function extractImageUrl(block: unknown): string | undefined {
 // not fetch external URLs itself. Fetching a user-supplied URL is a minor SSRF
 // surface, acceptable for a single-user self-hosted proxy; we still restrict to
 // http/https and cap the size. Returns null (part skipped) on any failure.
-/** Small wrapper that aborts a fetch if it hasn't completed within the
- * given timeout (in ms). Falls through to the surrounding catch handler
- * on timeout. */
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit = {},
-  timeoutMs = 30000,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 
 async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; data: string } | null> {
   const dataMatch = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
@@ -241,20 +225,24 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
       // Block internal / private IPs to prevent SSRF probing of local services.
       // Single-user self-hosted proxy — but the unified API key is portable,
       // so internal-network requests a leaked key could make are worth blocking.
-      // Follow redirects manually so assertPublicHttpUrl is re-run on EACH
-      // hop (scheme + literal-IP + DNS-resolved private-range checks — H10):
-      // a public URL 302-redirecting to an internal host (e.g.
-      // http://169.254.169.254/ or a name that re-resolves privately) must
-      // never reach that host.
+      // Follow redirects manually: guardedFetch re-runs the full guard AND
+      // pins the validated DNS answer on EVERY hop (§11.3 — no re-resolution
+      // between validation and connect), so a public URL 302-redirecting to
+      // an internal host (e.g. http://169.254.169.254/ or a name that
+      // re-resolves privately) must never reach that host.
       let currentUrl = url;
-      let res: Response | null = null;
+      let res: GuardedResponse | null = null;
       for (let hop = 0; hop < 3; hop++) {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 30000);
+        let hopRes: GuardedResponse;
         try {
-          await assertPublicHttpUrl(currentUrl);
+          hopRes = await guardedFetch(currentUrl, { signal: controller.signal });
         } catch {
-          return null;
+          clearTimeout(timeout);
+          return null; // guard rejection or transport failure — skip the part
         }
-        const hopRes = await fetchWithTimeout(currentUrl, { redirect: 'manual' });
+        clearTimeout(timeout);
         if (hopRes.status >= 300 && hopRes.status < 400) {
           const location = hopRes.headers.get('location');
           if (!location) return null;

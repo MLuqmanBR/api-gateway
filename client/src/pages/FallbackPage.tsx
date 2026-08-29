@@ -34,6 +34,7 @@ import { ModelsTabs } from '@/components/models-tabs'
 import { Tooltip } from '@/components/tooltip'
 import { ModelSearchBox } from '@/components/model-search-box'
 import { matchesModelQuery } from '@/lib/model-search'
+import { THINKING_LEVELS, THINKING_OFF, toggleThinkingLevel } from '@/lib/thinking-levels'
 
 interface FallbackEntry {
   modelDbId: number
@@ -56,6 +57,7 @@ interface FallbackEntry {
   contextWindow: number | null
   maxOutputTokens: number | null
   supportsVision: boolean
+  thinkingLevels: string[]
   keyCount: number
 }
 
@@ -360,7 +362,7 @@ function EditModelModal({
   const [rpdLimit, setRpdLimit] = useState(model.rpdLimit ?? null)
   const [tpmLimit, setTpmLimit] = useState(model.tpmLimit ?? null)
   const [tpdLimit, setTpdLimit] = useState(model.tpdLimit ?? null)
-
+  const [thinkingLevels, setThinkingLevels] = useState<string[]>(model.thinkingLevels ?? [...THINKING_LEVELS])
   // N55: Escape/backdrop must not silently discard typed edits — any field
   // deviating from the row's current values routes a close through a confirm.
   const hasInput =
@@ -375,7 +377,8 @@ function EditModelModal({
     rpmLimit !== (model.rpmLimit ?? null) ||
     rpdLimit !== (model.rpdLimit ?? null) ||
     tpmLimit !== (model.tpmLimit ?? null) ||
-    tpdLimit !== (model.tpdLimit ?? null)
+    tpdLimit !== (model.tpdLimit ?? null) ||
+    thinkingLevels.join(',') !== (model.thinkingLevels ?? [...THINKING_LEVELS]).join(',')
   const { confirming, setConfirming, requestClose } = useDiscardGuard(hasInput, onClose)
 
   const submit = (e: React.FormEvent) => {
@@ -393,6 +396,7 @@ function EditModelModal({
       rpdLimit,
       tpmLimit,
       tpdLimit,
+      thinkingLevels,
     }
     onQueueEdit(model.modelDbId, body)
     onClose()
@@ -469,6 +473,45 @@ function EditModelModal({
             <div className="space-y-1.5">
               <Label className="text-xs">TPD limit</Label>
               <Input type="number" min={0} value={tpdLimit ?? ''} onChange={e => setTpdLimit(e.target.value ? parseInt(e.target.value, 10) : null)} className="font-mono text-xs" />
+            </div>
+          </div>
+          <div className="pt-1">
+            <Label className="text-xs">Supported thinking levels</Label>
+            <p className="text-[11px] text-muted-foreground mt-0.5 mb-1.5">
+              Requests asking for a deselected level are redirected to the nearest supported one.
+              Selecting <span className="font-mono">off</span> force-disables thinking: the model is
+              advertised without a thinking menu and effort-bearing requests are rejected.
+            </p>
+            <div className="flex flex-wrap gap-1.5">
+              <button
+                type="button"
+                onClick={() => setThinkingLevels(cur => toggleThinkingLevel(cur, THINKING_OFF))}
+                className={`px-2 py-0.5 rounded-full border text-[11px] font-mono transition-colors ${
+                  thinkingLevels.includes(THINKING_OFF)
+                    ? 'bg-red-500/15 border-red-500/50 text-red-600 dark:text-red-400'
+                    : 'bg-transparent border-border text-muted-foreground hover:text-foreground'
+                }`}
+                title="Force-disable thinking for this model"
+              >
+                off
+              </button>
+              {THINKING_LEVELS.map(level => {
+                const on = thinkingLevels.includes(level)
+                return (
+                  <button
+                    key={level}
+                    type="button"
+                    onClick={() => setThinkingLevels(cur => toggleThinkingLevel(cur, level))}
+                    className={`px-2 py-0.5 rounded-full border text-[11px] font-mono transition-colors ${
+                      on
+                        ? 'bg-primary/10 border-primary/40 text-primary'
+                        : 'bg-transparent border-border text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    {level}
+                  </button>
+                )
+              })}
             </div>
           </div>
           <div className="flex justify-end gap-2 pt-1">

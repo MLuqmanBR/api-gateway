@@ -372,7 +372,7 @@ function applyModels(
                   rpm_limit, rpd_limit, tpm_limit, tpd_limit,
                   monthly_token_budget, context_window, enabled,
                   supports_vision, max_output_tokens,
-                  paid_input_per_m, paid_output_per_m
+                  paid_input_per_m, paid_output_per_m, pricing_manual
            FROM models WHERE id = ?`,
         ).get(existing.id) as {
           display_name: string; intelligence_rank: number; speed_rank: number;
@@ -381,7 +381,7 @@ function applyModels(
           monthly_token_budget: string; context_window: number | null;
           enabled: number; supports_vision: number;
           max_output_tokens: number | null; paid_input_per_m: number | null;
-          paid_output_per_m: number | null;
+          paid_output_per_m: number | null; pricing_manual: number;
         };
         const sameAsRow = (a: number | string | null, b: number | string | null): boolean => {
           if (a === b) return true;
@@ -405,7 +405,12 @@ function applyModels(
           current.supports_vision === (m.supportsVision ? 1 : 0) &&
           sameAsRow(current.max_output_tokens, m.maxOutputTokens) &&
           sameAsRow(current.paid_input_per_m, m.paidInputPerM) &&
-          sameAsRow(current.paid_output_per_m, m.paidOutputPerM);
+          sameAsRow(current.paid_output_per_m, m.paidOutputPerM) &&
+          // Marker not yet set → fall through to the UPDATE branch so the
+          // imported prices become operator-owned (pricing_manual = 1);
+          // otherwise a pre-marker import would keep getting refreshed by
+          // release map updates.
+          current.pricing_manual === 1;
         if (identical) {
           okModels.set(key, existing.id);
           ids?.models.push({ platform: m.platform, modelId: m.modelId, id: existing.id });
@@ -418,7 +423,7 @@ function applyModels(
             size_label = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?,
             monthly_token_budget = ?, context_window = ?, enabled = ?,
             supports_vision = ?, max_output_tokens = ?,
-            paid_input_per_m = ?, paid_output_per_m = ?
+            paid_input_per_m = ?, paid_output_per_m = ?, pricing_manual = 1
           WHERE id = ?
         `).run(
           m.displayName, m.intelligenceRank, m.speedRank,
@@ -436,8 +441,8 @@ function applyModels(
           INSERT INTO models (platform, model_id, display_name, intelligence_rank,
             speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit,
             monthly_token_budget, context_window, enabled, supports_vision,
-            max_output_tokens, paid_input_per_m, paid_output_per_m)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_output_tokens, paid_input_per_m, paid_output_per_m, pricing_manual)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         `).run(
           m.platform, m.modelId, m.displayName, m.intelligenceRank,
           m.speedRank, m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,

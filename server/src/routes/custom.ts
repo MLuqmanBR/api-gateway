@@ -7,6 +7,8 @@ import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 import { decrypt } from '../lib/crypto.js';
+import { applyTierRules, applyThinkingLevelRules, applyVisionRules } from '../db/migrations.js';
+import { THINKING_LEVELS, THINKING_OFF } from '../lib/thinking.js';
 
 // L11: strict numeric-id guard for :id path params. parseInt('12abc') === 12
 // silently accepted garbage; this accepts only whole numbers ('' and
@@ -89,11 +91,23 @@ const createModelSchema = z.object({
   tpmLimit: z.number().int().positive().nullable().optional(),
   tpdLimit: z.number().int().positive().nullable().optional(),
   maxOutputTokens: z.number().int().positive().nullable().optional(),
+  // 'off' is an exclusive force-disable switch; mixed input normalizes to
+  // ['off'] via canonicalizeThinkingLevels below.
+  thinkingLevels: z.array(z.enum(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])).min(1).optional(),
 });
 
 const updateModelSchema = createModelSchema.partial().extend({
   enabled: z.boolean().optional(),
 });
+
+/** Normalizes a client-supplied thinking-levels array for storage. 'off' is
+ *  an exclusive capability switch — when present it wins over any levels.
+ *  Levels dedupe into canonical scale order so storage is deterministic
+ *  regardless of client ordering. */
+function canonicalizeThinkingLevels(input: string[]): string[] {
+  if (input.includes(THINKING_OFF)) return [THINKING_OFF];
+  return THINKING_LEVELS.filter(l => input.includes(l));
+}
 // Returns true if the slug belongs to a known provider — either a built-in
 // (registered in providers/index.ts) or a custom provider (present in
 // custom_providers). Models on either kind of platform are user-editable
@@ -226,6 +240,7 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
 
     const db = getDb();
     const added: string[] = [];
+    const addedIds: number[] = [];
     const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
 
     const insertModel = db.prepare(`
@@ -259,11 +274,21 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
           MODEL_DEFAULTS.monthlyTokenBudget, null, // context_window = unknown
           MODEL_DEFAULTS.supportsVision ? 1 : 0,
         );
-        insertFb.run(Number(result.lastInsertRowid), maxPriority + added.length + 1);
+        const newId = Number(result.lastInsertRowid);
+        insertFb.run(newId, maxPriority + added.length + 1);
         added.push(modelId);
+        addedIds.push(newId);
       }
     });
     tx();
+
+    // Flag/tier ONLY the rows this sync inserted — never revisit existing
+    // rows, or operator edits would be clobbered on every sync.
+    if (addedIds.length > 0) {
+      applyVisionRules(db, addedIds);
+      applyTierRules(db, addedIds);
+      applyThinkingLevelRules(db, addedIds);
+    }
 
     console.log(`[Custom] ${slug}: discovered ${added.length} models (${models.length} total, skipped ${models.length - added.length} existing)`);
     return { fetched: added.length, added };
@@ -735,8 +760,9 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, max_output_tokens, key_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL)
+         enabled, supports_vision, max_output_tokens, key_id,
+         thinking_levels, thinking_levels_manual)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, ?, ?)
     `).run(
       slug, modelId, displayName,
       d.intelligenceRank ?? MODEL_DEFAULTS.intelligenceRank,
@@ -749,6 +775,8 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       d.monthlyTokenBudget ?? MODEL_DEFAULTS.monthlyTokenBudget,
       d.contextWindow ?? null,
       d.supportsVision ?? MODEL_DEFAULTS.supportsVision ? 1 : 0,
+      d.thinkingLevels ? JSON.stringify(canonicalizeThinkingLevels(d.thinkingLevels)) : JSON.stringify([...THINKING_LEVELS]),
+      d.thinkingLevels ? 1 : 0,
     );
     const modelDbId = Number(result.lastInsertRowid);
     // Append to the fallback chain if not already present.
@@ -760,6 +788,13 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
     return modelDbId;
   });
   const modelDbId = tx();
+  // Apply catalog rules ONLY for fields the operator left unspecified — an
+  // explicit supportsVision/sizeLabel in the request body wins.
+  if (d.supportsVision === undefined) applyVisionRules(db, [modelDbId]);
+  if (d.sizeLabel === undefined) applyTierRules(db, [modelDbId]);
+  // Levels: only seed when the operator gave none — an explicit choice wins
+  // and the manual flag (set in the INSERT) keeps boot passes off the row.
+  if (d.thinkingLevels === undefined) applyThinkingLevelRules(db, [modelDbId]);
   res.status(201).json({
     success: true,
     id: modelDbId,
@@ -806,6 +841,14 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   if (d.tpmLimit !== undefined) { updates.push('tpm_limit = ?'); values.push(d.tpmLimit); }
   if (d.tpdLimit !== undefined) { updates.push('tpd_limit = ?'); values.push(d.tpdLimit); }
   if (d.maxOutputTokens !== undefined) { updates.push('max_output_tokens = ?'); values.push(d.maxOutputTokens); }
+  if (d.thinkingLevels !== undefined) {
+    // Canonicalize to scale order so storage is deterministic regardless of
+    // client ordering, and set the manual flag — this row is now
+    // operator-owned and no future boot rule pass may touch it.
+    updates.push('thinking_levels = ?');
+    values.push(JSON.stringify(canonicalizeThinkingLevels(d.thinkingLevels!)));
+    updates.push('thinking_levels_manual = 1');
+  }
   if (d.enabled !== undefined) { updates.push('enabled = ?'); values.push(d.enabled ? 1 : 0); }
 
   if (updates.length === 0) {

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, Suspense, lazy } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CircleUserRound, LogOut, Menu, Moon, Sun, Loader2 } from 'lucide-react'
+import { CircleUserRound, Home, LogOut, Menu, Moon, Sun, Loader2 } from 'lucide-react'
 import { Button, buttonVariants } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -27,11 +27,13 @@ const FallbackPage = lazy(() => import('@/pages/FallbackPage'))
 const EmbeddingsPage = lazy(() => import('@/pages/EmbeddingsPage'))
 const AnalyticsPage = lazy(() => import('@/pages/AnalyticsPage'))
 const SettingsPage = lazy(() => import('@/pages/SettingsPage'))
+const WebhooksPage = lazy(() => import('@/pages/WebhooksPage'))
 const queryClient = new QueryClient()
 const navItems = [
   { to: '/models', label: 'Models' },
   { to: '/playground', label: 'Playground' },
   { to: '/keys', label: 'Keys' },
+  { to: '/webhooks', label: 'Webhooks' },
   { to: '/budgets', label: 'Budgets' },
   { to: '/analytics', label: 'Analytics' },
   { to: '/middle', label: 'Middle' },
@@ -112,8 +114,10 @@ function PageLoader() {
   )
 }
 
-// Subset of AuthGate's /api/auth/status payload — only what the menu label needs.
-interface AuthStatus { email: string | null }
+// Subset of AuthGate's /api/auth/status payload — the menu reads hasSession to
+// branch the action between "Log out" (real login) and "Home" (LAN auto-trust
+// on localhost, where there is no session to log out of).
+interface AuthStatus { hasSession: boolean; email: string | null }
 
 // Mirrors the desktop app's logout: best-effort revoke of the session, then
 // drop all cached data and force the AuthGate back to the login form via the
@@ -134,6 +138,7 @@ function useLogout() {
 
 function UserMenu() {
   const logout = useLogout()
+  const navigate = useNavigate()
   // Reads the status AuthGate already fetched (same query key); never refetches.
   const { data: authStatus } = useQuery<AuthStatus>({
     queryKey: ['auth-status'],
@@ -141,6 +146,13 @@ function UserMenu() {
     enabled: false,
     retry: false,
   })
+
+  // LAN auto-trust means "authenticated" without a real session
+  // (server/src/routes/auth.ts:99-105). On a real session, "Log out" makes sense.
+  // On LAN-trusted-only, the user is on localhost and the only useful action is
+  // to jump to the dashboard home — so offer "Home" instead.
+  const isLocalOnly = !authStatus?.hasSession
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
@@ -150,13 +162,21 @@ function UserMenu() {
         <CircleUserRound />
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-52">
-        <DropdownMenuLabel className="font-normal">
-          {authStatus?.email ?? 'Signed in'}
-        </DropdownMenuLabel>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={logout}>
-          <LogOut /> Log out
-        </DropdownMenuItem>
+        <DropdownMenuGroup>
+          <DropdownMenuLabel className="font-normal">
+            {isLocalOnly ? 'Local session' : (authStatus?.email ?? 'Signed in')}
+          </DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          {isLocalOnly ? (
+            <DropdownMenuItem onClick={() => navigate('/models/chat')}>
+              <Home /> Home
+            </DropdownMenuItem>
+          ) : (
+            <DropdownMenuItem onClick={logout}>
+              <LogOut /> Log out
+            </DropdownMenuItem>
+          )}
+        </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -248,30 +268,33 @@ function App() {
     <QueryClientProvider client={queryClient}>
       <BrowserRouter basename={import.meta.env.BASE_URL}>
         <AuthGate>
-          <Toaster />
-          <div className="min-h-screen bg-background">
-            <Navbar />
-            <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
-              <Suspense fallback={<PageLoader />}>
-                <ErrorBoundary>
-                  <Routes>
-                    <Route path="/" element={<Navigate to="/models/chat" replace />} />
-                    <Route path="/models" element={<Navigate to="/models/chat" replace />} />
-                    <Route path="/models/chat" element={<FallbackPage />} />
-                    <Route path="/models/embeddings" element={<EmbeddingsPage />} />
-                    <Route path="/playground" element={<PlaygroundPage />} />
-                    <Route path="/analytics" element={<AnalyticsPage />} />
-                    <Route path="/keys" element={<KeysPage />} />
-                    <Route path="/middle" element={<MiddlePage />} />
-                    <Route path="/budgets" element={<BudgetPage />} />
-                    <Route path="/settings" element={<SettingsPage />} />
-                    <Route path="/test" element={<Navigate to="/playground" replace />} />
-                    <Route path="/health" element={<Navigate to="/keys" replace />} />
-                  </Routes>
-                </ErrorBoundary>
-              </Suspense>
-            </main>
-          </div>
+          <ErrorBoundary>
+            <Toaster />
+            <div className="min-h-screen bg-background">
+              <Navbar />
+              <main className="max-w-6xl mx-auto px-4 sm:px-6 py-8">
+                <Suspense fallback={<PageLoader />}>
+                  <ErrorBoundary>
+                    <Routes>
+                      <Route path="/" element={<Navigate to="/models/chat" replace />} />
+                      <Route path="/models" element={<Navigate to="/models/chat" replace />} />
+                      <Route path="/models/chat" element={<FallbackPage />} />
+                      <Route path="/models/embeddings" element={<EmbeddingsPage />} />
+                      <Route path="/playground" element={<PlaygroundPage />} />
+                      <Route path="/analytics" element={<AnalyticsPage />} />
+                      <Route path="/keys" element={<KeysPage />} />
+                      <Route path="/webhooks" element={<WebhooksPage />} />
+                      <Route path="/middle" element={<MiddlePage />} />
+                      <Route path="/budgets" element={<BudgetPage />} />
+                      <Route path="/settings" element={<SettingsPage />} />
+                      <Route path="/test" element={<Navigate to="/playground" replace />} />
+                      <Route path="/health" element={<Navigate to="/keys" replace />} />
+                    </Routes>
+                  </ErrorBoundary>
+                </Suspense>
+              </main>
+            </div>
+          </ErrorBoundary>
         </AuthGate>
       </BrowserRouter>
     </QueryClientProvider>

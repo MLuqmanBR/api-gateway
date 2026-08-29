@@ -20,6 +20,7 @@ import { contentToString, messageHasImage, normalizeOutboundContent } from '../l
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
+import { applyThinkingPolicy, resolveThinkingPolicy, parseStoredThinkingLevels, THINKING_LEVELS } from '../lib/thinking.js';
 import { ThinkTagStream } from '../lib/think-tags.js';
 import { getContextHandoffMode, recordIncomingMessages, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { pipeline } from '../lib/hook-pipeline.js';
@@ -211,31 +212,56 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
 //                              providers — see `services/responses.ts`).
 //   - `capabilities.streaming` true: every chat model here supports SSE
 //                              through `/v1/chat/completions?stream=true`.
-//   - `capabilities.reasoning` derived from model_id patterns (mirrors the
-//                              rule-based V16 family detector). True
-//                              for chat-tuned CoT families only — we never
-//                              claim reasoning capability on bare base
-//                              models. Heuristic, not a probe.
-function buildModelCapabilities(modelId: string, maxOutputTokens: number | null, supportsVision: boolean) {
-  const reasoningFamily = isReasoningModelId(modelId);
+//   - `capabilities.reasoning` is DATA-DRIVEN from `models.thinking_levels`:
+//                              thinking enabled by default (full six-level
+//                              menu); an operator subset narrows it;
+//                              `["off"]` force-disables (reasoning=false,
+//                              no menu). No id-pattern matching here — the
+//                              dashboard is the single source of truth.
+function buildModelCapabilities(
+  modelId: string,
+  maxOutputTokens: number | null,
+  supportsVision: boolean,
+  thinkingLevelsRaw: string | null,
+) {
+  // Thinking capability is DATA-DRIVEN, never id-pattern-matched: the
+  // dashboard is the single source of truth. Untouched rows (NULL column)
+  // default to thinking ENABLED with the full six-level menu; an explicit
+  // subset narrows it; `["off"]` force-disables (advertised as
+  // non-reasoning, no efforts field).
+  const policy = resolveThinkingPolicy(thinkingLevelsRaw);
 
   const modalities: { input: string[]; output: string[] } = {
     input: supportsVision ? ['text', 'image'] : ['text'],
     output: ['text'],
   };
 
+  const capabilities: {
+    tool_calls: boolean;
+    vision: boolean;
+    json_mode: boolean;
+    streaming: boolean;
+    reasoning: boolean;
+    reasoning_efforts?: string[];
+  } = {
+    tool_calls: true,
+    vision: supportsVision,
+    json_mode: true,
+    streaming: true,
+    reasoning: policy.kind !== 'off',
+  };
+  if (policy.kind === 'levels') {
+    capabilities.reasoning_efforts = [...policy.levels];
+  } else if (policy.kind === 'unrestricted') {
+    capabilities.reasoning_efforts = [...THINKING_LEVELS];
+  }
+
   return {
     // OpenAI-aligned token caps. `max_tokens` is the per-completion output
     // cap a client should send; `context_window` is the input+output cap.
     max_tokens: maxOutputTokens ?? null,
     modalities: modalities,
-    capabilities: {
-      tool_calls: true,
-      vision: supportsVision,
-      json_mode: true,
-      streaming: true,
-      reasoning: reasoningFamily,
-    },
+    capabilities: capabilities,
   };
 }
 
@@ -253,7 +279,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   const models = db.prepare(`
     SELECT
       m.id, m.platform, m.model_id, m.display_name, m.context_window,
-      m.max_output_tokens, m.supports_vision,
+      m.max_output_tokens, m.supports_vision, m.thinking_levels,
       m.intelligence_rank
     FROM models m
     WHERE m.enabled = 1
@@ -280,7 +306,12 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         context_window: null,
       },
       ...models.map(m => {
-        const caps = buildModelCapabilities(m.model_id, m.max_output_tokens, m.supports_vision === 1);
+        const caps = buildModelCapabilities(
+          m.model_id,
+          m.max_output_tokens,
+          m.supports_vision === 1,
+          m.thinking_levels,
+        );
         return {
           id: `${m.platform}/${m.model_id}`,
           object: 'model',
@@ -461,7 +492,10 @@ const chatCompletionSchema = z.object({
   // Thinking controls — either the shorthand `reasoning_effort` or the
   // richer `thinking` object is honored; provider code translates them
   // into the wire shape each upstream accepts. (#290)
-  reasoning_effort: thinkingEffortSchema.nullable().optional(),
+  // The six effort levels, plus the literal 'off' — clients use it to mean
+  // "do not think this turn"; normalized into thinking:{type:'disabled'} at
+  // the destructure site below. (#thinking-off)
+  reasoning_effort: z.union([thinkingEffortSchema, z.literal('off')]).nullable().optional(),
   thinking: thinkingConfigSchema.nullable().optional(),
   // F5: per-request cache control. `cache: {no_cache: true}` bypasses the
   // response cache for this single request (litellm's per-request pattern).
@@ -489,20 +523,20 @@ export function isRetryableError(err: any): boolean {
   }
   // Fallback: message-based heuristics (legacy path, keeps existing behavior).
   const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
+  return /\b429\b/.test(msg) || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
     || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
     || msg.includes('econnrefused') || msg.includes('econnreset')
-    || msg.includes('503') || msg.includes('unavailable')
-    || msg.includes('500') || msg.includes('internal server error')
+    || /\b503\b/.test(msg) || msg.includes('unavailable')
+    || /\b500\b/.test(msg) || msg.includes('internal server error')
     // 413: this model's payload limit is too small for the request, but another
     // provider in the fallback chain may have a larger limit. Same reasoning as 503.
-    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
+    || /\b413\b/.test(msg) || msg.includes('payload too large') || msg.includes('request body too large')
     || msg.includes('request entity too large') || msg.includes('content too large')
     // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
-    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
+    || /\b404\b/.test(msg) || msg.includes('not found') || msg.includes('no endpoints found')
     // 403: the key is valid (passed validateKey, health checker disables
     // truly-forbidden keys) but this specific model is off-limits to the
     // key's tier. The normal retry path exhausts this key after
@@ -510,7 +544,7 @@ export function isRetryableError(err: any): boolean {
     // on the same model; if no siblings survive, the outer loop moves to
     // the next model. Cooldown uses the standard computeRetryCooldownMs
     // — no special day-long bench. See issue #256.
-    || msg.includes('403') || msg.includes('forbidden') || (err?.status === 403)
+    || /\b403\b/.test(msg) || msg.includes('forbidden') || (err?.status === 403)
     // 400: one provider may reject parameters another accepts (e.g. max_tokens
     // limits, unsupported params). The matching pattern is "api error 400"
     // which comes from the OpenAI-compat provider's error formatting, not
@@ -538,9 +572,21 @@ export function isRetryableError(err: any): boolean {
 // model via isRetryableError) and for C1 cooldown-reason recording.
 export function isPaymentRequiredError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('402') || msg.includes('payment required')
+  return /\b402\b/.test(msg) || msg.includes('payment required')
     || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
     || msg.includes('insufficient balance');
+}
+
+// Genuine upstream rate-limit 429 (structured status first, message
+// heuristic fallback). Shared by the proxy's keyRetry backoff and the
+// responses retry loop so both paths classify identically.
+export function isRateLimitError(err: unknown): boolean {
+  const e = err as { status?: unknown; message?: unknown } | null | undefined;
+  const status = typeof e?.status === 'number' ? e.status : undefined;
+  const msg = typeof e?.message === 'string' ? e.message.toLowerCase() : '';
+  return status === 429 || /\b429\b/.test(msg)
+    || msg.includes('rate limit') || msg.includes('too many requests')
+    || msg.includes('resource_exhausted');
 }
 
 /** C1: classify the cooldown reason from the error for debug metadata.
@@ -658,8 +704,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // Build the per-call thinking view once; providers receive it through
   // CompletionOptions. Explicit nulls are normalized to undefined so the
   // provider-side `if (options?.reasoning_effort)` pattern works. (#290)
-  const reasoning_effort = inboundReasoningEffort ?? undefined;
-  const thinking = inboundThinking ?? undefined;
+  // The client shorthand 'off' means "do not think this turn": folded into
+  // the existing explicit-disable representation so policy checks, cache
+  // keys, pass-through spreads, and provider emitters all see one shape.
+  // Top-level 'off' wins over any contradictory thinking-object fields.
+  const reasoning_effort = inboundReasoningEffort === 'off'
+    ? undefined
+    : inboundReasoningEffort ?? undefined;
+  const thinking = inboundReasoningEffort === 'off'
+    ? { ...(inboundThinking ?? {}), type: 'disabled' as const, effort: undefined }
+    : inboundThinking ?? undefined;
   // Pairing state for id-less tool calls (#200): every tool_call id (given or
   // synthesized) queues up here; a tool message without a tool_call_id takes
   // the oldest unanswered one, which matches the single-call-per-turn flow
@@ -883,6 +937,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // retry rather than only once 1-RPM recovery kicks in. `0` = infinite, but
   // the loop is still interruptible by a client disconnect. (#292)
   let upstreamAttempts = 0;
+  // §11.6: set when an upstream attempt failed with a 400-class error. At
+  // chain exhaustion this distinguishes "every route rejected this request"
+  // (likely a client-side malformed request) from a provider outage.
+  let sawUpstream400 = false;
 
   // Client-disconnect detection: if the agent presses Stop or closes the
   // session, abort the whole retry/recovery loop instead of grinding through
@@ -911,7 +969,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (cacheable) {
     cacheKey = computeCacheKey({
       model: requestedModel ?? 'auto', messages, tools, tool_choice,
-      temperature, top_p, max_tokens, reasoning_effort, thinking,
+      temperature, top_p, max_tokens, reasoning_effort, thinking, parallel_tool_calls,
     });
     const cached = getCachedResponse(cacheKey);
     if (cached) {
@@ -1067,6 +1125,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // full speed when no upstream call ever sets lastRequestTime.
         if (firstEntry) {
           lastRequestTime = 0;
+          if (sawUpstream400 && upstreamAttempts > 0) {
+            logger.warn('[Proxy] exhausted all routes with 400-class upstream failures — every model/key rejected this request; likely a client-side malformed request, not a provider outage', { id: requestId, attempts: upstreamAttempts, lastError: lastError ? String(lastError.message ?? '').slice(0, 200) : 'unknown' });
+          }
         } else {
           // Enforce the throttle only when we actually called a provider
           // in the previous cycle — if routeRequest threw without any
@@ -1086,6 +1147,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       skipKeys.clear();
       if (firstEntry) {
         lastRequestTime = 0;
+        if (sawUpstream400 && upstreamAttempts > 0) {
+          logger.warn('[Proxy] exhausted all routes with 400-class upstream failures — every model/key rejected this request; likely a client-side malformed request, not a provider outage', { id: requestId, attempts: upstreamAttempts, lastError: lastError ? String(lastError.message ?? '').slice(0, 200) : 'unknown' });
+        }
       } else {
         if (upstreamAttempts > 0) lastRequestTime = Date.now();
         await abortableSleep(1000, abortSignal);
@@ -1285,6 +1349,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           choices: [{ index: 0, delta, finish_reason: finish }],
         });
         const writeChunk = (c: unknown) => res.write(`data: ${JSON.stringify(c)}\n\n`);
+        // Force-off models reject thinking attempts outright (operator
+        // switch, not a redirect); level subsets rewrite; rest pass. This is
+        // a client-contract rejection — respond 400 immediately instead of
+        // entering the failover loop below.
+        const thinkingDecision = applyThinkingPolicy(route.thinkingPolicy, { reasoning_effort, thinking });
+        if (!thinkingDecision.ok) {
+          const msg = sanitizeProviderErrorMessage(thinkingDecision.error);
+          logger.warn(`[Proxy] Rejected thinking attempt on force-disabled model`, { platform: route.platform, model: route.modelId });
+          res.status(400).json({ error: { message: msg, type: 'invalid_request_error' } });
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, msg, null, pinnedModelId, false);
+          return;
+        }
+        const thinkingRewrite = thinkingDecision.rewrite ?? { reasoning_effort, thinking };
 
         try {
           upstreamAttempts++; // counted toward the global recovery limit. (#292)
@@ -1293,7 +1370,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             route.apiKey, outboundMessages, route.modelId,
             {
               temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
-              reasoning_effort, thinking,
+              ...thinkingRewrite,
               abortSignal,
             },
           );
@@ -1570,12 +1647,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           throw streamErr;
         }
       } else {
+        // Same force-off rejection as the streaming path above.
+        const thinkingDecision = applyThinkingPolicy(route.thinkingPolicy, { reasoning_effort, thinking });
+        if (!thinkingDecision.ok) {
+          const msg = sanitizeProviderErrorMessage(thinkingDecision.error);
+          logger.warn(`[Proxy] Rejected thinking attempt on force-disabled model`, { platform: route.platform, model: route.modelId });
+          res.status(400).json({ error: { message: msg, type: 'invalid_request_error' } });
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, msg, null, pinnedModelId, false);
+          return;
+        }
+        const thinkingRewrite = thinkingDecision.rewrite ?? { reasoning_effort, thinking };
         upstreamAttempts++; // counted toward the global recovery limit. (#292)
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
           {
             temperature, max_tokens: effectiveMaxTokens, top_p, tools, tool_choice, parallel_tool_calls,
-            reasoning_effort, thinking,
+            ...thinkingRewrite,
             abortSignal,
           },
         );
@@ -1811,15 +1898,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           // models under one key (40 RPM). One failing request then self-DoS'd
           // 3 keys × 3 retries = 9 real upstream 429 calls in <1.5s, exhausting
           // the shared bucket for the whole account and every sibling model.
-          // Now: back off before the retry — honor an upstream Retry-After
-          // (capped at one minute) else a short escalating sleep (1s, 2s). The
-          // abortableSleep yields on client disconnect so a dead request stops
-          // consuming budget. Transient transport errors (timeout, econnreset,
-          // 5xx) keep the immediate retry — they don't draw on a shared
-          // per-minute quota, so backoff only helps the genuine 429 path.
-          const is429 = err.status === 429
-            || msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
-            || msg.includes('resource_exhausted');
+          // Now: back off before the retry — a short escalating sleep (1s,
+          // 2s) only; upstream Retry-After headers are deliberately NOT
+          // parsed (F13 stance). The abortableSleep yields on client
+          // disconnect so a dead request stops consuming budget. Transient
+          // transport errors (timeout, econnreset, 5xx) keep the immediate
+          // retry — they don't draw on a shared per-minute quota, so backoff
+          // only helps the genuine 429 path.
+          const is429 = isRateLimitError(err);
           if (is429) {
             const sleepMs = 1000 * (keyAttempt + 1); // 1s then 2s
             logger.info(`[Proxy] rate-limited — backing off ${sleepMs}ms then retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, sleepMs, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
@@ -1828,10 +1914,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
             logger.info(`[Proxy] retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
           }
+          if (err?.status === 400 || (err?.message ?? '').includes('api error 400')) sawUpstream400 = true;
           lastError = err;
           continue keyRetry;
         }
         // Last retry attempt exhausted → fall through to key exhaustion.
+        if (err?.status === 400 || (err?.message ?? '').includes('api error 400')) sawUpstream400 = true;
         lastError = err;
         break keyRetry;
       } else {

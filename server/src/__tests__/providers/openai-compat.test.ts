@@ -172,12 +172,12 @@ describe('OpenAICompatProvider', () => {
       expect(body.reasoning_effort).toBeUndefined();
     });
 
-    it('leaves GLM 5.1 on NVIDIA on the glm_mapped path (no chat_template_kwargs; effort clamped)', async () => {
+    it('leaves GLM 5.1 on NVIDIA on the glm_mapped path (no chat_template_kwargs; effort forwarded verbatim)', async () => {
       let body: any = null;
       vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
       await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.1', { reasoning_effort: 'max' });
       expect(body.chat_template_kwargs).toBeUndefined();
-      expect(body.reasoning_effort).toBe('high'); // max → high under glm_mapped
+      expect(body.reasoning_effort).toBe('max'); // verbatim — per-model redirect happens in the proxy
     });
   });
 

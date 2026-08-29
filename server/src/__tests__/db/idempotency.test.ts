@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { initDb } from '../../db/index.js';
+import { applyTierRules, applyThinkingLevelRules, applyVisionRules, migrateDbSchema } from '../../db/migrations.js';
+import { THINKING_LEVELS } from '../../lib/thinking.js';
+import { MODEL_PRICING } from '../../db/model-pricing.js';
 
 /**
  * All migrations must be idempotent: running initDb twice on the same
@@ -297,5 +300,140 @@ describe('Migration idempotency', () => {
 
     const missing = platforms.filter(p => !hasProvider(p));
     expect(missing).toEqual([]);
+  });
+
+  it('catalog rules seed fresh families but never revisit operator-edited rows', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-rules-${Date.now()}.db`;
+    const db = initDb(tmpPath);
+
+    // Seeded families are flagged/tiered by the one-time rule pass.
+    const gemini = db.prepare(
+      "SELECT id, supports_vision FROM models WHERE platform = 'google' LIMIT 1",
+    ).get() as { id: number; supports_vision: number };
+    expect(gemini.supports_vision).toBe(1);
+
+    // Scoping guard: a scoped helper call touches ONLY the given ids.
+    // The manual row below matches an EARLIER OR branch of its rule chain
+    // than the appended id-IN clause — SQL precedence bugs would clobber it.
+    const glm = db.prepare(
+      "SELECT id FROM models WHERE LOWER(model_id) LIKE '%glm-4.6v%' LIMIT 1",
+    ).get() as { id: number };
+    db.prepare('UPDATE models SET supports_vision = 0 WHERE id IN (?, ?)').run(glm.id, gemini.id);
+    const ins = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('google', 'gemini-9.9-test', 'Gemini 9.9 Test', 10, 10, '', 1)
+    `).run();
+    const newId = Number(ins.lastInsertRowid);
+    applyVisionRules(db, [newId]);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(newId) as { v: number }).v).toBe(1);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(gemini.id) as { v: number }).v).toBe(0);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(glm.id) as { v: number }).v).toBe(0);
+
+    // Restart path: migrateDbSchema re-run (one-time block skipped at
+    // user_version = CURRENT_DATA_VERSION) must not touch operator edits.
+    const tiered = db.prepare(
+      "SELECT id FROM models WHERE LOWER(model_id) LIKE '%llama-3.3-70b%' LIMIT 1",
+    ).get() as { id: number };
+    db.prepare("UPDATE models SET size_label = 'Small' WHERE id = ?").run(tiered.id);
+    migrateDbSchema(db);
+    expect((db.prepare('SELECT supports_vision AS v FROM models WHERE id = ?').get(gemini.id) as { v: number }).v).toBe(0);
+    expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(tiered.id) as { s: string }).s).toBe('Small');
+    // ...while a scoped tier pass still flags brand-new rows.
+    const ins2 = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES ('groq', 'llama-3.3-70b-versatile-new', 'Llama New', 10, 10, '', 1)
+    `).run();
+    const newTierId = Number(ins2.lastInsertRowid);
+    applyTierRules(db, [newTierId]);
+    expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(newTierId) as { s: string }).s).toBe('Medium');
+    // llama-3.3-70b sits in an EARLIER Medium OR branch than the appended
+    // id-IN clause — precedence would revert it to 'Medium' if unscoped.
+    expect((db.prepare('SELECT size_label AS s FROM models WHERE id = ?').get(tiered.id) as { s: string }).s).toBe('Small');
+    db.close();
+  });
+
+  it('thinking levels: boot pass seeds glm_mapped rows and never revisits operator-owned ones', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-thinking-${Date.now()}.db`;
+    const db = initDb(tmpPath);
+    const DEFAULT = JSON.stringify([...THINKING_LEVELS]);
+    const GLM = JSON.stringify(['low', 'medium', 'high']);
+    // Named row shapes (unchecked casts): the SELECT aliases are fixed by the
+    // SQL below, not external input.
+    type LevelRow = { l: string };
+    type FlagRow = { m: number };
+    const levelsOf = (id: number): string => {
+      const row = db.prepare('SELECT thinking_levels AS l FROM models WHERE id = ?').get(id) as LevelRow | undefined;
+      return row?.l ?? '';
+    };
+    const manualFlag = (id: number): number => {
+      const row = db.prepare('SELECT thinking_levels_manual AS m FROM models WHERE id = ?').get(id) as FlagRow | undefined;
+      return row?.m ?? -1;
+    };
+
+    const ins = db.prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
+      VALUES (?, ?, ?, 10, 10, '', 1)
+    `);
+    // Host-based rule match (GLM_HOST_PLATFORMS) and id-based (isGlmModel).
+    const hostRow = Number(ins.run('glmaggregatorb', 'glm-test-host', 'Host Row').lastInsertRowid);
+    const idRow = Number(ins.run('some-platform', 'z-ai/glm-5.1', 'Id Row').lastInsertRowid);
+    const otherRow = Number(ins.run('openrouter', 'deepseek-v4-pro', 'Other').lastInsertRowid);
+
+    // glm-mapped rows get the narrow set, everything else stays at default.
+    applyThinkingLevelRules(db, [hostRow, idRow, otherRow]);
+    expect(levelsOf(hostRow)).toBe(GLM);
+    expect(levelsOf(idRow)).toBe(GLM);
+    expect(levelsOf(otherRow)).toBe(DEFAULT);
+
+    // (a) operator-edited row survives reboots untouched.
+    db.prepare("UPDATE models SET thinking_levels = ?, thinking_levels_manual = 1 WHERE id = ?").run(JSON.stringify(['high']), hostRow);
+    // (b) operator deliberately resetting to all-six keeps it after reboot —
+    // the manual flag, not the value, decides ownership.
+    db.prepare("UPDATE models SET thinking_levels = ?, thinking_levels_manual = 1 WHERE id = ?").run(DEFAULT, idRow);
+    migrateDbSchema(db);
+    expect(levelsOf(hostRow)).toBe(JSON.stringify(['high']));
+    expect(levelsOf(idRow)).toBe(DEFAULT);
+    expect(manualFlag(hostRow)).toBe(1);
+    expect(manualFlag(idRow)).toBe(1);
+
+    // (c) a still-default glm_mapped row IS seeded by the next boot pass,
+    // with the manual flag left at 0 so operators can still claim it later.
+    const freshRow = Number(ins.run('glmaggregatorb', 'glm-fresh-row', 'Fresh').lastInsertRowid);
+    expect(levelsOf(freshRow)).toBe(DEFAULT);
+    migrateDbSchema(db);
+    expect(levelsOf(freshRow)).toBe(GLM);
+    expect(manualFlag(freshRow)).toBe(0);
+
+    // Discovery path: runtime ingest scopes the rule to newly inserted ids
+    // so late-synced models don't wait for a reboot.
+    const lateRow = Number(ins.run('some-platform', 'zai-org/glm_5_2-x', 'Late').lastInsertRowid);
+    applyThinkingLevelRules(db, [lateRow]);
+    expect(levelsOf(lateRow)).toBe(GLM);
+    expect(manualFlag(lateRow)).toBe(0);
+    db.close();
+  });
+
+  it('applyModelPricing refreshes mapped prices but respects pricing_manual', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-pricing-${Date.now()}.db`;
+    const db = initDb(tmpPath);
+
+    const [pPlatform, pModelId, pIn, pOut] = MODEL_PRICING[0];
+    const marked = db.prepare(
+      'SELECT id FROM models WHERE platform = ? AND model_id = ?',
+    ).get(pPlatform, pModelId) as { id: number };
+    db.prepare('UPDATE models SET paid_input_per_m = 9.99, pricing_manual = 1 WHERE id = ?').run(marked.id);
+
+    const other = MODEL_PRICING.find(([pl, mid]) => !(pl === pPlatform && mid === pModelId) && pl === pPlatform)!;
+    const unmarked = db.prepare(
+      'SELECT id, paid_input_per_m FROM models WHERE platform = ? AND model_id = ?',
+    ).get(other[0], other[1]) as { id: number; paid_input_per_m: number | null };
+
+    migrateDbSchema(db);
+    expect((db.prepare('SELECT paid_input_per_m AS p FROM models WHERE id = ?').get(marked.id) as { p: number }).p).toBe(9.99);
+    expect((db.prepare('SELECT paid_input_per_m AS p FROM models WHERE id = ?').get(unmarked.id) as { p: number }).p).toBe(other[2]);
+    db.close();
   });
 });

@@ -50,6 +50,35 @@ describe('Response cache service (F5)', () => {
     expect(k1).not.toBe(k2);
   });
 
+  it('computeCacheKey differs when output-affecting fields differ', () => {
+    // Every field in the signature object must change the key — including
+    // fields the chat schema does not parse yet (stop, response_format,
+    // logit_bias, n): they default to null so a future schema addition
+    // cannot silently collide cached responses (the drift that hit the
+    // penalties before).
+    const base = { model: 'groq/llama', messages: [{ role: 'user', content: 'Hi' }], temperature: 0 };
+    const variants: Record<string, unknown> = {
+      temperature: 1,
+      tools: [{ type: 'function', function: { name: 'f' } }],
+      tool_choice: 'auto',
+      max_tokens: 100,
+      frequency_penalty: 0.5,
+      presence_penalty: 0.5,
+      reasoning_effort: 'low',
+      thinking: { type: 'enabled' },
+      stop: ['END'],
+      response_format: { type: 'json_object' },
+      parallel_tool_calls: false,
+      logit_bias: { '50256': -100 },
+      n: 2,
+    };
+    for (const [field, value] of Object.entries(variants)) {
+      const k1 = computeCacheKey(base);
+      const k2 = computeCacheKey({ ...base, [field]: value });
+      expect(k2, `${field} must change the cache key`).not.toBe(k1);
+    }
+  });
+
   it('isCacheableTemp: only temperature === 0 is cacheable', () => {
     expect(isCacheableTemp(0, undefined)).toBe(true);
     expect(isCacheableTemp(0, 1)).toBe(true);

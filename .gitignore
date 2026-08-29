@@ -34,6 +34,7 @@ PRIVACY-LAYER-FABLE.md
 UPGRADE-PROGRESS.md
 .upgrade-findings/
 FEATURES-FABLE.md
+PROJECT-STATE.md
 temp/
 
 # Python (native desktop app)
@@ -43,3 +44,4 @@ __pycache__/
 *.egg-info/
 build/
 .pytest_cache/
+.claude/

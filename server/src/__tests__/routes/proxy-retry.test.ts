@@ -110,4 +110,26 @@ describe('isRetryableError', () => {
       // block above, where it's classified as retryable. (issue #256)
     });
   });
+
+  describe('numeric substrings need word boundaries', () => {
+    it('does not match numbers that merely contain a status code', () => {
+      expect(isRetryableError(new Error('request 14293 failed against model-4295'))).toBe(false);
+      expect(isRetryableError(new Error('body of 14293 bytes'))).toBe(false);
+      expect(isPaymentRequiredError(new Error('error 14025 out of range'))).toBe(false);
+    });
+
+    it('still matches real status codes with boundaries', () => {
+      expect(isRetryableError(new Error('HTTP 500 returned'))).toBe(true);
+      expect(isRetryableError(new Error('API error 429: slow down'))).toBe(true);
+      expect(isPaymentRequiredError(new Error('API error 402: Payment required'))).toBe(true);
+    });
+
+    it('bare "not found" breadth is a deliberate, test-locked tradeoff', () => {
+      // "required field not found" false-positives into key rotation —
+      // accepted: models-not-found phrasings vary wildly across providers,
+      // rotating is the desired behavior for them, and this breadth is
+      // pinned by the 404 block above.
+      expect(isRetryableError(new Error('required field not found'))).toBe(true);
+    });
+  });
 });
