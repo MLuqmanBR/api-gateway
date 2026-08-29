@@ -937,6 +937,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // retry rather than only once 1-RPM recovery kicks in. `0` = infinite, but
   // the loop is still interruptible by a client disconnect. (#292)
   let upstreamAttempts = 0;
+  // §11.6: set when an upstream attempt failed with a 400-class error. At
+  // chain exhaustion this distinguishes "every route rejected this request"
+  // (likely a client-side malformed request) from a provider outage.
+  let sawUpstream400 = false;
 
   // Client-disconnect detection: if the agent presses Stop or closes the
   // session, abort the whole retry/recovery loop instead of grinding through
@@ -1121,6 +1125,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // full speed when no upstream call ever sets lastRequestTime.
         if (firstEntry) {
           lastRequestTime = 0;
+          if (sawUpstream400 && upstreamAttempts > 0) {
+            logger.warn('[Proxy] exhausted all routes with 400-class upstream failures — every model/key rejected this request; likely a client-side malformed request, not a provider outage', { id: requestId, attempts: upstreamAttempts, lastError: lastError ? String(lastError.message ?? '').slice(0, 200) : 'unknown' });
+          }
         } else {
           // Enforce the throttle only when we actually called a provider
           // in the previous cycle — if routeRequest threw without any
@@ -1140,6 +1147,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       skipKeys.clear();
       if (firstEntry) {
         lastRequestTime = 0;
+        if (sawUpstream400 && upstreamAttempts > 0) {
+          logger.warn('[Proxy] exhausted all routes with 400-class upstream failures — every model/key rejected this request; likely a client-side malformed request, not a provider outage', { id: requestId, attempts: upstreamAttempts, lastError: lastError ? String(lastError.message ?? '').slice(0, 200) : 'unknown' });
+        }
       } else {
         if (upstreamAttempts > 0) lastRequestTime = Date.now();
         await abortableSleep(1000, abortSignal);
@@ -1904,10 +1914,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
             logger.info(`[Proxy] retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
           }
+          if (err?.status === 400 || (err?.message ?? '').includes('api error 400')) sawUpstream400 = true;
           lastError = err;
           continue keyRetry;
         }
         // Last retry attempt exhausted → fall through to key exhaustion.
+        if (err?.status === 400 || (err?.message ?? '').includes('api error 400')) sawUpstream400 = true;
         lastError = err;
         break keyRetry;
       } else {
