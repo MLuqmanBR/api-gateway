@@ -1,20 +1,26 @@
-"""Fallback chain editor: drag-and-drop model routing order."""
+"""Fallback chain editor: drag-order, per-row enable, routing strategy, retry."""
 
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from ..widgets.toast import Toaster
 from .base import BasePage
+
+STRATEGIES = ["priority", "balanced", "smartest", "fastest", "reliable", "custom"]
 
 
 class FallbackPage(BasePage):
@@ -44,6 +50,33 @@ class FallbackPage(BasePage):
         layout.addLayout(title_block)
         layout.addWidget(self.error_label)
 
+        # -- Routing controls ------------------------------------------------
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Strategy:"))
+        self.strategy_box = QComboBox()
+        self.strategy_box.addItems(STRATEGIES)
+        self.strategy_box.setToolTip(
+            "priority = the manual chain order; the others score models "
+            "on reliability / speed / intelligence"
+        )
+        self.strategy_box.currentTextChanged.connect(self._strategy_changed)
+        controls.addWidget(self.strategy_box)
+        controls.addWidget(QLabel("Retry limit:"))
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(0, 20)
+        self.retry_spin.setSpecialValueText("∞")  # 0 = infinite (server allows 0-100)
+        self.retry_spin.setToolTip(
+            "How many models to try before giving up. 0 = unlimited."
+        )
+        self.retry_spin.valueChanged.connect(self._retry_changed)
+        controls.addWidget(self.retry_spin)
+        self.filter_edit = QLineEdit()
+        self.filter_edit.setPlaceholderText("Filter models…")
+        self.filter_edit.setClearButtonEnabled(True)
+        self.filter_edit.textChanged.connect(self._apply_filter)
+        controls.addWidget(self.filter_edit, 1)
+        layout.addLayout(controls)
+
         actions = QHBoxLayout()
         save_btn = QPushButton("Save order")
         save_btn.setObjectName("primary")
@@ -60,21 +93,48 @@ class FallbackPage(BasePage):
         self.list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # Per-row enable/disable: the checkbox edits the entry's `enabled`,
+        # saved through the same PUT /api/fallback payload as the order.
+        self.list.itemChanged.connect(self._row_toggled)
         layout.addWidget(self.list, 1)
+
+    # -- lifecycle ----------------------------------------------------------
 
     def on_show(self):
         self.refresh()
 
     def refresh(self):
         self.set_loading(True)
-        self.call_in_background(
-            lambda: self.api.get("/api/fallback"),
-            on_success=self._apply,
-        )
+        self.call_in_background(self._fetch, on_success=self._apply)
 
-    def _apply(self, data):
+    def _fetch(self):
+        chain = self.api.get("/api/fallback") or []
+        try:
+            routing = self.api.get("/api/fallback/routing") or {}
+        except Exception:  # noqa: BLE001 — chain still renders without routing
+            routing = {}
+        try:
+            retry = self.api.get("/api/fallback/retry-limit") or {}
+        except Exception:  # noqa: BLE001
+            retry = {}
+        return chain, routing, retry
+
+    def _apply(self, result):
         self.set_loading(False)
-        rows = data if isinstance(data, list) else data.get("chain", data.get("models", [])) if isinstance(data, dict) else []
+        chain, routing, retry = result
+        self._block_signals(True)
+        strategy = routing.get("strategy") if isinstance(routing, dict) else None
+        if strategy in STRATEGIES:
+            self.strategy_box.setCurrentText(strategy)
+        limit = retry.get("limit") if isinstance(retry, dict) else None
+        if isinstance(limit, int):
+            self.retry_spin.setValue(limit)
+        self._block_signals(False)
+
+        rows = chain if isinstance(chain, list) else (
+            chain.get("chain", chain.get("models", [])) if isinstance(chain, dict) else []
+        )
+        self._block_signals(True)
         self.list.clear()
         for row in rows or []:
             if not isinstance(row, dict):
@@ -84,11 +144,64 @@ class FallbackPage(BasePage):
             enabled = bool(row.get("enabled", True))
             priority = row.get("priority")
             db_id = row.get("modelDbId", row.get("id"))
-            item = QListWidgetItem(f"{label}  ·  {platform}" + ("" if enabled else "  (disabled)"))
-            item.setData(Qt.ItemDataRole.UserRole, {"id": db_id, "priority": priority, "enabled": enabled})
-            if not enabled:
-                item.setForeground(self.palette().placeholderText())
+            item = QListWidgetItem(f"{label}  ·  {platform}")
+            item.setData(Qt.ItemDataRole.UserRole, {
+                "id": db_id, "priority": priority, "enabled": enabled,
+                "label": label, "platform": platform,
+            })
+            # Checkable = the per-row enable toggle; checked state mirrors
+            # `enabled` so save round-trips it.
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+            )
             self.list.addItem(item)
+        self._block_signals(False)
+        self._apply_filter()
+
+    def _block_signals(self, blocked: bool) -> None:
+        self.strategy_box.blockSignals(blocked)
+        self.retry_spin.blockSignals(blocked)
+        self.list.blockSignals(blocked)
+
+    # -- controls -----------------------------------------------------------
+
+    def _strategy_changed(self, strategy: str):
+        self.call_in_background(
+            lambda: self.api.put("/api/fallback/routing", json={"strategy": strategy}),
+            on_success=lambda _r: Toaster.show(f"Routing strategy: {strategy}", "success"),
+            on_error=lambda e: Toaster.show(str(e), "error"),
+        )
+
+    def _retry_changed(self, limit: int):
+        self.call_in_background(
+            lambda: self.api.put("/api/fallback/retry-limit", json={"limit": limit}),
+            on_success=lambda _r: Toaster.show("Retry limit saved", "success"),
+            on_error=lambda e: Toaster.show(str(e), "error"),
+        )
+
+    # -- chain editing --------------------------------------------------------
+
+    def _row_toggled(self, item: QListWidgetItem):
+        meta = item.data(Qt.ItemDataRole.UserRole) or {}
+        meta["enabled"] = item.checkState() == Qt.CheckState.Checked
+        item.setData(Qt.ItemDataRole.UserRole, meta)
+        if not meta.get("enabled"):
+            item.setForeground(self.palette().placeholderText())
+        else:
+            item.setForeground(self.palette().text())
+        Toaster.info("Enable/disable staged — press Save order to apply")
+
+    def _apply_filter(self, text: str | None = None):
+        """Case-insensitive live filter on label / platform."""
+        needle = (text if text is not None else self.filter_edit.text()).strip().lower()
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            meta = item.data(Qt.ItemDataRole.UserRole) or {}
+            hay = f"{meta.get('label', '')} {meta.get('platform', '')}".lower()
+            item.setHidden(bool(needle) and needle not in hay)
+
+    # -- save -----------------------------------------------------------------
 
     def _save(self):
         payload = []
