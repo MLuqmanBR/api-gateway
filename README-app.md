@@ -2,7 +2,7 @@
 
 A PyQt6/Qt-Widgets client that turns the api-gateway web dashboard into a
 proper Linux desktop application: native window, system tray, autostart,
-logind-managed backend service.
+and a backend that is managed however you run it.
 
 The Node/Express server and the React dashboard stay exactly as they were —
 this is an **additional** front end, not a replacement. Both can drive the
@@ -13,14 +13,18 @@ same local gateway at the same time.
 - **Native Qt Widgets UI** — no browser engine, no Electron. Idle CPU is
   essentially zero; RSS in the tens of MiB, not hundreds.
 - **9 pages:** Dashboard, Analytics, Keys, Budget, Playground, Fallback,
-  Embeddings, Privacy, Settings. Coverage mirrors the web dashboard's core
-  workflows (key management, routing, budgets, privacy); some web-only
-  niceties (e.g. live analytics charts) are simpler here.
+  Embeddings, Privacy, Settings — full management parity with the web
+  dashboard's core workflows: key/provider/platform management, health
+  checks, routing strategy + retry limit, per-model enable with search,
+  budgets (create/reset/delete), embeddings editing, privacy middle-layer,
+  config export/import across all 10 sections.
+- **Backend-aware:** the app detects how your gateway runs — the `api`
+  CLI (start/stop/restart) or the systemd user unit — and controls it
+  accordingly. It never starts a second server when one is already
+  answering; if the unit is deliberately disabled (CLI-managed machines),
+  it stays disabled.
 - **System tray:** closing the window minimizes to the tray; the backend
   keeps serving `/v1` traffic. Right-click the icon for full control.
-- **Autostart:** logind-managed (`systemctl --user enable api-gateway`) so
-  the gateway comes up with your session. The GUI autostart is a separate
-  toggle in Settings.
 - **Live events** via Server-Sent Events, threaded off the GUI.
 - **Catppuccin theming** matching the web dashboard.
 
@@ -43,7 +47,11 @@ That's it. The script:
 3. Installs a `~/.local/share/icons/hicolor/scalable/apps/api-gateway.svg`
    icon and `~/.local/share/applications/api-gateway.desktop` launcher.
 4. Installs `~/.config/systemd/user/api-gateway.service` (with the repo
-   path baked in) and starts it.
+   path baked in) and reloads the systemd daemon — but deliberately does
+   NOT enable/start the unit. Machines that manage the gateway with the
+   `api` CLI keep the unit disabled; if you want systemd to run the
+   backend, enable it yourself with
+   `systemctl --user enable --now api-gateway.service`.
 
 After install, open "API Gateway" from your launcher or run:
 
@@ -80,34 +88,40 @@ native package.
 
 ### Verify
 
-- `systemctl --user status api-gateway` — service should be `active (running)`
 - `curl http://127.0.0.1:3001/api/ping` — should return `{"status":"ok"}`
+  (start the backend with `api start` if it isn't running)
 - `api-gateway` from a terminal — the window should open with the dashboard
+- The titlebar pill shows how the backend is being managed
+  ("api CLI · running" or "Service running")
 
 ## Usage
 
 - **Close the window** — minimizes to the system tray. The backend keeps
   proxying `/v1` requests.
 - **Quit from the tray menu** — actually exits the GUI process. The backend
-  service keeps running.
-- **Settings → Application preferences** — toggle "Start at login" (GUI
-  autostart) and "Start backend at boot" (service autostart) independently.
+  keeps running however it was started.
+- **Dashboard Start/Stop/Restart** — control the backend through whichever
+  manager is active (api CLI or systemd).
+- **Settings → Application preferences** — "Start at login" toggles the GUI
+  autostart. On CLI-managed machines the "Start backend at boot" unit
+  toggle is hidden (the unit stays disabled by choice).
 
 ## Architecture
 
 ```
-+---------------+          HTTP/JSON + SSE           +---------------------+
-| api-gateway   |<---------------------------------->| api-gateway.service |
-| PyQt6 GUI     |    http://127.0.0.1:3001/api/*     | systemctl --user    |
-+---------------+                                    +---------------------+
++---------------+        HTTP/JSON + SSE          +------------------------+
+| api-gateway   |<------------------------------->| api-gateway backend    |
+| PyQt6 GUI     |  http://127.0.0.1:3001/api/*   | (api CLI or systemd)   |
++---------------+                                +------------------------+
         |                                                       |
-        |      the web dashboard is                             |
-+---->  http://localhost:3001  <-----  react client ------------+
+        |      the web dashboard is                              |
++---->  http://localhost:3001  <-----  react client -------------+
 ```
 
-The app *controls* the service; it does not embed it. The Node server is the
-same `server/dist/index.js` you've been running — now just managed by
-systemd.
+The app *controls* the backend via `manager.py` — it detects whether the
+`api` CLI or the systemd user unit is running the server and issues the
+matching start/stop/restart. It never starts a second server when
+`/api/ping` already answers.
 
 ## Files it touches
 

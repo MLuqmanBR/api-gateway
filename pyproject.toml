@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "api-gateway-app"
-version = "0.1.0"
+version = "0.2.0"
 description = "Native Linux desktop client for the api-gateway dashboard"
 readme = "README-app.md"
 requires-python = ">=3.11"
