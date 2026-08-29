@@ -167,7 +167,9 @@ class MainWindow(QMainWindow):
         return bar
 
     def _apply_service_status(self, status) -> None:
-        self._service_ok = bool(status.active)
+        from .manager import BackendMode
+        self._service_ok = bool(status.running)
+        self._service_status_obj = status
         self._render_service_pill()
 
     def _render_service_pill(self) -> None:
@@ -179,7 +181,14 @@ class MainWindow(QMainWindow):
                 f"padding: 6px 12px; border-radius: 14px; color: {p['subtext']}; font-weight: 600;")
             return
         accent = p["green"] if self._service_ok else p["red"]
-        self.service_pill.setText("●  Service running" if self._service_ok else "●  Service stopped")
+        st = getattr(self, "_service_status_obj", None)
+        if st is not None and getattr(st, "mode", None) == BackendMode.CLI:
+            text = "●  api CLI · running"
+        elif self._service_ok:
+            text = "●  Service running"
+        else:
+            text = "●  Service stopped"
+        self.service_pill.setText(text)
         # 0.125 ≈ the old '#a6e3a120' alpha byte (0x20 / 0xff).
         self.service_pill.setStyleSheet(
             "padding: 6px 12px; border-radius: 14px; "
@@ -196,10 +205,8 @@ class MainWindow(QMainWindow):
         Toaster.success(f"{'Dark' if self._theme_dark else 'Light'} theme applied")
 
     def _restart_service_click(self):
-        if "stopped" in self.service_pill.text().lower():
-            action = systemd_gui.start_service
-        else:
-            action = systemd_gui.restart_service
+        from . import systemd_gui as _sui
+        action = _sui.restart_service
         run_in_background(action, on_error=self._service_action_error)
         QTimer.singleShot(1500, service_status_poller().refresh)
 

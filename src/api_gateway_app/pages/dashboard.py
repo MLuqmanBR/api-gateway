@@ -141,7 +141,14 @@ class DashboardPage(BasePage):
         self.call_in_background(self._fetch, on_success=self._apply)
 
     def _on_service_status(self, status) -> None:
-        self._apply_status(status.active, status.pid, status.memory_bytes, status.uptime_s)
+        from ..manager import BackendMode
+        self._apply_status(
+            status.running, status.pid, status.memory_bytes, status.uptime_s
+        )
+        if getattr(status, "mode", None) == BackendMode.CLI:
+            self.service_status.setText(
+                "Backend is running — managed by the api CLI on this machine."
+            )
 
     def _style_pill(self, running: bool):
         from ..theme import hex_to_rgba, palette as _pal
@@ -160,8 +167,13 @@ class DashboardPage(BasePage):
             mem = f"{memory_bytes / (1024 * 1024):.1f} MiB"
         self.card_mem.set_value(mem)
         self.card_up.set_value(_fmt_uptime(uptime_s))
-        pid_text = f"pid {pid}" if pid else "not running"
-        self.service_status.setText(f"api-gateway.service — {pid_text} · {mem} · up {_fmt_uptime(uptime_s)}")
+        if not active:
+            self.service_status.setText("api-gateway.service — not running")
+            return
+        pid_text = f"pid {pid}" if pid else "managed by the api CLI"
+        self.service_status.setText(
+            f"api-gateway.service — {pid_text} · {mem} · up {_fmt_uptime(uptime_s)}"
+        )
 
     def _fetch(self):
         summary = {}

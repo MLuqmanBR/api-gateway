@@ -1,9 +1,9 @@
-"""GUI-side helpers around the systemd user service.
+"""GUI-side helpers around backend lifecycle (systemd unit OR api CLI).
 
-Wraps :mod:`api_gateway_app.systemd` so pages have a small, mockable surface,
+Wraps :mod:`api_gateway_app.manager` so pages have a small, mockable surface,
 and owns the ONE shared service-status poller (titlebar pill + dashboard both
-read its result) plus a ``run_in_background`` helper so systemctl calls never
-block the GUI thread.
+read its result) plus a ``run_in_background`` helper so subprocess/HTTP
+probes never block the GUI thread.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal, pyqtSlot
 
+from . import manager as _mgr
 from . import systemd as _sysd
 
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="api-gw-sysd")
@@ -23,25 +24,21 @@ class SystemdGuiError(RuntimeError):
 
 
 def restart_service() -> None:
-    try:
-        _sysd.restart_service()
-    except _sysd.SystemdError as exc:
-        raise SystemdGuiError(str(exc)) from exc
+    """Restart the backend however it is running (api CLI or the unit)."""
+    _mgr.restart()
 
 
 def stop_service() -> None:
-    try:
-        _sysd.stop_service()
-    except _sysd.SystemdError as exc:
-        raise SystemdGuiError(str(exc)) from exc
+    """Stop the backend however it is running."""
+    _mgr.stop()
 
 
 def start_service() -> None:
-    try:
-        _sysd.ensure_service_installed()
-        _sysd.start_service()
-    except _sysd.SystemdError as exc:
-        raise SystemdGuiError(str(exc)) from exc
+    """Start the backend; a no-op when it already answers /api/ping."""
+    if not _mgr.ensure_running():
+        raise SystemdGuiError(
+            "Could not start the backend — run 'api start' in a terminal."
+        )
 
 
 def enable_service_at_boot(enabled: bool) -> None:
@@ -60,15 +57,15 @@ SystemdError = SystemdGuiError
 
 
 class ServiceStatusPoller(QObject):
-    """Single shared poller for api-gateway.service status.
+    """Single shared poller for the backend (api CLI or systemd unit).
 
-    ``systemctl --user show`` runs on a worker thread (a hung systemctl must
-    never freeze the window); the result is marshalled back to the GUI thread
-    via a queued signal.  Probes never overlap: a tick while one is in flight
-    is skipped.
+    ``manager.status()`` runs on a worker thread (a hung probe must never
+    freeze the window); the result is marshalled back to the GUI thread
+    via a queued signal.  Probes never overlap: a tick while one is in
+    flight is skipped.
     """
 
-    status_ready = pyqtSignal(object)  # systemd.ServiceStatus
+    status_ready = pyqtSignal(object)  # manager.BackendStatus
 
     def __init__(self, interval_ms: int = 5000):
         super().__init__()
@@ -91,14 +88,13 @@ class ServiceStatusPoller(QObject):
 
     def _probe(self) -> None:
         try:
-            status = _sysd.service_status()
-        except _sysd.SystemdError:
-            status = _sysd.ServiceStatus(
-                active=False, pid=None, memory_bytes=None, uptime_s=None
-            )
+            status = _mgr.status()
+        except Exception:  # noqa: BLE001 — treat any probe failure as down
+            status = _mgr.BackendStatus(running=False, mode=_mgr.BackendMode.NONE)
         # Queued connection: subscribers run on the GUI thread.
         self.status_ready.emit(status)
         self._in_flight = False
+
 
 
 _poller: ServiceStatusPoller | None = None

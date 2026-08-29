@@ -21,6 +21,7 @@ MODULES = [
     "api_gateway_app.backend",
     "api_gateway_app.systemd",
     "api_gateway_app.systemd_gui",
+    "api_gateway_app.manager",
     "api_gateway_app.settings",
     "api_gateway_app.theme",
     "api_gateway_app.qt",

@@ -73,14 +73,19 @@ def main(argv: list[str] | None = None) -> int:
 
     theme.apply(app, dark=app_settings.theme_dark())
 
-    # Ensure backend service exists and is running before we look like a "real" app.
+    # Ensure the backend is running — via manager (api CLI or systemd unit),
+    # never blocking the GUI boot: run on a worker thread.  manager's
+    # invariant: if the server already answers /api/ping it starts NOTHING,
+    # so a CLI-managed gateway is never duplicated by the unit.
     try:
         systemd.ensure_service_installed()
     except systemd.SystemdError:
         pass  # status page will surface details; don't hard-fail the GUI
+    from . import manager
+    from .systemd_gui import run_in_background as _rbg
     try:
-        systemd.ensure_service_running()
-    except systemd.SystemdError:
+        _rbg(manager.ensure_running)
+    except Exception:  # noqa: BLE001 — boot must never fail on the backend probe
         pass
 
     api = ApiClient()

@@ -250,6 +250,22 @@ class SettingsPage(BasePage):
         boot.addWidget(self.boot_btn)
         boot.addStretch()
         form.addRow(boot)
+        from .. import manager as _mgr
+        if _mgr.api_cli_path():
+            # The gateway on this machine is managed by the api CLI, not the
+            # systemd unit — enabling the unit at boot would fight the CLI
+            # (two servers, one port).  Show the fact instead of the button.
+            self.boot_btn.hide()
+            self._cli_managed = QLabel(
+                "Backend is managed by the `api` CLI on this machine — start "
+                "and stop it with `api start` / `api stop`."
+            )
+            from ..widgets.styled import style_page_subtitle as _ps4
+            from ..widgets.styled import watch_style as _ws4
+            _ws4(lambda: _ps4(self._cli_managed))
+            _ps4(self._cli_managed)
+            self._cli_managed.setWordWrap(True)
+            form.addRow(self._cli_managed)
         self._refresh_boot_label()
         return box
 

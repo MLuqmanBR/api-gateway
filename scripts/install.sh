@@ -178,7 +178,10 @@ HAVE_SYSTEMD=0
 if command -v systemctl >/dev/null 2>&1; then
   HAVE_SYSTEMD=1
   systemctl --user daemon-reload
-  systemctl --user enable --now api-gateway.service
+  # Deliberately NOT enabling/starting the unit here: machines that manage
+  # the gateway with the `api` CLI keep the unit disabled (starting it would
+  # spawn a duplicate server on the same port).  Operators who want systemd
+  # management can run:  systemctl --user enable --now api-gateway.service
 else
   say 'systemd not found — start the server manually with: api start'
 fi
