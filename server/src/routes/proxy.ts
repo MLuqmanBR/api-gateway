@@ -577,6 +577,18 @@ export function isPaymentRequiredError(err: any): boolean {
     || msg.includes('insufficient balance');
 }
 
+// Genuine upstream rate-limit 429 (structured status first, message
+// heuristic fallback). Shared by the proxy's keyRetry backoff and the
+// responses retry loop so both paths classify identically.
+export function isRateLimitError(err: unknown): boolean {
+  const e = err as { status?: unknown; message?: unknown } | null | undefined;
+  const status = typeof e?.status === 'number' ? e.status : undefined;
+  const msg = typeof e?.message === 'string' ? e.message.toLowerCase() : '';
+  return status === 429 || /\b429\b/.test(msg)
+    || msg.includes('rate limit') || msg.includes('too many requests')
+    || msg.includes('resource_exhausted');
+}
+
 /** C1: classify the cooldown reason from the error for debug metadata.
  *  Does NOT affect cooldown duration (flat 90s via X1). */
 export function classifyCooldownReason(err: any): { reason: string; statusCode?: number } {
@@ -1876,15 +1888,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           // models under one key (40 RPM). One failing request then self-DoS'd
           // 3 keys × 3 retries = 9 real upstream 429 calls in <1.5s, exhausting
           // the shared bucket for the whole account and every sibling model.
-          // Now: back off before the retry — honor an upstream Retry-After
-          // (capped at one minute) else a short escalating sleep (1s, 2s). The
-          // abortableSleep yields on client disconnect so a dead request stops
-          // consuming budget. Transient transport errors (timeout, econnreset,
-          // 5xx) keep the immediate retry — they don't draw on a shared
-          // per-minute quota, so backoff only helps the genuine 429 path.
-          const is429 = err.status === 429
-            || msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
-            || msg.includes('resource_exhausted');
+          // Now: back off before the retry — a short escalating sleep (1s,
+          // 2s) only; upstream Retry-After headers are deliberately NOT
+          // parsed (F13 stance). The abortableSleep yields on client
+          // disconnect so a dead request stops consuming budget. Transient
+          // transport errors (timeout, econnreset, 5xx) keep the immediate
+          // retry — they don't draw on a shared per-minute quota, so backoff
+          // only helps the genuine 429 path.
+          const is429 = isRateLimitError(err);
           if (is429) {
             const sleepMs = 1000 * (keyAttempt + 1); // 1s then 2s
             logger.info(`[Proxy] rate-limited — backing off ${sleepMs}ms then retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, sleepMs, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
