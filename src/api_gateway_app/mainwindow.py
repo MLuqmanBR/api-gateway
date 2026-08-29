@@ -20,11 +20,11 @@ from PyQt6.QtWidgets import (
 )
 
 from . import settings as app_settings
-from . import systemd_gui
+from .systemd_gui import run_in_background, service_status_poller
 from . import theme
 from .backend import ApiClient, EventStream
 from .icons import icon
-from .systemd_gui import run_in_background, service_status_poller
+from .manager import BackendMode
 from .widgets.nav import Sidebar
 from .pages.analytics import AnalyticsPage
 from .pages.base import BasePage
@@ -167,7 +167,6 @@ class MainWindow(QMainWindow):
         return bar
 
     def _apply_service_status(self, status) -> None:
-        from .manager import BackendMode
         self._service_ok = bool(status.running)
         self._service_status_obj = status
         self._render_service_pill()
