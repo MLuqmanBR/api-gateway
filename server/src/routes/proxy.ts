@@ -523,20 +523,20 @@ export function isRetryableError(err: any): boolean {
   }
   // Fallback: message-based heuristics (legacy path, keeps existing behavior).
   const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
+  return /\b429\b/.test(msg) || msg.includes('rate limit') || msg.includes('too many requests')
     || msg.includes('quota') || msg.includes('resource_exhausted')
     || msg.includes('aborted') || msg.includes('timeout') || msg.includes('etimedout')
     || msg.includes('econnrefused') || msg.includes('econnreset')
-    || msg.includes('503') || msg.includes('unavailable')
-    || msg.includes('500') || msg.includes('internal server error')
+    || /\b503\b/.test(msg) || msg.includes('unavailable')
+    || /\b500\b/.test(msg) || msg.includes('internal server error')
     // 413: this model's payload limit is too small for the request, but another
     // provider in the fallback chain may have a larger limit. Same reasoning as 503.
-    || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
+    || /\b413\b/.test(msg) || msg.includes('payload too large') || msg.includes('request body too large')
     || msg.includes('request entity too large') || msg.includes('content too large')
     // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
-    || msg.includes('404') || msg.includes('not found') || msg.includes('no endpoints found')
+    || /\b404\b/.test(msg) || msg.includes('not found') || msg.includes('no endpoints found')
     // 403: the key is valid (passed validateKey, health checker disables
     // truly-forbidden keys) but this specific model is off-limits to the
     // key's tier. The normal retry path exhausts this key after
@@ -544,7 +544,7 @@ export function isRetryableError(err: any): boolean {
     // on the same model; if no siblings survive, the outer loop moves to
     // the next model. Cooldown uses the standard computeRetryCooldownMs
     // — no special day-long bench. See issue #256.
-    || msg.includes('403') || msg.includes('forbidden') || (err?.status === 403)
+    || /\b403\b/.test(msg) || msg.includes('forbidden') || (err?.status === 403)
     // 400: one provider may reject parameters another accepts (e.g. max_tokens
     // limits, unsupported params). The matching pattern is "api error 400"
     // which comes from the OpenAI-compat provider's error formatting, not
@@ -572,9 +572,21 @@ export function isRetryableError(err: any): boolean {
 // model via isRetryableError) and for C1 cooldown-reason recording.
 export function isPaymentRequiredError(err: any): boolean {
   const msg = (err.message ?? '').toLowerCase();
-  return msg.includes('402') || msg.includes('payment required')
+  return /\b402\b/.test(msg) || msg.includes('payment required')
     || msg.includes('insufficient_quota') || msg.includes('insufficient credit')
     || msg.includes('insufficient balance');
+}
+
+// Genuine upstream rate-limit 429 (structured status first, message
+// heuristic fallback). Shared by the proxy's keyRetry backoff and the
+// responses retry loop so both paths classify identically.
+export function isRateLimitError(err: unknown): boolean {
+  const e = err as { status?: unknown; message?: unknown } | null | undefined;
+  const status = typeof e?.status === 'number' ? e.status : undefined;
+  const msg = typeof e?.message === 'string' ? e.message.toLowerCase() : '';
+  return status === 429 || /\b429\b/.test(msg)
+    || msg.includes('rate limit') || msg.includes('too many requests')
+    || msg.includes('resource_exhausted');
 }
 
 /** C1: classify the cooldown reason from the error for debug metadata.
@@ -925,6 +937,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // retry rather than only once 1-RPM recovery kicks in. `0` = infinite, but
   // the loop is still interruptible by a client disconnect. (#292)
   let upstreamAttempts = 0;
+  // §11.6: set when an upstream attempt failed with a 400-class error. At
+  // chain exhaustion this distinguishes "every route rejected this request"
+  // (likely a client-side malformed request) from a provider outage.
+  let sawUpstream400 = false;
 
   // Client-disconnect detection: if the agent presses Stop or closes the
   // session, abort the whole retry/recovery loop instead of grinding through
@@ -953,7 +969,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (cacheable) {
     cacheKey = computeCacheKey({
       model: requestedModel ?? 'auto', messages, tools, tool_choice,
-      temperature, top_p, max_tokens, reasoning_effort, thinking,
+      temperature, top_p, max_tokens, reasoning_effort, thinking, parallel_tool_calls,
     });
     const cached = getCachedResponse(cacheKey);
     if (cached) {
@@ -1109,6 +1125,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // full speed when no upstream call ever sets lastRequestTime.
         if (firstEntry) {
           lastRequestTime = 0;
+          if (sawUpstream400 && upstreamAttempts > 0) {
+            logger.warn('[Proxy] exhausted all routes with 400-class upstream failures — every model/key rejected this request; likely a client-side malformed request, not a provider outage', { id: requestId, attempts: upstreamAttempts, lastError: lastError ? String(lastError.message ?? '').slice(0, 200) : 'unknown' });
+          }
         } else {
           // Enforce the throttle only when we actually called a provider
           // in the previous cycle — if routeRequest threw without any
@@ -1128,6 +1147,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       skipKeys.clear();
       if (firstEntry) {
         lastRequestTime = 0;
+        if (sawUpstream400 && upstreamAttempts > 0) {
+          logger.warn('[Proxy] exhausted all routes with 400-class upstream failures — every model/key rejected this request; likely a client-side malformed request, not a provider outage', { id: requestId, attempts: upstreamAttempts, lastError: lastError ? String(lastError.message ?? '').slice(0, 200) : 'unknown' });
+        }
       } else {
         if (upstreamAttempts > 0) lastRequestTime = Date.now();
         await abortableSleep(1000, abortSignal);
@@ -1876,15 +1898,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           // models under one key (40 RPM). One failing request then self-DoS'd
           // 3 keys × 3 retries = 9 real upstream 429 calls in <1.5s, exhausting
           // the shared bucket for the whole account and every sibling model.
-          // Now: back off before the retry — honor an upstream Retry-After
-          // (capped at one minute) else a short escalating sleep (1s, 2s). The
-          // abortableSleep yields on client disconnect so a dead request stops
-          // consuming budget. Transient transport errors (timeout, econnreset,
-          // 5xx) keep the immediate retry — they don't draw on a shared
-          // per-minute quota, so backoff only helps the genuine 429 path.
-          const is429 = err.status === 429
-            || msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
-            || msg.includes('resource_exhausted');
+          // Now: back off before the retry — a short escalating sleep (1s,
+          // 2s) only; upstream Retry-After headers are deliberately NOT
+          // parsed (F13 stance). The abortableSleep yields on client
+          // disconnect so a dead request stops consuming budget. Transient
+          // transport errors (timeout, econnreset, 5xx) keep the immediate
+          // retry — they don't draw on a shared per-minute quota, so backoff
+          // only helps the genuine 429 path.
+          const is429 = isRateLimitError(err);
           if (is429) {
             const sleepMs = 1000 * (keyAttempt + 1); // 1s then 2s
             logger.info(`[Proxy] rate-limited — backing off ${sleepMs}ms then retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, sleepMs, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
@@ -1893,10 +1914,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             publish({ type: 'routing.key_retry', id: requestId, provider: route.platform, keyId: route.keyId, model: route.modelId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, at: Date.now() });
             logger.info(`[Proxy] retry ${keyAttempt + 1}/${PER_KEY_RETRIES} (same key)`, { provider: route.platform, model: route.modelId, keyId: route.keyId, attempt: keyAttempt + 1, max: PER_KEY_RETRIES, message: safeError.slice(0, 300) });
           }
+          if (err?.status === 400 || (err?.message ?? '').includes('api error 400')) sawUpstream400 = true;
           lastError = err;
           continue keyRetry;
         }
         // Last retry attempt exhausted → fall through to key exhaustion.
+        if (err?.status === 400 || (err?.message ?? '').includes('api error 400')) sawUpstream400 = true;
         lastError = err;
         break keyRetry;
       } else {

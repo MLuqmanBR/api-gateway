@@ -1,4 +1,6 @@
 import { lookup } from 'node:dns/promises';
+import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 
 /**
@@ -71,10 +73,11 @@ export function isPrivateV6(ip: string): boolean {
   return false;
 }
 
-/** Validate an outbound http(s) URL: scheme check + local-name check + DNS
- *  resolution with every address checked against private ranges. Throws
- *  UrlGuardError on any violation. Returns the parsed URL for convenience. */
-export async function assertPublicHttpUrl(raw: string): Promise<URL> {
+/** Full URL guard minus the URL return: parse, scheme, local-name, literal-IP
+ *  and resolving checks. Returns every validated address so callers can pin
+ *  the DNS answer into the socket layer (safeFetchDispatcher) and close the
+ *  rebinding window between validation and connect. */
+export async function resolvePublicAddresses(raw: string): Promise<Array<{ address: string; family: number }>> {
   let url: URL;
   try {
     url = new URL(raw);
@@ -89,11 +92,11 @@ export async function assertPublicHttpUrl(raw: string): Promise<URL> {
 
   if (net.isIPv4(host)) {
     if (isPrivateV4(host)) throw new UrlGuardError(raw, `private IPv4 ${host}`);
-    return url;
+    return [{ address: host, family: 4 }];
   }
   if (net.isIPv6(host)) {
     if (isPrivateV6(host)) throw new UrlGuardError(raw, `private IPv6 ${host}`);
-    return url;
+    return [{ address: host, family: 6 }];
   }
   // Hostname form — local names never leave the machine.
   const h = host.toLowerCase();
@@ -114,5 +117,86 @@ export async function assertPublicHttpUrl(raw: string): Promise<URL> {
     const bad = family === 4 ? isPrivateV4(address) : isPrivateV6(address);
     if (bad) throw new UrlGuardError(raw, `resolves to private address ${address}`);
   }
-  return url;
+  return addrs;
+}
+
+/** Validate an outbound http(s) URL: scheme check + local-name check + DNS
+ *  resolution with every address checked against private ranges. Throws
+ *  UrlGuardError on any violation. Returns the parsed URL for convenience. */
+export async function assertPublicHttpUrl(raw: string): Promise<URL> {
+  await resolvePublicAddresses(raw);
+  return new URL(raw);
+}
+
+/** Response-shaped view over a guarded node:http response. `headers.get`
+ *  collapses array-valued headers to their first value; the body is read
+ *  lazily via arrayBuffer() — consumers that never read it (webhook
+ *  delivery status checks) simply leave the socket to their abort signal. */
+export interface GuardedResponse {
+  status: number;
+  ok: boolean;
+  headers: { get(name: string): string | null };
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export interface GuardedFetchInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  signal?: AbortSignal;
+}
+
+/** §11.3: assertPublicHttpUrl validates the DNS answer at call time, but the
+ *  fetch that follows re-resolves the hostname inside the socket layer — a
+ *  hostile DNS server can hand back a different (private) address for that
+ *  second lookup (DNS rebinding). guardedFetch closes that window by
+ *  validating AND connecting in one step: it runs the full URL guard, then
+ *  issues a single http/https request whose `lookup` is pinned to exactly
+ *  the addresses that were just validated — the socket layer never
+ *  re-resolves. Throws UrlGuardError on any guard violation (including
+ *  literal private IPs — the guard covers them like any other URL).
+ *  Redirect handling stays with the caller: re-invoke guardedFetch on every
+ *  hop of a manual redirect loop. */
+export async function guardedFetch(raw: string, init: GuardedFetchInit = {}): Promise<GuardedResponse> {
+  const pinned = await resolvePublicAddresses(raw);
+  const url = new URL(raw);
+  const transport = url.protocol === 'https:' ? https : http;
+  return await new Promise<GuardedResponse>((resolve, reject) => {
+    const req = transport.request(url, {
+      method: init.method ?? 'GET',
+      headers: init.headers,
+      lookup: (_host, _opts, cb: (err: NodeJS.ErrnoException | null, addresses: Array<{ address: string; family: number }>) => void) => cb(null, pinned),
+    }, (res) => {
+      const headers = {
+        get: (name: string) => {
+          const v = res.headers[name.toLowerCase()];
+          return Array.isArray(v) ? (v[0] ?? null) : (v ?? null);
+        },
+      };
+      const status = res.statusCode ?? 0;
+      resolve({
+        status,
+        ok: status >= 200 && status < 300,
+        headers,
+        arrayBuffer: async () => {
+          const chunks: Buffer[] = [];
+          for await (const chunk of res) chunks.push(chunk as Buffer);
+          const buf = Buffer.concat(chunks);
+          const out = new ArrayBuffer(buf.byteLength);
+          new Uint8Array(out).set(buf);
+          return out;
+        },
+      });
+    });
+    req.on('error', reject);
+    if (init.signal) {
+      if (init.signal.aborted) {
+        req.destroy(new Error('aborted'));
+      } else {
+        init.signal.addEventListener('abort', () => req.destroy(new Error('aborted')), { once: true });
+      }
+    }
+    if (init.body !== undefined) req.write(init.body);
+    req.end();
+  });
 }

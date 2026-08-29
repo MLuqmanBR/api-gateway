@@ -16,7 +16,7 @@
 
 import crypto from 'crypto';
 import { getDb, getSetting } from '../db/index.js';
-import { assertPublicHttpUrl } from '../lib/url-guard.js';
+import { guardedFetch } from '../lib/url-guard.js';
 import { subscribe } from './events.js';
 
 const CHANNEL_SIZE = 1024;
@@ -191,17 +191,13 @@ async function deliverWebhook(webhook: Webhook, event: string, payload: unknown,
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // H10: redirects are followed MANUALLY so every hop re-runs the
-      // resolving SSRF guard — the default fetch would silently follow a
-      // 3xx to an internal host.
       let currentUrl = webhook.url;
-      let res: Response | null = null;
+      let res: { status: number; ok: boolean; headers: { get(name: string): string | null } } | null = null;
       for (let hop = 0; hop < 3; hop++) {
-        if (!internalAllowed) await assertPublicHttpUrl(currentUrl);
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), DELIVERY_TIMEOUT_MS);
         try {
-          const hopRes = await fetch(currentUrl, {
+          const init = {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
@@ -209,8 +205,15 @@ async function deliverWebhook(webhook: Webhook, event: string, payload: unknown,
             },
             body,
             signal: controller.signal,
-            redirect: 'manual',
-          });
+          };
+          // H10: redirects are followed MANUALLY so every hop re-runs the
+          // guard. §11.3: guarded hops validate AND pin the DNS answer in
+          // one step (no re-resolution between validation and connect);
+          // internal-allowed deliveries keep the plain global fetch — LAN
+          // receivers are a supported configuration.
+          const hopRes = internalAllowed
+            ? await fetch(currentUrl, { ...init, redirect: 'manual' })
+            : await guardedFetch(currentUrl, init);
           clearTimeout(timer);
           if (hopRes.status >= 300 && hopRes.status < 400) {
             const location = hopRes.headers.get('location');

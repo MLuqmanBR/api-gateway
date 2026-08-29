@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { createReadStream, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync, realpathSync, writeSync, readSync, closeSync } from 'node:fs';
+import { createReadStream, readFileSync, writeFileSync, existsSync, unlinkSync, openSync, statSync, renameSync, readlinkSync, realpathSync, writeSync, readSync, closeSync, mkdirSync, rmdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import http from 'node:http';
@@ -71,8 +71,52 @@ function readInstances(): Record<string, number> {
   try { return JSON.parse(readFileSync(INSTANCES_FILE, 'utf8')); } catch { return {}; }
 }
 
-function writeInstances(inst) {
-  writeFileSync(INSTANCES_FILE, JSON.stringify(inst, null, 2));
+// Registry writes are atomic (tmp file + rename — a concurrent `api status`
+// never sees a torn read) and serialized through a mkdir lock so two CLI
+// processes can't clobber each other's entries (lost update). A lock older
+// than REGISTRY_STALE_MS is assumed abandoned (crashed CLI) and taken over.
+const REGISTRY_LOCK = INSTANCES_FILE + '.lock';
+const REGISTRY_TMP = INSTANCES_FILE + '.tmp';
+const REGISTRY_STALE_MS = 5000;
+
+function writeInstancesAtomic(inst: Record<string, number>) {
+  writeFileSync(REGISTRY_TMP, JSON.stringify(inst, null, 2));
+  renameSync(REGISTRY_TMP, INSTANCES_FILE);
+}
+
+function withRegistryLock<T>(fn: () => T): T {
+  const deadline = Date.now() + REGISTRY_STALE_MS + 1000;
+  for (;;) {
+    try { mkdirSync(REGISTRY_LOCK); break; }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      let stale = false;
+      try { stale = Date.now() - statSync(REGISTRY_LOCK).mtimeMs > REGISTRY_STALE_MS; }
+      catch { continue; } // lock vanished between mkdir and stat — retry
+      if (stale || Date.now() > deadline) {
+        try { rmdirSync(REGISTRY_LOCK); } catch {}
+        continue;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); // sync sleep
+    }
+  }
+  try { return fn(); } finally { try { rmdirSync(REGISTRY_LOCK); } catch {} }
+}
+
+// Read-modify-write under the registry lock. The mutator sees a FRESH read
+// (not a stale snapshot taken before a wait), the write is skipped when
+// nothing changed, and an empty registry removes the file entirely.
+function updateInstances(mutate: (inst: Record<string, number>) => void): Record<string, number> {
+  return withRegistryLock(() => {
+    const inst = readInstances();
+    const before = JSON.stringify(inst);
+    mutate(inst);
+    if (JSON.stringify(inst) !== before) {
+      if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
+      else writeInstancesAtomic(inst);
+    }
+    return inst;
+  });
 }
 
 function readPort(dir = ROOT) {
@@ -134,16 +178,11 @@ function isOurServerProcess(pid) {
 }
 
 function cleanInstances() {
-  const inst = readInstances();
-  let changed = false;
-  for (const [port, pid] of Object.entries(inst)) {
-    if (!isRunning(pid)) { delete inst[port]; changed = true; }
-  }
-  if (changed) {
-    if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-    else { writeInstances(inst); }
-  }
-  return inst;
+  return updateInstances((inst) => {
+    for (const [port, pid] of Object.entries(inst)) {
+      if (!isRunning(pid)) delete inst[port];
+    }
+  });
 }
 
 function build() {
@@ -287,8 +326,7 @@ async function startServer(port) {
 
   child.unref();
 
-  inst[String(port)] = child.pid!; // set synchronously on successful spawn; failures surface via the 'error' handler above
-  writeInstances(inst);
+  updateInstances((cur) => { cur[String(port)] = child.pid!; }); // fresh read under the lock — concurrent starts can't clobber each other
 
   console.log(`Starting server on port ${port} (PID ${child.pid})…`);
   return waitForReady(port, child, out).then(() => {
@@ -395,16 +433,12 @@ function stopOne(port) {
   }
   if (!isRunning(pid)) {
     console.log(`PID ${pid} on port ${port} is not running. Cleaning up.`);
-    delete inst[key];
-    if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-    else { writeInstances(inst); }
+    updateInstances((cur) => { delete cur[key]; });
     return Promise.resolve();
   }
   if (!isOurServerProcess(pid)) {
     console.warn(`PID ${pid} recorded for port ${port} no longer looks like our server (identity check failed — likely PID reuse). Not sending a signal; cleaning up the stale entry instead.`);
-    delete inst[key];
-    if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-    else { writeInstances(inst); }
+    updateInstances((cur) => { delete cur[key]; });
     return Promise.resolve();
   }
   console.log(`Stopping server on port ${port} (PID ${pid})…`);
@@ -414,9 +448,7 @@ function stopOne(port) {
     const check = setInterval(() => {
       if (!isRunning(pid)) {
         clearInterval(check);
-        delete inst[key];
-        if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-        else { writeInstances(inst); }
+        updateInstances((cur) => { delete cur[key]; });
         console.log('Server stopped.');
         resolve();
         return;
@@ -424,9 +456,7 @@ function stopOne(port) {
       if (++attempts > 10) {
         try { process.kill(pid, 'SIGKILL'); } catch {}
         clearInterval(check);
-        delete inst[key];
-        if (Object.keys(inst).length === 0) { try { unlinkSync(INSTANCES_FILE); } catch {} }
-        else { writeInstances(inst); }
+        updateInstances((cur) => { delete cur[key]; });
         console.log('Server force-stopped.');
         resolve();
       }

@@ -1,7 +1,24 @@
 // H09/H10 regressions: X-Forwarded-For trust requires a trusted proxy peer,
 // and the outbound URL guard resolves hosts and rejects every private form.
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import http from 'node:http';
+import type { LookupAddress } from 'node:dns';
+import net from 'node:net';
 import { getClientIp, isTrustedRequest } from '../../lib/ip-trust.js';
-import { assertPublicHttpUrl, UrlGuardError, isPrivateV4, isPrivateV6 } from '../../lib/url-guard.js';
+import { assertPublicHttpUrl, UrlGuardError, isPrivateV4, isPrivateV6, guardedFetch } from '../../lib/url-guard.js';
+
+// DNS is file-mocked with a passthrough default so the dispatcher tests can
+// script resolutions deterministically while every other test keeps using
+// real DNS.
+const lookupMock = vi.hoisted(() => vi.fn());
+vi.mock('node:dns/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:dns/promises')>();
+  return { ...actual, lookup: lookupMock };
+});
+const realLookup: typeof import('node:dns/promises')['lookup'] = (await vi.importActual('node:dns/promises')).lookup;
+
+beforeEach(() => { lookupMock.mockImplementation(realLookup); });
+afterEach(() => { lookupMock.mockReset(); lookupMock.mockImplementation(realLookup); });
 
 function fakeReq(opts: { ip?: string; remoteAddress?: string | null; xff?: string }) {
   return {
@@ -72,5 +89,69 @@ describe('H10 — resolving SSRF URL guard', () => {
     expect(isPrivateV6('::ffff:10.0.0.1')).toBe(true);
     expect(isPrivateV6('::ffff:7f00:1')).toBe(true); // hex-mapped 127.0.0.1 (URL-canonicalized form)
     expect(isPrivateV6('2607:f8b0::1')).toBe(false);
+  });
+});
+
+describe('guardedFetch — DNS rebinding pin (§11.3)', () => {
+  it('rejects with UrlGuardError when the host resolves private', async () => {
+    lookupMock.mockResolvedValue([{ address: '10.0.0.5', family: 4 }] as LookupAddress[]);
+    await expect(guardedFetch('https://rebind.test/x')).rejects.toBeInstanceOf(UrlGuardError);
+  });
+
+  it('rejects a literal private IP before touching DNS', async () => {
+    await expect(guardedFetch('http://127.0.0.1:8080/x')).rejects.toBeInstanceOf(UrlGuardError);
+    expect(lookupMock).not.toHaveBeenCalled();
+  });
+
+  it('pins the validated addresses into the socket lookup — no re-resolution', async () => {
+    lookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }] as LookupAddress[]);
+    // Throwing stub: never connects, but the captured options expose the
+    // pinned lookup guardedFetch installed.
+    const requestSpy = vi.spyOn(http, 'request').mockImplementation(() => {
+      throw new Error('no-connect-in-test');
+    });
+    try {
+      await expect(guardedFetch('http://public.test/x')).rejects.toThrow('no-connect-in-test');
+      expect(requestSpy).toHaveBeenCalledTimes(1);
+      const opts = requestSpy.mock.calls[0][1] as http.RequestOptions & {
+        lookup: (h: string, o: unknown, cb: (e: NodeJS.ErrnoException | null, a: Array<{ address: string; family: number }>) => void) => void;
+      };
+      const cb = vi.fn();
+      opts.lookup('public.test', {}, cb);
+      expect(cb).toHaveBeenCalledWith(null, [{ address: '93.184.216.34', family: 4 }]);
+      expect(lookupMock).toHaveBeenCalledTimes(1); // validated ONCE — the socket layer never re-resolves
+    } finally {
+      requestSpy.mockRestore();
+    }
+  });
+
+  it('wraps the response with status/ok/headers.get and a lazy body', async () => {
+    lookupMock.mockResolvedValue([{ address: '93.184.216.34', family: 4 }] as LookupAddress[]);
+    const requestSpy = vi.spyOn(http, 'request');
+    const fakeRes = Object.assign(new http.IncomingMessage(new net.Socket()), {
+      statusCode: 200,
+      headers: { 'content-type': 'text/plain' },
+    });
+    const chunks = [Buffer.from('hel'), Buffer.from('lo')];
+    fakeRes[Symbol.asyncIterator] = async function* () {
+      while (chunks.length) yield chunks.shift()!;
+    };
+    // Scripted fake req/res objects, not a real socket exchange — the
+    // double cast only relaxes the incoming side of the spy.
+    const fakeReq = { on: vi.fn(), write: vi.fn(), end: vi.fn(), destroy: vi.fn() };
+    requestSpy.mockImplementation(((_url: URL, _opts: http.RequestOptions, cb: (r: http.IncomingMessage) => void) => {
+      queueMicrotask(() => cb(fakeRes as unknown as http.IncomingMessage));
+      return fakeReq as unknown as http.ClientRequest;
+    }) as unknown as typeof http.request);
+    try {
+      const out = await guardedFetch('http://public.test/x');
+      expect(out.status).toBe(200);
+      expect(out.ok).toBe(true);
+      expect(out.headers.get('content-type')).toBe('text/plain');
+      expect(out.headers.get('missing')).toBeNull();
+      expect(new TextDecoder().decode(await out.arrayBuffer())).toBe('hello');
+    } finally {
+      requestSpy.mockRestore();
+    }
   });
 });

@@ -21,6 +21,7 @@ import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarke
 import {
   isRetryableError,
   isPaymentRequiredError,
+  isRateLimitError,
   classifyCooldownReason,
   timingSafeStringEqual,
   extractApiToken,
@@ -396,6 +397,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const configuredLimit = getGlobalRetryLimit();
   const attemptLimit = configuredLimit > 0 ? configuredLimit : MAX_ATTEMPTS;
   let upstreamAttempts = 0;
+  let backoffBudgetMs = 10_000; // cumulative 429-backoff budget for the whole request (Imp 13)
 
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
@@ -873,14 +875,16 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // latency without helping). The sleep is abort-aware: a client Stop
         // rejects with RequestAbortError, which escapes this catch and lands
         // in the outer abort handler (silent end). Escalation is capped at
-        // the proxy's ceiling (2s): first wait 1s, subsequent waits 2s.
-        const msg: string = err.message ?? '';
-        const is429 = err.status === 429
-          || msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
-          || msg.includes('resource_exhausted');
-        if (is429) {
-          const sleepMs = Math.min(1000 * (attempt + 1), 2000);
-          await abortableSleep(sleepMs, abortSignal);
+        // the proxy's ceiling (2s): first wait 1s, subsequent waits 2s — the
+        // FINAL attempt never sleeps (nothing follows to protect) and the
+        // waits draw down a 10s cumulative budget so a long attempt chain
+        // can't stack backoff into an unbounded stall on its own.
+        if (isRateLimitError(err) && attempt + 1 < attemptLimit) {
+          const sleepMs = Math.min(1000 * (attempt + 1), 2000, backoffBudgetMs);
+          if (sleepMs > 0) {
+            backoffBudgetMs -= sleepMs;
+            await abortableSleep(sleepMs, abortSignal);
+          }
         }
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
         setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
