@@ -107,6 +107,11 @@ export function computeCacheKey(params: {
   presence_penalty?: unknown;
   reasoning_effort?: unknown;
   thinking?: unknown;
+  stop?: unknown;
+  response_format?: unknown;
+  parallel_tool_calls?: unknown;
+  logit_bias?: unknown;
+  n?: unknown;
   [key: string]: unknown;
 }): string {
   // Build a stable JSON string of all fields that affect the response.
@@ -123,6 +128,11 @@ export function computeCacheKey(params: {
     presence_penalty: params.presence_penalty ?? null,
     reasoning_effort: params.reasoning_effort ?? null,
     thinking: params.thinking ?? null,
+    stop: params.stop ?? null,
+    response_format: params.response_format ?? null,
+    parallel_tool_calls: params.parallel_tool_calls ?? null,
+    logit_bias: params.logit_bias ?? null,
+    n: params.n ?? null,
   };
   const json = JSON.stringify(signature);
   return createHash('sha256').update(json).digest('hex');

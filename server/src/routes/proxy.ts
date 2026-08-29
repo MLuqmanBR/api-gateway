@@ -965,7 +965,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (cacheable) {
     cacheKey = computeCacheKey({
       model: requestedModel ?? 'auto', messages, tools, tool_choice,
-      temperature, top_p, max_tokens, reasoning_effort, thinking,
+      temperature, top_p, max_tokens, reasoning_effort, thinking, parallel_tool_calls,
     });
     const cached = getCachedResponse(cacheKey);
     if (cached) {
