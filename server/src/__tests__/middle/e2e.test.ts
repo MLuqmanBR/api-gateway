@@ -9,7 +9,7 @@ import { initSecretsStore, addSecret, listSecrets, _resetCacheForTesting } from 
 import { clearMiddleConfigCache } from '../../middle/index.js';
 
 // Mock routeRequest so we don't need real provider keys.
-const { mockRouteRequest } = vi.hoisted(() => ({ mockRouteRequest: vi.fn() }));
+const { mockRouteRequest, state } = vi.hoisted(() => ({ mockRouteRequest: vi.fn(), state: { interceptorProviderBuilt: false } }));
 vi.mock('../../services/router.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../services/router.js')>();
   return { ...actual, routeRequest: mockRouteRequest };
@@ -19,6 +19,34 @@ vi.mock('../../services/router.js', async (importOriginal) => {
 vi.mock('../../lib/crypto.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/crypto.js')>();
   return { ...actual, decrypt: vi.fn((_e: string, _i: string, _t: string) => 'mocked-api-key') };
+});
+// The inbound interceptor resolves its provider via buildProviderFor — it does
+// NOT go through routeRequest (interceptor.ts dispatches the scan itself). The
+// "interceptor not invoked" flag must therefore be wired HERE: the prior
+// version set it inside the routeRequest mock, a function the interceptor
+// never calls, so the streaming-skip assertion could never fail (ZCODE H36).
+// The non-stream twin below proves the flag flips when the interceptor really
+// dispatches, which makes the stream test's `false` meaningful.
+vi.mock('../../providers/index.js', async (importOriginal) => {
+  const actual = (await importOriginal()) as Record<string, unknown> & {
+    buildProviderFor: (p: string) => unknown;
+  };
+  return {
+    ...actual,
+    buildProviderFor: (platform: string) => {
+      state.interceptorProviderBuilt = true;
+      // The scan dispatches through a stub whose response never parses as a
+      // span list, so the interceptor deterministically floors: the dispatch
+      // is real (flag flips) but no redaction ever applies.
+      return {
+        name: 'InterceptorStub',
+        chatCompletion: async () => ({
+          choices: [{ message: { role: 'assistant', content: 'not-a-span-list' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1 },
+        }),
+      };
+    },
+  };
 });
 
 function fakeRoute(provider: any) {
@@ -74,6 +102,7 @@ beforeEach(() => {
   _resetCacheForTesting();
   clearMiddleConfigCache();
   capturedMessages = null;
+  state.interceptorProviderBuilt = false;
 
   addSecret(SECRET, 'api_key', 'manual', 'Test API Key');
 
@@ -81,6 +110,7 @@ beforeEach(() => {
   db.prepare("DELETE FROM api_keys WHERE platform='fake'").run();
   db.prepare("INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled) VALUES ('fake', 'test', 'enc', 'iv', 'tag', 'healthy', 1)").run();
   db.prepare("INSERT INTO models (id, platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled) VALUES (9999, 'fake', 'fake-model', 'Fake Model', 5, 5, 'Small', 1) ON CONFLICT(id) DO UPDATE SET platform='fake', model_id='fake-model', enabled=1").run();
+  db.prepare("INSERT INTO models (id, platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled) VALUES (9998, 'fake', 'interceptor-model', 'Interceptor Model', 5, 5, 'Small', 1) ON CONFLICT(id) DO UPDATE SET platform='fake', model_id='interceptor-model', enabled=1").run();
 });
 
 afterEach(() => {
@@ -192,19 +222,20 @@ describe('B2-8: inbound interceptor (B2-4b)', () => {
 
     setSetting('middle_redaction_enabled', '1');
     setSetting('middle_interceptor_inbound_enabled', '1');
-    // Use the same mock routeRequest as the interceptor's model (it will fail the floor;
-    // the inbound interceptor dispatches via routeRequest which returns a fake route
-    // whose chatCompletion would be called by the interceptor. Since our mock returns
-    // the same fakeRoute for ALL routeRequest calls, the interceptor's call returns
-    // content that doesn't parse as a span list → floor → no redaction of new secrets.)
-    // To make this test meaningful, we accept the floor behavior: when the interceptor
-    // cannot produce valid spans, the new secret reaches the client as-is.
+    setSetting('middle_interceptor_model', '9998'); // numeric models.id — getInterceptorModelId() Number()s it
+    // Positive control for the streaming-skip test below: with the interceptor
+    // model configured, the inbound scan dispatches through buildProviderFor
+    // (flagged in the mock above). The real buildProviderFor has no 'fake'
+    // platform, so the scan floors immediately — the new secret still reaches
+    // the client as-is — but the flag flip proves the interceptor dispatched.
     clearMiddleConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
       model: 'fake-model', messages: [{ role: 'user', content: 'Find secrets' }], stream: false,
     }, key);
     expect(status).toBe(200);
+    // The inbound interceptor DID dispatch (provider built) before flooring.
+    expect(state.interceptorProviderBuilt).toBe(true);
     // The outbound Stage-1 applied (capturedMessages has the user's content, no known secret here)
     expect(capturedMessages).toBeTruthy();
     // Inbound interceptor floor: if it can't run, the new secret reaches the client.
@@ -215,10 +246,7 @@ describe('B2-8: inbound interceptor (B2-4b)', () => {
 
   it('stream: inbound interceptor NOT invoked (streaming-skip assertion)', async () => {
     const NEW_SECRET = 'sk-stream-new-secret-5555555';
-    let interceptorCalled = false;
-    mockRouteRequest.mockImplementation((req: any) => {
-      // If this is an interceptor call (different model), flag it.
-      if (req?.model === 'interceptor-model') interceptorCalled = true;
+    mockRouteRequest.mockImplementation(() => {
       return fakeRoute({
         async chatCompletion() { throw new Error('should not be called for stream'); },
         async *streamChatCompletion(_k: string, messages: any[]) {
@@ -232,15 +260,17 @@ describe('B2-8: inbound interceptor (B2-4b)', () => {
 
     setSetting('middle_redaction_enabled', '1');
     setSetting('middle_interceptor_inbound_enabled', '1');
-    setSetting('middle_interceptor_model', 'interceptor-model');
+    setSetting('middle_interceptor_model', '9998'); // numeric models.id — getInterceptorModelId() Number()s it
     clearMiddleConfigCache();
 
     const { status, text } = await request(app, '/v1/chat/completions', {
       model: 'fake-model', messages: [{ role: 'user', content: 'Find secrets' }], stream: true,
     }, key);
     expect(status).toBe(200);
-    // Inbound interceptor is NOT invoked on streaming responses
-    expect(interceptorCalled).toBe(false);
+    // Inbound interceptor is NOT invoked on streaming responses — and this
+    // assertion is meaningful because the non-stream twin above proves the
+    // flag flips when the interceptor dispatches (ZCODE H36 fix).
+    expect(state.interceptorProviderBuilt).toBe(false);
     // New secret reaches the client in the stream (documented limitation)
     expect(text).toContain(NEW_SECRET);
   });

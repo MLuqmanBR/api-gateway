@@ -30,7 +30,7 @@ import {
   logRequest,
 } from './proxy.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
-import { attachClientAbort, isAbortError } from '../lib/abort.js';
+import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
 import { resolvePinnedModel, formatPinnedModelRejection } from '../lib/pinned-model.js';
 import { getGlobalRetryLimit } from '../services/router.js';
 import { publish } from '../services/events.js';
@@ -863,6 +863,25 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
 
       if (isRetryableError(err)) {
+        // Imp 13: genuine upstream rate-limit 429 — wait before benching this
+        // key and cycling to the next one, mirroring the proxy's per-key
+        // backoff (proxy.ts keyRetry). Without this, a burst of transient
+        // 429s benches every key in the fleet within seconds even though a
+        // short wait on the same provider would have succeeded. Only genuine
+        // 429s wait — transient transport errors and 5xx keep the immediate
+        // cycle (they don't draw on a shared per-minute quota, so a wait adds
+        // latency without helping). The sleep is abort-aware: a client Stop
+        // rejects with RequestAbortError, which escapes this catch and lands
+        // in the outer abort handler (silent end). Escalation is capped at
+        // the proxy's ceiling (2s): first wait 1s, subsequent waits 2s.
+        const msg: string = err.message ?? '';
+        const is429 = err.status === 429
+          || msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
+          || msg.includes('resource_exhausted');
+        if (is429) {
+          const sleepMs = Math.min(1000 * (attempt + 1), 2000);
+          await abortableSleep(sleepMs, abortSignal);
+        }
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
         setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(
           isPaymentRequiredError(err),
