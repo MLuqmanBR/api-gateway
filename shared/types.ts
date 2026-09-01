@@ -454,6 +454,7 @@ export type ConfigSection =
   | 'budgets'
   | 'webhooks'
   | 'embeddings'
+  | 'transcriptions'
   | 'settings'
   | 'quirks';
 
@@ -592,6 +593,24 @@ export interface ConfigEmbeddingFamily {
   quotaLabel: string;
 }
 
+export interface ConfigTranscriptionFamily {
+  family: string;
+  /** Ordered list of provider entries; same position-as-priority contract
+   * as ConfigEmbeddingFamily.providers. `pricePerHourUsd` null = unknown /
+   * unenforced (self-hosted NIM). */
+  providers: Array<{
+    platform: string;
+    modelId: string;
+    priority: number;
+    enabled: boolean;
+    pricePerHourUsd: number | null;
+  }>;
+  maxFileMb: number;
+  supportsTranslations: boolean;
+  displayName: string;
+  quotaLabel: string;
+}
+
 export interface ConfigSettings {
   routingStrategy?: 'priority' | 'balanced' | 'smartest' | 'fastest' | 'reliable' | 'custom';
   globalRetryLimit?: number;
@@ -599,6 +618,10 @@ export interface ConfigSettings {
   /** L30: the export inventory counts this settings key; the settings
    * section carries it so export/import round-trips stay aligned. */
   embeddingsDefaultFamily?: string;
+  /** L30 sibling: the export inventory counts transcriptions_default_family
+   * among the settings keys — the section must carry it for round-trip
+   * parity. */
+  transcriptionsDefaultFamily?: string;
 }
 
 export interface ConfigQuirk {
@@ -648,6 +671,10 @@ export interface ConfigEnvelope {
     embeddings?: {
       defaultFamily?: string;
       families: ConfigEmbeddingFamily[];
+    };
+    transcriptions?: {
+      defaultFamily?: string;
+      families: ConfigTranscriptionFamily[];
     };
     settings?: ConfigSettings;
     quirks?: ConfigQuirk[];

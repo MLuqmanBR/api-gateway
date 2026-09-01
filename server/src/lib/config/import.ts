@@ -32,6 +32,7 @@ import {
   type ConfigCustomProvider,
   type ConfigApiKey,
   type ConfigEmbeddingFamily,
+  type ConfigTranscriptionFamily,
   type ConfigSettings,
   type ConfigQuirk,
   type ConfigClientKey,
@@ -185,6 +186,17 @@ function applySettings(db: DatabasePort, settings: ConfigSettings, diff: Section
     const current = getSetting('embeddings_default_family');
     if (current !== settings.embeddingsDefaultFamily) {
       setSetting('embeddings_default_family', settings.embeddingsDefaultFamily);
+      diff.updated++;
+    } else {
+      diff.skipped++;
+    }
+  }
+  if (settings.transcriptionsDefaultFamily !== undefined) {
+    // L30 sibling: the transcriptions section (applied later) carries the
+    // same setting and wins when both are present.
+    const current = getSetting('transcriptions_default_family');
+    if (current !== settings.transcriptionsDefaultFamily) {
+      setSetting('transcriptions_default_family', settings.transcriptionsDefaultFamily);
       diff.updated++;
     } else {
       diff.skipped++;
@@ -752,6 +764,91 @@ function applyEmbeddings(
   summary.embeddings = diff;
 }
 
+// ── Transcriptions ────────────────────────────────────────────────────────
+
+function applyTranscriptions(
+  db: DatabasePort,
+  families: ConfigTranscriptionFamily[],
+  defaultFamily: string | undefined,
+  mode: ConfigImportOptions['mode'],
+  summary: Record<string, SectionDiff>,
+): void {
+  const diff = summary.transcriptions ?? emptyDiff();
+  if (mode === 'replace') {
+    db.prepare('DELETE FROM transcription_models').run();
+  }
+  for (const fam of families) {
+    if (mode === 'replace') {
+      // Insert blindly — the wipe above cleared everything.
+      for (const p of fam.providers) {
+        db.prepare(`
+          INSERT INTO transcription_models (family, platform, model_id, display_name,
+            max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(fam.family, p.platform, p.modelId, fam.displayName,
+          fam.maxFileMb, fam.supportsTranslations ? 1 : 0, p.pricePerHourUsd,
+          p.priority, p.enabled ? 1 : 0, fam.quotaLabel);
+        diff.added++;
+      }
+      continue;
+    }
+    for (const p of fam.providers) {
+      try {
+        const existing = db.prepare('SELECT id, priority, enabled, max_file_mb, supports_translations, price_per_hour_usd, display_name, quota_label FROM transcription_models WHERE family = ? AND platform = ? AND model_id = ?').get(fam.family, p.platform, p.modelId) as {
+          id: number; priority: number; enabled: number;
+          max_file_mb: number; supports_translations: number;
+          price_per_hour_usd: number | null; display_name: string; quota_label: string;
+        } | undefined;
+        if (existing) {
+          if (mode === 'skip-existing') { diff.skipped++; continue; }
+          const enabledNext = p.enabled ? 1 : 0;
+          const supportsNext = fam.supportsTranslations ? 1 : 0;
+          const identical =
+            existing.priority === p.priority &&
+            existing.enabled === enabledNext &&
+            existing.max_file_mb === fam.maxFileMb &&
+            existing.supports_translations === supportsNext &&
+            (existing.price_per_hour_usd ?? null) === (p.pricePerHourUsd ?? null) &&
+            existing.display_name === fam.displayName &&
+            existing.quota_label === fam.quotaLabel;
+          if (identical) {
+            diff.skipped++;
+            continue;
+          }
+          db.prepare(`
+            UPDATE transcription_models SET priority = ?, enabled = ?,
+              max_file_mb = ?, supports_translations = ?, price_per_hour_usd = ?,
+              display_name = ?, quota_label = ?
+            WHERE id = ?
+          `).run(p.priority, enabledNext, fam.maxFileMb, supportsNext, p.pricePerHourUsd, fam.displayName, fam.quotaLabel, existing.id);
+          diff.updated++;
+        } else {
+          db.prepare(`
+            INSERT INTO transcription_models (family, platform, model_id, display_name,
+              max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(fam.family, p.platform, p.modelId, fam.displayName,
+            fam.maxFileMb, fam.supportsTranslations ? 1 : 0, p.pricePerHourUsd,
+            p.priority, p.enabled ? 1 : 0, fam.quotaLabel);
+          diff.added++;
+        }
+      } catch (err) {
+        diff.errors.push(`${fam.family}/${p.platform}/${p.modelId}: ${(err as Error).message}`);
+      }
+    }
+  }
+  if (defaultFamily !== undefined) {
+    const current = getSetting('transcriptions_default_family');
+    if (current !== defaultFamily) {
+      setSetting('transcriptions_default_family', defaultFamily);
+      diff.updated++;
+    } else {
+      diff.skipped++;
+    }
+  }
+  summary.transcriptions = diff;
+}
+
 // ── Quirks ────────────────────────────────────────────────────────────────
 
 function applyQuirks(
@@ -1112,7 +1209,8 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
   const eff: ConfigImportOptions = parsedOptions.data;
   const sectionAllow = new Set(eff.sections ?? [
     'models', 'fallback_chain', 'custom_providers', 'api_keys',
-    'client_keys', 'budgets', 'webhooks', 'embeddings', 'settings', 'quirks',
+    'client_keys', 'budgets', 'webhooks', 'embeddings', 'transcriptions',
+    'settings', 'quirks',
   ]);
 
   // Decrypt the keysCipher blob up-front (if any) — outside the
@@ -1221,6 +1319,16 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
       );
     }
 
+    if (sectionAllow.has('transcriptions') && env.sections.transcriptions) {
+      applyTranscriptions(
+        db,
+        env.sections.transcriptions.families,
+        env.sections.transcriptions.defaultFamily,
+        eff.mode,
+        summary,
+      );
+    }
+
     if (sectionAllow.has('quirks') && env.sections.quirks) {
       applyQuirks(db, env.sections.quirks, eff.mode, summary);
     }
@@ -1318,6 +1426,7 @@ export function previewEnvelope(envelope: unknown): {
     budgets: env.sections.budgets?.length ?? 0,
     webhooks: env.sections.webhooks?.length ?? 0,
     embeddings: env.sections.embeddings?.families.length ?? 0,
+    transcriptions: env.sections.transcriptions?.families.length ?? 0,
     settings: env.sections.settings ? 1 : 0,
     quirks: env.sections.quirks?.length ?? 0,
   };

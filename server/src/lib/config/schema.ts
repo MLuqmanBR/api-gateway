@@ -113,6 +113,28 @@ const embeddingsSectionSchema = z.object({
   families: z.array(embeddingFamilySchema).max(64),
 });
 
+const transcriptionProviderSchema = z.object({
+  platform,
+  modelId,
+  priority: z.number().int().min(0),
+  enabled: z.boolean(),
+  pricePerHourUsd: z.number().nullable(),
+});
+
+const transcriptionFamilySchema = z.object({
+  family: z.string().min(1).max(100),
+  providers: z.array(transcriptionProviderSchema).max(64),
+  maxFileMb: z.number().int().positive(),
+  supportsTranslations: z.boolean(),
+  displayName: z.string().min(1).max(200),
+  quotaLabel: z.string().max(200).default(''),
+});
+
+const transcriptionsSectionSchema = z.object({
+  defaultFamily: z.string().min(1).max(100).optional(),
+  families: z.array(transcriptionFamilySchema).max(64),
+});
+
 const settingsSchema = z.object({
   routingStrategy: z.enum(['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom']).optional(),
   globalRetryLimit: z.number().int().min(0).max(100).optional(),
@@ -124,6 +146,8 @@ const settingsSchema = z.object({
   // L30: the export inventory counts embeddings_default_family among the
   // settings keys — the section must carry it for round-trip parity.
   embeddingsDefaultFamily: z.string().min(1).max(100).optional(),
+  // L30 sibling for transcriptions_default_family.
+  transcriptionsDefaultFamily: z.string().min(1).max(100).optional(),
 }).refine(
   (v) => Object.values(v).some((x) => x !== undefined),
   { message: 'settings section cannot be empty' },
@@ -215,6 +239,7 @@ export const configEnvelopeSchema = z.object({
     budgets: z.array(budgetSchema).max(512).optional(),
     webhooks: z.array(webhookSchema).max(128).optional(),
     embeddings: embeddingsSectionSchema.optional(),
+    transcriptions: transcriptionsSectionSchema.optional(),
     settings: settingsSchema.optional(),
     quirks: z.array(quirkSchema).max(256).optional(),
   }).refine(
@@ -233,7 +258,7 @@ export const configImportOptionsSchema = z.object({
   sections: z.array(z.enum([
     'models', 'fallback_chain', 'custom_providers', 'api_keys',
     'client_keys', 'budgets', 'webhooks',
-    'embeddings', 'settings', 'quirks',
+    'embeddings', 'transcriptions', 'settings', 'quirks',
   ])).min(1).max(16).optional(),
 });
 

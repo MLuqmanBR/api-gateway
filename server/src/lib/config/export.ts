@@ -27,6 +27,7 @@ import {
   type ConfigSettings,
   type ConfigQuirk,
   type ConfigEmbeddingFamily,
+  type ConfigTranscriptionFamily,
   type ConfigExportRequest,
 } from '@api-gateway/shared';
 import { encryptKeysWithPassphrase } from './passphrase-crypto.js';
@@ -36,11 +37,10 @@ export interface BuildExportOptions {
   passphrase?: string;
   label?: string;
 }
-
 const ALL_SECTIONS: ConfigSection[] = [
   'models', 'fallback_chain', 'custom_providers', 'api_keys',
   'client_keys', 'budgets', 'webhooks',
-  'embeddings', 'settings', 'quirks',
+  'embeddings', 'transcriptions', 'settings', 'quirks',
 ];
 
 function sectionSet(sections?: ConfigSection[]): Record<ConfigSection, true> {
@@ -310,6 +310,49 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
       };
     }
 
+    if (sections.transcriptions) {
+      const defaultFamily = db.prepare(
+        "SELECT value FROM settings WHERE key = 'transcriptions_default_family'",
+      ).get() as { value: string } | undefined;
+      const familyRows = db.prepare(`
+        SELECT family, platform, model_id, display_name, max_file_mb,
+               supports_translations, price_per_hour_usd, priority, enabled, quota_label
+        FROM transcription_models
+        ORDER BY family ASC, priority ASC
+      `).all() as Array<{
+        family: string; platform: string; model_id: string;
+        display_name: string; max_file_mb: number;
+        supports_translations: number; price_per_hour_usd: number | null;
+        priority: number; enabled: number; quota_label: string;
+      }>;
+      const byFamily = new Map<string, ConfigTranscriptionFamily>();
+      for (const r of familyRows) {
+        let fam = byFamily.get(r.family);
+        if (!fam) {
+          fam = {
+            family: r.family,
+            providers: [],
+            maxFileMb: r.max_file_mb,
+            supportsTranslations: r.supports_translations === 1,
+            displayName: r.display_name,
+            quotaLabel: r.quota_label,
+          };
+          byFamily.set(r.family, fam);
+        }
+        fam.providers.push({
+          platform: r.platform,
+          modelId: r.model_id,
+          priority: r.priority,
+          enabled: r.enabled === 1,
+          pricePerHourUsd: r.price_per_hour_usd,
+        });
+      }
+      out.transcriptions = {
+        defaultFamily: defaultFamily?.value,
+        families: Array.from(byFamily.values()),
+      };
+    }
+
     if (sections.settings) {
       const s: ConfigSettings = {};
       const strat = db.prepare(
@@ -321,14 +364,18 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
       const weights = db.prepare(
         "SELECT value FROM settings WHERE key = 'routing_custom_weights'",
       ).get() as { value: string } | undefined;
-      // L30: the fourth inventory-counted settings key — emitted so the
-      // inventory count and the emitted fields stay aligned.
+      // L30: inventory-counted settings keys — emitted so the inventory
+      // count and the emitted fields stay aligned.
       const fam = db.prepare(
         "SELECT value FROM settings WHERE key = 'embeddings_default_family'",
+      ).get() as { value: string } | undefined;
+      const tfam = db.prepare(
+        "SELECT value FROM settings WHERE key = 'transcriptions_default_family'",
       ).get() as { value: string } | undefined;
       if (strat) s.routingStrategy = strat.value as ConfigSettings['routingStrategy'];
       if (retry) s.globalRetryLimit = parseInt(retry.value, 10);
       if (fam) s.embeddingsDefaultFamily = fam.value;
+      if (tfam) s.transcriptionsDefaultFamily = tfam.value;
       if (weights) {
         try {
           s.customWeights = JSON.parse(weights.value);
@@ -433,7 +480,8 @@ export function getExportInventory(): Record<ConfigSection, number> {
     budgets: (db.prepare('SELECT COUNT(*) AS n FROM budgets').get() as { n: number }).n,
     webhooks: (db.prepare('SELECT COUNT(*) AS n FROM webhooks').get() as { n: number }).n,
     embeddings: (db.prepare('SELECT COUNT(*) AS n FROM embedding_models').get() as { n: number }).n,
-    settings: (db.prepare("SELECT COUNT(*) AS n FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family')").get() as { n: number }).n,
+    transcriptions: (db.prepare('SELECT COUNT(*) AS n FROM transcription_models').get() as { n: number }).n,
+    settings: (db.prepare("SELECT COUNT(*) AS n FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family','transcriptions_default_family')").get() as { n: number }).n,
     quirks: (db.prepare('SELECT COUNT(*) AS n FROM quirks').get() as { n: number }).n,
   };
 }

@@ -51,6 +51,7 @@ const SECTIONS: { value: ConfigSection; label: string; description: string }[] =
   { value: 'budgets', label: 'Budgets', description: 'Spend limits per client key and global; usage starts fresh at zero.' },
   { value: 'webhooks', label: 'Webhooks', description: 'Notification URLs with their signing secrets.' },
   { value: 'embeddings', label: 'Embeddings', description: 'Family configuration + default family.' },
+  { value: 'transcriptions', label: 'Transcription', description: 'Audio model families + default family.' },
   { value: 'settings', label: 'Routing settings', description: 'Strategy, retry limit, custom weights.' },
   { value: 'quirks', label: 'Quirks', description: 'Provider/model notes you authored.' },
 ]
@@ -80,6 +81,7 @@ export default function SettingsPage() {
     budgets: true,
     webhooks: true,
     embeddings: true,
+    transcriptions: true,
     settings: true,
     quirks: true,
   })

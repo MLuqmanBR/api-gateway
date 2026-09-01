@@ -48,7 +48,7 @@ const exportRequestSchema = z.object({
   sections: z.array(z.enum([
     'models', 'fallback_chain', 'custom_providers', 'api_keys',
     'client_keys', 'budgets', 'webhooks',
-    'embeddings', 'settings', 'quirks',
+    'embeddings', 'transcriptions', 'settings', 'quirks',
   ])).max(16).optional(),
   passphrase: z.string().min(1).max(1024).optional(),
   label: z.string().max(120).optional(),
