@@ -18,6 +18,8 @@ import { responsesRouter } from './routes/responses.js';
 import { messagesRouter } from './routes/messages.js';
 import { fallbackRouter } from './routes/fallback.js';
 import { embeddingsRouter } from './routes/embeddings.js';
+import { transcriptionsRouter } from './routes/transcriptions.js';
+import { audioRouter } from './routes/audio.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
@@ -114,6 +116,7 @@ export function createApp() {
   app.use('/api/models', modelsRouter);
   app.use('/api/fallback', fallbackRouter);
   app.use('/api/embeddings', embeddingsRouter);
+  app.use('/api/transcriptions', transcriptionsRouter);
   app.use('/api/events', eventsRouter);
   app.use('/api/analytics', analyticsRouter);
   app.use('/api/health', healthRouter);
@@ -130,6 +133,9 @@ export function createApp() {
   app.use('/v1', responsesRouter);
   // F6: Anthropic-format inbound (POST /v1/messages — Claude Code / Anthropic CLI)
   app.use('/v1', messagesRouter);
+  // Batch audio passthrough (POST /v1/audio/{transcriptions,translations}).
+  // Falls through the proxy router safely — no catch-all there.
+  app.use('/v1', audioRouter);
   // Error handler (for API routes)
   app.use(errorHandler);
 

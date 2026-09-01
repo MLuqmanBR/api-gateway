@@ -119,16 +119,19 @@ export interface TranscriptionResult {
   actualSeconds: number | null;
 }
 
-/** Parse a raw multipart body via the bundled-undici Request.formData(). The
- *  first File-valued entry is the file; `model`/`stream` are read from string
- *  entries and returned separately (the service rewrites model from the
- *  catalog row and never forwards stream). */
-export async function parseAudioRequest(contentType: string, body: Buffer): Promise<{
+/** Parse result of parseAudioRequest. */
+export interface ParsedAudioRequest {
   fields: Array<[string, MultipartValue]>;
   file: File | null;
   model: string;
   stream: boolean;
-}> {
+}
+
+/** Parse a raw multipart body via the bundled-undici Request.formData(). The
+ *  first File-valued entry is the file; `model`/`stream` are read from string
+ *  entries and returned separately (the service rewrites model from the
+ *  catalog row and never forwards stream). */
+export async function parseAudioRequest(contentType: string, body: Buffer): Promise<ParsedAudioRequest> {
   const form = await new Request('http://localhost', {
     method: 'POST',
     headers: { 'content-type': contentType },
@@ -251,9 +254,7 @@ export async function runTranscription(request: TranscriptionCall): Promise<Tran
   const { kind, model, fields, file, clientModelAllowlist } = request;
   const family = resolveFamily(model);
   if (!family) {
-    throw new TranscriptionError(
-      `unknown transcription model '${model}'. Use 'auto', a family name, or a provider model id.`, 400,
-    );
+    throw new TranscriptionError(`unknown transcription model: '${model}'`, 400);
   }
 
   const chain = (getDb().prepare(
@@ -267,25 +268,29 @@ export async function runTranscription(request: TranscriptionCall): Promise<Tran
   // Checked before the allowlist filter so the gate message is always the
   // model's own limitation, not the key's scope.
   if (kind === 'translations' && !chain.some(r => r.supports_translations === 1)) {
-    throw new TranscriptionError(`model does not support translation ('${family}')`, 400);
+    throw new TranscriptionError('model does not support translation', 400);
   }
   const dispatchChain = kind === 'translations'
     ? chain.filter(r => r.supports_translations === 1)
     : chain;
 
   // Allowlist enforcement — audio mirrors the chat proxy, not embeddings.
-  // The filter runs against the dispatchable rows; the two 403s are distinct:
-  // (a) the requested family/model itself is out of scope, (b) the family is
-  // fine but every provider row in it is filtered out.
+  // On empty-after-filter, (b) fires unconditionally: the key can't reach
+  // ANY provider of this family, whichever phrasing the caller expected.
+  // (a) fires only when survivors exist but the explicitly requested
+  // (non-'auto') resolved row isn't among them — e.g. a family whose other
+  // providers are in scope while the pinned one isn't.
   let effectiveChain = dispatchChain;
   if (clientModelAllowlist && clientModelAllowlist.length > 0) {
     effectiveChain = dispatchChain.filter(r => isModelAllowed(clientModelAllowlist, r.platform, r.model_id));
     if (effectiveChain.length === 0) {
+      throw new TranscriptionError('no transcription models allowed for this client key', 403);
+    }
+    if (model !== '' && model !== 'auto') {
       const requested = resolveTranscriptionModel(model);
       if (requested && !isModelAllowed(clientModelAllowlist, requested.platform, requested.model_id)) {
-        throw new TranscriptionError(`transcription model '${requested.platform}/${requested.model_id}' not allowed for this client key`, 403);
+        throw new TranscriptionError('transcription model not allowed for this client key', 403);
       }
-      throw new TranscriptionError('no transcription models allowed for this client key', 403);
     }
   }
 
