@@ -21,6 +21,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV31ApiFormat(db);
   seedBuiltInProviderSettings(db);
   migrateEmbeddingsV1(db);
+  migrateTranscriptionsV1(db);
   migrateCustomProvidersV24(db);
 
   // Data migrations run exactly once per database, guarded by user_version.
@@ -252,8 +253,18 @@ function normalizeClientKeyAllowlists(db: DatabasePort) {
   const rows = db.prepare(
     'SELECT id, model_allowlist FROM client_keys WHERE model_allowlist IS NOT NULL',
   ).all() as Array<{ id: string; model_allowlist: string }>;
-  const byName = db.prepare('SELECT platform FROM models WHERE model_id = ?');
-  const byPair = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?');
+  // Both tables are consulted: a transcription model picked in the KeysPage
+  // allowlist picker is a qualified `platform/model_id` pair living in
+  // transcription_models, NOT models — a models-only check would silently
+  // drop every audio entry on the next boot.
+  const byName = db.prepare(`
+    SELECT platform FROM models WHERE model_id = ?
+    UNION ALL
+    SELECT platform FROM transcription_models WHERE model_id = ?`);
+  const byPair = db.prepare(`
+    SELECT 1 FROM models WHERE platform = ? AND model_id = ?
+    UNION ALL
+    SELECT 1 FROM transcription_models WHERE platform = ? AND model_id = ?`);
   for (const row of rows) {
     let entries: string[];
     try {
@@ -269,12 +280,14 @@ function normalizeClientKeyAllowlists(db: DatabasePort) {
     for (const entry of entries) {
       const slashIdx = entry.indexOf('/');
       if (slashIdx > 0) {
-        if (byPair.get(entry.slice(0, slashIdx), entry.slice(slashIdx + 1))) {
+        const platform = entry.slice(0, slashIdx);
+        const id = entry.slice(slashIdx + 1);
+        if (byPair.get(platform, id, platform, id)) {
           next.add(entry);
           continue;
         }
       }
-      const platforms = byName.all(entry) as Array<{ platform: string }>;
+      const platforms = byName.all(entry, entry) as Array<{ platform: string }>;
       changed = true;
       for (const { platform } of platforms) next.add(`${platform}/${entry}`);
     }
@@ -2150,6 +2163,61 @@ function migrateEmbeddingsV1(db: DatabasePort) {
   const def = db.prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get();
   if (!def) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('embeddings_default_family', 'gemini-embedding-001')").run();
+  }
+}
+
+// Transcriptions V1 (2026-09): batch audio transcription/translation catalog.
+// Mirrors embedding_models — a "family" is one model identity (e.g.
+// whisper-large-v3-turbo) and failover only walks providers serving that same
+// family. Prices live here so the client-key budget path can price audio by
+// the hour without a chat-table dependency. Pricing verified live 2026-09-01
+// (Groq pricing page: whisper-large-v3-turbo $0.04/hr, whisper-large-v3
+// $0.111/hr; Mistral pricing page: voxtral-mini-2602 $0.003/min = $0.18/hr).
+// voxtral-mini-2507 is deprecated + retired (2026-02-27 + 6-month GA notice)
+// and is NOT seeded; voxtral-mini-2602 is the sole Mistral entry.
+function migrateTranscriptionsV1(db: DatabasePort) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS transcription_models (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      family TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      max_file_mb INTEGER NOT NULL DEFAULT 25,
+      supports_translations INTEGER NOT NULL DEFAULT 0,
+      price_per_hour_usd REAL,
+      priority INTEGER NOT NULL DEFAULT 1,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      quota_label TEXT NOT NULL DEFAULT '',
+      UNIQUE(platform, model_id)
+    );
+  `);
+
+  // Tag request rows so audio traffic doesn't pollute the chat token budget /
+  // headroom math, and carry the actual audio duration for billing rollups.
+  // Mirrors ensureRequestTtfbColumn.
+  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'audio_seconds')) {
+    db.prepare('ALTER TABLE requests ADD COLUMN audio_seconds INTEGER').run();
+  }
+
+  const seed = db.prepare(`
+    INSERT OR IGNORE INTO transcription_models
+      (family, platform, model_id, display_name, max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const rows: Array<[string, string, string, string, number, number, number, number, number, string]> = [
+    // family, platform, provider model id, display name, max MB, translations, price $/hr, priority, enabled, quota label
+    ['whisper-large-v3-turbo', 'groq', 'whisper-large-v3-turbo', 'Whisper Large V3 Turbo', 25, 0, 0.04, 1, 1, ''],
+    ['whisper-large-v3',       'groq', 'whisper-large-v3',       'Whisper Large V3',       25, 1, 0.111, 1, 1, ''],
+    ['voxtral-mini-2602',      'mistral', 'voxtral-mini-2602',  'Voxtral Mini Transcribe 2', 25, 0, 0.18, 1, 1, ''],
+  ];
+  const apply = db.transaction(() => { for (const r of rows) seed.run(...r); });
+  apply();
+
+  const def = db.prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get();
+  if (!def) {
+    db.prepare("INSERT INTO settings (key, value) VALUES ('transcriptions_default_family', 'whisper-large-v3-turbo')").run();
   }
 }
 
