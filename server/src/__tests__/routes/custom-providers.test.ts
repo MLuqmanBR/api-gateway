@@ -5,6 +5,7 @@ import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
 import { buildProviderFor } from '../../providers/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
+import { syncModelsFromProvider } from '../../routes/custom.js';
 
 let dashToken = '';
 
@@ -304,6 +305,22 @@ describe('Custom providers (#230)', () => {
     expect(status).toBe(409);
   });
 
+  it('rejects adding a chat model whose pair is cataloged in transcription_models or embedding_models with 409', async () => {
+    // nvidia/nv-embedqa-e5-v5 is a seeded embedding_models row (V1 catalog).
+    // Adding it as a CHAT model on the same platform would resurrect the
+    // exact row boot reconciliation (reconcileCatalogRowsOutOfChat) removes
+    // on every start — reject instead of duplicating. nvidia is a built-in
+    // slug, so no provider creation is needed.
+    const { status, body } = await request(app, 'POST', '/api/custom-providers/nvidia/models', {
+      modelId: 'nvidia/nv-embedqa-e5-v5', displayName: 'NV-EmbedQA E5 v5',
+    });
+    expect(status).toBe(409);
+    expect(body.error.message).toContain('cataloged');
+    expect(getDb().prepare(
+      "SELECT 1 FROM models WHERE platform = 'nvidia' AND model_id = 'nvidia/nv-embedqa-e5-v5'",
+    ).get()).toBeUndefined();
+  });
+
   it('returns 404 when adding a model to an unknown provider', async () => {
     const { status } = await request(app, 'POST', '/api/custom-providers/no-such-thing/models', {
       modelId: 'm', displayName: 'M',
@@ -380,8 +397,44 @@ describe('Custom providers (#230)', () => {
     expect(cfModel).toBeDefined();
   });
 
+  it('syncModelsFromProvider skips ids cataloged in transcription_models or embedding_models', async () => {
+    // Discover-models sync must not resurrect catalog rows in the chat
+    // table. Stub the provider /models response to return two cataloged ids
+    // (nvidia embedding catalog pairs) plus one normal id; only the normal
+    // id may be inserted.
+    const realFetch = globalThis.fetch;
+    const realVitest = process.env.VITEST;
+    delete process.env.VITEST; // syncModelsFromProvider no-ops under VITEST
+    globalThis.fetch = (async () => new Response(
+      JSON.stringify({ data: [
+        { id: 'nvidia/nv-embedqa-e5-v5' },
+        { id: 'nvidia/llama-nemotron-embed-1b-v2' },
+        { id: 'a-real-chat-model' },
+      ] }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )) as typeof fetch;
+    try {
+      const result = await syncModelsFromProvider('http://nvidia-sync.example.com/v1', 'nvidia');
+      expect(result.error).toBeUndefined();
+      expect(result.fetched).toBe(1);
+      expect(result.added).toEqual(['a-real-chat-model']);
+      const db = getDb();
+      expect(db.prepare(
+        "SELECT 1 FROM models WHERE platform = 'nvidia' AND model_id IN ('nvidia/nv-embedqa-e5-v5','nvidia/llama-nemotron-embed-1b-v2')",
+      ).get()).toBeUndefined();
+      expect(db.prepare(
+        "SELECT 1 FROM models WHERE platform = 'nvidia' AND model_id = 'a-real-chat-model'",
+      ).get()).toBeDefined();
+      // Catalog untouched.
+      expect((db.prepare('SELECT COUNT(*) AS n FROM embedding_models').get() as any).n).toBe(12);
+      expect((db.prepare('SELECT COUNT(*) AS n FROM transcription_models').get() as any).n).toBe(3);
+    } finally {
+      globalThis.fetch = realFetch;
+      if (realVitest !== undefined) process.env.VITEST = realVitest; else delete process.env.VITEST;
+    }
+  });
+
   it('DELETE /api/custom-models/:id archives models on built-in providers', async () => {
-    // Find the custom model we added to cloudflare
     const db = getDb();
     const model = db.prepare("SELECT id FROM models WHERE platform = 'cloudflare' AND model_id = 'custom-cloudflare-model'").get() as any;
     expect(model).toBeDefined();
