@@ -167,17 +167,17 @@ describe('Client keys API (F3)', () => {
 
 describe('isModelAllowed (strict qualified matching)', () => {
   it('a qualified entry matches its exact platform only', () => {
-    expect(isModelAllowed(['aggregatore/kimi-k3'], 'aggregatore', 'kimi-k3')).toBe(true);
-    expect(isModelAllowed(['aggregatore/kimi-k3'], 'aggregatorf', 'kimi-k3')).toBe(false);
+    expect(isModelAllowed(['agg-a/kimi-k3'], 'agg-a', 'kimi-k3')).toBe(true);
+    expect(isModelAllowed(['agg-a/kimi-k3'], 'agg-b', 'kimi-k3')).toBe(false);
   });
 
   it('a bare entry admits nothing', () => {
-    expect(isModelAllowed(['kimi-k3'], 'aggregatore', 'kimi-k3')).toBe(false);
+    expect(isModelAllowed(['kimi-k3'], 'agg-a', 'kimi-k3')).toBe(false);
     expect(isModelAllowed(['kimi-k3'], 'nvidia', 'moonshotai/kimi-k3')).toBe(false);
   });
 
   it('a qualified entry does not match a different model on the same platform', () => {
-    expect(isModelAllowed(['aggregatore/deepseek-v4-pro'], 'aggregatore', 'deepseek-v4-flash')).toBe(false);
+    expect(isModelAllowed(['agg-a/deepseek-v4-pro'], 'agg-a', 'deepseek-v4-flash')).toBe(false);
   });
 });
 
