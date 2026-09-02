@@ -248,4 +248,19 @@ describe('client key allowlist normalization (bare → qualified)', () => {
     migrateDbSchema(getDb());
     expect(allowlistOf('k4')).toBe(once);
   });
+
+  it('preserves a qualified audio entry — transcription_models union hit', () => {
+    // The transcription seed rows exist from the migration; the entry is a
+    // qualified pair for a transcription_models row, not a chat models row.
+    insertKey('k5', JSON.stringify(['groq/whisper-large-v3-turbo']));
+    migrateDbSchema(getDb());
+    expect(JSON.parse(allowlistOf('k5')!)).toEqual(['groq/whisper-large-v3-turbo']);
+  });
+
+  it('expands a bare audio id to its transcription platform', () => {
+    // Bare 'whisper-large-v3' exists ONLY in transcription_models (groq).
+    insertKey('k6', JSON.stringify(['whisper-large-v3']));
+    migrateDbSchema(getDb());
+    expect(JSON.parse(allowlistOf('k6')!)).toEqual(['groq/whisper-large-v3']);
+  });
 });

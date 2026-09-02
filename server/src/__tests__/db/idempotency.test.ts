@@ -436,4 +436,43 @@ describe('Migration idempotency', () => {
     expect((db.prepare('SELECT paid_input_per_m AS p FROM models WHERE id = ?').get(unmarked.id) as { p: number }).p).toBe(other[2]);
     db.close();
   });
+  it('transcription_models: seeds are stable, UNIQUE holds, audio_seconds column present after both inits', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-transcription-idem-${Date.now()}.db`;
+
+    const db1 = initDb(tmpPath);
+    const before = {
+      rows: (db1.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c,
+      dups: (db1.prepare(`
+        SELECT COUNT(*) AS c FROM (
+          SELECT platform, model_id FROM transcription_models
+           GROUP BY platform, model_id HAVING COUNT(*) > 1
+        )
+      `).get() as { c: number }).c,
+      defaultFamily: (db1.prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get() as { value: string }).value,
+    };
+    const cols1 = (db1.prepare('PRAGMA table_info(requests)').all() as { name: string }[]).map(c => c.name);
+    db1.close();
+
+    const db2 = initDb(tmpPath);
+    const after = {
+      rows: (db2.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c,
+      dups: (db2.prepare(`
+        SELECT COUNT(*) AS c FROM (
+          SELECT platform, model_id FROM transcription_models
+           GROUP BY platform, model_id HAVING COUNT(*) > 1
+        )
+      `).get() as { c: number }).c,
+      defaultFamily: (db2.prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get() as { value: string }).value,
+    };
+    const cols2 = (db2.prepare('PRAGMA table_info(requests)').all() as { name: string }[]).map(c => c.name);
+    db2.close();
+
+    expect(after).toEqual(before);
+    expect(after.rows).toBe(3);
+    expect(after.dups).toBe(0);
+    expect(after.defaultFamily).toBe('whisper-large-v3-turbo');
+    expect(cols1).toContain('audio_seconds');
+    expect(cols2).toContain('audio_seconds');
+  });
 });
