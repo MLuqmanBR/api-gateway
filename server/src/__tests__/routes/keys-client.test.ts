@@ -257,10 +257,29 @@ describe('client key allowlist normalization (bare → qualified)', () => {
     expect(JSON.parse(allowlistOf('k5')!)).toEqual(['groq/whisper-large-v3-turbo']);
   });
 
-  it('expands a bare audio id to its transcription platform', () => {
-    // Bare 'whisper-large-v3' exists ONLY in transcription_models (groq).
+  it('expands a bare audio id to every transcription platform serving it', () => {
+    // Bare 'whisper-large-v3' lives in transcription_models only — the
+    // migration seeds groq (V1); the test seeds the kilo and ovh rows
+    // because the migration no longer ships a curated multi-platform tier
+    // list. byName walks models UNION ALL transcription_models; the
+    // transcription_models leg scans the UNIQUE(platform, model_id)
+    // covering index, so platforms come back alphabetically: groq, kilo,
+    // ovh. The models leg contributes nothing (no chat seed lists contain
+    // these ids), and the Set preserves the first-seen order.
+    const db = getDb();
+    const seedTm = db.prepare(
+      `INSERT INTO transcription_models
+         (family, platform, model_id, display_name, max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+       VALUES ('whisper-large-v3', ?, 'whisper-large-v3', 'Whisper Large V3', 25, 0, NULL, ?, 1, '')`,
+    );
+    seedTm.run('kilo', 2);
+    seedTm.run('ovh', 3);
     insertKey('k6', JSON.stringify(['whisper-large-v3']));
     migrateDbSchema(getDb());
-    expect(JSON.parse(allowlistOf('k6')!)).toEqual(['groq/whisper-large-v3']);
+    expect(JSON.parse(allowlistOf('k6')!)).toEqual([
+      'groq/whisper-large-v3',
+      'kilo/whisper-large-v3',
+      'ovh/whisper-large-v3',
+    ]);
   });
 });

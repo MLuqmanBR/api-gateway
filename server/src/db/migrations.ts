@@ -22,6 +22,7 @@ export function migrateDbSchema(db: DatabasePort) {
   seedBuiltInProviderSettings(db);
   migrateEmbeddingsV1(db);
   migrateTranscriptionsV1(db);
+  reconcileCatalogRowsOutOfChat(db);
   migrateCustomProvidersV24(db);
 
   // Data migrations run exactly once per database, guarded by user_version.
@@ -2220,6 +2221,38 @@ function migrateTranscriptionsV1(db: DatabasePort) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('transcriptions_default_family', 'whisper-large-v3-turbo')").run();
   }
 }
+
+// Boot reconciliation (2026-09-03, replaces the Transcriptions V2 seed):
+// the catalog tables — transcription_models and embedding_models — OWN their
+// ids. Any chat `models` row whose (platform, model_id) pair exists in a
+// catalog table is a resurrection (provider discovery, manual add, restore
+// of a pre-reconciliation config backup) and is deleted at boot. The
+// discovery/manual-add guards in routes/custom.ts prevent new resurrections
+// at request time; this pass catches everything that predates them or
+// arrives via config import.
+//
+// Unguarded every-boot pass (CURRENT_DATA_VERSION is FROZEN — new data fixes
+// must be idempotent + unguarded, like normalizeClientKeyAllowlists):
+// idempotent by construction (second run finds no offending rows), no
+// hardcoded pair list — the catalog tables are the single source of truth.
+// Fresh DBs: the chat seed list contains no catalog pairs, so this no-ops.
+//
+// fallback_config rows are deleted FIRST: fallback_config.model_db_id is the
+// only FK into models(id) and PRAGMA foreign_keys = ON.
+export function reconcileCatalogRowsOutOfChat(db: DatabasePort): void {
+  db.transaction(() => {
+    db.prepare(`DELETE FROM fallback_config WHERE model_db_id IN (
+      SELECT m.id FROM models m
+      WHERE EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = m.platform AND tm.model_id = m.model_id)
+         OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = m.platform AND em.model_id = m.model_id)
+    )`).run();
+    db.prepare(`DELETE FROM models WHERE
+        EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = models.platform AND tm.model_id = models.model_id)
+     OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = models.platform AND em.model_id = models.model_id)
+    `).run();
+  })();
+}
+
 
 // Custom providers V24: promote the special-cased 'custom' platform to a real
 // custom_providers row. Pre-existing api_keys (with their base_url) and models

@@ -475,4 +475,67 @@ describe('Migration idempotency', () => {
     expect(cols1).toContain('audio_seconds');
     expect(cols2).toContain('audio_seconds');
   });
+  it('reconcileCatalogRowsOutOfChat: catalog-owned pairs cannot live in chat models, idempotently', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const db = initDb(':memory:');
+
+    // Catalog tables (transcription_models, embedding_models) own their ids:
+    // any chat-model row for a cataloged pair is a resurrection (discovery,
+    // manual add, old config import) and boot reconciliation deletes it.
+    // Recreate that state: chat models row + fallback row for one pair from
+    // each catalog. The nvidia pair is in the V1 embedding seed; the ovh pair
+    // (public upstream built-in) needs a seeded transcription row.
+    const insertModel = db.prepare(
+      'INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank) VALUES (?, ?, ?, 1, 1)',
+    );
+    const insertFallback = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+    const pairs: Array<[string, string]> = [
+      ['nvidia', 'nvidia/nv-embedqa-e5-v5'],
+      ['ovh', 'whisper-large-v3'],
+    ];
+    db.prepare(
+      `INSERT INTO transcription_models
+         (family, platform, model_id, display_name, max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+       VALUES ('whisper-large-v3', 'ovh', 'whisper-large-v3', 'Whisper Large V3 (OVH)', 25, 0, NULL, 2, 1, '')`,
+    ).run();
+    const modelsBefore = (db.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c;
+    for (const [platform, modelId] of pairs) {
+      const info = insertModel.run(platform, modelId, modelId);
+      insertFallback.run(Number(info.lastInsertRowid), 1);
+    }
+
+    // Re-run the full migration on the already-initialized DB.
+    migrateDbSchema(db);
+
+    // Catalog-owned pairs left the chat catalog…
+    for (const [platform, modelId] of pairs) {
+      expect(
+        (db.prepare('SELECT COUNT(*) AS c FROM models WHERE platform = ? AND model_id = ?').get(platform, modelId) as { c: number }).c,
+      ).toBe(0);
+    }
+    expect((db.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c).toBe(modelsBefore);
+    // …no orphaned fallback rows were left behind…
+    expect((db.prepare(`
+      SELECT COUNT(*) AS c FROM fallback_config f
+      LEFT JOIN models m ON f.model_db_id = m.id
+      WHERE m.id IS NULL
+    `).get() as { c: number }).c).toBe(0);
+    // …catalog rows survive untouched (3 V1 transcription + 1 seeded, 12 V1 embeddings)…
+    expect((db.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c).toBe(4);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM embedding_models').get() as { c: number }).c).toBe(12);
+    expect((db.prepare(`
+      SELECT COUNT(*) AS c FROM (
+        SELECT platform, model_id FROM transcription_models
+         GROUP BY platform, model_id HAVING COUNT(*) > 1
+      )
+    `).get() as { c: number }).c).toBe(0);
+
+    // Second re-run: stable (DELETEs find nothing; counts identical).
+    migrateDbSchema(db);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c).toBe(modelsBefore);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c).toBe(4);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM embedding_models').get() as { c: number }).c).toBe(12);
+
+    db.close();
+  });
 });

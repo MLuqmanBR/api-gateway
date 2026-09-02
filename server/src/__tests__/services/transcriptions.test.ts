@@ -50,9 +50,9 @@ describe('transcriptions service', () => {
   });
 
   describe('migration seed', () => {
-    it('seeds three transcription rows with prices and a default family', () => {
+    it('seeds the three core transcription rows with prices and a default family', () => {
       const rows = getDb().prepare(
-        'SELECT platform, model_id, price_per_hour_usd, supports_translations FROM transcription_models ORDER BY id',
+        "SELECT platform, model_id, price_per_hour_usd, supports_translations FROM transcription_models WHERE platform IN ('groq', 'mistral') ORDER BY id",
       ).all() as { platform: string; model_id: string; price_per_hour_usd: number; supports_translations: number }[];
       expect(rows).toEqual([
         { platform: 'groq', model_id: 'whisper-large-v3-turbo', price_per_hour_usd: 0.04, supports_translations: 0 },
@@ -198,8 +198,10 @@ describe('transcriptions service', () => {
     });
 
     it("a keyless family cannot be rescued by another platform's key", async () => {
-      // whisper-large-v3-turbo's chain is groq-only. A mistral key exists,
-      // but mistral serves a different family — it must not be borrowed.
+      // Fresh-DB chain for whisper-large-v3-turbo is groq-only (V1 seed);
+      // this test DB has no groq keys (keyless rows are skipped silently). A
+      // mistral key exists, but mistral serves a different family — it must
+      // not be borrowed.
       addKey('mistral');
       const fetchMock = vi.fn(async () => okMistral());
       globalThis.fetch = fetchMock as typeof fetch;
