@@ -1,5 +1,6 @@
 // Tests for the F3/F4/F8 backup-restore sections of the config importer
-// (server/src/lib/config/import.ts): client_keys, budgets, webhooks.
+// (server/src/lib/config/import.ts): client_keys, budgets, webhooks, plus
+// the transcription_models / embedding_models catalogs (round-trip below).
 //
 // These drive runImport()/previewEnvelope() directly against an in-memory
 // database. The centerpiece is IDEMPOTENCY: importing the SAME envelope
@@ -233,5 +234,107 @@ describe('config import backup sections (client_keys / budgets / webhooks)', () 
       { platform: 'openai', label: 'plain', enabled: true, key: 'sk-plain-text' },
     ];
     expect(probeKeyCompatibility(env)).toBe('plaintext');
+  });
+
+  it('transcription_models and embedding_models round-trip every field through export/import shape', () => {
+    // Envelope mirrors what buildExport emits for these sections: family
+    // records with provider lists, family-level fields, and the section
+    // defaultFamily. Providers groq/ovh/cloudflare/huggingface are public
+    // built-ins.
+    const base = baseEnvelope();
+    const env: ConfigEnvelope = {
+      ...base,
+      sections: {
+        ...base.sections,
+        transcriptions: {
+          defaultFamily: 'whisper-large-v3-turbo',
+          families: [{
+            family: 'whisper-large-v3-turbo',
+            displayName: 'Whisper Large v3 Turbo',
+            maxFileMb: 25,
+            supportsTranslations: false,
+            quotaLabel: '',
+            providers: [
+              { platform: 'groq', modelId: 'whisper-large-v3-turbo', priority: 1, enabled: true, pricePerHourUsd: 0.04 },
+              { platform: 'ovh', modelId: 'whisper-large-v3-turbo', priority: 2, enabled: false, pricePerHourUsd: null },
+            ],
+          }],
+        },
+        embeddings: {
+          defaultFamily: 'bge-m3',
+          families: [{
+            family: 'bge-m3',
+            displayName: 'BGE-M3',
+            dimensions: 1024,
+            maxInputTokens: 8192,
+            quotaLabel: '',
+            providers: [
+              { platform: 'cloudflare', modelId: '@cf/baai/bge-m3', priority: 1, enabled: true },
+              { platform: 'huggingface', modelId: 'BAAI/bge-m3', priority: 2, enabled: false },
+            ],
+          }],
+        },
+      },
+    };
+
+    // previewEnvelope counts FAMILIES for these two sections.
+    const p = previewEnvelope(structuredClone(env));
+    expect(p.sections.transcriptions).toBe(1);
+    expect(p.sections.embeddings).toBe(1);
+
+    const expectedTm = [
+      { family: 'whisper-large-v3-turbo', platform: 'groq', model_id: 'whisper-large-v3-turbo', display_name: 'Whisper Large v3 Turbo', max_file_mb: 25, supports_translations: 0, price_per_hour_usd: 0.04, priority: 1, enabled: 1, quota_label: '' },
+      { family: 'whisper-large-v3-turbo', platform: 'ovh', model_id: 'whisper-large-v3-turbo', display_name: 'Whisper Large v3 Turbo', max_file_mb: 25, supports_translations: 0, price_per_hour_usd: null, priority: 2, enabled: 0, quota_label: '' },
+    ];
+    const expectedEm = [
+      { family: 'bge-m3', platform: 'cloudflare', model_id: '@cf/baai/bge-m3', display_name: 'BGE-M3', dimensions: 1024, max_input_tokens: 8192, priority: 1, enabled: 1, quota_label: '' },
+      { family: 'bge-m3', platform: 'huggingface', model_id: 'BAAI/bge-m3', display_name: 'BGE-M3', dimensions: 1024, max_input_tokens: 8192, priority: 2, enabled: 0, quota_label: '' },
+    ];
+    const tmRows = () => getDb().prepare(
+      'SELECT family, platform, model_id, display_name, max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label FROM transcription_models ORDER BY platform',
+    ).all();
+    const emRows = () => getDb().prepare(
+      'SELECT family, platform, model_id, display_name, dimensions, max_input_tokens, priority, enabled, quota_label FROM embedding_models ORDER BY platform',
+    ).all();
+    const defaultFamilies = () => ({
+      t: (getDb().prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get() as { value: string } | undefined)?.value,
+      e: (getDb().prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get() as { value: string } | undefined)?.value,
+    });
+
+    for (const mode of ['skip-existing', 'overwrite', 'replace'] as const) {
+      // Start from empty catalogs AND no default-family settings: proves the
+      // import writes every column and both settings keys, not just patches.
+      const db = getDb();
+      db.prepare('DELETE FROM transcription_models').run();
+      db.prepare('DELETE FROM embedding_models').run();
+      db.prepare("DELETE FROM settings WHERE key IN ('transcriptions_default_family','embeddings_default_family')").run();
+
+      const first = runImport({ envelope: structuredClone(env), options: { mode, dryRun: false } });
+      expect(first.sections.transcriptions?.errors ?? []).toEqual([]);
+      expect(first.sections.embeddings?.errors ?? []).toEqual([]);
+      expect(count('transcription_models')).toBe(2);
+      expect(count('embedding_models')).toBe(2);
+      expect(tmRows()).toEqual(expectedTm);
+      expect(emRows()).toEqual(expectedEm);
+      expect(defaultFamilies()).toEqual({ t: 'whisper-large-v3-turbo', e: 'bge-m3' });
+
+      // Same envelope again: zero duplicates in every mode.
+      const second = runImport({ envelope: structuredClone(env), options: { mode, dryRun: false } });
+      expect(second.sections.transcriptions?.errors ?? []).toEqual([]);
+      expect(second.sections.embeddings?.errors ?? []).toEqual([]);
+      expect(count('transcription_models')).toBe(2);
+      expect(count('embedding_models')).toBe(2);
+      expect(tmRows()).toEqual(expectedTm);
+      expect(emRows()).toEqual(expectedEm);
+      expect(defaultFamilies()).toEqual({ t: 'whisper-large-v3-turbo', e: 'bge-m3' });
+      if (mode === 'replace') {
+        // Wipe-and-reinsert: every row counts as added again, nothing accumulates.
+        expect(second.sections.transcriptions?.added).toBe(2);
+        expect(second.sections.embeddings?.added).toBe(2);
+      } else {
+        expect(second.sections.transcriptions?.added).toBe(0);
+        expect(second.sections.embeddings?.added).toBe(0);
+      }
+    }
   });
 });
