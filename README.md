@@ -52,6 +52,7 @@ Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per m
 | **Per-client-key auth** | Issue multiple dashboard-level client keys, each with its own spend cap and label. Apps authenticate with an `api-gateway-...` bearer token. | Multi-app isolation without multi-tenant overhead. Each app gets its own key and budget. |
 | **Tool call repair** | Automatic correction for JSON Schema mismatches and rescue for inline tool-call dialects. | Fewer broken tool loops. |
 | **Embeddings with family routing** | `/v1/embeddings` routes by model family. Cascade only walks providers serving the same model. | Never silently corrupts your vector store by switching embedding models. |
+| **Batch audio transcription** | `/v1/audio/transcriptions` and `/v1/audio/translations` passthrough with family routing (Groq whisper, Mistral voxtral). Client-key allowlists and $-budgets enforced like chat. | Transcribe or translate audio through the same gateway, keys, and budgets as your chat traffic. |
 | **Full config export/import** | One JSON file: models, cascade, providers, keys (optionally passphrase-encrypted), routing strategy, embeddings. Dry-run preview, atomic import with rollback. | Move your entire setup between machines safely. |
 | **Response caching** | Exact-match cache for temp-0 requests. `X-API-Gateway-No-Cache` to bypass. | Zero-latency repeat responses, zero upstream spend on identical requests. |
 | **Anthropic-format inbound** | `/v1/messages` accepts Anthropic-format requests and translates to OpenAI internally. | Use the Anthropic SDK directly without switching your endpoint. |
@@ -70,7 +71,6 @@ Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per m
 <summary><b>What's not supported yet</b></summary>
 
 - Image generation (`/v1/images/*`)
-- Audio / speech (`/v1/audio/*`)
 - Legacy completions (`/v1/completions`) — only chat is implemented
 - Moderation (`/v1/moderations`)
 - `n > 1` (multiple completions per request)
