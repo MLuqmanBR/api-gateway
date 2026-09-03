@@ -19,6 +19,6 @@ export function isReasoningModelId(modelId: string): boolean {
     || ml.includes('minimax-m3')                       // MiniMax M3 = thinking tier
     || ml.includes('minimax-m2')                       // MiniMax M2.x (m2.5/m2.7) = thinking tier (#292)
     || ml.includes('minimaxai/minimax-m')             // NVIDIA-style id `minimaxai/minimax-mN` — catch M2.x/M3 family (#292)
-    || ml.includes('glm-5.2')                          // GLM 5.2 — reasoning tier on every host (incl. aggregatord coding-glm-5.2-free) (#292)
+    || ml.includes('glm-5.2')                          // GLM 5.2 — reasoning tier on every host (#292)
     || ml.includes('mimo-v');                            // Xiaomi MiMo family — reasoning-capable
 }

@@ -1,6 +1,6 @@
 // Pure `<think>` tag extractor for MiniMax reasoning content.
 //
-// Some providers (aggregatorc, openrouter, nvidia) return MiniMax M3 / M2.x
+// Some providers (openrouter, nvidia, and similar aggregators) return MiniMax M3 / M2.x
 // reasoning inline in the `content` field wrapped in `<think>` tags, with no
 // separate `reasoning_content` field. Both the streaming and non-streaming
 // code paths in `routes/proxy.ts` use this module to split that into
