@@ -355,6 +355,9 @@ describe('Migration idempotency', () => {
 
   it('thinking levels: boot pass seeds glm_mapped rows and never revisits operator-owned ones', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const savedMapped = process.env.THINKING_GLM_MAPPED_HOSTS;
+    process.env.THINKING_GLM_MAPPED_HOSTS = 'env-host-c';
+    try {
     const tmpPath = `/tmp/api-gateway-thinking-${Date.now()}.db`;
     const db = initDb(tmpPath);
     const DEFAULT = JSON.stringify([...THINKING_LEVELS]);
@@ -376,14 +379,17 @@ describe('Migration idempotency', () => {
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
       VALUES (?, ?, ?, 10, 10, '', 1)
     `);
-    // Host-based rule match (GLM_HOST_PLATFORMS) and id-based (isGlmModel).
-    const hostRow = Number(ins.run('glmaggregatorb', 'glm-test-host', 'Host Row').lastInsertRowid);
+    // Host-based rule match (glmMappedHosts: public + env-registered hosts)
+    // and id-based (isGlmModel).
+    const hostRow = Number(ins.run('zhipu', 'glm-test-host', 'Host Row').lastInsertRowid);
+    const envRow = Number(ins.run('env-host-c', 'glm-env-row', 'Env Row').lastInsertRowid);
     const idRow = Number(ins.run('some-platform', 'z-ai/glm-5.1', 'Id Row').lastInsertRowid);
     const otherRow = Number(ins.run('openrouter', 'deepseek-v4-pro', 'Other').lastInsertRowid);
 
     // glm-mapped rows get the narrow set, everything else stays at default.
-    applyThinkingLevelRules(db, [hostRow, idRow, otherRow]);
+    applyThinkingLevelRules(db, [hostRow, envRow, idRow, otherRow]);
     expect(levelsOf(hostRow)).toBe(GLM);
+    expect(levelsOf(envRow)).toBe(GLM);
     expect(levelsOf(idRow)).toBe(GLM);
     expect(levelsOf(otherRow)).toBe(DEFAULT);
 
@@ -400,7 +406,7 @@ describe('Migration idempotency', () => {
 
     // (c) a still-default glm_mapped row IS seeded by the next boot pass,
     // with the manual flag left at 0 so operators can still claim it later.
-    const freshRow = Number(ins.run('glmaggregatorb', 'glm-fresh-row', 'Fresh').lastInsertRowid);
+    const freshRow = Number(ins.run('zhipu', 'glm-fresh-row', 'Fresh').lastInsertRowid);
     expect(levelsOf(freshRow)).toBe(DEFAULT);
     migrateDbSchema(db);
     expect(levelsOf(freshRow)).toBe(GLM);
@@ -413,6 +419,10 @@ describe('Migration idempotency', () => {
     expect(levelsOf(lateRow)).toBe(GLM);
     expect(manualFlag(lateRow)).toBe(0);
     db.close();
+    } finally {
+      if (savedMapped === undefined) delete process.env.THINKING_GLM_MAPPED_HOSTS;
+      else process.env.THINKING_GLM_MAPPED_HOSTS = savedMapped;
+    }
   });
 
   it('applyModelPricing refreshes mapped prices but respects pricing_manual', () => {

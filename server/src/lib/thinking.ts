@@ -235,7 +235,7 @@ export function geminiThinkingConfig(
 
 // Per-host thinking-field policy for OpenAI-compat providers. Each host
 // accepts a different subset of the thinking vocabulary, and forwarding a
-// field the host rejects produces a 400 — notably GLM-5.1 on GlmAggregatorB
+// field the host rejects produces a 400 — notably GLM-5.1 on some GLM proxies
 // returns a pydantic `literal_error` for the rich Anthropic-style `thinking`
 // object, killing every request (#292). The gateway therefore never forwards
 // a field unless the host is known to accept it.
@@ -257,7 +257,7 @@ export type OpenAiCompatThinkingPolicy =
   | 'reasoning_effort_only'   // default — emit reasoning_effort verbatim
   | 'glm_mapped'              // GLM — forward the (pre-redirected) effort verbatim, drop the rich object
   | 'glm_nvidia'              // GLM on NVIDIA NIM — needs chat_template_kwargs.enable_thinking; accepts full effort range
-  | 'glm52_synthetic'             // gatewaysynth × glm-5.2 — synthesize thinking={type:enabled} so reasoning_content surfaces; forward effort verbatim across the full 7-value enum
+  | 'glm52_synthetic'         // THINKING_GLM52_SYNTHETIC_HOSTS gateways × glm-5.2 — synthesize thinking={type:'enabled'} so reasoning_content surfaces; forward effort verbatim across the full 7-value enum
   | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only)
 
 
@@ -268,14 +268,20 @@ export type OpenAiCompatThinkingPolicy =
 // model accepts is per-model data (`models.thinking_levels`, seeded for
 // glm_mapped rows); the proxy redirects out-of-set requests upstream, so this
 // layer forwards the effort verbatim and never the rich object.
-// (#292 — confirmed live against GlmAggregatorB's zai-org/GLM-5.1-FP8.)
-const GLM_HOST_PLATFORMS = new Set<string>([
-  'glmaggregatorb', // zai-org/GLM-5.1-FP8
-  'z-ai',          // GLM hosted on NVIDIA NIM
-  'zai',
-  'glmaggregatora',    // z-ai/glm-5.1
-  'zhipu',         // Zhipu/GLM native
-]);
+// Public GLM wrappers are built in; operators register additional hosts via
+// THINKING_GLM_MAPPED_HOSTS (comma-separated platform slugs), read at call
+// time so test stubs and runtime restarts both pick up changes. (#292)
+function glmMappedHosts(): Set<string> {
+  const extra = (process.env.THINKING_GLM_MAPPED_HOSTS ?? '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  return new Set(['z-ai', 'zai', 'zhipu', ...extra]);
+}
+
+/** Hosts registered for the synthetic glm-5.2 thinking switch. */
+function syntheticThinkingHosts(): Set<string> {
+  return new Set((process.env.THINKING_GLM52_SYNTHETIC_HOSTS ?? '')
+    .split(',').map(s => s.trim()).filter(Boolean));
+}
 
 /** True when the model id is a GLM-family model (glm-4.x / glm-5.x in any
  *  case, with any org prefix like `z-ai/`, `zai-org/`). Used so GLM models
@@ -306,28 +312,30 @@ export function isGlmNvidiaThinkingModel(platform: string, modelId?: string): bo
   return /(^|\/)glm[-_.]?5[-_.]?2([-_.]|$)/.test(modelId.toLowerCase());
 }
 
-/** True for GLM 5.2 served on the gatewaysynth New-API gateway (`gatewaysynth` + `glm-5.2`).
- *  Unlike GLM's own OpenAI-compat wrapper (handled by `glm_mapped`), gatewaysynth's
- *  gateway accepts the rich `thinking` object AND the full `reasoning_effort`
- *  enum (none|minimal|low|medium|high|xhigh|max). Critically, `reasoning_effort`
+/** True for GLM 5.2 served on a synthetic-thinking gateway registered via
+ *  THINKING_GLM52_SYNTHETIC_HOSTS (`platform` + `glm-5.2`). Unlike GLM's own
+ *  OpenAI-compat wrapper (handled by `glm_mapped`), these gateways accept the
+ *  rich `thinking` object AND the full `reasoning_effort` enum
+ *  (none|minimal|low|medium|high|xhigh|max). Critically, `reasoning_effort`
  *  alone does NOT surface `reasoning_content` — the `thinking={"type":"enabled"}`
  *  switch is required to make the trace visible, so the body builder synthesizes
  *  it when the caller asks for thinking via `reasoning_effort` alone. Confirmed
- *  live against `glm-5.2` at `https://api.gatewaysynth.example/v1`. Scoped to 5.2 on the
- *  gatewaysynth slug only; gatewaysynth's other models (DeepSeek-V4-Pro, MiniMax-M3) keep the
- *  default. */
+ *  live against a registered gateway. Scoped to 5.2; a registered host's other
+ *  models (DeepSeek, MiniMax) keep the default. */
 export function isSyntheticGlm52ThinkingModel(platform: string, modelId?: string): boolean {
-  if (platform !== 'gatewaysynth' || !modelId) return false;
+  if (!modelId || !syntheticThinkingHosts().has(platform)) return false;
   // Match `glm-5.2` (any separator / org prefix / case), e.g. `glm-5.2`,
   // `z-ai/glm-5.2`. Same regex shape as isGlmNvidiaThinkingModel.
   return /(^|\/)glm[-_.]?5[-_.]?2([-_.]|$)/.test(modelId.toLowerCase());
 }
 
 /** Resolve the thinking-field policy for an OpenAI-compat host. `platform`
- *  is the provider slug; `modelId` is the model being called. GLM 5.2 on
- *  NVIDIA NIM gets `'glm_nvidia'` (needs `chat_template_kwargs.enable_thinking`
- *  and accepts the full effort range) — checked first so it wins over the
- *  generic GLM handling. Any other GLM host OR GLM model gets `'glm_mapped'`
+ *  is the provider slug; `modelId` is the model being called. A glm-5.2 model
+ *  on a gateway registered via THINKING_GLM52_SYNTHETIC_HOSTS gets
+ *  `'glm52_synthetic'` (rich `thinking` object + full effort enum, with the
+ *  synthesized enable switch) — checked first. GLM 5.2 on NVIDIA NIM gets
+ *  `'glm_nvidia'` (needs `chat_template_kwargs.enable_thinking` and accepts
+ *  the full effort range). Any GLM host OR GLM model gets `'glm_mapped'`
  *  (GLM accepts a narrow `reasoning_effort` enum but rejects the rich
  *  `thinking` object); everyone else gets the safe `reasoning_effort_only`
  *  default so future providers never trigger a literal_error from an unverified
@@ -336,7 +344,7 @@ export function isSyntheticGlm52ThinkingModel(platform: string, modelId?: string
 export function openAiCompatThinkingPolicy(platform: string, modelId?: string): OpenAiCompatThinkingPolicy {
   if (isSyntheticGlm52ThinkingModel(platform, modelId)) return 'glm52_synthetic';
   if (isGlmNvidiaThinkingModel(platform, modelId)) return 'glm_nvidia';
-  if (GLM_HOST_PLATFORMS.has(platform)) return 'glm_mapped';
+  if (glmMappedHosts().has(platform)) return 'glm_mapped';
   if (modelId && isGlmModel(modelId)) return 'glm_mapped';
   return 'reasoning_effort_only';
 }
@@ -401,27 +409,27 @@ export function openaiCompatThinkingBody(
   }
 
   if (policy === 'glm52_synthetic') {
-    // gatewaysynth accepts reasoning_effort as a string across the full enum
-    // (none|minimal|low|medium|high|xhigh|max) and accepts `thinking` as a
+    // Synthetic-thinking gateways accept reasoning_effort as a string across
+    // the full enum (none|minimal|low|medium|high|xhigh|max) and accepts `thinking` as a
     // boolean or {type} object. But reasoning_effort ALONE does not surface
     // reasoning_content — the thinking={type:enabled} switch is required.
     // So when the caller asks for thinking by any means, ensure the thinking
-    // object reaches gatewaysynth. Confirmed live (Turn 1).
+    // object reaches the gateway. Confirmed live.
 
     // Honor an explicit disable: forward verbatim, send no effort.
     if (original?.thinking?.type === 'disabled') {
       return { thinking: { type: 'disabled' } };
     }
 
-    // Nothing requested — send nothing; gatewaysynth defaults to no trace.
+    // Nothing requested — send nothing; these gateways default to no trace.
     const requested = effort !== undefined || original?.thinking !== undefined;
     if (!requested) return out;
 
-    // Forward the caller's thinking object verbatim when present (gatewaysynth accepts
+    // Forward the caller's thinking object verbatim when present (they accept
     // boolean, {type:enabled}, {type:adaptive}); otherwise synthesize the
     // {type:enabled} switch that surfaces the trace.
     out.thinking = original?.thinking ?? { type: 'enabled' };
-    // Forward effort verbatim (gatewaysynth accepts the full 7-value enum; GLM's
+    // Forward effort verbatim (they accept the full 7-value enum; GLM's
     // narrow-enum restriction is handled per-model upstream, not here).
     if (effort) out.reasoning_effort = effort;
     return out;
