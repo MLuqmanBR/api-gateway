@@ -2003,10 +2003,11 @@ function migrateModelsV26MaxOutputTokens(db: DatabasePort) {
   }
 }
 
-// V27: user-requested custom providers and their models (GlmAggregatorA,
-// GlmAggregatorB, DeepSeek). Each is an OpenAI-compatible endpoint with
-// free-tier API keys. Models are registered and added to the fallback
-// chain at lowest priority so they don't displace existing models.
+// V27: seeded custom provider (DeepSeek) with its models. An OpenAI-compatible
+// endpoint with free-tier API keys. Models are registered and added to the
+// fallback chain at lowest priority so they don't displace existing models.
+// Operator-added providers come from the dashboard or config import; only
+// public seeds live here.
 function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
   type ProviderDef = { slug: string; name: string; url: string };
   type ModelDef = {
@@ -2016,20 +2017,10 @@ function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
   };
 
   const providers: ProviderDef[] = [
-    { slug: 'glmaggregatora', name: 'GlmAggregatorA', url: 'https://api.glmaggregatora.example/v1' },
-    { slug: 'glmaggregatorb', name: 'GlmAggregatorB', url: 'https://api.glmaggregatorb.example/v1' },
     { slug: 'deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com' },
   ];
 
   const models: ModelDef[] = [
-    // GlmAggregatorA
-    { provider: 'glmaggregatora', id: 'accounts/fireworks/models/deepseek-v4-pro', name: 'DeepSeek v4 Pro', context: 1048576, maxOut: 131072, intel: 95, speed: 40, size: 'Frontier' },
-    { provider: 'glmaggregatora', id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', context: 262144, maxOut: 65536, intel: 90, speed: 45, size: 'Frontier' },
-    { provider: 'glmaggregatora', id: 'qwen3.6-max-preview', name: 'Qwen 3.6 Max Preview', context: 262144, maxOut: 65536, intel: 88, speed: 50, size: 'Frontier' },
-    { provider: 'glmaggregatora', id: 'z-ai/glm-5.1', name: 'GLM 5.1', context: 200000, maxOut: 65536, intel: 85, speed: 55, size: 'Large' },
-    { provider: 'glmaggregatora', id: 'DeepSeek-V4-Flash', name: 'DeepSeek v4 Flash', context: 1048576, maxOut: 131072, intel: 85, speed: 70, size: 'Frontier' },
-    // GlmAggregatorB
-    { provider: 'glmaggregatorb', id: 'zai-org/GLM-5.1-FP8', name: 'GLM 5.1', context: 202752, maxOut: 32768, intel: 85, speed: 60, size: 'Large' },
     // DeepSeek
     { provider: 'deepseek', id: 'deepseek-v4-pro', name: 'DeepSeek v4 Pro', context: 1048576, maxOut: 262144, intel: 95, speed: 40, size: 'Frontier' },
     { provider: 'deepseek', id: 'deepseek-v4-flash', name: 'DeepSeek v4 Flash', context: 1048576, maxOut: 262144, intel: 85, speed: 70, size: 'Frontier' },
@@ -2040,8 +2031,6 @@ function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
       "INSERT OR IGNORE INTO custom_providers (slug, display_name, base_url, rpm_limit, max_parallel_requests) VALUES (?, ?, ?, ?, ?)"
     );
     const limits: Record<string, [number | null, number | null]> = {
-      glmaggregatora: [15, 5],
-      glmaggregatorb: [60, null],
       deepseek: [500, 500],
     };
     const updProv = db.prepare(
