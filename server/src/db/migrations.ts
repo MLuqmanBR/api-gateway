@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import type { DatabasePort } from './types.js';
 import { initEncryptionKey } from '../lib/crypto.js';
 import { applyModelPricing, applyActualCostPricing } from './model-pricing.js';
-import { THINKING_LEVELS, openAiCompatThinkingPolicy } from '../lib/thinking.js';
+import { THINKING_LEVELS } from '../lib/thinking.js';
 
 // FROZEN — do NOT bump. All new model-seed migrations MUST be idempotent and
 // unguarded (outside the `version < CURRENT_DATA_VERSION` transaction) so they
@@ -84,14 +84,6 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV45MiddleRedaction(db);
   migrateSchemaV46DropSupportsTools(db);
   migrateSchemaV47ModelThinkingLevels(db);
-  // Boot-time pass of the thinking-level rules over every row — same class as
-  // applyActualCostPricing/normalizeClientKeyAllowlists: runs every boot, safe
-  // because the rule's guard never touches operator-edited rows (the
-  // thinking_levels_manual flag) or rows already carrying a rule outcome.
-  applyThinkingLevelRules(
-    db,
-    (db.prepare('SELECT id FROM models').all() as Array<{ id: number }>).map(r => r.id),
-  );
   // AFTER all schema migrations — needs client_keys (V39) + final models state.
   normalizeClientKeyAllowlists(db);
 }
@@ -2798,13 +2790,13 @@ function migrateSchemaV46DropSupportsTools(db: DatabasePort) {
 // V47 (2026-08-26): per-model supported thinking levels. `thinking_levels`
 // holds a JSON array of the effort levels (`minimal|low|medium|high|xhigh|max`)
 // the model actually accepts; the proxy redirects unsupported client-requested
-// levels to the nearest supported one at request time. Replaces the hard-coded
-// GLM enum clamp (mapGlmEffort) with per-model data editable from the
-// dashboard. `thinking_levels_manual` is the operator-override flag (the
-// pricing_manual pattern): any dashboard write sets it to 1 and the boot-time
-// rule pass below then never revisits the row, in either direction.
+// levels to the nearest supported one at request time. Levels are per-model
+// data editable from the dashboard. `thinking_levels_manual` is the
+// operator-override flag (the
+// pricing_manual pattern): any dashboard write sets it to 1. With rule-based
+// seeding removed, levels are purely operator-driven — untouched rows keep
+// the unrestricted default.
 const DEFAULT_THINKING_LEVELS = JSON.stringify([...THINKING_LEVELS]);
-const GLM_THINKING_LEVELS = JSON.stringify(['low', 'medium', 'high']);
 
 function migrateSchemaV47ModelThinkingLevels(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
@@ -2816,30 +2808,3 @@ function migrateSchemaV47ModelThinkingLevels(db: DatabasePort) {
   }
 }
 
-/** Applies the thinking-level rules to the given model ids. Rule-based rather
- *  than an id list so it survives catalog churn, like applyVisionRules. Today
- *  there is exactly one rule: glm_mapped models (GLM's own OpenAI-compat hosts)
- *  accept only low|medium|high — see openAiCompatThinkingPolicy — so their rows
- *  are seeded with that subset of the scale. glm_nvidia / glm52_synthetic pairs take
- *  the full range and stay at the default. The double guard makes boot passes
- *  inert against operator intent: rows with thinking_levels_manual = 1 are
- *  skipped outright, and rows already carrying a rule outcome (levels ≠ default)
- *  are not re-derived. Runtime ingest re-applies this SCOPED to freshly
- *  inserted ids (routes/custom.ts) so late-synced models don't wait for a
- *  reboot. */
-export function applyThinkingLevelRules(db: DatabasePort, ids: number[]): void {
-  if (ids.length === 0) return;
-  const rows = db.prepare(
-    `SELECT id, platform, model_id FROM models WHERE id IN (${ids.map(() => '?').join(',')})`,
-  ).all(...ids) as Array<{ id: number; platform: string; model_id: string }>;
-  const apply = db.transaction(() => {
-    for (const row of rows) {
-      if (openAiCompatThinkingPolicy(row.platform, row.model_id) !== 'glm_mapped') continue;
-      db.prepare(`
-        UPDATE models SET thinking_levels = ?
-        WHERE id = ? AND thinking_levels_manual = 0 AND thinking_levels = ?
-      `).run(GLM_THINKING_LEVELS, row.id, DEFAULT_THINKING_LEVELS);
-    }
-  });
-  apply();
-}

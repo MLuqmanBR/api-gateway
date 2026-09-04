@@ -131,71 +131,7 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
-  describe('GLM 5.2 on NVIDIA NIM thinking wiring (#292)', () => {
-    const nim = () => new OpenAICompatProvider({
-      platform: 'nvidia',
-      name: 'NVIDIA NIM',
-      baseUrl: 'https://integrate.api.nvidia.com/v1',
-      forceSingleToolCall: true,
-    });
-    const okResponse = {
-      ok: true,
-      json: () => Promise.resolve({
-        id: 'x', object: 'chat.completion', created: 1, model: 'm',
-        choices: [{ index: 0, message: { role: 'assistant', content: 'hi' }, finish_reason: 'stop' }],
-        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
-      }),
-    } as any;
-
-    it('sends chat_template_kwargs.enable_thinking + verbatim effort for z-ai/glm-5.2', async () => {
-      let body: any = null;
-      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
-      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.2', { reasoning_effort: 'max' });
-      // enable_thinking is the switch that actually turns reasoning on; the
-      // effort is forwarded unclamped (NVIDIA accepts the full range).
-      expect(body.chat_template_kwargs).toEqual({ enable_thinking: true, clear_thinking: false });
-      expect(body.reasoning_effort).toBe('max');
-    });
-
-    it('does NOT clamp minimal/xhigh the way the GLM-native (glm_mapped) path does', async () => {
-      let body: any = null;
-      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
-      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.2', { reasoning_effort: 'minimal' });
-      expect(body.reasoning_effort).toBe('minimal');
-    });
-
-    it('omits thinking fields entirely when no effort/thinking is requested', async () => {
-      let body: any = null;
-      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
-      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.2', {});
-      expect(body.chat_template_kwargs).toBeUndefined();
-      expect(body.reasoning_effort).toBeUndefined();
-    });
-
-    it('leaves GLM 5.1 on NVIDIA on the glm_mapped path (no chat_template_kwargs; effort forwarded verbatim)', async () => {
-      let body: any = null;
-      vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => { body = JSON.parse((init as any).body); return okResponse; });
-      await nim().chatCompletion('k', [{ role: 'user', content: 'hi' }], 'z-ai/glm-5.1', { reasoning_effort: 'max' });
-      expect(body.chat_template_kwargs).toBeUndefined();
-      expect(body.reasoning_effort).toBe('max'); // verbatim — per-model redirect happens in the proxy
-    });
-  });
-
-  describe('GLM 5.2 on a synthetic thinking gateway (reasoning_content surfacing)', () => {
-    let savedSynthetic: string | undefined;
-    beforeEach(() => {
-      savedSynthetic = process.env.THINKING_GLM52_SYNTHETIC_HOSTS;
-      process.env.THINKING_GLM52_SYNTHETIC_HOSTS = 'synth-gateway';
-    });
-    afterEach(() => {
-      if (savedSynthetic === undefined) delete process.env.THINKING_GLM52_SYNTHETIC_HOSTS;
-      else process.env.THINKING_GLM52_SYNTHETIC_HOSTS = savedSynthetic;
-    });
-    const ihc = () => new OpenAICompatProvider({
-      platform: 'synth-gateway',
-      name: 'Synthetic Gateway',
-      baseUrl: 'https://api.synth-gateway.example/v1',
-    });
+  describe('thinking fields — default path (single reasoning_effort, rich object never forwarded)', () => {
     const okResponse = {
       ok: true,
       json: () => Promise.resolve({
@@ -204,46 +140,76 @@ describe('OpenAICompatProvider', () => {
         usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
       }),
     } as unknown as Response; // minimal Response stub for the fetch spy
+    const sseResponse = (...chunks: string[]): Response => {
+      const enc = new TextEncoder();
+      let i = 0;
+      return {
+        ok: true,
+        body: new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (i < chunks.length) controller.enqueue(enc.encode(chunks[i++]));
+            else controller.close();
+          },
+        }),
+      } as unknown as Response;
+    };
 
-    const captureBody = async (model: string, opts: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    const captureBody = async (model: string, opts: Record<string, unknown>, stream = false): Promise<Record<string, unknown>> => {
       let body: Record<string, unknown> = {};
       vi.spyOn(global, 'fetch').mockImplementation(async (_u, init) => {
         const text = typeof init?.body === 'string' ? init.body : '{}';
         body = JSON.parse(text) as Record<string, unknown>;
+        if (stream) return sseResponse(
+          'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+          'data: {"id":"x","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+          'data: [DONE]\n\n',
+        );
         return okResponse;
       });
-      await ihc().chatCompletion('k', [{ role: 'user', content: 'hi' }], model, opts);
+      const p = new OpenAICompatProvider({
+        platform: 'synth-gateway',
+        name: 'Synthetic Gateway',
+        baseUrl: 'https://api.synth-gateway.example/v1',
+      });
+      if (stream) {
+        const gen = p.streamChatCompletion('k', [{ role: 'user', content: 'hi' }], model, opts);
+        await gen.next(); // first fetch happens here — the body is captured in the spy
+        await gen.return(undefined);
+      } else {
+        await p.chatCompletion('k', [{ role: 'user', content: 'hi' }], model, opts);
+      }
       return body;
     };
 
-    it('synthesizes thinking={type:enabled} when only reasoning_effort is sent (OMP/OpenAI-SDK pattern)', async () => {
-      const body = await captureBody('glm-5.2', { reasoning_effort: 'high' });
-      expect(body.thinking).toEqual({ type: 'enabled' });
-      expect(body.reasoning_effort).toBe('high');
-    });
-
-    it('forwards reasoning_effort verbatim across the full enum (no glm_mapped clamping)', async () => {
-      const body = await captureBody('glm-5.2', { reasoning_effort: 'max' });
+    it('forwards reasoning_effort verbatim — GLM ids included (no narrowing at the provider layer)', async () => {
+      const body = await captureBody('z-ai/glm-5.2', { reasoning_effort: 'max' });
       expect(body.reasoning_effort).toBe('max');
-      expect(body.thinking).toEqual({ type: 'enabled' });
-    });
-
-    it('forwards an explicit thinking object verbatim alongside extracted effort', async () => {
-      const body = await captureBody('glm-5.2', { reasoning_effort: 'max', thinking: { type: 'enabled' } });
-      expect(body.thinking).toEqual({ type: 'enabled' });
-      expect(body.reasoning_effort).toBe('max');
-    });
-
-    it('omits thinking fields entirely when no effort/thinking is requested', async () => {
-      const body = await captureBody('glm-5.2', {});
       expect(body.thinking).toBeUndefined();
+      expect(body.chat_template_kwargs).toBeUndefined();
+    });
+
+    it('keeps the full enum verbatim (no clamping for any model id)', async () => {
+      expect((await captureBody('glm-5.3-flash', { reasoning_effort: 'minimal' })).reasoning_effort).toBe('minimal');
+      expect((await captureBody('glm-5.3-flash', { reasoning_effort: 'xhigh' })).reasoning_effort).toBe('xhigh');
+    });
+
+    it('derives reasoning_effort from a rich thinking object and never forwards the object itself', async () => {
+      const body = await captureBody('deepseek-v4-pro', { thinking: { type: 'enabled', effort: 'high', budget: 4000 } });
+      expect(body).toEqual({ model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'high' });
+    });
+
+    it('omits all thinking fields when no knob is set', async () => {
+      const body = await captureBody('deepseek-v4-pro', {});
       expect(body.reasoning_effort).toBeUndefined();
+      expect(body.thinking).toBeUndefined();
+      expect(body.chat_template_kwargs).toBeUndefined();
     });
 
-    it('leaves non-GLM-5.2 models on the default path (no thinking synthesized)', async () => {
-      const body = await captureBody('DeepSeek-V4-Pro', { reasoning_effort: 'high' });
+    it('sends the same thinking fields on the streaming path (shared buildBody)', async () => {
+      const body = await captureBody('z-ai/glm-5.2', { reasoning_effort: 'high', thinking: { type: 'enabled', effort: 'low' } }, true);
       expect(body.reasoning_effort).toBe('high');
       expect(body.thinking).toBeUndefined();
+      expect(body.chat_template_kwargs).toBeUndefined();
     });
   });
 

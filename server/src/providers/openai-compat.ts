@@ -5,10 +5,6 @@ import type {
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { extractErrorMessage } from '../lib/error-body.js';
-import {
-  openAiCompatThinkingPolicy,
-  openaiCompatThinkingBody,
-} from '../lib/thinking.js';
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
  * Covers: Groq, Cerebras, NVIDIA NIM, Mistral, OpenRouter,
@@ -55,19 +51,18 @@ export class OpenAICompatProvider extends BaseProvider {
     this.keyFormat = opts.keyFormat ?? 'simple';
   }
 
-  /** Resolve the per-call thinking policy: the host's base policy, tightened
-   * to `'none'` when this specific model is a GLM model (e.g.
-   * `nvidia/z-ai/glm-5.1`) regardless of host. Then build only the fields the
-   * resolved policy permits. (#292) */
-  private buildThinkingFields(
-    modelId: string,
-    options?: CompletionOptions,
-  ): Record<string, unknown> {
-    const policy = openAiCompatThinkingPolicy(this.platform, modelId);
-    return openaiCompatThinkingBody(policy, {
-      reasoning_effort: options?.reasoning_effort,
-      thinking: options?.thinking,
-    });
+  /** Build the outbound thinking fields. Emits a single `reasoning_effort`
+   *  derived from the explicit `reasoning_effort` or, when only a rich
+   *  `thinking` object was sent, from `thinking.effort`. The rich object
+   *  itself is never forwarded — per-host acceptance is unverified and it
+   *  triggers literal_errors on strict wrappers (#292). Per-model level
+   *  enforcement is the proxy's data-driven redirect
+   *  (`redirectThinkingRequest`), upstream of here. */
+  private buildThinkingFields(options?: CompletionOptions): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    const effort = options?.reasoning_effort ?? options?.thinking?.effort;
+    if (effort) out.reasoning_effort = effort;
+    return out;
   }
 
   /** Resolve the parallel_tool_calls flag to send upstream. For providers that
@@ -82,8 +77,8 @@ export class OpenAICompatProvider extends BaseProvider {
   /** Assemble the request body shared by chatCompletion and
    * streamChatCompletion. Optional params are included only when explicitly
    * set — some providers (NVIDIA NIM minimax) reject unknown or zero-valued
-   * params. Thinking/reasoning knobs are forwarded ONLY for fields this host
-   * (and this model) accept; see buildThinkingFields. */
+   * params. Thinking is forwarded as a single `reasoning_effort`; see
+   * buildThinkingFields. */
   private buildBody(
     messages: ChatMessage[],
     modelId: string,
@@ -98,7 +93,7 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.tool_choice !== undefined) body.tool_choice = options.tool_choice;
     const parallel = this.resolveParallelToolCalls(options);
     if (parallel !== undefined) body.parallel_tool_calls = parallel;
-    Object.assign(body, this.buildThinkingFields(modelId, options));
+    Object.assign(body, this.buildThinkingFields(options));
     if (stream) body.stream = true;
     return body;
   }

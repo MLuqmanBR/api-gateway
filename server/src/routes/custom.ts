@@ -7,7 +7,7 @@ import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 import { decrypt } from '../lib/crypto.js';
-import { applyTierRules, applyThinkingLevelRules, applyVisionRules } from '../db/migrations.js';
+import { applyTierRules, applyVisionRules } from '../db/migrations.js';
 import { THINKING_LEVELS, THINKING_OFF } from '../lib/thinking.js';
 
 // L11: strict numeric-id guard for :id path params. parseInt('12abc') === 12
@@ -297,7 +297,6 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
     if (addedIds.length > 0) {
       applyVisionRules(db, addedIds);
       applyTierRules(db, addedIds);
-      applyThinkingLevelRules(db, addedIds);
     }
 
     console.log(`[Custom] ${slug}: discovered ${added.length} models (${models.length} total, skipped ${models.length - added.length} existing)`);
@@ -816,9 +815,6 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
   // explicit supportsVision/sizeLabel in the request body wins.
   if (d.supportsVision === undefined) applyVisionRules(db, [modelDbId]);
   if (d.sizeLabel === undefined) applyTierRules(db, [modelDbId]);
-  // Levels: only seed when the operator gave none — an explicit choice wins
-  // and the manual flag (set in the INSERT) keeps boot passes off the row.
-  if (d.thinkingLevels === undefined) applyThinkingLevelRules(db, [modelDbId]);
   res.status(201).json({
     success: true,
     id: modelDbId,
