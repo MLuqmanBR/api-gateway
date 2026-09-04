@@ -1260,7 +1260,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const catalogCap = route.maxOutputTokens ?? undefined;
     const effectiveMaxTokens = max_tokens ?? catalogCap;
 
-    // MiniMax M2.x/M3 on aggregatorc / openrouter / nvidia returns reasoning
+    // MiniMax M2.x/M3 on openrouter / nvidia and similar aggregators returns reasoning
     // inline in `content` wrapped in `<think>` tags instead of using a separate
     // `reasoning_content` field. The api-gateway splits that into the
     // `reasoning_content` transport field so clients see a clean answer. The

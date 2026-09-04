@@ -47,7 +47,7 @@ describe('extractThinkTags', () => {
   // visible output is what is between the two blocks. This is
   // the documented limit of text-only extraction; the real model
   // response on this prompt is captured live 2026-06-19 from
-  // aggregatorc/MiniMax-M3, and the visible residue is non-code-
+  // a MiniMax-M3 provider, and the visible residue is non-code-
   // (the answer body is the code block, the first block is the
   // reasoning about the user request). The integration relies on
   // a single think block per response, not on adversarial cases
@@ -62,7 +62,7 @@ describe('extractThinkTags', () => {
     expect(r.visible).toBe('\n\n```python\npattern = r""\n```');
   });
 
-  // Adversarial live test, captured 2026-06-19 from aggregatorc/MiniMax-M3
+  // Adversarial live test, captured 2026-06-19 from a MiniMax-M3 provider
   // with prompt: "Write a Python function that adds two numbers. Include
   // a comment with the word think in it."
   it('preserves code block containing the word "think" as a comment', () => {

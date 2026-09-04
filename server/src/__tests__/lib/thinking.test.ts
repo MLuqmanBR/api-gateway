@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   normalizeThinking,
   anthropicThinking,
@@ -135,11 +135,9 @@ describe('geminiThinkingConfig', () => {
 });
 
 describe('openAiCompatThinkingPolicy', () => {
-  it('returns "glm_mapped" for GLM host platforms', () => {
-    expect(openAiCompatThinkingPolicy('glmaggregatorb')).toBe('glm_mapped');
+  it('returns "glm_mapped" for public GLM host platforms', () => {
     expect(openAiCompatThinkingPolicy('z-ai')).toBe('glm_mapped');
     expect(openAiCompatThinkingPolicy('zai')).toBe('glm_mapped');
-    expect(openAiCompatThinkingPolicy('glmaggregatora')).toBe('glm_mapped');
     expect(openAiCompatThinkingPolicy('zhipu')).toBe('glm_mapped');
   });
 
@@ -168,20 +166,58 @@ describe('openAiCompatThinkingPolicy', () => {
     expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.1')).toBe('glm_mapped');
   });
 
-  it('returns "glm52_synthetic" for GLM 5.2 on gatewaysynth (synthesizes thinking to surface reasoning_content)', () => {
-    expect(openAiCompatThinkingPolicy('gatewaysynth', 'glm-5.2')).toBe('glm52_synthetic');
-    expect(openAiCompatThinkingPolicy('gatewaysynth', 'z-ai/glm-5.2')).toBe('glm52_synthetic');
-  });
 
-  it('keeps gatewaysynth non-GLM-5.2 models on the default policy (no gatewaysynth-wide exception)', () => {
-    expect(openAiCompatThinkingPolicy('gatewaysynth', 'DeepSeek-V4-Pro')).toBe('reasoning_effort_only');
-    expect(openAiCompatThinkingPolicy('gatewaysynth', 'MiniMax-M3')).toBe('reasoning_effort_only');
-  });
-
-  it('keeps GLM 5.2 on non-gatewaysynth hosts unchanged (the gatewaysynth quirk is host-specific)', () => {
+  it('keeps GLM 5.2 on non-registered hosts unchanged (the synthetic switch is host-specific)', () => {
     expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.2')).toBe('glm_nvidia');
     expect(openAiCompatThinkingPolicy('openrouter', 'z-ai/glm-5.2')).toBe('glm_mapped');
     expect(openAiCompatThinkingPolicy('zhipu', 'glm-5.2')).toBe('glm_mapped');
+  });
+});
+
+describe('env-registered thinking hosts', () => {
+  let savedMapped: string | undefined;
+  let savedSynthetic: string | undefined;
+  beforeEach(() => {
+    savedMapped = process.env.THINKING_GLM_MAPPED_HOSTS;
+    savedSynthetic = process.env.THINKING_GLM52_SYNTHETIC_HOSTS;
+    delete process.env.THINKING_GLM_MAPPED_HOSTS;
+    delete process.env.THINKING_GLM52_SYNTHETIC_HOSTS;
+  });
+  afterEach(() => {
+    if (savedMapped === undefined) delete process.env.THINKING_GLM_MAPPED_HOSTS;
+    else process.env.THINKING_GLM_MAPPED_HOSTS = savedMapped;
+    if (savedSynthetic === undefined) delete process.env.THINKING_GLM52_SYNTHETIC_HOSTS;
+    else process.env.THINKING_GLM52_SYNTHETIC_HOSTS = savedSynthetic;
+  });
+
+  it('registers glm_mapped hosts via THINKING_GLM_MAPPED_HOSTS (entries trimmed)', () => {
+    process.env.THINKING_GLM_MAPPED_HOSTS = 'env-host-a, env-host-b';
+    expect(openAiCompatThinkingPolicy('env-host-a')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('env-host-b')).toBe('glm_mapped');
+    // Public GLM wrappers stay registered; NVIDIA stays on its own path.
+    expect(openAiCompatThinkingPolicy('zhipu')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('nvidia')).toBe('reasoning_effort_only');
+  });
+
+  it('registers the synthetic glm-5.2 switch via THINKING_GLM52_SYNTHETIC_HOSTS (host-scoped, model-scoped)', () => {
+    process.env.THINKING_GLM52_SYNTHETIC_HOSTS = 'env-gateway';
+    expect(openAiCompatThinkingPolicy('env-gateway', 'glm-5.2')).toBe('glm52_synthetic');
+    expect(openAiCompatThinkingPolicy('env-gateway', 'z-ai/glm-5.2')).toBe('glm52_synthetic');
+    // Non-GLM-5.2 models on a registered host keep the default policy.
+    expect(openAiCompatThinkingPolicy('env-gateway', 'DeepSeek-V4-Pro')).toBe('reasoning_effort_only');
+    expect(openAiCompatThinkingPolicy('env-gateway', 'MiniMax-M3')).toBe('reasoning_effort_only');
+    // GLM 5.1 on the same host is plain glm_mapped (narrow enum, no switch).
+    expect(openAiCompatThinkingPolicy('env-gateway', 'z-ai/glm-5.1')).toBe('glm_mapped');
+    // The NVIDIA quirk still wins on NVIDIA; public wrappers are unaffected.
+    expect(openAiCompatThinkingPolicy('nvidia', 'z-ai/glm-5.2')).toBe('glm_nvidia');
+    expect(openAiCompatThinkingPolicy('zhipu', 'glm-5.2')).toBe('glm_mapped');
+  });
+
+  it('with both vars unset, unregistered hosts keep the safe default (env is the only registration path)', () => {
+    expect(openAiCompatThinkingPolicy('env-host-a')).toBe('reasoning_effort_only');
+    // The GLM model-id fallback still applies on unregistered hosts.
+    expect(openAiCompatThinkingPolicy('env-gateway', 'glm-5.2')).toBe('glm_mapped');
+    expect(openAiCompatThinkingPolicy('env-gateway', 'glm-5.2')).not.toBe('glm52_synthetic');
   });
 });
 

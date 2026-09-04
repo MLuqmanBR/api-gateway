@@ -251,6 +251,9 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL)
     `);
     const insertFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+    const catalogedPair = db.prepare(`
+      SELECT 1 WHERE EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = ? AND tm.model_id = ?)
+                  OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = ? AND em.model_id = ?)`);
 
     const tx = db.transaction(() => {
       for (const m of models) {
@@ -262,6 +265,13 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
         // Skip if already registered
         const exists = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?').get(slug, modelId);
         if (exists) continue;
+
+        // Skip ids owned by a catalog table (transcription_models or
+        // embedding_models). Discovering them here would resurrect the exact
+        // chat rows boot reconciliation (reconcileCatalogRowsOutOfChat)
+        // deletes at boot (whack-a-mole until restart), and double-list the
+        // pair in allowlist expansion, which unions all three tables.
+        if (catalogedPair.get(slug, modelId, slug, modelId)) continue;
 
         // Use the model id as display name (user can rename later).
         // Defaults match MODEL_DEFAULTS: middle ranks, no rate limits,
@@ -753,6 +763,20 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
     res.status(200).json({
       success: true, id: dup.id, platform: slug, modelId, displayName, revived: true,
     });
+    return;
+  }
+
+  // Ids cataloged in transcription_models or embedding_models are owned by
+  // their catalog — adding one as a chat model would resurrect the row boot
+  // reconciliation (reconcileCatalogRowsOutOfChat) deletes on every start
+  // (see the sync-path guard in syncModelsFromProvider for the same rule on
+  // discovery).
+  const cataloged = db.prepare(`
+    SELECT 1 WHERE EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = ? AND tm.model_id = ?)
+                OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = ? AND em.model_id = ?)
+  `).get(slug, modelId, slug, modelId);
+  if (cataloged) {
+    res.status(409).json({ error: { message: `model '${modelId}' is cataloged in transcription_models/embedding_models for '${slug}' — catalog ids cannot be added as chat models` } });
     return;
   }
   const tx = db.transaction(() => {

@@ -25,6 +25,7 @@ const BudgetPage = lazy(() => import('@/pages/BudgetPage'))
 const PlaygroundPage = lazy(() => import('@/pages/PlaygroundPage'))
 const FallbackPage = lazy(() => import('@/pages/FallbackPage'))
 const EmbeddingsPage = lazy(() => import('@/pages/EmbeddingsPage'))
+const TranscriptionPage = lazy(() => import('@/pages/TranscriptionPage'))
 const AnalyticsPage = lazy(() => import('@/pages/AnalyticsPage'))
 const SettingsPage = lazy(() => import('@/pages/SettingsPage'))
 const WebhooksPage = lazy(() => import('@/pages/WebhooksPage'))
@@ -280,6 +281,7 @@ function App() {
                       <Route path="/models" element={<Navigate to="/models/chat" replace />} />
                       <Route path="/models/chat" element={<FallbackPage />} />
                       <Route path="/models/embeddings" element={<EmbeddingsPage />} />
+                      <Route path="/models/transcriptions" element={<TranscriptionPage />} />
                       <Route path="/playground" element={<PlaygroundPage />} />
                       <Route path="/analytics" element={<AnalyticsPage />} />
                       <Route path="/keys" element={<KeysPage />} />

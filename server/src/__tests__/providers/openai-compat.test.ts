@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { OpenAICompatProvider } from '../../providers/openai-compat.js';
 
 describe('OpenAICompatProvider', () => {
@@ -181,11 +181,20 @@ describe('OpenAICompatProvider', () => {
     });
   });
 
-  describe('GLM 5.2 on gatewaysynth thinking wiring (reasoning_content surfacing)', () => {
+  describe('GLM 5.2 on a synthetic thinking gateway (reasoning_content surfacing)', () => {
+    let savedSynthetic: string | undefined;
+    beforeEach(() => {
+      savedSynthetic = process.env.THINKING_GLM52_SYNTHETIC_HOSTS;
+      process.env.THINKING_GLM52_SYNTHETIC_HOSTS = 'synth-gateway';
+    });
+    afterEach(() => {
+      if (savedSynthetic === undefined) delete process.env.THINKING_GLM52_SYNTHETIC_HOSTS;
+      else process.env.THINKING_GLM52_SYNTHETIC_HOSTS = savedSynthetic;
+    });
     const ihc = () => new OpenAICompatProvider({
-      platform: 'gatewaysynth',
-      name: 'gatewaysynth',
-      baseUrl: 'https://api.gatewaysynth.example/v1',
+      platform: 'synth-gateway',
+      name: 'Synthetic Gateway',
+      baseUrl: 'https://api.synth-gateway.example/v1',
     });
     const okResponse = {
       ok: true,
@@ -231,7 +240,7 @@ describe('OpenAICompatProvider', () => {
       expect(body.reasoning_effort).toBeUndefined();
     });
 
-    it('leaves gatewaysynth non-GLM-5.2 models on the default path (no thinking synthesized)', async () => {
+    it('leaves non-GLM-5.2 models on the default path (no thinking synthesized)', async () => {
       const body = await captureBody('DeepSeek-V4-Pro', { reasoning_effort: 'high' });
       expect(body.reasoning_effort).toBe('high');
       expect(body.thinking).toBeUndefined();

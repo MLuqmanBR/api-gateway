@@ -167,17 +167,17 @@ describe('Client keys API (F3)', () => {
 
 describe('isModelAllowed (strict qualified matching)', () => {
   it('a qualified entry matches its exact platform only', () => {
-    expect(isModelAllowed(['aggregatore/kimi-k3'], 'aggregatore', 'kimi-k3')).toBe(true);
-    expect(isModelAllowed(['aggregatore/kimi-k3'], 'aggregatorf', 'kimi-k3')).toBe(false);
+    expect(isModelAllowed(['agg-a/kimi-k3'], 'agg-a', 'kimi-k3')).toBe(true);
+    expect(isModelAllowed(['agg-a/kimi-k3'], 'agg-b', 'kimi-k3')).toBe(false);
   });
 
   it('a bare entry admits nothing', () => {
-    expect(isModelAllowed(['kimi-k3'], 'aggregatore', 'kimi-k3')).toBe(false);
+    expect(isModelAllowed(['kimi-k3'], 'agg-a', 'kimi-k3')).toBe(false);
     expect(isModelAllowed(['kimi-k3'], 'nvidia', 'moonshotai/kimi-k3')).toBe(false);
   });
 
   it('a qualified entry does not match a different model on the same platform', () => {
-    expect(isModelAllowed(['aggregatore/deepseek-v4-pro'], 'aggregatore', 'deepseek-v4-flash')).toBe(false);
+    expect(isModelAllowed(['agg-a/deepseek-v4-pro'], 'agg-a', 'deepseek-v4-flash')).toBe(false);
   });
 });
 
@@ -247,5 +247,39 @@ describe('client key allowlist normalization (bare → qualified)', () => {
     const once = allowlistOf('k4');
     migrateDbSchema(getDb());
     expect(allowlistOf('k4')).toBe(once);
+  });
+
+  it('preserves a qualified audio entry — transcription_models union hit', () => {
+    // The transcription seed rows exist from the migration; the entry is a
+    // qualified pair for a transcription_models row, not a chat models row.
+    insertKey('k5', JSON.stringify(['groq/whisper-large-v3-turbo']));
+    migrateDbSchema(getDb());
+    expect(JSON.parse(allowlistOf('k5')!)).toEqual(['groq/whisper-large-v3-turbo']);
+  });
+
+  it('expands a bare audio id to every transcription platform serving it', () => {
+    // Bare 'whisper-large-v3' lives in transcription_models only — the
+    // migration seeds groq (V1); the test seeds the kilo and ovh rows
+    // because the migration no longer ships a curated multi-platform tier
+    // list. byName walks models UNION ALL transcription_models; the
+    // transcription_models leg scans the UNIQUE(platform, model_id)
+    // covering index, so platforms come back alphabetically: groq, kilo,
+    // ovh. The models leg contributes nothing (no chat seed lists contain
+    // these ids), and the Set preserves the first-seen order.
+    const db = getDb();
+    const seedTm = db.prepare(
+      `INSERT INTO transcription_models
+         (family, platform, model_id, display_name, max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+       VALUES ('whisper-large-v3', ?, 'whisper-large-v3', 'Whisper Large V3', 25, 0, NULL, ?, 1, '')`,
+    );
+    seedTm.run('kilo', 2);
+    seedTm.run('ovh', 3);
+    insertKey('k6', JSON.stringify(['whisper-large-v3']));
+    migrateDbSchema(getDb());
+    expect(JSON.parse(allowlistOf('k6')!)).toEqual([
+      'groq/whisper-large-v3',
+      'kilo/whisper-large-v3',
+      'ovh/whisper-large-v3',
+    ]);
   });
 });

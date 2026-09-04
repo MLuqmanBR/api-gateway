@@ -245,11 +245,26 @@ interface ClientKeyPatch {
   expires_at_ms?: number | null
 }
 
+// Provider row from GET /api/transcriptions (camelCase dashboard shape) —
+// only the fields the allowlist picker needs.
+interface TranscriptionPickerModel {
+  id: number
+  platform: string
+  modelId: string
+  displayName: string
+  priority: number
+  enabled: boolean
+  quotaLabel: string
+  keyCount: number
+  pricePerHourUsd: number | null
+}
+
 // Inline per-key editor: label, model allowlist, RPM override, expiry. Saved
-// as ONE PATCH to the existing endpoint. The allowlist holds BARE model_id
-// strings (that is what the router compares); /api/models only returns
-// composite `platform/model_id` values, so each option strips its own
-// platform prefix. Empty selection saves null = unrestricted.
+// as ONE PATCH to the existing endpoint. The allowlist holds qualified
+// `platform/model_id` strings (isModelAllowed compares exactly that), which is
+// also what the picker's composite modelId values from /api/models (and the
+// transcription picker entries built from /api/transcriptions) already carry.
+// Empty selection saves null = unrestricted.
 function ClientKeyEditor({ k, models, onSave, onClose }: {
   k: ClientKey
   models: Model[]
@@ -391,6 +406,35 @@ function ClientKeysSection() {
     queryKey: ['models'],
     queryFn: () => apiFetch('/api/models'),
   })
+
+  // Transcription models for the allowlist picker. The dashboard groups them
+  // by family; the picker flattens to provider rows and maps them into the
+  // Model shape the editor already consumes (chat-only fields get inert
+  // values). modelId is the qualified `platform/model_id` the allowlist
+  // stores and the picker toggles on.
+  const { data: transcriptionData } = useQuery<{ defaultFamily: string; families: Array<{ family: string; providers: TranscriptionPickerModel[] }> }>({
+    queryKey: ['transcriptions'],
+    queryFn: () => apiFetch('/api/transcriptions'),
+  })
+  const transcriptionModels: Model[] = (transcriptionData?.families ?? [])
+    .flatMap(f => f.providers)
+    .map((t): Model => ({
+      id: t.id,
+      platform: t.platform,
+      modelId: `${t.platform}/${t.modelId}`,
+      displayName: t.displayName,
+      intelligenceRank: 0,
+      speedRank: 0,
+      sizeLabel: '',
+      rpmLimit: null,
+      rpdLimit: null,
+      tpmLimit: null,
+      tpdLimit: null,
+      monthlyTokenBudget: '',
+      contextWindow: null,
+      enabled: t.enabled,
+      supportsVision: false,
+    }))
 
   const mint = useMutation({
     mutationFn: (label: string) =>
@@ -544,7 +588,7 @@ function ClientKeysSection() {
               {editingId === k.id && (
                 <ClientKeyEditor
                   k={k}
-                  models={models}
+                  models={[...models, ...transcriptionModels]}
                   onSave={async (patch) => {
                     await update.mutateAsync({ id: k.id, patch })
                   }}

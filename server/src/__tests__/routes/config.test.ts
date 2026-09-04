@@ -72,7 +72,7 @@ function seedModels(): void {
   db.prepare(`DELETE FROM custom_providers`).run();
   db.prepare(`DELETE FROM api_keys`).run();
   db.prepare(`DELETE FROM embedding_models`).run();
-  db.prepare(`DELETE FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family')`).run();
+  db.prepare(`DELETE FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family','transcriptions_default_family')`).run();
   db.prepare(`DELETE FROM quirks`).run();
   db.prepare(`DELETE FROM quirk_targets`).run();
 
@@ -1373,6 +1373,33 @@ describe('Config API', () => {
     expect(imp.body.sections.embeddings?.skipped).toBe(1);
   });
 
+  it('re-importing an unchanged transcription family row produces zero updates', async () => {
+    const env: ConfigEnvelope = {
+      schemaVersion: 1,
+      generator: 'api-gateway',
+      exportedAt: new Date().toISOString(),
+      sections: {
+        transcriptions: {
+          families: [{
+            family: 'whisper-large-v3-turbo',
+            providers: [{ platform: 'groq', modelId: 'whisper-large-v3-turbo', priority: 1, enabled: true, pricePerHourUsd: 0.04 }],
+            maxFileMb: 25,
+            supportsTranslations: false,
+            displayName: 'Whisper Large V3 Turbo',
+            quotaLabel: '',
+          }],
+        },
+      },
+    };
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'overwrite', dryRun: true },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.transcriptions?.updated).toBe(0);
+    expect(imp.body.sections.transcriptions?.skipped).toBe(1);
+  });
+
   // ── Regression: a real-world export round-trips cleanly ──────────
   // Loads the user's actual export file (when present on disk in the
   // expected location) and asserts that:
@@ -1464,10 +1491,10 @@ describe('Config API', () => {
     const { status, body } = await request(app, 'POST', '/api/config/export', {});
     expect(status).toBe(200);
     expect(body.sections.settings.embeddingsDefaultFamily).toBe('minimax');
-    // Inventory counts these 4 settings keys — emitted fields must align
+    // Inventory counts these 5 settings keys — emitted fields must align
     // with how many of them actually exist in the DB.
     const counted = (db.prepare(
-      "SELECT COUNT(*) AS n FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family')",
+      "SELECT COUNT(*) AS n FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family','transcriptions_default_family')",
     ).get() as { n: number }).n;
     expect(Object.keys(body.sections.settings).length).toBe(counted);
     db.prepare("UPDATE settings SET value = 'openai' WHERE key = 'embeddings_default_family'").run();
@@ -1481,7 +1508,30 @@ describe('Config API', () => {
       .toMatchObject({ value: 'minimax' });
   });
 
-  it('L44: duplicate (platform,label) api_keys rows are rejected, not collapsed', async () => {
+  it('L30 sibling: export emits transcriptions_default_family in settings; import applies it', async () => {
+    const db = getDb();
+    setSetting('transcriptions_default_family', 'voxtral-mini-2602');
+    const { status, body } = await request(app, 'POST', '/api/config/export', {});
+    expect(status).toBe(200);
+    expect(body.sections.settings.transcriptionsDefaultFamily).toBe('voxtral-mini-2602');
+    // Inventory counts these 5 settings keys — emitted fields must align
+    // with how many of them actually exist in the DB.
+    const counted = (db.prepare(
+      "SELECT COUNT(*) AS n FROM settings WHERE key IN ('routing_strategy','global_retry_limit','routing_custom_weights','embeddings_default_family','transcriptions_default_family')",
+    ).get() as { n: number }).n;
+    expect(Object.keys(body.sections.settings).length).toBe(counted);
+    db.prepare("UPDATE settings SET value = 'whisper-large-v3' WHERE key = 'transcriptions_default_family'").run();
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: body,
+      options: { sections: ['settings'] },
+    });
+    expect(imp.status).toBe(200);
+    expect(imp.body.sections.settings.updated).toBe(1);
+    expect(db.prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get())
+      .toMatchObject({ value: 'voxtral-mini-2602' });
+  });
+
+  it('L44: import rejects duplicate (platform, label) api_keys rows', async () => {
     const env = {
       schemaVersion: 1,
       generator: 'api-gateway',

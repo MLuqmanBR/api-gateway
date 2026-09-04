@@ -355,6 +355,9 @@ describe('Migration idempotency', () => {
 
   it('thinking levels: boot pass seeds glm_mapped rows and never revisits operator-owned ones', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const savedMapped = process.env.THINKING_GLM_MAPPED_HOSTS;
+    process.env.THINKING_GLM_MAPPED_HOSTS = 'env-host-c';
+    try {
     const tmpPath = `/tmp/api-gateway-thinking-${Date.now()}.db`;
     const db = initDb(tmpPath);
     const DEFAULT = JSON.stringify([...THINKING_LEVELS]);
@@ -376,14 +379,17 @@ describe('Migration idempotency', () => {
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
       VALUES (?, ?, ?, 10, 10, '', 1)
     `);
-    // Host-based rule match (GLM_HOST_PLATFORMS) and id-based (isGlmModel).
-    const hostRow = Number(ins.run('glmaggregatorb', 'glm-test-host', 'Host Row').lastInsertRowid);
+    // Host-based rule match (glmMappedHosts: public + env-registered hosts)
+    // and id-based (isGlmModel).
+    const hostRow = Number(ins.run('zhipu', 'glm-test-host', 'Host Row').lastInsertRowid);
+    const envRow = Number(ins.run('env-host-c', 'glm-env-row', 'Env Row').lastInsertRowid);
     const idRow = Number(ins.run('some-platform', 'z-ai/glm-5.1', 'Id Row').lastInsertRowid);
     const otherRow = Number(ins.run('openrouter', 'deepseek-v4-pro', 'Other').lastInsertRowid);
 
     // glm-mapped rows get the narrow set, everything else stays at default.
-    applyThinkingLevelRules(db, [hostRow, idRow, otherRow]);
+    applyThinkingLevelRules(db, [hostRow, envRow, idRow, otherRow]);
     expect(levelsOf(hostRow)).toBe(GLM);
+    expect(levelsOf(envRow)).toBe(GLM);
     expect(levelsOf(idRow)).toBe(GLM);
     expect(levelsOf(otherRow)).toBe(DEFAULT);
 
@@ -400,7 +406,7 @@ describe('Migration idempotency', () => {
 
     // (c) a still-default glm_mapped row IS seeded by the next boot pass,
     // with the manual flag left at 0 so operators can still claim it later.
-    const freshRow = Number(ins.run('glmaggregatorb', 'glm-fresh-row', 'Fresh').lastInsertRowid);
+    const freshRow = Number(ins.run('zhipu', 'glm-fresh-row', 'Fresh').lastInsertRowid);
     expect(levelsOf(freshRow)).toBe(DEFAULT);
     migrateDbSchema(db);
     expect(levelsOf(freshRow)).toBe(GLM);
@@ -413,6 +419,10 @@ describe('Migration idempotency', () => {
     expect(levelsOf(lateRow)).toBe(GLM);
     expect(manualFlag(lateRow)).toBe(0);
     db.close();
+    } finally {
+      if (savedMapped === undefined) delete process.env.THINKING_GLM_MAPPED_HOSTS;
+      else process.env.THINKING_GLM_MAPPED_HOSTS = savedMapped;
+    }
   });
 
   it('applyModelPricing refreshes mapped prices but respects pricing_manual', () => {
@@ -434,6 +444,108 @@ describe('Migration idempotency', () => {
     migrateDbSchema(db);
     expect((db.prepare('SELECT paid_input_per_m AS p FROM models WHERE id = ?').get(marked.id) as { p: number }).p).toBe(9.99);
     expect((db.prepare('SELECT paid_input_per_m AS p FROM models WHERE id = ?').get(unmarked.id) as { p: number }).p).toBe(other[2]);
+    db.close();
+  });
+  it('transcription_models: seeds are stable, UNIQUE holds, audio_seconds column present after both inits', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const tmpPath = `/tmp/api-gateway-transcription-idem-${Date.now()}.db`;
+
+    const db1 = initDb(tmpPath);
+    const before = {
+      rows: (db1.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c,
+      dups: (db1.prepare(`
+        SELECT COUNT(*) AS c FROM (
+          SELECT platform, model_id FROM transcription_models
+           GROUP BY platform, model_id HAVING COUNT(*) > 1
+        )
+      `).get() as { c: number }).c,
+      defaultFamily: (db1.prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get() as { value: string }).value,
+    };
+    const cols1 = (db1.prepare('PRAGMA table_info(requests)').all() as { name: string }[]).map(c => c.name);
+    db1.close();
+
+    const db2 = initDb(tmpPath);
+    const after = {
+      rows: (db2.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c,
+      dups: (db2.prepare(`
+        SELECT COUNT(*) AS c FROM (
+          SELECT platform, model_id FROM transcription_models
+           GROUP BY platform, model_id HAVING COUNT(*) > 1
+        )
+      `).get() as { c: number }).c,
+      defaultFamily: (db2.prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get() as { value: string }).value,
+    };
+    const cols2 = (db2.prepare('PRAGMA table_info(requests)').all() as { name: string }[]).map(c => c.name);
+    db2.close();
+
+    expect(after).toEqual(before);
+    expect(after.rows).toBe(3);
+    expect(after.dups).toBe(0);
+    expect(after.defaultFamily).toBe('whisper-large-v3-turbo');
+    expect(cols1).toContain('audio_seconds');
+    expect(cols2).toContain('audio_seconds');
+  });
+  it('reconcileCatalogRowsOutOfChat: catalog-owned pairs cannot live in chat models, idempotently', () => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    const db = initDb(':memory:');
+
+    // Catalog tables (transcription_models, embedding_models) own their ids:
+    // any chat-model row for a cataloged pair is a resurrection (discovery,
+    // manual add, old config import) and boot reconciliation deletes it.
+    // Recreate that state: chat models row + fallback row for one pair from
+    // each catalog. The nvidia pair is in the V1 embedding seed; the ovh pair
+    // (public upstream built-in) needs a seeded transcription row.
+    const insertModel = db.prepare(
+      'INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank) VALUES (?, ?, ?, 1, 1)',
+    );
+    const insertFallback = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+    const pairs: Array<[string, string]> = [
+      ['nvidia', 'nvidia/nv-embedqa-e5-v5'],
+      ['ovh', 'whisper-large-v3'],
+    ];
+    db.prepare(
+      `INSERT INTO transcription_models
+         (family, platform, model_id, display_name, max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+       VALUES ('whisper-large-v3', 'ovh', 'whisper-large-v3', 'Whisper Large V3 (OVH)', 25, 0, NULL, 2, 1, '')`,
+    ).run();
+    const modelsBefore = (db.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c;
+    for (const [platform, modelId] of pairs) {
+      const info = insertModel.run(platform, modelId, modelId);
+      insertFallback.run(Number(info.lastInsertRowid), 1);
+    }
+
+    // Re-run the full migration on the already-initialized DB.
+    migrateDbSchema(db);
+
+    // Catalog-owned pairs left the chat catalog…
+    for (const [platform, modelId] of pairs) {
+      expect(
+        (db.prepare('SELECT COUNT(*) AS c FROM models WHERE platform = ? AND model_id = ?').get(platform, modelId) as { c: number }).c,
+      ).toBe(0);
+    }
+    expect((db.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c).toBe(modelsBefore);
+    // …no orphaned fallback rows were left behind…
+    expect((db.prepare(`
+      SELECT COUNT(*) AS c FROM fallback_config f
+      LEFT JOIN models m ON f.model_db_id = m.id
+      WHERE m.id IS NULL
+    `).get() as { c: number }).c).toBe(0);
+    // …catalog rows survive untouched (3 V1 transcription + 1 seeded, 12 V1 embeddings)…
+    expect((db.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c).toBe(4);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM embedding_models').get() as { c: number }).c).toBe(12);
+    expect((db.prepare(`
+      SELECT COUNT(*) AS c FROM (
+        SELECT platform, model_id FROM transcription_models
+         GROUP BY platform, model_id HAVING COUNT(*) > 1
+      )
+    `).get() as { c: number }).c).toBe(0);
+
+    // Second re-run: stable (DELETEs find nothing; counts identical).
+    migrateDbSchema(db);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM models').get() as { c: number }).c).toBe(modelsBefore);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM transcription_models').get() as { c: number }).c).toBe(4);
+    expect((db.prepare('SELECT COUNT(*) AS c FROM embedding_models').get() as { c: number }).c).toBe(12);
+
     db.close();
   });
 });

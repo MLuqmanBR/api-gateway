@@ -21,6 +21,8 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV31ApiFormat(db);
   seedBuiltInProviderSettings(db);
   migrateEmbeddingsV1(db);
+  migrateTranscriptionsV1(db);
+  reconcileCatalogRowsOutOfChat(db);
   migrateCustomProvidersV24(db);
 
   // Data migrations run exactly once per database, guarded by user_version.
@@ -252,8 +254,18 @@ function normalizeClientKeyAllowlists(db: DatabasePort) {
   const rows = db.prepare(
     'SELECT id, model_allowlist FROM client_keys WHERE model_allowlist IS NOT NULL',
   ).all() as Array<{ id: string; model_allowlist: string }>;
-  const byName = db.prepare('SELECT platform FROM models WHERE model_id = ?');
-  const byPair = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?');
+  // Both tables are consulted: a transcription model picked in the KeysPage
+  // allowlist picker is a qualified `platform/model_id` pair living in
+  // transcription_models, NOT models — a models-only check would silently
+  // drop every audio entry on the next boot.
+  const byName = db.prepare(`
+    SELECT platform FROM models WHERE model_id = ?
+    UNION ALL
+    SELECT platform FROM transcription_models WHERE model_id = ?`);
+  const byPair = db.prepare(`
+    SELECT 1 FROM models WHERE platform = ? AND model_id = ?
+    UNION ALL
+    SELECT 1 FROM transcription_models WHERE platform = ? AND model_id = ?`);
   for (const row of rows) {
     let entries: string[];
     try {
@@ -269,12 +281,14 @@ function normalizeClientKeyAllowlists(db: DatabasePort) {
     for (const entry of entries) {
       const slashIdx = entry.indexOf('/');
       if (slashIdx > 0) {
-        if (byPair.get(entry.slice(0, slashIdx), entry.slice(slashIdx + 1))) {
+        const platform = entry.slice(0, slashIdx);
+        const id = entry.slice(slashIdx + 1);
+        if (byPair.get(platform, id, platform, id)) {
           next.add(entry);
           continue;
         }
       }
-      const platforms = byName.all(entry) as Array<{ platform: string }>;
+      const platforms = byName.all(entry, entry) as Array<{ platform: string }>;
       changed = true;
       for (const { platform } of platforms) next.add(`${platform}/${entry}`);
     }
@@ -1989,10 +2003,11 @@ function migrateModelsV26MaxOutputTokens(db: DatabasePort) {
   }
 }
 
-// V27: user-requested custom providers and their models (GlmAggregatorA,
-// GlmAggregatorB, DeepSeek). Each is an OpenAI-compatible endpoint with
-// free-tier API keys. Models are registered and added to the fallback
-// chain at lowest priority so they don't displace existing models.
+// V27: seeded custom provider (DeepSeek) with its models. An OpenAI-compatible
+// endpoint with free-tier API keys. Models are registered and added to the
+// fallback chain at lowest priority so they don't displace existing models.
+// Operator-added providers come from the dashboard or config import; only
+// public seeds live here.
 function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
   type ProviderDef = { slug: string; name: string; url: string };
   type ModelDef = {
@@ -2002,20 +2017,10 @@ function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
   };
 
   const providers: ProviderDef[] = [
-    { slug: 'glmaggregatora', name: 'GlmAggregatorA', url: 'https://api.glmaggregatora.example/v1' },
-    { slug: 'glmaggregatorb', name: 'GlmAggregatorB', url: 'https://api.glmaggregatorb.example/v1' },
     { slug: 'deepseek', name: 'DeepSeek', url: 'https://api.deepseek.com' },
   ];
 
   const models: ModelDef[] = [
-    // GlmAggregatorA
-    { provider: 'glmaggregatora', id: 'accounts/fireworks/models/deepseek-v4-pro', name: 'DeepSeek v4 Pro', context: 1048576, maxOut: 131072, intel: 95, speed: 40, size: 'Frontier' },
-    { provider: 'glmaggregatora', id: 'moonshotai/kimi-k2.6', name: 'Kimi K2.6', context: 262144, maxOut: 65536, intel: 90, speed: 45, size: 'Frontier' },
-    { provider: 'glmaggregatora', id: 'qwen3.6-max-preview', name: 'Qwen 3.6 Max Preview', context: 262144, maxOut: 65536, intel: 88, speed: 50, size: 'Frontier' },
-    { provider: 'glmaggregatora', id: 'z-ai/glm-5.1', name: 'GLM 5.1', context: 200000, maxOut: 65536, intel: 85, speed: 55, size: 'Large' },
-    { provider: 'glmaggregatora', id: 'DeepSeek-V4-Flash', name: 'DeepSeek v4 Flash', context: 1048576, maxOut: 131072, intel: 85, speed: 70, size: 'Frontier' },
-    // GlmAggregatorB
-    { provider: 'glmaggregatorb', id: 'zai-org/GLM-5.1-FP8', name: 'GLM 5.1', context: 202752, maxOut: 32768, intel: 85, speed: 60, size: 'Large' },
     // DeepSeek
     { provider: 'deepseek', id: 'deepseek-v4-pro', name: 'DeepSeek v4 Pro', context: 1048576, maxOut: 262144, intel: 95, speed: 40, size: 'Frontier' },
     { provider: 'deepseek', id: 'deepseek-v4-flash', name: 'DeepSeek v4 Flash', context: 1048576, maxOut: 262144, intel: 85, speed: 70, size: 'Frontier' },
@@ -2026,8 +2031,6 @@ function migrateCustomProvidersV27UserProviders(db: DatabasePort) {
       "INSERT OR IGNORE INTO custom_providers (slug, display_name, base_url, rpm_limit, max_parallel_requests) VALUES (?, ?, ?, ?, ?)"
     );
     const limits: Record<string, [number | null, number | null]> = {
-      glmaggregatora: [15, 5],
-      glmaggregatorb: [60, null],
       deepseek: [500, 500],
     };
     const updProv = db.prepare(
@@ -2152,6 +2155,93 @@ function migrateEmbeddingsV1(db: DatabasePort) {
     db.prepare("INSERT INTO settings (key, value) VALUES ('embeddings_default_family', 'gemini-embedding-001')").run();
   }
 }
+
+// Transcriptions V1 (2026-09): batch audio transcription/translation catalog.
+// Mirrors embedding_models — a "family" is one model identity (e.g.
+// whisper-large-v3-turbo) and failover only walks providers serving that same
+// family. Prices live here so the client-key budget path can price audio by
+// the hour without a chat-table dependency. Pricing verified live 2026-09-01
+// (Groq pricing page: whisper-large-v3-turbo $0.04/hr, whisper-large-v3
+// $0.111/hr; Mistral pricing page: voxtral-mini-2602 $0.003/min = $0.18/hr).
+// voxtral-mini-2507 is deprecated + retired (2026-02-27 + 6-month GA notice)
+// and is NOT seeded; voxtral-mini-2602 is the sole Mistral entry.
+function migrateTranscriptionsV1(db: DatabasePort) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS transcription_models (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      family TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      max_file_mb INTEGER NOT NULL DEFAULT 25,
+      supports_translations INTEGER NOT NULL DEFAULT 0,
+      price_per_hour_usd REAL,
+      priority INTEGER NOT NULL DEFAULT 1,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      quota_label TEXT NOT NULL DEFAULT '',
+      UNIQUE(platform, model_id)
+    );
+  `);
+
+  // Tag request rows so audio traffic doesn't pollute the chat token budget /
+  // headroom math, and carry the actual audio duration for billing rollups.
+  // Mirrors ensureRequestTtfbColumn.
+  const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'audio_seconds')) {
+    db.prepare('ALTER TABLE requests ADD COLUMN audio_seconds INTEGER').run();
+  }
+
+  const seed = db.prepare(`
+    INSERT OR IGNORE INTO transcription_models
+      (family, platform, model_id, display_name, max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const rows: Array<[string, string, string, string, number, number, number, number, number, string]> = [
+    // family, platform, provider model id, display name, max MB, translations, price $/hr, priority, enabled, quota label
+    ['whisper-large-v3-turbo', 'groq', 'whisper-large-v3-turbo', 'Whisper Large V3 Turbo', 25, 0, 0.04, 1, 1, ''],
+    ['whisper-large-v3',       'groq', 'whisper-large-v3',       'Whisper Large V3',       25, 1, 0.111, 1, 1, ''],
+    ['voxtral-mini-2602',      'mistral', 'voxtral-mini-2602',  'Voxtral Mini Transcribe 2', 25, 0, 0.18, 1, 1, ''],
+  ];
+  const apply = db.transaction(() => { for (const r of rows) seed.run(...r); });
+  apply();
+
+  const def = db.prepare("SELECT value FROM settings WHERE key = 'transcriptions_default_family'").get();
+  if (!def) {
+    db.prepare("INSERT INTO settings (key, value) VALUES ('transcriptions_default_family', 'whisper-large-v3-turbo')").run();
+  }
+}
+
+// Boot reconciliation (2026-09-03, replaces the Transcriptions V2 seed):
+// the catalog tables — transcription_models and embedding_models — OWN their
+// ids. Any chat `models` row whose (platform, model_id) pair exists in a
+// catalog table is a resurrection (provider discovery, manual add, restore
+// of a pre-reconciliation config backup) and is deleted at boot. The
+// discovery/manual-add guards in routes/custom.ts prevent new resurrections
+// at request time; this pass catches everything that predates them or
+// arrives via config import.
+//
+// Unguarded every-boot pass (CURRENT_DATA_VERSION is FROZEN — new data fixes
+// must be idempotent + unguarded, like normalizeClientKeyAllowlists):
+// idempotent by construction (second run finds no offending rows), no
+// hardcoded pair list — the catalog tables are the single source of truth.
+// Fresh DBs: the chat seed list contains no catalog pairs, so this no-ops.
+//
+// fallback_config rows are deleted FIRST: fallback_config.model_db_id is the
+// only FK into models(id) and PRAGMA foreign_keys = ON.
+export function reconcileCatalogRowsOutOfChat(db: DatabasePort): void {
+  db.transaction(() => {
+    db.prepare(`DELETE FROM fallback_config WHERE model_db_id IN (
+      SELECT m.id FROM models m
+      WHERE EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = m.platform AND tm.model_id = m.model_id)
+         OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = m.platform AND em.model_id = m.model_id)
+    )`).run();
+    db.prepare(`DELETE FROM models WHERE
+        EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = models.platform AND tm.model_id = models.model_id)
+     OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = models.platform AND em.model_id = models.model_id)
+    `).run();
+  })();
+}
+
 
 // Custom providers V24: promote the special-cased 'custom' platform to a real
 // custom_providers row. Pre-existing api_keys (with their base_url) and models
