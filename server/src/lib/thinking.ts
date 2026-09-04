@@ -16,10 +16,10 @@
 //                 `thinkingLevel`; 2.5 series uses `thinkingBudget`.
 //
 //   OpenAI-    ─  `reasoning_effort: 'low'|'medium'|'high'|'xhigh'|'max'` as
-//   compat       a top-level field on the chat-completions body. Some compat
-//                 providers also accept a richer `thinking` object; we pass
-//                 both through unchanged when present so model-layer matching
-//                 decides.
+//   compat       a top-level field on the chat-completions body. The single
+//                 string is derived from either request surface (the explicit
+//                 `reasoning_effort` or `thinking.effort`); the rich
+//                 `thinking` object is never forwarded on this path.
 //
 // Anything a provider doesn't recognize is dropped. The proxy never invents
 // shape names — it maps every request knob down to a wire field that
@@ -231,227 +231,6 @@ export function geminiThinkingConfig(
   return cfg;
 }
 
-// ─── OpenAI-compat ────────────────────────────────────────────────────────
-
-// Per-host thinking-field policy for OpenAI-compat providers. Each host
-// accepts a different subset of the thinking vocabulary, and forwarding a
-// field the host rejects produces a 400 — notably GLM-5.1 on some GLM proxies
-// returns a pydantic `literal_error` for the rich Anthropic-style `thinking`
-// object, killing every request (#292). The gateway therefore never forwards
-// a field unless the host is known to accept it.
-//
-//   'reasoning_effort_only'  default — emit the single `reasoning_effort`
-//                            string (derived from `reasoning_effort` OR
-//                            `thinking.effort`). Most OpenAI-compat hosts
-//                            (NVIDIA, OpenRouter, Groq, Cerebras, …) accept it.
-//   'glm_mapped'            GLM hosts — emit ONLY `reasoning_effort`; never
-//                            the rich object (GLM rejects it outright,
-//                            literal_error). The effort arrives already
-//                            redirected to the model's supported level set
-//                            (per-model `models.thinking_levels`) and is
-//                            forwarded verbatim — no mapping here.
-//   'both'                   hosts verified to accept the rich `thinking`
-//                            object alongside `reasoning_effort`. Reserved for
-//                            explicit allowlisting once a host is confirmed.
-export type OpenAiCompatThinkingPolicy =
-  | 'reasoning_effort_only'   // default — emit reasoning_effort verbatim
-  | 'glm_mapped'              // GLM — forward the (pre-redirected) effort verbatim, drop the rich object
-  | 'glm_nvidia'              // GLM on NVIDIA NIM — needs chat_template_kwargs.enable_thinking; accepts full effort range
-  | 'glm52_synthetic'         // THINKING_GLM52_SYNTHETIC_HOSTS gateways × glm-5.2 — synthesize thinking={type:'enabled'} so reasoning_content surfaces; forward effort verbatim across the full 7-value enum
-  | 'both';                   // forward reasoning_effort + thinking verbatim (verified hosts only)
-
-
-// GLM-family hosts. GLM's OpenAI-compat wrapper accepts ONLY
-// `reasoning_effort` and ONLY the values `none | low | medium | high` — it
-// rejects `max`, `xhigh`, `minimal` with a pydantic literal_error, and rejects
-// the rich Anthropic-style `thinking` object outright. Which levels a GLM
-// model accepts is per-model data (`models.thinking_levels`, seeded for
-// glm_mapped rows); the proxy redirects out-of-set requests upstream, so this
-// layer forwards the effort verbatim and never the rich object.
-// Public GLM wrappers are built in; operators register additional hosts via
-// THINKING_GLM_MAPPED_HOSTS (comma-separated platform slugs), read at call
-// time so test stubs and runtime restarts both pick up changes. (#292)
-function glmMappedHosts(): Set<string> {
-  const extra = (process.env.THINKING_GLM_MAPPED_HOSTS ?? '')
-    .split(',').map(s => s.trim()).filter(Boolean);
-  return new Set(['z-ai', 'zai', 'zhipu', ...extra]);
-}
-
-/** Hosts registered for the synthetic glm-5.2 thinking switch. */
-function syntheticThinkingHosts(): Set<string> {
-  return new Set((process.env.THINKING_GLM52_SYNTHETIC_HOSTS ?? '')
-    .split(',').map(s => s.trim()).filter(Boolean));
-}
-
-/** True when the model id is a GLM-family model (glm-4.x / glm-5.x in any
- *  case, with any org prefix like `z-ai/`, `zai-org/`). Used so GLM models
- *  hosted on non-GLM platforms (e.g. `nvidia/z-ai/glm-5.1`) still get the
- *  GLM effort-mapping treatment regardless of host. */
-export function isGlmModel(modelId: string): boolean {
-  const m = modelId.toLowerCase();
-  // Match `glm-4`, `glm-5`, `glm4`, `glm5` (with or without a separator)
-  // after an org prefix like `z-ai/`, `zai-org/`. The 4.x/5.x families are
-  // the reasoning GLM models. `glm` must be a token start (preceded by start
-  // or `/`) so unrelated ids (e.g. `glmist`) don't trip it.
-  return /(^|\/)glm[-_.]?[45]([-_.]|$)/.test(m);
-}
-
-/** True for GLM 5.2 served on NVIDIA NIM (`nvidia` + `z-ai/glm-5.2`). This
- *  host+model pair is special: unlike GLM's own OpenAI-compat wrapper (which
- *  the `glm_mapped` policy handles), NVIDIA's GLM 5.2 endpoint ignores a bare
- *  `reasoning_effort` — thinking stays OFF unless the request also carries
- *  `chat_template_kwargs.enable_thinking: true`. It also accepts the FULL
- *  effort range (`minimal`…`max`, all HTTP 200), so its rows keep the
- *  unrestricted default in `models.thinking_levels`. Confirmed live against
- *  `z-ai/glm-5.2` on NVIDIA NIM (all six effort levels return a populated
- *  `reasoning_content`; `reasoning_effort` alone returns none). Scoped to
- *  5.2 — GLM 5.1 on NVIDIA keeps `glm_mapped`. */
-export function isGlmNvidiaThinkingModel(platform: string, modelId?: string): boolean {
-  if (platform !== 'nvidia' || !modelId) return false;
-  // Match `glm-5.2` (any separator / org prefix / case), e.g. `z-ai/glm-5.2`.
-  return /(^|\/)glm[-_.]?5[-_.]?2([-_.]|$)/.test(modelId.toLowerCase());
-}
-
-/** True for GLM 5.2 served on a synthetic-thinking gateway registered via
- *  THINKING_GLM52_SYNTHETIC_HOSTS (`platform` + `glm-5.2`). Unlike GLM's own
- *  OpenAI-compat wrapper (handled by `glm_mapped`), these gateways accept the
- *  rich `thinking` object AND the full `reasoning_effort` enum
- *  (none|minimal|low|medium|high|xhigh|max). Critically, `reasoning_effort`
- *  alone does NOT surface `reasoning_content` — the `thinking={"type":"enabled"}`
- *  switch is required to make the trace visible, so the body builder synthesizes
- *  it when the caller asks for thinking via `reasoning_effort` alone. Confirmed
- *  live against a registered gateway. Scoped to 5.2; a registered host's other
- *  models (DeepSeek, MiniMax) keep the default. */
-export function isSyntheticGlm52ThinkingModel(platform: string, modelId?: string): boolean {
-  if (!modelId || !syntheticThinkingHosts().has(platform)) return false;
-  // Match `glm-5.2` (any separator / org prefix / case), e.g. `glm-5.2`,
-  // `z-ai/glm-5.2`. Same regex shape as isGlmNvidiaThinkingModel.
-  return /(^|\/)glm[-_.]?5[-_.]?2([-_.]|$)/.test(modelId.toLowerCase());
-}
-
-/** Resolve the thinking-field policy for an OpenAI-compat host. `platform`
- *  is the provider slug; `modelId` is the model being called. A glm-5.2 model
- *  on a gateway registered via THINKING_GLM52_SYNTHETIC_HOSTS gets
- *  `'glm52_synthetic'` (rich `thinking` object + full effort enum, with the
- *  synthesized enable switch) — checked first. GLM 5.2 on NVIDIA NIM gets
- *  `'glm_nvidia'` (needs `chat_template_kwargs.enable_thinking` and accepts
- *  the full effort range). Any GLM host OR GLM model gets `'glm_mapped'`
- *  (GLM accepts a narrow `reasoning_effort` enum but rejects the rich
- *  `thinking` object); everyone else gets the safe `reasoning_effort_only`
- *  default so future providers never trigger a literal_error from an unverified
- *  rich `thinking` object. Promote a host to `'both'` only after live
- *  confirmation. */
-export function openAiCompatThinkingPolicy(platform: string, modelId?: string): OpenAiCompatThinkingPolicy {
-  if (isSyntheticGlm52ThinkingModel(platform, modelId)) return 'glm52_synthetic';
-  if (isGlmNvidiaThinkingModel(platform, modelId)) return 'glm_nvidia';
-  if (glmMappedHosts().has(platform)) return 'glm_mapped';
-  if (modelId && isGlmModel(modelId)) return 'glm_mapped';
-  return 'reasoning_effort_only';
-}
-
-/** Decide which thinking fields to put on the outbound OpenAI-compat body,
- *  honoring the host's policy. Never forwards a field the host doesn't accept.
- *
- *  - `reasoning_effort_only`: emit `reasoning_effort`, derived from either the
- *    explicit `reasoning_effort` string or, when only a `thinking` object was
- *    sent, from `thinking.effort`. The rich `thinking` object is NEVER
- *    forwarded here — that's the field that triggers literal_errors.
- *  - `glm_mapped`: forward the (already per-model-redirected) effort verbatim
- *    and emit ONLY `reasoning_effort` — never the rich object (GLM).
- *  - `both`: forward `reasoning_effort` and `thinking` verbatim (only for
- *    hosts verified to accept the rich object).
- *  - `glm_nvidia`: GLM 5.2 on NVIDIA NIM — emit the
- *    `chat_template_kwargs.enable_thinking` switch that actually turns thinking
- *    on (a bare `reasoning_effort` is ignored), plus the effort verbatim across
- *    the full range. The rich `thinking` object is not forwarded (unverified on
- *    this host); its effort is extracted.
- *
- *  (#292.) */
-export function openaiCompatThinkingBody(
-  policy: OpenAiCompatThinkingPolicy,
-  original: {
-    reasoning_effort?: ThinkingEffort;
-    thinking?: ThinkingConfig;
-  } | undefined,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-
-  if (policy === 'both') {
-    if (original?.reasoning_effort) out.reasoning_effort = original.reasoning_effort;
-    if (original?.thinking) out.thinking = original.thinking;
-    return out;
-  }
-
-  // Resolve the effective effort: prefer explicit `reasoning_effort`, fall
-  // back to `thinking.effort` so a client that only sent a `thinking` object
-  // still has its level honored.
-  const effort = original?.reasoning_effort ?? original?.thinking?.effort;
-
-  if (policy === 'glm_nvidia') {
-    // NVIDIA's GLM 5.2 ignores a bare `reasoning_effort` — thinking stays OFF
-    // unless the request carries `chat_template_kwargs.enable_thinking: true`.
-    // It accepts the full effort range (`minimal`…`max`) verbatim, so no clamp.
-    // `clear_thinking: false` mirrors NVIDIA's documented sample. Confirmed
-    // live against `z-ai/glm-5.2`. (#292)
-    if (original?.thinking?.type === 'disabled') {
-      // Honor an explicit disable — turn the switch off, send no effort.
-      out.chat_template_kwargs = { enable_thinking: false, clear_thinking: false };
-      return out;
-    }
-    // Enable when the caller asked for thinking (an effort level OR any
-    // thinking object). With nothing requested, send nothing and let the model
-    // use its default (thinking off).
-    const requested = effort !== undefined || original?.thinking !== undefined;
-    if (!requested) return out;
-    out.chat_template_kwargs = { enable_thinking: true, clear_thinking: false };
-    if (effort) out.reasoning_effort = effort;
-    return out;
-  }
-
-  if (policy === 'glm52_synthetic') {
-    // Synthetic-thinking gateways accept reasoning_effort as a string across
-    // the full enum (none|minimal|low|medium|high|xhigh|max) and accepts `thinking` as a
-    // boolean or {type} object. But reasoning_effort ALONE does not surface
-    // reasoning_content — the thinking={type:enabled} switch is required.
-    // So when the caller asks for thinking by any means, ensure the thinking
-    // object reaches the gateway. Confirmed live.
-
-    // Honor an explicit disable: forward verbatim, send no effort.
-    if (original?.thinking?.type === 'disabled') {
-      return { thinking: { type: 'disabled' } };
-    }
-
-    // Nothing requested — send nothing; these gateways default to no trace.
-    const requested = effort !== undefined || original?.thinking !== undefined;
-    if (!requested) return out;
-
-    // Forward the caller's thinking object verbatim when present (they accept
-    // boolean, {type:enabled}, {type:adaptive}); otherwise synthesize the
-    // {type:enabled} switch that surfaces the trace.
-    out.thinking = original?.thinking ?? { type: 'enabled' };
-    // Forward effort verbatim (they accept the full 7-value enum; GLM's
-    // narrow-enum restriction is handled per-model upstream, not here).
-    if (effort) out.reasoning_effort = effort;
-    return out;
-  }
-
-  if (policy === 'glm_mapped') {
-    // GLM accepts ONLY `reasoning_effort` in {none,low,medium,high} and rejects
-    // the rich `thinking` object. Which of the six levels this model accepts is
-    // per-model data (`models.thinking_levels`) enforced by the proxy's
-    // redirectThinkingRequest BEFORE the provider call — so whatever effort
-    // survives to here is already in-set: forward it verbatim. Never forward
-    // the rich object. If no effort was requested, send nothing and let GLM
-    // use its default (which is thinking-enabled). (#292)
-    if (effort) out.reasoning_effort = effort;
-    return out;
-  }
-
-  // policy === 'reasoning_effort_only'
-  if (effort) out.reasoning_effort = effort;
-  return out;
-}
-
 // ─── Per-model supported-level redirect ───────────────────────────────────
 
 /** The canonical effort scale, in increasing order. `models.thinking_levels`
@@ -555,8 +334,8 @@ export type ThinkingRequestDecision =
  *  - `levels` → nearest-enabled redirect (see {@link redirectEffort}); when a
  *    redirect occurs the effective effort (`thinking.effort` wins over
  *    `reasoning_effort`, matching normalizeThinking) is rewritten on BOTH
- *    surfaces so no downstream reader (openaiCompatThinkingBody prefers
- *    reasoning_effort) sees a stale value; a present `thinking` object is
+ *    surfaces so no downstream reader (the compat path emits a single
+ *    `reasoning_effort`) sees a stale value; a present `thinking` object is
  *    shallow-cloned with only its `effort` replaced — type/budget/display
  *    preserved verbatim. */
 export function applyThinkingPolicy(

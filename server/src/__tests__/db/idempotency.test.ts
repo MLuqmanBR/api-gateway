@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { initDb } from '../../db/index.js';
-import { applyTierRules, applyThinkingLevelRules, applyVisionRules, migrateDbSchema } from '../../db/migrations.js';
+import { applyTierRules, applyVisionRules, migrateDbSchema } from '../../db/migrations.js';
 import { THINKING_LEVELS } from '../../lib/thinking.js';
 import { MODEL_PRICING } from '../../db/model-pricing.js';
 
@@ -353,15 +353,11 @@ describe('Migration idempotency', () => {
     db.close();
   });
 
-  it('thinking levels: boot pass seeds glm_mapped rows and never revisits operator-owned ones', () => {
+  it('thinking levels: fresh DBs seed the unrestricted default and migration passes stay inert', () => {
     process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    const savedMapped = process.env.THINKING_GLM_MAPPED_HOSTS;
-    process.env.THINKING_GLM_MAPPED_HOSTS = 'env-host-c';
-    try {
     const tmpPath = `/tmp/api-gateway-thinking-${Date.now()}.db`;
     const db = initDb(tmpPath);
     const DEFAULT = JSON.stringify([...THINKING_LEVELS]);
-    const GLM = JSON.stringify(['low', 'medium', 'high']);
     // Named row shapes (unchecked casts): the SELECT aliases are fixed by the
     // SQL below, not external input.
     type LevelRow = { l: string };
@@ -379,50 +375,26 @@ describe('Migration idempotency', () => {
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
       VALUES (?, ?, ?, 10, 10, '', 1)
     `);
-    // Host-based rule match (glmMappedHosts: public + env-registered hosts)
-    // and id-based (isGlmModel).
-    const hostRow = Number(ins.run('zhipu', 'glm-test-host', 'Host Row').lastInsertRowid);
-    const envRow = Number(ins.run('env-host-c', 'glm-env-row', 'Env Row').lastInsertRowid);
-    const idRow = Number(ins.run('some-platform', 'z-ai/glm-5.1', 'Id Row').lastInsertRowid);
-    const otherRow = Number(ins.run('openrouter', 'deepseek-v4-pro', 'Other').lastInsertRowid);
+    const glmHostRow = Number(ins.run('zhipu', 'glm-host-row', 'Host Row').lastInsertRowid);
+    const glmIdRow = Number(ins.run('some-platform', 'z-ai/glm-5.1', 'Id Row').lastInsertRowid);
 
-    // glm-mapped rows get the narrow set, everything else stays at default.
-    applyThinkingLevelRules(db, [hostRow, envRow, idRow, otherRow]);
-    expect(levelsOf(hostRow)).toBe(GLM);
-    expect(levelsOf(envRow)).toBe(GLM);
-    expect(levelsOf(idRow)).toBe(GLM);
-    expect(levelsOf(otherRow)).toBe(DEFAULT);
+    // No rule-based seeding: GLM-named rows keep the unrestricted six-level
+    // default exactly like every other model — operators pick levels per
+    // model in the dashboard (manual flag set on write).
+    expect(levelsOf(glmHostRow)).toBe(DEFAULT);
+    expect(levelsOf(glmIdRow)).toBe(DEFAULT);
+    expect(manualFlag(glmHostRow)).toBe(0);
+    expect(manualFlag(glmIdRow)).toBe(0);
 
-    // (a) operator-edited row survives reboots untouched.
-    db.prepare("UPDATE models SET thinking_levels = ?, thinking_levels_manual = 1 WHERE id = ?").run(JSON.stringify(['high']), hostRow);
-    // (b) operator deliberately resetting to all-six keeps it after reboot —
-    // the manual flag, not the value, decides ownership.
-    db.prepare("UPDATE models SET thinking_levels = ?, thinking_levels_manual = 1 WHERE id = ?").run(DEFAULT, idRow);
+    // Reboot is inert: a second migrateDbSchema pass changes nothing for any
+    // row, operator-edited or untouched.
+    db.prepare("UPDATE models SET thinking_levels = ?, thinking_levels_manual = 1 WHERE id = ?").run(JSON.stringify(['high']), glmHostRow);
     migrateDbSchema(db);
-    expect(levelsOf(hostRow)).toBe(JSON.stringify(['high']));
-    expect(levelsOf(idRow)).toBe(DEFAULT);
-    expect(manualFlag(hostRow)).toBe(1);
-    expect(manualFlag(idRow)).toBe(1);
-
-    // (c) a still-default glm_mapped row IS seeded by the next boot pass,
-    // with the manual flag left at 0 so operators can still claim it later.
-    const freshRow = Number(ins.run('zhipu', 'glm-fresh-row', 'Fresh').lastInsertRowid);
-    expect(levelsOf(freshRow)).toBe(DEFAULT);
-    migrateDbSchema(db);
-    expect(levelsOf(freshRow)).toBe(GLM);
-    expect(manualFlag(freshRow)).toBe(0);
-
-    // Discovery path: runtime ingest scopes the rule to newly inserted ids
-    // so late-synced models don't wait for a reboot.
-    const lateRow = Number(ins.run('some-platform', 'zai-org/glm_5_2-x', 'Late').lastInsertRowid);
-    applyThinkingLevelRules(db, [lateRow]);
-    expect(levelsOf(lateRow)).toBe(GLM);
-    expect(manualFlag(lateRow)).toBe(0);
+    expect(levelsOf(glmHostRow)).toBe(JSON.stringify(['high']));
+    expect(levelsOf(glmIdRow)).toBe(DEFAULT);
+    expect(manualFlag(glmHostRow)).toBe(1);
+    expect(manualFlag(glmIdRow)).toBe(0);
     db.close();
-    } finally {
-      if (savedMapped === undefined) delete process.env.THINKING_GLM_MAPPED_HOSTS;
-      else process.env.THINKING_GLM_MAPPED_HOSTS = savedMapped;
-    }
   });
 
   it('applyModelPricing refreshes mapped prices but respects pricing_manual', () => {
