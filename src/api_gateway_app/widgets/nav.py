@@ -40,6 +40,7 @@ class Sidebar(QWidget):
         else:
             dot.setText("\u25c6")
         dot.setObjectName("brandDot")
+        brand_layout.addWidget(dot)
         name = QLabel("API Gateway")
         name.setStyleSheet("font-weight: 800; font-size: 15px;")
         brand_layout.addWidget(name)
