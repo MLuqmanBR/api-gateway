@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import unittest
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -83,7 +84,22 @@ class StatusTests(unittest.TestCase):
     def test_cli_mode(self):
         """Unit inactive but ping OK → CLI (this machine's shape)."""
         with mock.patch.object(manager._sysd, "is_service_running", return_value=False), \
-             mock.patch.object(manager, "ping_ok", return_value=True):
+             mock.patch.object(manager, "ping_ok", return_value=True), \
+             mock.patch.object(manager, "_cli_process_status",
+                               return_value=(802268, 183_914_496, 71_118.0)):
+            st = manager.status()
+            self.assertTrue(st.running)
+            self.assertIs(st.mode, manager.BackendMode.CLI)
+            self.assertEqual(st.pid, 802268)
+            self.assertEqual(st.memory_bytes, 183_914_496)
+            self.assertEqual(st.uptime_s, 71_118.0)
+
+    def test_cli_mode_unidentified_process(self):
+        """Registry missing / process gone → CLI still, stats stay None."""
+        with mock.patch.object(manager._sysd, "is_service_running", return_value=False), \
+             mock.patch.object(manager, "ping_ok", return_value=True), \
+             mock.patch.object(manager, "_cli_process_status",
+                               return_value=(None, None, None)):
             st = manager.status()
             self.assertTrue(st.running)
             self.assertIs(st.mode, manager.BackendMode.CLI)
@@ -95,6 +111,27 @@ class StatusTests(unittest.TestCase):
             st = manager.status()
             self.assertFalse(st.running)
             self.assertIs(st.mode, manager.BackendMode.NONE)
+
+    def test_cli_process_status_reads_registry(self):
+        """A registry pid whose cmdline is the server → stats from /proc."""
+        with mock.patch.object(manager._sysd, "repo_root", return_value=Path("/repo")), \
+             mock.patch.object(Path, "read_text", return_value='{"3001": 4242}'), \
+             mock.patch.object(Path, "read_bytes",
+                               return_value=b"node\0server/dist/index.js\0"), \
+             mock.patch.object(manager, "_proc_stats",
+                               return_value=(4242, 7340032, 125.0)) as stats:
+            self.assertEqual(manager._cli_process_status(), (4242, 7340032, 125.0))
+            stats.assert_called_once_with(4242)
+
+    def test_cli_process_status_ignores_foreign_pid(self):
+        """A registry pid that is NOT the server → no stats, no crash."""
+        with mock.patch.object(manager._sysd, "repo_root", return_value=Path("/repo")), \
+             mock.patch.object(Path, "read_text", return_value='{"3001": 999}'), \
+             mock.patch.object(Path, "read_bytes",
+                               return_value=b"python3\0unrelated.py\0"), \
+             mock.patch.object(manager, "_proc_stats") as stats:
+            self.assertEqual(manager._cli_process_status(), (None, None, None))
+            stats.assert_not_called()
 
 
 class StopRestartTests(unittest.TestCase):

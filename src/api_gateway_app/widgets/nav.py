@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..icons import icon
+from ..icons import app_logo_pixmap, icon
 from ..theme import THEME_BUS, palette
 
 
@@ -33,9 +33,13 @@ class Sidebar(QWidget):
         brand_layout = QHBoxLayout(brand)
         brand_layout.setContentsMargins(16, 4, 16, 14)
         brand_layout.setSpacing(10)
-        dot = QLabel("◆")
+        brand_pix = app_logo_pixmap(26)
+        dot = QLabel()
+        if brand_pix is not None:
+            dot.setPixmap(brand_pix)
+        else:
+            dot.setText("\u25c6")
         dot.setObjectName("brandDot")
-        brand_layout.addWidget(dot)
         name = QLabel("API Gateway")
         name.setStyleSheet("font-weight: 800; font-size: 15px;")
         brand_layout.addWidget(name)

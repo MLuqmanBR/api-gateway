@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 
 from .. import settings as app_settings
 from ..backend import ApiClient, ApiError
+from ..icons import app_logo_pixmap
 from ..theme import palette as _current_palette
 
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="api-gw-auth")
@@ -60,9 +61,15 @@ class AuthGate(QWidget):
         card_layout.setSpacing(14)
 
         p = self._p
-        logo = QLabel("\u25c6")
+        logo = QLabel()
+        _logo_pix = app_logo_pixmap(40)
+        if _logo_pix is not None:
+            logo.setPixmap(_logo_pix)
+        else:
+            # QtSvg not shipped by the distro split — keep the glyph fallback.
+            logo.setText("\u25c6")
+            logo.setStyleSheet(f"font-size: 26px; color: {p['blue']};")
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setStyleSheet(f"font-size: 26px; color: {p['blue']};")
         card_layout.addWidget(logo)
 
         title = QLabel("API Gateway")

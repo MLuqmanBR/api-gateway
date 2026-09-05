@@ -18,11 +18,14 @@ server guard.
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 
 from . import systemd as _sysd
 
@@ -79,8 +82,64 @@ def status() -> BackendStatus:
             memory_bytes=st.memory_bytes, uptime_s=st.uptime_s,
         )
     if ping_ok():
-        return BackendStatus(running=True, mode=BackendMode.CLI)
+        st = _cli_process_status()
+        return BackendStatus(
+            running=True, mode=BackendMode.CLI,
+            pid=st[0], memory_bytes=st[1], uptime_s=st[2],
+        )
     return BackendStatus(running=False, mode=BackendMode.NONE)
+
+
+def _cli_process_status() -> tuple[int | None, int | None, float | None]:
+    """Identify the CLI-managed backend process via the api CLI's own
+    instance registry (``<repo>/.api-gateway.instances``: {port: pid}) and
+    read its live stats from /proc — the systemd path gets this from
+    systemctl, the CLI path would otherwise show "—" cards forever."""
+    candidates: list[int] = []
+    # The CLI writes its instance registry next to the checkout it manages.
+    # With a linked worktree (app running from api-gateway-dev) the backend
+    # lives in the main checkout — search every sibling checkout sharing
+    # the same base name (api-gateway, api-gateway-dev, ...) too.
+    root = _sysd.repo_root()
+    parent = root.parent
+    base_name = root.name.removesuffix("-dev")
+    search_dirs = [root] + sorted(
+        p for p in parent.glob(f"{base_name}*") if p.is_dir()
+    )
+    for registry in (d / ".api-gateway.instances" for d in search_dirs):
+        try:
+            port_map = json.loads(registry.read_text())
+            candidates.extend(
+                int(pid) for pid in port_map.values() if str(pid).isdigit()
+            )
+        except (OSError, ValueError, AttributeError):
+            continue
+    for pid in candidates:
+        try:
+            cmdline = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+        except OSError:
+            continue
+        parts = cmdline.decode("utf-8", "replace").split("\0")
+        if any(p.endswith("server/dist/index.js") for p in parts if p):
+            return _proc_stats(pid)
+    return (None, None, None)
+
+
+def _proc_stats(pid: int) -> tuple[int | None, int | None, float | None]:
+    """RSS bytes + process start time → (pid, memory_bytes, uptime_s)."""
+    try:
+        statm = (Path("/proc") / str(pid) / "statm").read_text().split()
+        rss_pages = int(statm[1])
+        stat = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+        starttime_ticks = int(stat[19])
+        with open("/proc/uptime", encoding="ascii") as up:
+            system_uptime = float(up.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return (None, None, None)
+    memory_bytes = rss_pages * os.sysconf("SC_PAGE_SIZE")
+    hz = os.sysconf("SC_CLK_TCK")
+    uptime_s = max(0.0, system_uptime - starttime_ticks / hz)
+    return (pid, memory_bytes, uptime_s)
 
 
 def ensure_running() -> bool:

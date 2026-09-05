@@ -246,5 +246,30 @@ def icon(name: str, size: int = 20) -> QIcon:
     return qicon
 
 
-__all__ = ["icon", "icon_pixmap",
+def app_logo_pixmap(size: int = 40):
+    """The app mark (hub-and-spokes SVG) as a transparent pixmap — the same
+    asset as the window/taskbar icon. Returns None when QtSvg is missing
+    from the distro's PyQt6 split or the asset is absent; callers fall back
+    to their text-glyph branding."""
+    try:
+        from PyQt6.QtSvg import QSvgRenderer
+    except ImportError:
+        return None
+    from .systemd import repo_root
+
+    svg = repo_root() / "resources" / "icons" / "api-gateway.svg"
+    if not svg.exists():
+        return None
+    renderer = QSvgRenderer(str(svg))
+    if not renderer.isValid():
+        return None
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = _new_painter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return pixmap
+
+
+__all__ = ["icon", "icon_pixmap", "app_logo_pixmap",
            "BLUE", "GREEN", "RED", "YELLOW", "PEACH", "MAUVE", "TEXT", "SUBTEXT"]
