@@ -95,6 +95,13 @@ async function main() {
       try { getDb().close(); } catch { /* already closed */ }
       process.exit(0);
     });
+    // Long-lived SSE connections (desktop app / dashboard EventStream) never
+    // end on their own and would hold close()'s callback until the 30s
+    // backstop — far past the api CLI's 5s SIGTERM window, degrading every
+    // `api stop`/`api restart` into a SIGKILL race. Close remaining
+    // connections at the 3s mark so the graceful path (WAL checkpoint on
+    // db.close()) still runs.
+    setTimeout(() => { try { activeServer.closeAllConnections(); } catch { /* listener already closed */ } }, 3_000).unref();
     setTimeout(() => process.exit(0), 30_000).unref();
   }
   process.on('SIGTERM', shutdown);

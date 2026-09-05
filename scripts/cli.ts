@@ -223,6 +223,42 @@ function portInUse(port) {
   return promise;
 }
 
+// After signalling a server to stop, a dead registry entry is not proof of
+// release: a SIGKILLed process takes a moment for the kernel to tear down
+// its listening socket, and `restart` probing the port during that window
+// saw "already in use" and aborted with the server left down. Both waits
+// are bounded so a stuck process can only add `timeoutMs` before
+// stop/restart proceed anyway.
+function sleep(ms) {
+  const { promise, resolve } = Promise.withResolvers();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
+async function waitPidGone(pid, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (isRunning(pid)) {
+    if (Date.now() > deadline) {
+      console.warn(`PID ${pid} still present ${timeoutMs}ms after SIGKILL; continuing.`);
+      return;
+    }
+    await sleep(100);
+  }
+}
+
+async function waitPortFree(port, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  // First probe runs immediately — on the healthy path the socket is
+  // already closed and this returns in one tick.
+  while (await portInUse(port)) {
+    if (Date.now() > deadline) {
+      console.warn(`Port ${port} still in use ${timeoutMs}ms after stop; continuing.`);
+      return;
+    }
+    await sleep(200);
+  }
+}
+
 const SYSTEMD_UNIT = 'api-gateway.service';
 
 // The systemd user unit (api-gateway.service) runs server/dist/index.js on
@@ -445,10 +481,11 @@ function stopOne(port) {
   try { process.kill(pid, 'SIGTERM'); } catch (e) { console.log(`Failed: ${(e as Error).message}`); }
   return new Promise<void>((resolve) => {
     let attempts = 0;
-    const check = setInterval(() => {
+    const check = setInterval(async () => {
       if (!isRunning(pid)) {
         clearInterval(check);
         updateInstances((cur) => { delete cur[key]; });
+        await waitPortFree(port);
         console.log('Server stopped.');
         resolve();
         return;
@@ -457,6 +494,8 @@ function stopOne(port) {
         try { process.kill(pid, 'SIGKILL'); } catch {}
         clearInterval(check);
         updateInstances((cur) => { delete cur[key]; });
+        await waitPidGone(pid);
+        await waitPortFree(port);
         console.log('Server force-stopped.');
         resolve();
       }
