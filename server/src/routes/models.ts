@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
 import { hasProvider, getAllProviders } from '../providers/index.js';
-import { syncModelsFromProvider, type ProviderSyncResult } from './custom.js';
+import { syncModelsFromProvider, syncBuiltinViaHook, type ProviderSyncResult } from './custom.js';
 import { parseStoredThinkingLevels } from '../lib/thinking.js';
 
 export const modelsRouter = Router();
@@ -63,11 +63,16 @@ modelsRouter.post('/sync-all', async (_req: Request, res: Response) => {
   const db = getDb();
   const builtins = getAllProviders();
 
-  // Collect slugs + baseUrls from built-ins that expose a discoverable /models endpoint.
-  const targets: { slug: string; baseUrl: string }[] = [];
+  // Collect slugs + baseUrls from built-ins that expose a discoverable
+  // /models endpoint, plus built-ins that carry their own discoverModels()
+  // hook (catalog not served as OpenAI /models — CommandCode's website
+  // catalog). Hook-only targets carry no baseUrl.
+  const targets: { slug: string; baseUrl?: string }[] = [];
   for (const p of builtins) {
     if (p.baseUrl) {
       targets.push({ slug: p.platform, baseUrl: p.baseUrl });
+    } else if (typeof p.discoverModels === 'function') {
+      targets.push({ slug: p.platform });
     }
   }
 
@@ -91,8 +96,11 @@ modelsRouter.post('/sync-all', async (_req: Request, res: Response) => {
   const worker = async (): Promise<void> => {
     while (nextTarget < targets.length) {
       const i = nextTarget++;
-      results[i] = await Promise.allSettled([syncModelsFromProvider(targets[i].baseUrl, targets[i].slug)])
-        .then(([r]) => r);
+      results[i] = await Promise.allSettled([
+        targets[i].baseUrl
+          ? syncModelsFromProvider(targets[i].baseUrl, targets[i].slug)
+          : syncBuiltinViaHook(targets[i].slug),
+      ]).then(([r]) => r);
     }
   };
   await Promise.all(

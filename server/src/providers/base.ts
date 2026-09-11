@@ -5,7 +5,6 @@ import type {
   ChatToolDefinition,
   ChatToolChoice,
 } from '@api-gateway/shared/types.js';
-
 import { createAbortRace } from '../lib/abort.js';
 
 /** A provider HTTP error carrying the upstream status. The router decides
@@ -22,6 +21,28 @@ export function providerHttpError(res: Response, message: string): ProviderHttpE
   const err = new Error(message) as ProviderHttpError;
   err.status = res.status;
   return err;
+}
+/** A model row a provider offers through its own discovery hook (as opposed
+ *  to the generic OpenAI /models scrape). `null` fields mean "unknown" — the
+ *  insert engine stores them as NULL and falls back to defaults. Rows that
+ *  carry an `intelligenceScore` are treated as scraped benchmark data: their
+ *  tier label derives from the score bands instead of the LIKE-pattern rules. */
+export interface DiscoveredModel {
+  modelId: string;
+  displayName: string;
+  contextWindow: number | null;
+  supportsVision: boolean;
+  /** Model reasons natively (drives the per-model thinking-levels menu). */
+  reasoning: boolean;
+  intelligenceScore: number | null;
+  tokensPerSecond: number | null;
+  inputPerM: number | null;
+  outputPerM: number | null;
+  cacheReadPerM: number | null;
+  cacheWritePerM: number | null;
+  /** Documented thinking levels for this model. Omitted = leave the DB
+   *  default (generic OpenAI discovery must NOT set ['off']). */
+  thinkingLevels?: string[];
 }
 
 export interface CompletionOptions {
@@ -136,6 +157,15 @@ export abstract class BaseProvider {
    * Cloudflare Workers AI — account_id embedded in the key) leave this empty. */
   baseUrl?: string;
 
+  /** Providers whose catalog cannot be scraped from an OpenAI-compatible
+   *  /models endpoint implement this hook instead (e.g. CommandCode's
+   *  website catalog). The sync-all orchestrator and the per-slug sync
+   *  route consult it when baseUrl is absent. Throwing is safe — callers
+   *  record a per-slug error and write nothing. */
+  discoverModels?(): Promise<DiscoveredModel[]>;
+
+  /** One-shot key validation for the health checker. Throwing (transport
+   *  failure) is allowed and classifies the key as transiently errored. */
   abstract validateKey(apiKey: string): Promise<boolean>;
 
   abstract chatCompletion(

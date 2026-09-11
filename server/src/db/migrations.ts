@@ -84,6 +84,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV45MiddleRedaction(db);
   migrateSchemaV46DropSupportsTools(db);
   migrateSchemaV47ModelThinkingLevels(db);
+  migrateSchemaV48ModelCacheTelemetry(db);
   // AFTER all schema migrations — needs client_keys (V39) + final models state.
   normalizeClientKeyAllowlists(db);
 }
@@ -2805,6 +2806,25 @@ function migrateSchemaV47ModelThinkingLevels(db: DatabasePort) {
   }
   if (!columns.some(col => col.name === 'thinking_levels_manual')) {
     db.prepare('ALTER TABLE models ADD COLUMN thinking_levels_manual INTEGER NOT NULL DEFAULT 0').run();
+  }
+}
+
+// V48 (2026-09-11): scraped catalog telemetry columns for the CommandCode
+// discovery wrapper (server/src/providers/commandcode-models.ts) — cache-read
+// / cache-write $/M and observed tok/s. All nullable; NOT read by the spend
+// chain (which uses paid_input_per_m/paid_output_per_m only); surfaced to the
+// dashboard via /api/models (SELECT m.*). No operator-manual flags yet: the
+// dashboard cannot edit these columns, so discovery refreshes them freely.
+function migrateSchemaV48ModelCacheTelemetry(db: DatabasePort) {
+  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'cache_read_per_m')) {
+    db.prepare('ALTER TABLE models ADD COLUMN cache_read_per_m REAL').run();
+  }
+  if (!columns.some(col => col.name === 'cache_write_per_m')) {
+    db.prepare('ALTER TABLE models ADD COLUMN cache_write_per_m REAL').run();
+  }
+  if (!columns.some(col => col.name === 'tokens_per_second')) {
+    db.prepare('ALTER TABLE models ADD COLUMN tokens_per_second REAL').run();
   }
 }
 
