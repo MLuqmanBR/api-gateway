@@ -6,8 +6,8 @@ import type {
   ChatToolDefinition,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
-import { contentToString } from '../lib/content.js';
 import { createAbortRace } from '../lib/abort.js';
+import { createHash, randomBytes } from 'node:crypto';
 
 const NPM_VERSION_URL = 'https://registry.npmjs.org/command-code/latest';
 const API_BASE = 'https://api.commandcode.ai';
@@ -70,11 +70,305 @@ function compareVersions(a: string, b: string): number {
   return 0;
 }
 
+// ── Per-key session + device fingerprint (anti-detection lifecycle) ──────
+// Ported from the reference proxy (commandcode-proxy/proxy.mjs): upstream
+// scores requests by CLI-session realism. Each API key gets its own stable
+// session UUID (12h + 1h jitter) and device fingerprint; fingerprint-record
+// and lifecycle pre-requests fire on first use and then every 8h ± 2h.
+
+const SESSION_DURATION_MS = 12 * 60 * 60 * 1000; // 12h
+const SESSION_JITTER_MS = 60 * 60 * 1000;        // ±1h
+
+const sessionStore = new Map<string, { sessionId: string; expiresAt: number }>();
+
+function ensureSession(apiKey: string): string {
+  const now = Date.now();
+  const entry = sessionStore.get(apiKey);
+  if (entry && now < entry.expiresAt) return entry.sessionId;
+  const jitter = Math.floor(Math.random() * SESSION_JITTER_MS);
+  const sessionId = crypto.randomUUID();
+  sessionStore.set(apiKey, { sessionId, expiresAt: now + SESSION_DURATION_MS + jitter });
+  return sessionId;
+}
+
+const FINGERPRINT_CPUS: Array<{ model: string; cores: number }> = [
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
+  { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
+  { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
+  { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
+  { model: '13th Gen Intel(R) Core(TM) i5-13600K', cores: 14 },
+  { model: '13th Gen Intel(R) Core(TM) i9-13900K', cores: 24 },
+  { model: 'Intel(R) Core(TM) Ultra 7 155H', cores: 16 },
+  { model: 'Intel(R) Core(TM) Ultra 9 285H', cores: 16 },
+  { model: 'Intel(R) Core(TM) i9-14900K', cores: 24 },
+  { model: 'Intel(R) Core(TM) i7-14700K', cores: 20 },
+  { model: 'AMD Ryzen 7 7800X3D', cores: 8 },
+  { model: 'AMD Ryzen 9 7950X', cores: 16 },
+  { model: 'AMD Ryzen 5 7600', cores: 6 },
+  { model: 'AMD Ryzen 9 7900X', cores: 12 },
+  { model: 'AMD Ryzen 7 5800X3D', cores: 8 },
+];
+const FINGERPRINT_MEMS = [8, 16, 24, 32, 48, 64];
+const FINGERPRINT_TZS = [
+  'America/New_York', 'America/Chicago', 'America/Los_Angeles', 'America/Toronto',
+  'Europe/London', 'Europe/Berlin', 'Europe/Paris', 'Europe/Moscow',
+  'Asia/Shanghai', 'Asia/Tokyo', 'Asia/Singapore', 'Asia/Seoul', 'Asia/Hong_Kong',
+  'Australia/Sydney', 'Pacific/Auckland',
+];
+const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5];
+
+function sha256(s: string): string {
+  return createHash('sha256').update(s).digest('hex');
+}
+
+function randHex(n: number): string {
+  return randomBytes(n).toString('hex');
+}
+
+interface FingerprintComponents {
+  machineIdHash: string;
+  macHashes: string[];
+  osUserHash: string;
+  hostnameHash: string;
+  gitEmailHash: string;
+  platform: string;
+  arch: string;
+  osRelease: string;
+  cpuModel: string;
+  cpuCount: number;
+  memGiB: number;
+  isContainer: boolean;
+  timezone: string;
+  runtime: string;
+  collectorVersion: number;
+}
+
+interface DeviceFingerprint {
+  thumbmark: string;
+  components: FingerprintComponents;
+}
+
+/** Generate a randomized Windows-CLI device fingerprint (verbatim port of the
+ *  reference proxy's generateFingerprint — the pools and hash composition are
+ *  what the upstream scores, so they must not be "improved"). */
+function generateFingerprint(): DeviceFingerprint {
+  const cpuEntry = FINGERPRINT_CPUS[Math.floor(Math.random() * FINGERPRINT_CPUS.length)];
+  const memGiB = FINGERPRINT_MEMS[Math.floor(Math.random() * FINGERPRINT_MEMS.length)];
+  const tz = FINGERPRINT_TZS[Math.floor(Math.random() * FINGERPRINT_TZS.length)];
+  const macCount = FINGERPRINT_MAC_COUNT_RANGE[Math.floor(Math.random() * FINGERPRINT_MAC_COUNT_RANGE.length)];
+
+  const macHashes: string[] = [];
+  for (let i = 0; i < macCount; i++) macHashes.push(sha256(randHex(32)));
+
+  const machineIdHash = sha256(randHex(32));
+  const osUserHash = sha256(randHex(16));
+  const hostnameHash = sha256(randHex(16));
+  const gitEmailHash = sha256(randHex(16));
+
+  const thumbData = [machineIdHash, ...macHashes, osUserHash, hostnameHash, gitEmailHash, 'win32', '10.0.22631', cpuEntry.model, String(cpuEntry.cores), String(memGiB)].join('|');
+  const thumbmark = sha256(thumbData);
+
+  return {
+    thumbmark,
+    components: {
+      machineIdHash,
+      macHashes,
+      osUserHash,
+      hostnameHash,
+      gitEmailHash,
+      platform: 'win32',
+      arch: 'x64',
+      osRelease: '10.0.22631',
+      cpuModel: cpuEntry.model,
+      cpuCount: cpuEntry.cores,
+      memGiB,
+      isContainer: false,
+      timezone: tz,
+      runtime: 'cli',
+      collectorVersion: 1,
+    },
+  };
+}
+
+interface CommandCodeKeyState {
+  fingerprint: DeviceFingerprint;
+  nextInitAt: number;
+}
+
+const keyStateStore = new Map<string, CommandCodeKeyState>();
+
+function getOrCreateKeyState(apiKey: string): CommandCodeKeyState {
+  let state = keyStateStore.get(apiKey);
+  if (!state) {
+    state = { fingerprint: generateFingerprint(), nextInitAt: 0 };
+    keyStateStore.set(apiKey, state);
+  }
+  return state;
+}
+
+const INIT_REFRESH_MS = 8 * 60 * 60 * 1000; // 8h
+const INIT_JITTER_MS = 2 * 60 * 60 * 1000;  // ±2h
+
+/** Fire the fingerprint-record + lifecycle pre-requests for a key on first use
+ *  and every 8h ± 2h after. Never throws and never blocks longer than the
+ *  per-request timeouts — a failed pre-request must not fail the chat call. */
+async function ensureInitialized(apiKey: string): Promise<void> {
+  const state = getOrCreateKeyState(apiKey);
+  if (Date.now() < state.nextInitAt) return;
+  const version = await getCommandCodeVersion();
+  try {
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-cli-environment': 'production',
+      'Authorization': `Bearer ${apiKey}`,
+      'x-command-code-version': version,
+    };
+    const fingerprint = state.fingerprint;
+
+    const results = await Promise.allSettled([
+      fetch(`${API_BASE}/alpha/fingerprint/record`, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(10000),
+        body: JSON.stringify(fingerprint),
+      }),
+      fetch(`${API_BASE}/alpha/lifecycle-events`, {
+        method: 'POST',
+        headers,
+        signal: AbortSignal.timeout(10000),
+        body: JSON.stringify({
+          eventType: 'cli_session_exists',
+          metadata: {
+            sessionId: `sess_${randomBytes(8).toString('hex')}`,
+            cliVersion: version,
+            mode: 'interactive',
+            os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
+          },
+        }),
+      }),
+    ]);
+    for (const r of results) {
+      if (r.status === 'rejected') {
+        console.warn(`[commandcode] init pre-request failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`);
+      } else if (!r.value.ok) {
+        console.warn(`[commandcode] init pre-request got HTTP ${r.value.status}`);
+        try { await r.value.body?.cancel(); } catch { /* already closed */ }
+      }
+    }
+    state.nextInitAt = Date.now() + INIT_REFRESH_MS + Math.floor(Math.random() * INIT_JITTER_MS);
+  } catch (err) {
+    console.warn(`[commandcode] fingerprint/lifecycle refresh error, will retry next request: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+// Hourly sweep so the per-key maps don't grow unbounded. unref'd: it must not
+// keep the event loop (or a vitest worker) alive on its own.
+const sessionCleanupTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of sessionStore) {
+    if (now >= entry.expiresAt) {
+      sessionStore.delete(key);
+      keyStateStore.delete(key);
+    }
+  }
+}, 60 * 60 * 1000);
+if (typeof sessionCleanupTimer.unref === 'function') sessionCleanupTimer.unref();
+
+/** Build a plausible Windows project slug from a session id (reference proxy
+ *  fakeProjectSlug — deterministic per session, shaped like the real CLI's). */
+function fakeProjectSlug(sessionId: string): string {
+  const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
+    'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
+  const id = String(sessionId || '');
+  const head = id.slice(0, 4);
+  let idx = parseInt(head, 16);
+  if (!Number.isFinite(idx)) {
+    let h = 0;
+    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+    idx = h;
+  }
+  const name = names[idx % names.length];
+  const suffix = head || '0000';
+  const path = `C:\\Users\\dev\\projects\\${name}-${suffix}`;
+  return path
+    .toLowerCase()
+    .replace(/^[a-z]:/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function generateTraceparent(): string {
+  const traceId = randomBytes(16).toString('hex');
+  const parentId = randomBytes(8).toString('hex');
+  return `00-${traceId}-${parentId}-01`;
+}
+
+/** Test hook: clear per-key session/fingerprint/init state. */
+export function resetCommandCodeSessionState(): void {
+  sessionStore.clear();
+  keyStateStore.clear();
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+// ── Option mapping helpers ───────────────────────────────────────────────
+
+/** Resolve the reasoning-effort level CommandCode understands. Upstream
+ *  validates params.reasoning_effort against low|medium|high|xhigh|max
+ *  (live-verified 2026-09-11); 'minimal' is a gateway-only level and maps to
+ *  'low'. The rich `thinking` object is NOT forwarded — upstream has no such
+ *  param — and `thinking.type === 'disabled'` omits the field entirely
+ *  (upstream always thinks; there is no disable path). */
+function resolveReasoningEffort(options?: CompletionOptions): string | undefined {
+  if (options?.thinking?.type === 'disabled') return undefined;
+  const effort = options?.thinking?.effort ?? options?.reasoning_effort;
+  if (!effort) return undefined;
+  return effort === 'minimal' ? 'low' : effort;
+}
+
+/** Map the OpenAI tool_choice shape to CommandCode's Anthropic-style shape
+ *  (reference proxy: strings auto/none → same, required → 'any'; function
+ *  object → {type:'tool', name}). */
+function mapToolChoice(toolChoice: NonNullable<CompletionOptions['tool_choice']>): Record<string, unknown> {
+  if (typeof toolChoice === 'string') {
+    const map: Record<string, string> = { auto: 'auto', none: 'none', required: 'any' };
+    return { type: map[toolChoice] ?? 'auto' };
+  }
+  return { type: 'tool', name: toolChoice.function.name };
+}
+
+/** Pull the URL/data-URI out of any image-shaped content part. Accepts the
+ *  OpenAI object form ({image_url:{url}}), the shorthand string form
+ *  ({image_url:'…'}), google-style ({type:'image', image:'…'}), and
+ *  Responses-style ({type:'input_image', image_url:'…'}). */
+function extractImageUrl(b: Record<string, unknown>): string | null {
+  const iu = b['image_url'];
+  if (typeof iu === 'string' && iu.length > 0) return iu;
+  if (iu && typeof iu === 'object' && typeof (iu as Record<string, unknown>)['url'] === 'string') {
+    return (iu as Record<string, unknown>)['url'] as string;
+  }
+  if (typeof b['image'] === 'string' && b['image'].length > 0) return b['image'];
+  if (typeof b['url'] === 'string' && b['url'].length > 0) return b['url'];
+  return null;
+}
+
+/** Anti false-billing (reference proxy normalizeUsage): a finish event with
+ *  no output tokens is a glitched response — zero the input tokens too so
+ *  spend accounting never charges a prompt for a response that produced
+ *  nothing. */
+function normalizeUsage(u: { inputTokens?: number; outputTokens?: number } | undefined): void {
+  if (!u) return;
+  if (!Number(u.outputTokens)) u.inputTokens = 0;
+}
+
 // ── CommandCode wire types ───────────────────────────────────────────────
 
 interface CCContentBlock {
   type: string;
   text?: string;
+  image?: string;
   id?: string;
   name?: string;
   input?: unknown;
@@ -141,13 +435,23 @@ interface StreamingDelta {
   reasoning_content?: string;
 }
 
+// ── Param-retraction contingency ─────────────────────────────────────────
+// A 400 whose body names `params.<field>` means this upstream build rejects
+// the field. Retry once without it and never send it again for the process
+// lifetime (one upstream API — a field rejected for one model is rejected
+// for all).
+
+const RETRACTABLE_PARAMS = ['tool_choice', 'parallel_tool_calls', 'reasoning_effort'] as const;
+const retractedParams = new Set<string>();
+
 // ── Provider ─────────────────────────────────────────────────────────────
 
 export class CommandCodeProvider extends BaseProvider {
   readonly platform = 'commandcode' as const;
   readonly name = 'CommandCode';
-  // baseUrl left undefined — CommandCode has no /v1/models endpoint, so
-  // auto-discovery skips this provider.
+  // baseUrl left undefined — CommandCode has no OpenAI /models endpoint, so
+  // the baseUrl-based discovery path skips this provider. Model discovery is
+  // provided by the website-scraping hook instead (see commandcode-models.ts).
 
   async chatCompletion(
     apiKey: string,
@@ -155,19 +459,7 @@ export class CommandCodeProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
-    const body = this.buildRequestBody(messages, modelId, options);
-    const headers = await this.requestHeaders(apiKey);
-    const res = await this.fetchWithTimeout(`${API_BASE}/alpha/generate`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    }, options?.timeoutMs ?? 120000, options?.abortSignal);
-
-    if (!res.ok) {
-      const err = await res.text().catch(() => '');
-      throw providerHttpError(res, `CommandCode API error ${res.status}: ${err}`);
-    }
-
+    const res = await this.postGenerate(apiKey, messages, modelId, options);
     return this.collectNonStreamResponse(res, modelId);
   }
 
@@ -177,18 +469,7 @@ export class CommandCodeProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const body = this.buildRequestBody(messages, modelId, options);
-    const headers = await this.requestHeaders(apiKey);
-    const res = await this.fetchWithTimeout(`${API_BASE}/alpha/generate`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    }, options?.timeoutMs ?? 120000, options?.abortSignal);
-    if (!res.ok) {
-      const err = await res.text().catch(() => '');
-      throw providerHttpError(res, `CommandCode API error ${res.status}: ${err}`);
-    }
-
+    const res = await this.postGenerate(apiKey, messages, modelId, options);
     yield* this.streamNdjsonResponse(res, modelId, options?.abortSignal);
   }
 
@@ -241,6 +522,65 @@ export class CommandCodeProvider extends BaseProvider {
     }
   }
 
+  // ── Request dispatch ───────────────────────────────────────────────────
+
+  /** POST /alpha/generate with the param-retraction contingency applied. */
+  private async postGenerate(
+    apiKey: string,
+    messages: ChatMessage[],
+    modelId: string,
+    options?: CompletionOptions,
+  ): Promise<Response> {
+    const send = async (): Promise<Response> => {
+      const body = this.buildRequestBody(messages, modelId, options);
+      const params = body['params'] as Record<string, unknown>;
+      for (const field of retractedParams) delete params[field];
+      const headers = await this.requestHeaders(apiKey);
+      return this.fetchWithTimeout(`${API_BASE}/alpha/generate`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+      }, options?.timeoutMs ?? 120000, options?.abortSignal);
+    };
+
+    let res = await send();
+    if (res.ok) return res;
+    let err = await res.text().catch(() => '');
+    if (res.status === 400) {
+      const named = RETRACTABLE_PARAMS.find(f => !retractedParams.has(f) && err.includes(`params.${f}`));
+      if (named) {
+        retractedParams.add(named);
+        try { await res.body?.cancel(); } catch { /* already closed */ }
+        res = await send();
+        if (res.ok) return res;
+        err = await res.text().catch(() => '');
+      }
+    }
+    throw providerHttpError(res, `CommandCode API error ${res.status}: ${err}`);
+  }
+
+  private async requestHeaders(apiKey: string): Promise<Record<string, string>> {
+    // Session/fingerprint lifecycle: warn-and-continue by contract.
+    await ensureInitialized(apiKey);
+    const version = await getCommandCodeVersion();
+    const sessionId = ensureSession(apiKey);
+    return {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'x-command-code-version': version,
+      'x-cli-environment': 'production',
+      // N18: the stream endpoint replies with newline-delimited JSON (see
+      // readNdjsonEvents), not SSE — ask for the right media type.
+      'Accept': 'application/x-ndjson',
+      // Session realism headers (reference proxy forwardToCC).
+      'x-session-id': sessionId,
+      'x-co-flag': 'false',
+      'x-taste-learning': 'false',
+      'x-project-slug': fakeProjectSlug(sessionId),
+      'traceparent': generateTraceparent(),
+    };
+  }
+
   // ── Request building ───────────────────────────────────────────────────
 
   private buildRequestBody(
@@ -257,26 +597,29 @@ export class CommandCodeProvider extends BaseProvider {
     // deepseek-v4-pro), and callers may also ask for more than the upstream
     // accepts. Clamp to the API ceiling so no request trips the 400.
     const maxTokens = Math.min(options?.max_tokens ?? FALLBACK_MAX_TOKENS, API_MAX_TOKENS);
+    const params: Record<string, unknown> = {
+      model: modelId,
+      messages: ccMessages,
+      tools,
+      // Upstream injects ~7.5K tokens of its own system prompt when
+      // params.system is absent/empty (live-measured prompt_tokens 7653 → 85
+      // with the single-space placeholder; reference proxy issue #17). The
+      // placeholder suppresses the injection without changing semantics.
+      system: system.length > 0 ? system : ' ',
+      max_tokens: maxTokens,
+      temperature,
+      stream: true,
+    };
+    const effort = resolveReasoningEffort(options);
+    if (effort) params['reasoning_effort'] = effort;
+    if (options?.tool_choice) params['tool_choice'] = mapToolChoice(options.tool_choice);
+    if (options?.parallel_tool_calls !== undefined) params['parallel_tool_calls'] = options.parallel_tool_calls;
     return {
       config: this.defaultConfig(),
       memory: '',
       taste: '',
       skills: '',
-      params: {
-        model: modelId,
-        messages: ccMessages,
-        tools,
-        system,
-        max_tokens: maxTokens,
-        temperature,
-        stream: true,
-        // Pass thinking signals through to the underlying provider. The
-        // CommandCode wrapper reaches model-specific APIs that recognize
-        // `reasoning_effort`; the richer `thinking` object is forwarded
-        // verbatim too so the wrapper can pick what it understands. (#290)
-        ...(options?.reasoning_effort ? { reasoning_effort: options.reasoning_effort } : {}),
-        ...(options?.thinking ? { thinking: options.thinking } : {}),
-      },
+      params,
       threadId: crypto.randomUUID(),
     };
   }
@@ -292,19 +635,6 @@ export class CommandCodeProvider extends BaseProvider {
       mainBranch: 'main',
       gitStatus: '',
       recentCommits: [],
-    };
-  }
-
-  private async requestHeaders(apiKey: string): Promise<Record<string, string>> {
-    const version = await getCommandCodeVersion();
-    return {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'x-command-code-version': version,
-      'x-cli-environment': 'production',
-      // N18: the stream endpoint replies with newline-delimited JSON (see
-      // readNdjsonEvents), not SSE — ask for the right media type.
-      'Accept': 'application/x-ndjson',
     };
   }
 
@@ -367,6 +697,7 @@ export class CommandCodeProvider extends BaseProvider {
     }
     return out;
   }
+
   /** Extract the text value from an individual content block object, mirroring
    *  the Go proxy's `contentPartToString()` in convert.go. Key difference from
    *  lib/content.ts's `contentToString`: that function operates on a whole
@@ -385,12 +716,6 @@ export class CommandCodeProvider extends BaseProvider {
       for (const key of ['text', 'content', 'output_text', 'input_text', 'refusal', 'thinking', 'redacted_thinking']) {
         if (typeof b[key] === 'string') return b[key] as string;
       }
-      // Image blocks → descriptive string
-      const iu = b['image_url'];
-      if (iu && typeof iu === 'object' && typeof (iu as Record<string,unknown>)['url'] === 'string') {
-        return `[Image URL: ${(iu as Record<string,unknown>)['url']}]`;
-      }
-      if (typeof iu === 'string') return `[Image URL: ${iu}]`;
       // Fallback: stringify the block
       try { return JSON.stringify(b); } catch { return String(b); }
     }
@@ -401,7 +726,10 @@ export class CommandCodeProvider extends BaseProvider {
   /** Convert an OpenAI content value to CommandCode content blocks.
    *  Matches the Go reference proxy's `parseContent()` in convert.go — every
    *  block type the Go proxy preserves is preserved here so conversation
-   *  history is never silently truncated. */
+   *  history is never silently truncated. Image parts become CommandCode's
+   *  native {type:'image', image:<url>} blocks (reference proxy + live
+   *  verification 2026-09-11); the previous "[Image URL: …]" stringification
+   *  discarded the image entirely. */
   private contentToBlocks(content: unknown): CCContentBlock[] {
     if (content === null || content === undefined) return [];
     if (typeof content === 'string') {
@@ -422,9 +750,14 @@ export class CommandCodeProvider extends BaseProvider {
             return { type: 'text', text: this.blockText(b) };
           }
 
-          // ── image-like blocks (Go: image_url, input_image, image → stringified text) ──
+          // ── image-like blocks → CC's native image part. Vision-capable
+          //    models (deepseek-v4.1-flash, mimo-v2.5) see the image;
+          //    non-vision models silently drop it upstream (their documented
+          //    behavior, verified live) — we must not mangle it into text. ──
           if (typ === 'image_url' || typ === 'input_image' || typ === 'image') {
-            return { type: 'text', text: this.blockText(b) };
+            const url = extractImageUrl(b);
+            if (url) return { type: 'image', image: url };
+            return { type: 'text', text: '[image part without url]' };
           }
 
           // ── tool-call blocks (Go: tool_use, tool-call) ──
@@ -529,6 +862,7 @@ export class CommandCodeProvider extends BaseProvider {
         }
         case 'finish':
           if (event.totalUsage) {
+            normalizeUsage(event.totalUsage);
             inputTokens = event.totalUsage.inputTokens;
             outputTokens = event.totalUsage.outputTokens;
           }
@@ -699,13 +1033,15 @@ export class CommandCodeProvider extends BaseProvider {
       }
       case 'finish': {
         const reason = this.mapFinishReason(event.finishReason);
+        const usage = event.totalUsage;
+        if (usage) normalizeUsage(usage);
         return {
           id, object: 'chat.completion.chunk', created, model: modelId,
           choices: [{ index: 0, delta: {}, finish_reason: reason }],
-          usage: event.totalUsage ? {
-            prompt_tokens: event.totalUsage.inputTokens,
-            completion_tokens: event.totalUsage.outputTokens,
-            total_tokens: event.totalUsage.inputTokens + event.totalUsage.outputTokens,
+          usage: usage ? {
+            prompt_tokens: usage.inputTokens,
+            completion_tokens: usage.outputTokens,
+            total_tokens: usage.inputTokens + usage.outputTokens,
           } : undefined,
         };
       }
