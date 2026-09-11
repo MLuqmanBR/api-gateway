@@ -89,14 +89,6 @@ async function fetchPage(url: string): Promise<string> {
 
 // ── CLI registry page ────────────────────────────────────────────────────
 
-interface CliRow {
-  modelId: string;
-  displayName: string;
-  slug: string;
-  company: string;
-  capsLabel: string;
-}
-
 /** Parse the per-company tables on /docs/reference/cli/models. The `<code>`
  *  cell is the authoritative dispatchable ID; the Capabilities cell's
  *  aria-label is the official capability list. */

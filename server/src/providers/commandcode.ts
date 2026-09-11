@@ -5,7 +5,8 @@ import type {
   ChatToolCall,
   ChatToolDefinition,
 } from '@api-gateway/shared/types.js';
-import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions, type DiscoveredModel } from './base.js';
+import { fetchCommandCodeCatalog } from './commandcode-models.js';
 import { createAbortRace } from '../lib/abort.js';
 import { createHash, randomBytes } from 'node:crypto';
 
@@ -452,6 +453,28 @@ export class CommandCodeProvider extends BaseProvider {
   // baseUrl left undefined — CommandCode has no OpenAI /models endpoint, so
   // the baseUrl-based discovery path skips this provider. Model discovery is
   // provided by the website-scraping hook instead (see commandcode-models.ts).
+
+  /** Website-catalog discovery: the CommandCode API has no /models endpoint,
+   *  so the catalog comes from the two public docs/marketing pages instead
+   *  (see commandcode-models.ts). Reasoning-glyph models get the upstream's
+   *  live-verified thinking-effort enum; non-reasoning models get ['off']. */
+  async discoverModels(): Promise<DiscoveredModel[]> {
+    const rows = await fetchCommandCodeCatalog();
+    return rows.map(r => ({
+      modelId: r.modelId,
+      displayName: r.displayName,
+      contextWindow: r.contextWindow,
+      supportsVision: r.supportsVision,
+      reasoning: r.reasoning,
+      intelligenceScore: r.intelligenceScore,
+      tokensPerSecond: r.tokensPerSecond,
+      inputPerM: r.inputPerM,
+      outputPerM: r.outputPerM,
+      cacheReadPerM: r.cacheReadPerM,
+      cacheWritePerM: r.cacheWritePerM,
+      thinkingLevels: r.reasoning ? ['low', 'medium', 'high', 'xhigh', 'max'] : ['off'],
+    }));
+  }
 
   async chatCompletion(
     apiKey: string,

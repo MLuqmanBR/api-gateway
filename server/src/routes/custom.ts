@@ -8,6 +8,7 @@ import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../provid
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 import { decrypt } from '../lib/crypto.js';
 import { applyTierRules, applyVisionRules } from '../db/migrations.js';
+import type { DiscoveredModel } from '../providers/base.js';
 import { THINKING_LEVELS, THINKING_OFF } from '../lib/thinking.js';
 
 // L11: strict numeric-id guard for :id path params. parseInt('12abc') === 12
@@ -129,6 +130,156 @@ export type ProviderSyncResult = {
   error?: string
 }
 
+/** Insert engine shared by every discovery path. Pure DB work — no fetching.
+ *  Generic OpenAI discovery maps its rows onto DiscoveredModel with all
+ *  scraped fields null/false, which reproduces the historical behavior
+ *  (MODEL_DEFAULTS ranks, pattern-based rules). Rows that carry an
+ *  `intelligenceScore` are scraped benchmark data: they get ordinal ranks
+ *  and score-derived tiers, and the LIKE-pattern tier rules are skipped for
+ *  them so a benchmark label is never clobbered by a name pattern. */
+export function insertDiscoveredModels(slug: string, rows: DiscoveredModel[]): ProviderSyncResult {
+  if (rows.length === 0) return { fetched: 0, added: [] };
+  const db = getDb();
+  const added: string[] = [];
+  const addedIds: number[] = [];
+  const scoredIds = new Set<number>();
+
+  // Ranks: ordinal position among the rows that carry the datum (1 = best),
+  // ties by tok/s desc then model_id so ordering is deterministic.
+  // Unscored rows keep the middle MODEL_DEFAULTS ranks.
+  const scored = rows.filter(r => r.intelligenceScore !== null).sort((a, b) =>
+    (b.intelligenceScore as number) - (a.intelligenceScore as number) ||
+    ((b.tokensPerSecond ?? 0) - (a.tokensPerSecond ?? 0)) ||
+    a.modelId.localeCompare(b.modelId));
+  const intelligenceRankOf = new Map(scored.map((r, i) => [r.modelId, i + 1] as const));
+  const speedSorted = rows.filter(r => r.tokensPerSecond !== null).sort((a, b) =>
+    (b.tokensPerSecond as number) - (a.tokensPerSecond as number) ||
+    a.modelId.localeCompare(b.modelId));
+  const speedRankOf = new Map(speedSorted.map((r, i) => [r.modelId, i + 1] as const));
+
+  const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
+
+  const insertModel = db.prepare(`
+    INSERT INTO models
+      (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
+       rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
+       enabled, supports_vision, max_output_tokens, key_id,
+       cache_read_per_m, cache_write_per_m, tokens_per_second)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, ?, ?, ?)
+  `);
+  const insertFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
+  const setThinking = db.prepare('UPDATE models SET thinking_levels = ? WHERE id = ?');
+  const catalogedPair = db.prepare(`
+    SELECT 1 WHERE EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = ? AND tm.model_id = ?)
+                OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = ? AND em.model_id = ?)`);
+
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      // Cap inserted rows to bound DB/routing growth from a hostile response.
+      if (added.length >= 2000) break;
+      const modelId = row.modelId.trim();
+      if (!modelId || modelId.length > 200) continue;
+
+      // Skip if already registered
+      const exists = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?').get(slug, modelId);
+      if (exists) continue;
+
+      // Skip ids owned by a catalog table (transcription_models or
+      // embedding_models). Discovering them here would resurrect the exact
+      // chat rows boot reconciliation (reconcileCatalogRowsOutOfChat)
+      // deletes at boot (whack-a-mole until restart), and double-list the
+      // pair in allowlist expansion, which unions all three tables.
+      if (catalogedPair.get(slug, modelId, slug, modelId)) continue;
+
+      // AA Index v4.0 tier bands (migrations.ts applyTierRules comment):
+      // Frontier ≥45 · Large 26–44 · Medium 13–25 · Small ≤12.
+      const intelligenceRank = intelligenceRankOf.get(modelId) ?? MODEL_DEFAULTS.intelligenceRank;
+      const speedRank = speedRankOf.get(modelId) ?? MODEL_DEFAULTS.speedRank;
+      const sizeLabel = row.intelligenceScore !== null
+        ? (row.intelligenceScore >= 45 ? 'Frontier' : row.intelligenceScore >= 26 ? 'Large' : row.intelligenceScore >= 13 ? 'Medium' : 'Small')
+        : MODEL_DEFAULTS.sizeLabel;
+      const result = insertModel.run(
+        slug, modelId, row.displayName || modelId,
+        intelligenceRank, speedRank, sizeLabel,
+        MODEL_DEFAULTS.rpmLimit, MODEL_DEFAULTS.rpdLimit, MODEL_DEFAULTS.tpmLimit, MODEL_DEFAULTS.tpdLimit,
+        MODEL_DEFAULTS.monthlyTokenBudget, row.contextWindow,
+        row.supportsVision ? 1 : 0,
+        row.cacheReadPerM, row.cacheWritePerM, row.tokensPerSecond,
+      );
+      const newId = Number(result.lastInsertRowid);
+      if (row.thinkingLevels) setThinking.run(JSON.stringify(row.thinkingLevels), newId);
+      insertFb.run(newId, maxPriority + added.length + 1);
+      added.push(modelId);
+      addedIds.push(newId);
+      if (row.intelligenceScore !== null) scoredIds.add(newId);
+    }
+  });
+  tx();
+
+  // Flag/tier ONLY the rows this sync inserted — never revisit existing
+  // rows, or operator edits would be clobbered on every sync. Scored
+  // (scraped) rows already carry their benchmark tier; pattern rules only
+  // apply to the unscored remainder.
+  if (addedIds.length > 0) applyVisionRules(db, addedIds);
+  const unscoredIds = addedIds.filter(id => !scoredIds.has(id));
+  if (unscoredIds.length > 0) applyTierRules(db, unscoredIds);
+
+  // Scraped pricing/thinking/telemetry metadata — guarded by the
+  // pricing_manual / thinking_levels_manual flags so operator edits always
+  // win. This pass also refreshes PRE-EXISTING rows (e.g. a hand-seeded
+  // V32 commandcode row) that insert-only discovery never revisits.
+  const priceUpdate = db.prepare(`
+    UPDATE models SET paid_input_per_m = ?, paid_output_per_m = ?
+    WHERE platform = ? AND model_id = ? AND pricing_manual = 0
+  `);
+  const telemetryUpdate = db.prepare(`
+    UPDATE models SET cache_read_per_m = ?, cache_write_per_m = ?, tokens_per_second = ?
+    WHERE platform = ? AND model_id = ?
+  `);
+  const thinkingUpdate = db.prepare(`
+    UPDATE models SET thinking_levels = ?
+    WHERE platform = ? AND model_id = ? AND thinking_levels_manual = 0
+  `);
+  const meta = db.transaction(() => {
+    for (const row of rows) {
+      if (row.inputPerM !== null || row.outputPerM !== null) {
+        priceUpdate.run(row.inputPerM, row.outputPerM, slug, row.modelId);
+      }
+      if (row.cacheReadPerM !== null || row.cacheWritePerM !== null || row.tokensPerSecond !== null) {
+        telemetryUpdate.run(row.cacheReadPerM, row.cacheWritePerM, row.tokensPerSecond, slug, row.modelId);
+      }
+      if (row.thinkingLevels) {
+        thinkingUpdate.run(JSON.stringify(row.thinkingLevels), slug, row.modelId);
+      }
+    }
+  });
+  meta();
+
+  return { fetched: added.length, added };
+}
+
+/** Model sync for built-in providers that carry a discoverModels() hook —
+ *  catalogs that don't live behind an OpenAI-compatible /models endpoint
+ *  (CommandCode). Never runs in test environments, matching
+ *  syncModelsFromProvider's guard: a vitest sweep must not touch the network. */
+export async function syncBuiltinViaHook(slug: string): Promise<ProviderSyncResult> {
+  if (process.env.VITEST) return { fetched: 0, added: [] };
+  const provider = buildProviderFor(slug);
+  if (!provider || typeof provider.discoverModels !== 'function') {
+    return { fetched: 0, added: [], error: 'provider does not support model discovery' };
+  }
+  try {
+    const rows = await provider.discoverModels();
+    const result = insertDiscoveredModels(slug, rows);
+    console.log(`[Custom] ${slug}: hook-discovered ${result.fetched} models (${rows.length} total)`);
+    return result;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.log(`[Custom] ${slug}: hook model sync failed: ${msg}`);
+    return { fetched: 0, added: [], error: msg };
+  }
+}
+
 export async function syncModelsFromProvider(baseUrl: string, slug: string): Promise<ProviderSyncResult> {
   // Skip auto-discovery in test environments — fake provider URLs won't respond.
   if (process.env.VITEST) return { fetched: 0, added: [] };
@@ -238,69 +389,30 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
       return { fetched: 0, added: [] };
     }
 
-    const db = getDb();
-    const added: string[] = [];
-    const addedIds: number[] = [];
-    const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
-
-    const insertModel = db.prepare(`
-      INSERT INTO models
-        (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
-         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, max_output_tokens, key_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL)
-    `);
-    const insertFb = db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)');
-    const catalogedPair = db.prepare(`
-      SELECT 1 WHERE EXISTS (SELECT 1 FROM transcription_models tm WHERE tm.platform = ? AND tm.model_id = ?)
-                  OR EXISTS (SELECT 1 FROM embedding_models em WHERE em.platform = ? AND em.model_id = ?)`);
-
-    const tx = db.transaction(() => {
-      for (const m of models) {
-        // Cap inserted rows to bound DB/routing growth from a hostile response.
-        if (added.length >= 2000) break;
-        const modelId = typeof m.id === 'string' ? m.id.trim() : '';
-        if (!modelId || modelId.length > 200) continue;
-
-        // Skip if already registered
-        const exists = db.prepare('SELECT 1 FROM models WHERE platform = ? AND model_id = ?').get(slug, modelId);
-        if (exists) continue;
-
-        // Skip ids owned by a catalog table (transcription_models or
-        // embedding_models). Discovering them here would resurrect the exact
-        // chat rows boot reconciliation (reconcileCatalogRowsOutOfChat)
-        // deletes at boot (whack-a-mole until restart), and double-list the
-        // pair in allowlist expansion, which unions all three tables.
-        if (catalogedPair.get(slug, modelId, slug, modelId)) continue;
-
-        // Use the model id as display name (user can rename later).
-        // Defaults match MODEL_DEFAULTS: middle ranks, no rate limits,
-        // tools=true, vision=false, unknown context window.
-        const displayName = modelId;
-        const result = insertModel.run(
-          slug, modelId, displayName,
-          MODEL_DEFAULTS.intelligenceRank, MODEL_DEFAULTS.speedRank, MODEL_DEFAULTS.sizeLabel,
-          MODEL_DEFAULTS.rpmLimit, MODEL_DEFAULTS.rpdLimit, MODEL_DEFAULTS.tpmLimit, MODEL_DEFAULTS.tpdLimit,
-          MODEL_DEFAULTS.monthlyTokenBudget, null, // context_window = unknown
-          MODEL_DEFAULTS.supportsVision ? 1 : 0,
-        );
-        const newId = Number(result.lastInsertRowid);
-        insertFb.run(newId, maxPriority + added.length + 1);
-        added.push(modelId);
-        addedIds.push(newId);
-      }
+    // Map OpenAI rows onto the shared DiscoveredModel shape (all scraped
+    // fields unknown) and hand off to the shared insert engine, which
+    // reproduces the historical defaults/rank behavior for them.
+    const discovered: DiscoveredModel[] = models.map((m: { id?: unknown }) => {
+      const modelId = typeof m.id === 'string' ? m.id.trim() : '';
+      return {
+        modelId,
+        displayName: modelId,
+        contextWindow: null,
+        supportsVision: false,
+        reasoning: false,
+        intelligenceScore: null,
+        tokensPerSecond: null,
+        inputPerM: null,
+        outputPerM: null,
+        cacheReadPerM: null,
+        cacheWritePerM: null,
+      };
     });
-    tx();
+    const result = insertDiscoveredModels(slug, discovered);
 
-    // Flag/tier ONLY the rows this sync inserted — never revisit existing
-    // rows, or operator edits would be clobbered on every sync.
-    if (addedIds.length > 0) {
-      applyVisionRules(db, addedIds);
-      applyTierRules(db, addedIds);
-    }
+    console.log(`[Custom] ${slug}: discovered ${result.fetched} models (${models.length} total, skipped ${models.length - result.fetched} existing)`);
+    return { fetched: result.fetched, added: result.added };
 
-    console.log(`[Custom] ${slug}: discovered ${added.length} models (${models.length} total, skipped ${models.length - added.length} existing)`);
-    return { fetched: added.length, added };
   } catch (err: any) {
     const msg = err.name === 'AbortError' ? 'timeout' : err.message;
     console.log(`[Custom] ${slug}: model sync failed: ${msg}`);
@@ -658,6 +770,13 @@ customRouter.post('/api/custom-providers/:slug/sync-models', async (req: Request
     baseUrl = provider?.baseUrl;
   }
   if (!baseUrl) {
+    // Built-ins without a baseUrl may still discover their catalog through a
+    // provider hook (commandcode's website catalog). Consult it before 404.
+    if (hasProvider(slug as any) && typeof buildProviderFor(slug)?.discoverModels === 'function') {
+      const hookResult = await syncBuiltinViaHook(slug);
+      res.json({ success: true, slug, fetched: hookResult.fetched, error: hookResult.error });
+      return;
+    }
     res.status(404).json({ error: { message: `provider '${slug}' not found or does not support model discovery` } });
     return;
   }
