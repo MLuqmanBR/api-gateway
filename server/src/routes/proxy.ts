@@ -870,6 +870,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // different model would be surprising to OpenAI-compatible clients.
   // Sticky-session is the fallback when no `model` field was sent at all.
   let preferredModel: number | undefined;
+  // Canonical `platform/model_id` of the resolved pin. Live events publish
+  // THIS (every pin spelling collapses to one display form); storage keeps
+  // the raw requestedModel via pinnedModelId below.
+  let pinnedDisplayModel: string | undefined;
   if (isAutoModel(requestedModel)) {
     // Explicit "auto" → behave exactly like an omitted model field.
     preferredModel = getStickyModel(token, messages, sessionIdHeader);
@@ -878,6 +882,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const resolution = resolvePinnedModel(db, requestedModel);
     if (resolution.kind === 'resolved') {
       preferredModel = resolution.modelDbId;
+      pinnedDisplayModel = `${resolution.platform}/${resolution.modelId}`;
     } else {
       const reason = formatPinnedModelRejection(resolution);
       res.status(400).json({
@@ -895,10 +900,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
   // For analytics: the model id the client pinned, null when auto-routed
   // ('auto' or omitted). Logged with every request row so pinned vs auto
-  // traffic and failover overrides are visible.
+  // traffic and failover overrides are visible. Kept RAW (the client's
+  // exact spelling) — live events publish the canonical pinnedDisplayModel
+  // instead so every pin form renders as one model in the terminal.
   const pinnedModelId: string | undefined = requestedModel && !isAutoModel(requestedModel) ? requestedModel : undefined;
   const requestId = crypto.randomUUID();
-  publish({ type: 'request.start', id: requestId, model: pinnedModelId, stream: !!stream, at: Date.now() });
+  publish({ type: 'request.start', id: requestId, model: pinnedDisplayModel, stream: !!stream, at: Date.now() });
 
   // Client-disconnect abort wiring. The controller's signal is threaded into
   // every upstream provider call AND every sleep in the retry loop, so a Stop
@@ -991,7 +998,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         res.setHeader('Cache-Control', 'no-cache');
         res.json(JSON.parse(cached));
       }
-      publish({ type: 'request.done', id: requestId, model: requestedModel ?? 'auto', provider: 'cache', keyId: 0, latencyMs: Date.now() - start, tokens: { in: 0, out: 0 }, at: Date.now() });
+      publish({ type: 'request.done', id: requestId, model: pinnedDisplayModel ?? 'auto', provider: 'cache', keyId: 0, latencyMs: Date.now() - start, tokens: { in: 0, out: 0 }, at: Date.now() });
       // M03: the response is already ended; detach the client-abort watcher
       // so its `close` listener doesn't outlive the request.
       detachAbortWatcher();
