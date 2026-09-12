@@ -10,7 +10,8 @@ vi.mock('../../services/router.js', async (importOriginal) => {
 
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
-import { initDb, getUnifiedApiKey } from '../../db/index.js';
+import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { subscribe } from '../../services/events.js';
 
 function fakeRoute(provider: any) {
   return { provider, modelId: 'fake-model', modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model', release: () => {} };
@@ -160,5 +161,84 @@ describe('POST /v1/responses (#96)', () => {
     expect(text).toContain('event: response.function_call_arguments.delta');
     expect(text).toContain('event: response.function_call_arguments.done');
     expect(text).toContain('"arguments":"{\\"city\\":\\"SF\\"}"');
+  });
+
+  // Strict pin contract on /v1/responses: resolve AFTER body validation but
+  // BEFORE `request.start`, publish the CANONICAL identity (every pin spelling
+  // collapses to `platform/model_id`), and reject off-form pins without
+  // leaving a dangling start event in the dashboard.
+  it('publishes the canonical pin identity, not the raw spelling', async () => {
+    const pinned = getDb().prepare(
+      'SELECT platform, model_id FROM models WHERE enabled = 1 ORDER BY id LIMIT 1',
+    ).get() as { platform: string; model_id: string };
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return {
+          id: 'c', object: 'chat.completion', created: 0, model: 'fake-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'pinned' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+    }));
+
+    const events: any[] = [];
+    const unsub = subscribe((e) => events.push(e));
+    try {
+      const { status } = await post(app, '/v1/responses', {
+        model: `api-gateway/${pinned.platform}/${pinned.model_id}`,
+        input: 'hi',
+      }, key);
+      expect(status).toBe(200);
+    } finally {
+      unsub();
+    }
+
+    const start = events.find(e => e.type === 'request.start');
+    expect(start).toBeDefined();
+    expect(start.model).toBe(`${pinned.platform}/${pinned.model_id}`);
+  });
+
+  it('rejects an off-form pin with 400 and never publishes request.start', async () => {
+    mockRouteRequest.mockClear();
+    const events: any[] = [];
+    const unsub = subscribe((e) => events.push(e));
+    try {
+      const { status, text } = await post(app, '/v1/responses', { model: 'not-a-canonical-pin', input: 'hi' }, key);
+      expect(status).toBe(400);
+      expect(text).toContain("does not match the required '<platform>/<model_id>' form");
+    } finally {
+      unsub();
+    }
+
+    // The rejection happens BEFORE the start publish, so no dangling
+    // `request.start` (which the dashboard's active-request counter keys on)
+    // survives the 400.
+    expect(events.filter(e => e.type === 'request.start')).toEqual([]);
+    expect(mockRouteRequest).not.toHaveBeenCalled();
+  });
+
+  it('publishes no model in request.start for auto routing', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return {
+          id: 'c', object: 'chat.completion', created: 0, model: 'fake-model',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'auto' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        };
+      },
+    }));
+
+    const events: any[] = [];
+    const unsub = subscribe((e) => events.push(e));
+    try {
+      const { status } = await post(app, '/v1/responses', { input: 'hi' }, key);
+      expect(status).toBe(200);
+    } finally {
+      unsub();
+    }
+
+    const start = events.find(e => e.type === 'request.start');
+    expect(start).toBeDefined();
+    expect(start.model).toBeUndefined();
   });
 });

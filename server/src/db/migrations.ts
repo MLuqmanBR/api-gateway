@@ -291,10 +291,14 @@ function normalizeClientKeyAllowlists(db: DatabasePort) {
   }
 }
 
-// `requested_model` is the model id the CLIENT pinned in the request body.
-// NULL when the request was auto-routed ('auto' or omitted model field).
-// requested_model = model_id means the pin was honored; a different model_id
-// means rate limits or failures forced a failover to another model.
+// `requested_model` is the RAW pin string the client sent in the model field
+// (NULL when auto-routed: 'auto' or the field omitted). Stored history spans
+// four spellings — `platform/model_id`, `api-gateway/platform/model_id`, bare
+// `model_id`, and `api-gateway/model_id`; new rows only ever store the
+// canonical form or its `api-gateway/`-enveloped variant, because the wire
+// contract now rejects every other shape. Analytics (see
+// routes/analytics.ts PIN_HONORED_SQL) compares it against those forms to
+// separate honored pins from failovers.
 function ensureRequestRequestedModelColumn(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(requests)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'requested_model')) {

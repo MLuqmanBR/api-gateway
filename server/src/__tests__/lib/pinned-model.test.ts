@@ -28,82 +28,97 @@ function addModel(platform: string, modelId: string, enabled: 0 | 1 = 1): number
 }
 
 describe('resolvePinnedModel', () => {
-  describe('Path A: platform/model_id wire form (the documented contract)', () => {
-    it('resolves uniquely when the client pins the advertised platform/model_id', () => {
+  describe('strict <platform>/<model_id> form', () => {
+    it('resolves when the pin names the exact platform+model pair', () => {
       const mma = addModel('deepseek', 'deepseek-v4-flash');
       addModel('commandcode', 'deepseek-v4-flash'); // sibling platform
       expect(resolvePinnedModel(db, 'deepseek/deepseek-v4-flash')).toEqual({
         kind: 'resolved',
         modelDbId: mma,
+        platform: 'deepseek',
+        modelId: 'deepseek-v4-flash',
       });
     });
 
-    it('treats the first-segment as the explicit platform choice even when it also collides with a sibling namespace (deepseek/deepseek-v4-flash stays deepseek, not ambiguous)', () => {
-      // The wire contract is `platform/model_id`; `deepseek` is a real
-      // platform here, so the client explicitly chose deepseek — we must NOT
-      // surface `ambiguous` just because commandcode also serves the id.
-      const ds = addModel('deepseek', 'deepseek-v4-flash');
-      addModel('commandcode', 'deepseek-v4-flash');
-      const r = resolvePinnedModel(db, 'deepseek/deepseek-v4-flash');
-      expect(r.kind).toBe('resolved');
-      if (r.kind === 'resolved') expect(r.modelDbId).toBe(ds);
+    it('splits at the FIRST slash so model ids that contain slashes stay intact', () => {
+      const kimi = addModel('nvidia', 'moonshotai/kimi-k2.6');
+      expect(resolvePinnedModel(db, 'nvidia/moonshotai/kimi-k2.6')).toEqual({
+        kind: 'resolved',
+        modelDbId: kimi,
+        platform: 'nvidia',
+        modelId: 'moonshotai/kimi-k2.6',
+      });
     });
 
-    it('returns disabled when the pinned platform+model pair exists but enabled=0', () => {
+    it('does NOT resolve a vendor-namespace prefix against the bare id (MiniMaxAI/MiniMax-M3 is not_found)', () => {
+      // The id `MiniMaxAI/MiniMax-M3` is stored WHOLE on two platforms. The
+      // pin's first segment `MiniMaxAI` is not a platform, and under the
+      // strict contract there is no fallback: the exact pair misses → reject.
+      addModel('huggingface', 'MiniMaxAI/MiniMax-M3');
+      addModel('commandcode', 'MiniMaxAI/MiniMax-M3');
+      expect(resolvePinnedModel(db, 'MiniMaxAI/MiniMax-M3')).toEqual({ kind: 'not_found' });
+    });
+
+    it('returns disabled when the exact pair exists but enabled=0', () => {
       addModel('nvidia', 'moonshotai/kimi-k2.6', 0);
       expect(resolvePinnedModel(db, 'nvidia/moonshotai/kimi-k2.6')).toEqual({ kind: 'disabled' });
     });
 
-    it('returns not_found when no platform+model row exists at all (not even disabled)', () => {
+    it('returns not_found when no row carries the platform+model pair', () => {
       expect(resolvePinnedModel(db, 'nope/does-not-exist')).toEqual({ kind: 'not_found' });
     });
+  });
 
-    it('falls through to Path B when the first segment is NOT a real platform (MiniMaxAI/MiniMax-M3 misses the platform-qualified query)', () => {
-      // `MiniMaxAI` is a vendor namespace fragment, not a platform slug.
-      // The platform-qualified query misses; the bare-id fallback then sees
-      // the multiple enabled rows that share this model_id → ambiguous.
-      addModel('huggingface', 'MiniMaxAI/MiniMax-M3');
-      addModel('commandcode', 'MiniMaxAI/MiniMax-M3');
-      const r = resolvePinnedModel(db, 'MiniMaxAI/MiniMax-M3');
-      expect(r.kind).toBe('ambiguous');
-      if (r.kind === 'ambiguous') {
-        expect(r.platforms.sort()).toEqual(['commandcode', 'huggingface']);
-      }
+  describe('malformed pins (no bare-id shorthand)', () => {
+    it('rejects a bare id even when exactly one enabled platform serves it', () => {
+      addModel('groq', 'llama-3.3-70b');
+      expect(resolvePinnedModel(db, 'llama-3.3-70b')).toEqual({ kind: 'malformed' });
+    });
+
+    it('rejects a bare id shared across platforms', () => {
+      addModel('groq', 'baremod');
+      addModel('nvidia', 'baremod');
+      expect(resolvePinnedModel(db, 'baremod')).toEqual({ kind: 'malformed' });
+    });
+
+    it('rejects a pin with no slash at all', () => {
+      expect(resolvePinnedModel(db, 'never-heard-of-it')).toEqual({ kind: 'malformed' });
+    });
+
+    it('rejects an empty platform segment (leading slash)', () => {
+      expect(resolvePinnedModel(db, '/llama-3.3-70b')).toEqual({ kind: 'malformed' });
+    });
+
+    it('rejects an empty model id segment (trailing slash)', () => {
+      expect(resolvePinnedModel(db, 'groq/')).toEqual({ kind: 'malformed' });
     });
   });
 
-  describe('Path B: bare id (no slash) — backward-compat shorthand', () => {
-    it('resolves when exactly one enabled platform serves the bare id', () => {
-      const sole = addModel('groq', 'llama-3.3-70b');
-      expect(resolvePinnedModel(db, 'llama-3.3-70b')).toEqual({ kind: 'resolved', modelDbId: sole });
-    });
-
-    it('returns ambiguous when two-or-more enabled platforms share the bare id', () => {
-      addModel('huggingface', 'MiniMaxAI/MiniMax-M3');
-      addModel('commandcode', 'MiniMaxAI/MiniMax-M3');
-      const r = resolvePinnedModel(db, 'MiniMaxAI/MiniMax-M3');
-      expect(r.kind).toBe('ambiguous');
-      if (r.kind === 'ambiguous') {
-        expect(r.platforms.sort()).toEqual(['commandcode', 'huggingface']);
-      }
-    });
-
-    it('returns disabled when the only row is enabled=0', () => {
-      addModel('groq', 'llama-3.3-70b', 0);
-      expect(resolvePinnedModel(db, 'llama-3.3-70b')).toEqual({ kind: 'disabled' });
-    });
-
-    it('returns not_found when no row exists at all', () => {
-      expect(resolvePinnedModel(db, 'never-heard-of-it')).toEqual({ kind: 'not_found' });
-    });
-  });
-
-  describe('api-gateway/ extension prefix stripping', () => {
-    it('strips the api-gateway/ prefix before resolving (OMP additional-providers-extension form)', () => {
+  describe('api-gateway/ extension envelope (stripped exactly once)', () => {
+    it('strips the prefix and resolves the canonical pin (OMP extension form)', () => {
       const mma = addModel('commandcode', 'MiniMaxAI/MiniMax-M3');
-      addModel('huggingface', 'MiniMaxAI/MiniMax-M3');
-      const r = resolvePinnedModel(db, 'api-gateway/commandcode/MiniMaxAI/MiniMax-M3');
-      expect(r).toEqual({ kind: 'resolved', modelDbId: mma });
+      expect(resolvePinnedModel(db, 'api-gateway/commandcode/MiniMaxAI/MiniMax-M3')).toEqual({
+        kind: 'resolved',
+        modelDbId: mma,
+        platform: 'commandcode',
+        modelId: 'MiniMaxAI/MiniMax-M3',
+      });
+    });
+
+    it('leaves a bare remainder malformed (api-gateway/llama-3.3-70b)', () => {
+      addModel('groq', 'llama-3.3-70b');
+      expect(resolvePinnedModel(db, 'api-gateway/llama-3.3-70b')).toEqual({ kind: 'malformed' });
+    });
+
+    it('treats a doubled prefix as a literal platform (api-gateway/api-gateway/x is not_found)', () => {
+      // One strip leaves `api-gateway/groq/x` → platform `api-gateway`, which
+      // no catalog row carries → rejected, not unwrapped a second time.
+      addModel('groq', 'x');
+      expect(resolvePinnedModel(db, 'api-gateway/api-gateway/groq/x')).toEqual({ kind: 'not_found' });
+    });
+
+    it('rejects the prefix alone as malformed', () => {
+      expect(resolvePinnedModel(db, 'api-gateway/')).toEqual({ kind: 'malformed' });
     });
   });
 });

@@ -138,7 +138,7 @@ describe('B2-8: disabled-path byte-identity', () => {
 
     clearMiddleConfigCache();
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
     expect((body as any).choices[0].message.content).toBe(responseText);
@@ -160,7 +160,7 @@ describe('B2-8: disabled-path byte-identity', () => {
 
     clearMiddleConfigCache();
     const { status, text } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: true,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: true,
     }, key);
     expect(status).toBe(200);
     // SSE bytes contain the real value (no redaction happened)
@@ -193,7 +193,7 @@ describe('B2-8: interceptor-failure floor', () => {
     // without a real chatCompletion that the interceptor can call. The floor says:
     // never block — Stage-1 still applies.
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
     // Stage-1 still applied: provider saw placeholder, not secret
@@ -231,7 +231,7 @@ describe('B2-8: inbound interceptor (B2-4b)', () => {
     clearMiddleConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: 'Find secrets' }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: 'Find secrets' }], stream: false,
     }, key);
     expect(status).toBe(200);
     // The inbound interceptor DID dispatch (provider built) before flooring.
@@ -264,7 +264,7 @@ describe('B2-8: inbound interceptor (B2-4b)', () => {
     clearMiddleConfigCache();
 
     const { status, text } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: 'Find secrets' }], stream: true,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: 'Find secrets' }], stream: true,
     }, key);
     expect(status).toBe(200);
     // Inbound interceptor is NOT invoked on streaming responses — and this
@@ -296,7 +296,7 @@ describe('B2-8: fenced code + JSON tool args byte-exact', () => {
     clearMiddleConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `Here:\n${codeBlock}` }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `Here:\n${codeBlock}` }], stream: false,
     }, key);
     expect(status).toBe(200);
     // Provider saw placeholder inside the fenced block
@@ -324,7 +324,7 @@ describe('B2-8: fenced code + JSON tool args byte-exact', () => {
     clearMiddleConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `Save: ${SECRET}` }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `Save: ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
     const args = JSON.parse((body as any).choices[0].message.tool_calls[0].function.arguments);
@@ -384,7 +384,7 @@ describe('B2-8: fuzz ≥500 cases (seeded PRNG)', () => {
       clearMiddleConfigCache();
 
       const { status, body } = await request(app, '/v1/chat/completions', {
-        model: 'fake-model', messages: [{ role: 'user', content: userContent }], stream: false,
+        model: 'fake/fake-model', messages: [{ role: 'user', content: userContent }], stream: false,
       }, key);
 
       if (status !== 200) { failures++; if (sampleFailures.length < 3) sampleFailures.push(`case ${i}: status ${status}`); continue; }
@@ -440,7 +440,7 @@ describe('B2-8: fuzz ≥500 cases (seeded PRNG)', () => {
       clearMiddleConfigCache();
 
       const { status, text } = await request(app, '/v1/chat/completions', {
-        model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: true,
+        model: 'fake/fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: true,
       }, key);
 
       if (status !== 200) { failures++; continue; }

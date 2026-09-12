@@ -3,6 +3,7 @@ import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { setGlobalRetryLimit } from '../../services/router.js';
+import { subscribe } from '../../services/events.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 
 let dashToken = '';
@@ -87,13 +88,13 @@ describe('requested_model analytics logging', () => {
 
   it('logs the pinned model id when the client names a model', async () => {
     const { status } = await request(app, 'POST', '/v1/chat/completions', {
-      model: groqModelId,
+      model: `groq/${groqModelId}`,
       messages: [{ role: 'user', content: 'hi' }],
     }, authHeaders());
     expect(status).toBe(200);
 
     const row = getDb().prepare('SELECT model_id, requested_model FROM requests ORDER BY id DESC LIMIT 1').get() as any;
-    expect(row.requested_model).toBe(groqModelId);
+    expect(row.requested_model).toBe(`groq/${groqModelId}`);
     expect(row.model_id).toBe(groqModelId); // pin honored
   });
 
@@ -106,6 +107,71 @@ describe('requested_model analytics logging', () => {
 
     const row = getDb().prepare('SELECT requested_model FROM requests ORDER BY id DESC LIMIT 1').get() as any;
     expect(row.requested_model).toBeNull();
+  });
+
+  // Strict pin contract: live events publish the CANONICAL `platform/model_id`
+  // of the resolved pin — every pin spelling (raw client form, extension
+  // envelope) collapses to one display form in the terminal. Storage keeps the
+  // raw spelling; analytics normalizes with PIN_HONORED_SQL.
+  it('publishes the canonical pin in live events and keeps the raw spelling in storage', async () => {
+    const events: any[] = [];
+    const unsub = subscribe((e) => events.push(e));
+    try {
+      const raw = `api-gateway/groq/${groqModelId}`;
+      // temperature 0 → cacheable, so call 2 exercises the cache-hit done path.
+      const first = await request(app, 'POST', '/v1/chat/completions', {
+        model: raw,
+        messages: [{ role: 'user', content: 'cache me' }],
+        temperature: 0,
+        stream: false,
+      }, authHeaders());
+      expect(first.status).toBe(200);
+
+      const second = await request(app, 'POST', '/v1/chat/completions', {
+        model: raw,
+        messages: [{ role: 'user', content: 'cache me' }],
+        temperature: 0,
+        stream: false,
+      }, authHeaders());
+      expect(second.status).toBe(200);
+      expect(second.headers['x-cache']).toBe('HIT');
+    } finally {
+      unsub();
+    }
+
+    const canonical = `groq/${groqModelId}`;
+    // Every start event for a pinned request carries the canonical identity —
+    // NOT the raw `api-gateway/...` spelling the client sent.
+    const starts = events.filter(e => e.type === 'request.start');
+    expect(starts.length).toBe(2);
+    for (const s of starts) expect(s.model).toBe(canonical);
+    // The cache-hit done path publishes the canonical model too (previously it
+    // published the raw pin, which rendered as a distinct model).
+    const cacheDone = events.filter(e => e.type === 'request.done' && e.provider === 'cache');
+    expect(cacheDone.length).toBe(1);
+    expect(cacheDone[0].model).toBe(canonical);
+
+    // Storage keeps the RAW pin spelling (no retroactive rewriting of history).
+    const row = getDb().prepare('SELECT requested_model FROM requests ORDER BY id DESC LIMIT 1').get() as any;
+    expect(row.requested_model).toBe(`api-gateway/groq/${groqModelId}`);
+  });
+
+  it('publishes no model in request.start for auto routing', async () => {
+    const events: any[] = [];
+    const unsub = subscribe((e) => events.push(e));
+    try {
+      const { status } = await request(app, 'POST', '/v1/chat/completions', {
+        model: 'auto',
+        messages: [{ role: 'user', content: 'hi' }],
+      }, authHeaders());
+      expect(status).toBe(200);
+    } finally {
+      unsub();
+    }
+
+    const start = events.find(e => e.type === 'request.start');
+    expect(start).toBeDefined();
+    expect(start.model).toBeUndefined();
   });
 });
 

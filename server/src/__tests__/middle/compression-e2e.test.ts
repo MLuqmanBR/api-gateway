@@ -121,7 +121,7 @@ describe('B1-6: compression e2e', () => {
 
     clearMiddleConfigCache();
     const { status } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model',
+      model: 'fake/fake-model',
       messages: [
         { role: 'user', content: 'analyze' },
         { role: 'tool', content: toolContent },
@@ -158,7 +158,7 @@ describe('B1-6: compression e2e', () => {
     clearCompressionConfigCache();
 
     const { status } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model',
+      model: 'fake/fake-model',
       // Pad past the protect_recent window (default 4) so the tool message is eligible.
       messages: withToolWindow(toolContent),
       stream: false,
@@ -197,7 +197,7 @@ describe('B1-6: compression e2e', () => {
     clearMiddleConfigCache();
 
     const { status } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model',
+      model: 'fake/fake-model',
       messages: [
         { role: 'user', content: 'process' },
         { role: 'tool', content: JSON.stringify(arr) },
@@ -236,7 +236,7 @@ describe('B1-6: compression e2e', () => {
     clearCompressionConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model',
+      model: 'fake/fake-model',
       messages: withToolWindow(toolContent),
       stream: false,
     }, key);
@@ -269,7 +269,7 @@ describe('B1-6: compression e2e', () => {
     clearMiddleConfigCache();
 
     const { status } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model',
+      model: 'fake/fake-model',
       messages: [
         { role: 'user', content: 'query' },
         { role: 'tool', content: smallArray },
@@ -303,7 +303,7 @@ describe('B1-6: compression e2e', () => {
     clearMiddleConfigCache();
 
     const { status } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model',
+      model: 'fake/fake-model',
       messages: [
         { role: 'user', content: 'query' },
         { role: 'tool', content: JSON.stringify(arr) },
@@ -368,7 +368,7 @@ describe('B1-6: fuzz ≥200 cases', () => {
       clearMiddleConfigCache();
 
       const { status } = await request(app, '/v1/chat/completions', {
-        model: 'fake-model',
+        model: 'fake/fake-model',
         messages: [
           { role: 'user', content: 'query' },
           { role: 'tool', content: JSON.stringify(arr) },

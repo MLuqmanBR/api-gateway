@@ -132,16 +132,16 @@ describe('Analytics API', () => {
   });
 
   describe('pinned vs auto tracking', () => {
-    function insertPinnedRequest(modelId: string, requestedModel: string | null, createdAt: string) {
+    function insertPinnedRequest(modelId: string, requestedModel: string | null, createdAt: string, platform = 'test') {
       getDb().prepare(`
         INSERT INTO requests (platform, model_id, requested_model, status, input_tokens, output_tokens, latency_ms, error, created_at)
-        VALUES ('test', ?, ?, 'success', 1, 2, 3, NULL, ?)
-      `).run(modelId, requestedModel, createdAt);
+        VALUES (?, ?, ?, 'success', 1, 2, 3, NULL, ?)
+      `).run(platform, modelId, requestedModel, createdAt);
     }
 
     it('summary splits pinned, honored, and auto requests', async () => {
-      insertPinnedRequest('model-a', 'model-a', '2026-05-29 11:00:00'); // pin honored
-      insertPinnedRequest('model-b', 'model-a', '2026-05-29 11:01:00'); // pin overridden by failover
+      insertPinnedRequest('model-a', 'test/model-a', '2026-05-29 11:00:00'); // pin honored (canonical)
+      insertPinnedRequest('model-b', 'test/model-a', '2026-05-29 11:01:00'); // pin overridden by failover
       insertPinnedRequest('model-b', null, '2026-05-29 11:02:00');      // auto-routed
 
       const { status, body } = await request(app, '/api/analytics/summary?range=24h');
@@ -152,10 +152,38 @@ describe('Analytics API', () => {
       expect(body.pinHonoredRequests).toBe(1);
     });
 
+    it('counts a pin as honored under every stored spelling', async () => {
+      // Stored history predates the strict wire contract, so rows carry the
+      // canonical pair, its `api-gateway/`-enveloped twin, or either legacy
+      // bare-id form. All four mean "the pinned model served this request".
+      insertPinnedRequest('model-a', 'test/model-a', '2026-05-29 11:00:00');
+      insertPinnedRequest('model-a', 'api-gateway/test/model-a', '2026-05-29 11:01:00');
+      insertPinnedRequest('model-a', 'model-a', '2026-05-29 11:02:00');
+      insertPinnedRequest('model-a', 'api-gateway/model-a', '2026-05-29 11:03:00');
+
+      const { status, body } = await request(app, '/api/analytics/summary?range=24h');
+
+      expect(status).toBe(200);
+      expect(body.pinnedRequests).toBe(4);
+      expect(body.pinHonoredRequests).toBe(4);
+    });
+
+    it('does NOT count a pin naming a different platform that shares the model id', async () => {
+      // `other/model-a` is not the `test/model-a` row: the old suffix match
+      // (`LIKE '%/' || model_id`) counted it as honored, hiding a failover.
+      insertPinnedRequest('model-a', 'other/model-a', '2026-05-29 11:00:00');
+
+      const { status, body } = await request(app, '/api/analytics/summary?range=24h');
+
+      expect(status).toBe(200);
+      expect(body.pinnedRequests).toBe(1);
+      expect(body.pinHonoredRequests).toBe(0);
+    });
+
     it('by-model counts only requests the model served because it was pinned', async () => {
-      insertPinnedRequest('model-a', 'model-a', '2026-05-29 11:00:00'); // pinned + served
+      insertPinnedRequest('model-a', 'test/model-a', '2026-05-29 11:00:00'); // pinned + served
       insertPinnedRequest('model-a', null, '2026-05-29 11:01:00');      // auto, same model
-      insertPinnedRequest('model-a', 'model-x', '2026-05-29 11:02:00'); // failover landed here
+      insertPinnedRequest('model-a', 'test/model-x', '2026-05-29 11:02:00'); // failover landed here
 
       const { status, body } = await request(app, '/api/analytics/by-model?range=24h');
 

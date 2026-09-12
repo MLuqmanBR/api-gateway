@@ -84,7 +84,7 @@ describe('Provider error redaction', () => {
     });
 
     const completion = await request(app, 'POST', '/v1/chat/completions', {
-      model: 'groq/compound-mini',
+      model: 'groq/groq/compound-mini',
       messages: [{ role: 'user', content: 'hello' }],
     }, authHeaders());
 

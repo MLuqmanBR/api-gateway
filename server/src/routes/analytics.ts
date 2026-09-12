@@ -24,6 +24,22 @@ function getSinceTimestamp(range: string): string {
   }
 }
 
+// A pinned request is "honored" when the model that served it is the model the
+// client pinned. `requested_model` stores the client's RAW pin spelling, which
+// in stored history takes four forms (the wire contract has since narrowed to
+// the first two — old rows keep all four, so all four still count):
+//   1. `platform/model_id`             (canonical)
+//   2. `api-gateway/platform/model_id` (canonical + extension envelope)
+//   3. `model_id`                      (legacy bare id)
+//   4. `api-gateway/model_id`          (legacy bare id + envelope)
+// Exact equality, NOT `LIKE '%/' || model_id`: the suffix match also counted a
+// pin that named a DIFFERENT platform than the one that served it (a failover)
+// as honored.
+const PIN_HONORED_SQL = `(r.requested_model = r.platform || '/' || r.model_id
+                    OR r.requested_model = 'api-gateway/' || r.platform || '/' || r.model_id
+                    OR r.requested_model = r.model_id
+                    OR r.requested_model = 'api-gateway/' || r.model_id)`;
+
 // Summary stats
 analyticsRouter.get('/summary', (req: Request, res: Response) => {
   const range = (req.query.range as string) ?? '7d';
@@ -44,11 +60,10 @@ analyticsRouter.get('/summary', (req: Request, res: Response) => {
       AVG(r.latency_ms) as avg_latency_ms,
       MIN(r.created_at) as first_request_at,
       SUM(CASE WHEN r.requested_model IS NOT NULL THEN 1 ELSE 0 END) as pinned_count,
-      -- M13: requested_model can be "platform/model_id", "api-gateway/model_id",
-      -- or bare "model_id"; model_id (right) is always unprefixed. Compare on
-      -- suffix match: requested ends with model_id (after optional "prefix/").
-      SUM(CASE WHEN r.requested_model = r.model_id
-                    OR r.requested_model LIKE '%/' || r.model_id
+      -- A pin is honored when the served model is the pinned one; the
+      -- difference is a failover that overrode the pin. See PIN_HONORED_SQL
+      -- for the stored spellings this compares against.
+      SUM(CASE WHEN ${PIN_HONORED_SQL}
                THEN 1 ELSE 0 END) as pin_honored_count,
       SUM(CASE WHEN r.status = 'success' THEN
         r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
@@ -96,7 +111,7 @@ analyticsRouter.get('/by-model', (req: Request, res: Response) => {
       AVG(r.latency_ms) as avg_latency_ms,
       SUM(r.input_tokens) as total_input_tokens,
       SUM(r.output_tokens) as total_output_tokens,
-      SUM(CASE WHEN r.requested_model = r.model_id THEN 1 ELSE 0 END) as pinned_requests,
+      SUM(CASE WHEN ${PIN_HONORED_SQL} THEN 1 ELSE 0 END) as pinned_requests,
       SUM(CASE WHEN r.status = 'success' THEN
         r.input_tokens  * COALESCE(m.paid_input_per_m,  ?) / 1000000.0 +
         r.output_tokens * COALESCE(m.paid_output_per_m, ?) / 1000000.0

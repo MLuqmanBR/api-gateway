@@ -320,7 +320,7 @@ export default function PlaygroundPage() {
 
   const activeModelLabel = selectedModel === 'auto'
     ? 'Auto (fallback chain)'
-    : availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
+    : availableModels.find(m => `${m.platform}/${m.modelId}` === selectedModel)?.displayName ?? selectedModel
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
@@ -336,7 +336,7 @@ export default function PlaygroundPage() {
               <SelectContent>
                 <SelectItem value="auto">Auto (fallback chain)</SelectItem>
                 {availableModels.map(m => (
-                  <SelectItem key={m.modelDbId} value={m.modelId}>
+                  <SelectItem key={m.modelDbId} value={`${m.platform}/${m.modelId}`}>
                     <span className="flex items-center gap-2">
                       <span>{m.displayName}</span>
                       <span className="text-xs text-muted-foreground">{m.platform}</span>

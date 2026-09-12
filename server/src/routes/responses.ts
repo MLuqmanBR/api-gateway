@@ -320,7 +320,33 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     return;
   }
   const responseId = newId('resp');
-  publish({ type: 'request.start', id: responseId, model: reqData.model, stream: !!reqData.stream, at: Date.now() });
+  // Strict pin contract (mirrors /chat/completions): resolve BEFORE the
+  // `request.start` publish so a rejected pin never leaves a dangling start
+  // event in the dashboard, and publish the CANONICAL `platform/model_id`
+  // rather than the raw client spelling so every pin form renders as one
+  // model in the terminal.
+  let preferredModel: number | undefined;
+  let pinnedDisplayModel: string | undefined;
+  const isPinned = !!(reqData.model && reqData.model !== 'auto');
+  if (isPinned) {
+    const db = getDb();
+    const resolution = resolvePinnedModel(db, reqData.model as string);
+    if (resolution.kind === 'resolved') {
+      preferredModel = resolution.modelDbId;
+      pinnedDisplayModel = `${resolution.platform}/${resolution.modelId}`;
+    } else {
+      const reason = formatPinnedModelRejection(resolution);
+      res.status(400).json({
+        error: {
+          message: `Model '${reqData.model}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      });
+      return;
+    }
+  }
+  publish({ type: 'request.start', id: responseId, model: pinnedDisplayModel, stream: !!reqData.stream, at: Date.now() });
   const stream = reqData.stream ?? false;
   let messages = toChatMessages(reqData);
   // B2-6 O2: apply middle-layer outbound transform (redact → compress).
@@ -353,32 +379,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  // Resolve the requested model via the shared resolver so behavior matches
-  // /chat/completions exactly: ambiguous bare/non-platform pins return 400
-  // model_not_found instead of silently rowid-first routing to a platform
-  // that may have zero healthy keys (which would spin the recovery loop).
-  let preferredModel: number | undefined;
-  if (reqData.model && reqData.model !== 'auto') {
-    const db = getDb();
-    const resolution = resolvePinnedModel(db, reqData.model);
-    if (resolution.kind === 'resolved') {
-      preferredModel = resolution.modelDbId;
-    } else {
-      const reason = formatPinnedModelRejection(resolution);
-      res.status(400).json({
-        error: {
-          message: `Model '${reqData.model}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
-          type: 'invalid_request_error',
-          code: 'model_not_found',
-        },
-      });
-      return;
-    }
-  }
-  const isPinned = !!(reqData.model && reqData.model !== 'auto');
   // L15: the client-pinned model id (null when auto/sticky routing), passed to
   // logRequest like the proxy's pinnedModelId so analytics can split pinned vs
   // auto traffic — without it every /v1/responses request read as auto-routed.
+  // Kept RAW (the client's exact spelling); live events publish the canonical
+  // pinnedDisplayModel instead.
   const pinnedModelId: string | null = isPinned ? (reqData.model as string) : null;
   if (!preferredModel) {
     preferredModel = getStickyModel(token, messages, sessionIdHeader); // N3: reuse the token extracted at auth
