@@ -106,7 +106,7 @@ describe('B2-6: disabled-path byte-identity', () => {
     clearMiddleConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
     expect((body as any).choices[0].message.content).toBe(responseText);
@@ -137,7 +137,7 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
     clearMiddleConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
     // Provider received the placeholder, NOT the real secret
@@ -171,7 +171,7 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
     clearMiddleConfigCache();
 
     const { status, text } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: true,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `My key is ${SECRET}` }], stream: true,
     }, key);
     expect(status).toBe(200);
     // Provider received the placeholder
@@ -204,7 +204,7 @@ describe('B2-6: enabled round-trip /v1/chat/completions', () => {
     clearMiddleConfigCache();
 
     const { status, body } = await request(app, '/v1/chat/completions', {
-      model: 'fake-model', messages: [{ role: 'user', content: `Save this: ${SECRET}` }], stream: false,
+      model: 'fake/fake-model', messages: [{ role: 'user', content: `Save this: ${SECRET}` }], stream: false,
     }, key);
     expect(status).toBe(200);
     // Client received the real value in tool-call args

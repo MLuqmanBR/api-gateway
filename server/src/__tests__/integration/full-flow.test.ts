@@ -162,20 +162,22 @@ describe('Full Integration Flow', () => {
     expect(s2).toBe(400);
   });
 
-  it('Step 11: Explicit unknown model returns 400 (not silent fallthrough)', async () => {
+  it('Step 11: Off-form model pin returns 400 (not silent fallthrough)', async () => {
+    // Strict contract: only `<platform>/<model_id>` is a pin. A bare id is
+    // rejected outright even when it names nothing at all.
     const { status, body } = await req(app, 'POST', '/v1/chat/completions', {
       model: 'definitely-not-a-real-model',
       messages: [{ role: 'user', content: 'hi' }],
     }, authHeaders());
     expect(status).toBe(400);
     expect(body.error.code).toBe('model_not_found');
-    expect(body.error.message).toContain('not in the catalog');
+    expect(body.error.message).toContain("does not match the required '<platform>/<model_id>' form");
   });
 
   it('Step 12: Explicit disabled model returns 400 with disabled reason', async () => {
-    // gemini-2.5-pro is disabled (V1 migration). Reuse it as a known-disabled fixture.
+    // google/gemini-2.5-pro is disabled (V5 migration). Reuse it as a known-disabled fixture.
     const { status, body } = await req(app, 'POST', '/v1/chat/completions', {
-      model: 'gemini-2.5-pro',
+      model: 'google/gemini-2.5-pro',
       messages: [{ role: 'user', content: 'hi' }],
     }, authHeaders());
     expect(status).toBe(400);

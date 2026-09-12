@@ -3,91 +3,69 @@ import type { DatabasePort } from '../db/types.js';
 /** Discriminated result of resolving a client-pinned `model` field to a
  *  concrete `models.id`. The chat (`/v1/chat/completions`) and responses
  *  (`/v1/responses`) routes both call this so resolution stays in one place.
- *  - `resolved`     → exactly one enabled model row matched. Use `modelDbId`;
- *                    `platform`/`modelId` are the row's canonical identity —
- *                    `${platform}/${modelId}` is the display form consumers
- *                    should render in place of the raw (client-spelled) pin.
- *  - `not_found`    → no enabled row, and no disabled row either. The id is
- *                    genuinely absent from the catalog.
- *  - `disabled`     → no enabled row, but a disabled row exists (so the
- *                    message can say "is disabled", not "is not in the catalog").
- *  - `ambiguous`    → the pin matches ≥2 enabled rows across different
- *                    platforms. The pin is silently cross-platform; reject it
- *                    and surface `platforms` so the client can re-pin with a
- *                    `platform/model_id` prefix. */
+ *
+ *  The wire contract is STRICT: the pin must be `<platform>/<model_id>` (after
+ *  stripping one optional `api-gateway/` envelope — see `EXTENSION_PREFIX`).
+ *  Nothing else is accepted: no bare-id shorthand, no vendor-namespace pins.
+ *
+ *  - `resolved`  → the exact `<platform>/<model_id>` pair matched an enabled
+ *                  row. `platform`/`modelId` are that row's canonical identity —
+ *                  `${platform}/${modelId}` is the display form consumers
+ *                  render in place of the raw (client-spelled) pin.
+ *  - `malformed` → the pin is not of the required form at all (no slash, an
+ *                  empty platform, or an empty model id).
+ *  - `not_found` → the pin is well-formed, but no row (enabled or disabled)
+ *                  carries that platform+model pair.
+ *  - `disabled`  → the exact pair exists but enabled=0, so the message can say
+ *                  "is disabled" instead of "is not in the catalog". */
 export type PinnedModelResolution =
   | { kind: 'resolved'; modelDbId: number; platform: string; modelId: string }
+  | { kind: 'malformed' }
   | { kind: 'not_found' }
-  | { kind: 'disabled' }
-  | { kind: 'ambiguous'; platforms: string[] };
+  | { kind: 'disabled' };
 
 /** The `api-gateway/` extension prefix the OMP additional-providers-extension
  *  prepends to every advertised id so OMP's resolver doesn't pick a native
- *  provider that shares the underlying model name. Stripped before resolution. */
+ *  provider that shares the underlying model name. It is the ONE sanctioned
+ *  envelope: stripped exactly once, before the strict form check. */
 const EXTENSION_PREFIX = 'api-gateway/';
 
 /** Resolve a client-pinned `model` to a `models.id`, or to an explicit
- *  not-found / disabled / ambiguous verdict the caller can surface as 400.
+ *  malformed / not-found / disabled verdict the caller surfaces as 400.
  *
  *  `db` is the gateway's database handle (the caller already has it via
  *  `getDb()`). `requestedModel` is the raw `model` field as the client sent it
  *  (still carrying the optional `api-gateway/` prefix). */
 export function resolvePinnedModel(db: DatabasePort, requestedModel: string): PinnedModelResolution {
-  let workingModel = requestedModel;
-  if (workingModel.startsWith(EXTENSION_PREFIX)) {
-    workingModel = workingModel.slice(EXTENSION_PREFIX.length);
-  }
+  // Strip the extension envelope AT MOST ONCE. `api-gateway/` alone unwraps to
+  // the empty string (malformed below), and a doubled envelope leaves
+  // `api-gateway/...` whose platform is literally `api-gateway` — no platform
+  // in the catalog, so it falls out as not_found rather than being unwrapped
+  // again.
+  const pin = requestedModel.startsWith(EXTENSION_PREFIX)
+    ? requestedModel.slice(EXTENSION_PREFIX.length)
+    : requestedModel;
 
-  const slashIdx = workingModel.indexOf('/');
+  // Strict form: `<platform>/<model_id>`, split at the FIRST slash so model
+  // ids that themselves contain slashes (e.g. `moonshotai/kimi-k2.6`) stay
+  // intact. A pin with no slash, an empty platform segment, or an empty model
+  // id segment is malformed — there is no bare-id shorthand.
+  const slashIdx = pin.indexOf('/');
+  if (slashIdx <= 0 || slashIdx === pin.length - 1) return { kind: 'malformed' };
 
-  // Path A: the client used the documented `platform/model_id` wire form (the
-  // shape /v1/models advertises). When the first segment IS a real platform AND
-  // that platform+model pair exists, this is the explicit-platform choice — it
-  // resolves uniquely and is never ambiguous, even when the same model_id is
-  // served by other platforms. When that exact platform+model is disabled we
-  // surface `disabled` (NOT ambiguous) so the user fixes the RIGHT thing.
-  // When the first segment ISN'T a real platform (e.g. `MiniMaxAI/MiniMax-M3`,
-  // where the WHOLE string is the stored `model_id` across huggingface +
-  // commandcode), the platform-qualified query misses AND there's no disabled
-  // sibling → fall through to Path B and try the full string as a bare model_id.
-  if (slashIdx > 0) {
-    const platform = workingModel.slice(0, slashIdx);
-    const modelId = workingModel.slice(slashIdx + 1);
-    const enabled = db.prepare(
-      'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1',
-    ).get(platform, modelId) as { id: number } | undefined;
-    if (enabled) return { kind: 'resolved', modelDbId: enabled.id, platform, modelId };
-    const disabled = db.prepare(
-      'SELECT id FROM models WHERE platform = ? AND model_id = ?',
-    ).get(platform, modelId) as { id: number } | undefined;
-    if (disabled) return { kind: 'disabled' };
-    // Otherwise: the first segment wasn't a real platform the client pinned.
-    // Fall through to Path B with the full working string.
-  }
+  const platform = pin.slice(0, slashIdx);
+  const modelId = pin.slice(slashIdx + 1);
 
-  // Path B: try the full working string as a bare `model_id`. Match enabled
-  // rows on model_id alone. When exactly one platform serves this id the bare
-  // form stays a backward-compat shorthand. When two-or-more platforms share
-  // the id the pin is silently cross-platform — return `ambiguous` and let the
-  // caller 400 it (resolving to rowid-first, as the prior code did, can route
-  // the request to a platform with zero healthy keys and spin the recovery
-  // loop forever).
-  const enabledRows = db.prepare(
-    'SELECT id, platform, model_id FROM models WHERE model_id = ? AND enabled = 1',
-  ).all(workingModel) as Array<{ id: number; platform: string; model_id: string }>;
-  if (enabledRows.length === 1) {
-    const row = enabledRows[0]!;
-    return { kind: 'resolved', modelDbId: row.id, platform: row.platform, modelId: row.model_id };
-  }
-  if (enabledRows.length >= 2) {
-    return { kind: 'ambiguous', platforms: enabledRows.map(r => r.platform) };
-  }
+  const enabled = db.prepare(
+    'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1',
+  ).get(platform, modelId) as { id: number } | undefined;
+  if (enabled) return { kind: 'resolved', modelDbId: enabled.id, platform, modelId };
 
-  // No enabled row. Was it disabled, or genuinely absent?
-  const disabledRow = db.prepare(
-    'SELECT id FROM models WHERE model_id = ?',
-  ).get(workingModel) as { id: number } | undefined;
-  return disabledRow ? { kind: 'disabled' } : { kind: 'not_found' };
+  // The exact pair missed on enabled rows. Was it disabled, or genuinely absent?
+  const disabled = db.prepare(
+    'SELECT id FROM models WHERE platform = ? AND model_id = ?',
+  ).get(platform, modelId) as { id: number } | undefined;
+  return disabled ? { kind: 'disabled' } : { kind: 'not_found' };
 }
 
 /** Format a non-resolved `PinnedModelResolution` as the reason string for a
@@ -96,9 +74,8 @@ export function resolvePinnedModel(db: DatabasePort, requestedModel: string): Pi
 export function formatPinnedModelRejection(
   resolution: Exclude<PinnedModelResolution, { kind: 'resolved' }>,
 ): string {
-  if (resolution.kind === 'ambiguous') {
-    const plats = resolution.platforms.slice().sort();
-    return `is served by multiple providers (${plats.join(', ')}). Pin it with a 'platform/model_id' prefix (e.g. '${plats[0]}/<model_id>') to disambiguate`;
+  if (resolution.kind === 'malformed') {
+    return "does not match the required '<platform>/<model_id>' form (e.g. 'groq/llama-3.3-70b-versatile')";
   }
   if (resolution.kind === 'disabled') return 'is disabled';
   return 'is not in the catalog';
