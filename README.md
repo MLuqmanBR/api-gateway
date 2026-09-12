@@ -145,7 +145,7 @@ client = OpenAI(
 )
 
 resp = client.chat.completions.create(
-    model="auto",  # let the router pick; or specify e.g. "gemini-2.5-flash"
+    model="auto",  # let the router pick; or pin e.g. "google/gemini-2.5-flash"
     messages=[{"role": "user", "content": "Summarize the fall of Rome in one sentence."}],
 )
 print(resp.choices[0].message.content)
@@ -237,6 +237,12 @@ print(resp.choices[0].message.content)
 If no vision-capable model is enabled in your cascade, an image request returns a clear `422` (`code: "no_vision_model"`) rather than silently dropping the image.
 
 Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. The `/v1/responses` route also sets `X-Fallback-Attempts: N` when it cascaded between providers.
+
+### Model pinning
+
+`model` accepts `auto` (or an omitted field) to let the router pick, or a **strict** `<platform>/<model_id>` pin — the same id form `/v1/models` returns, e.g. `groq/llama-3.3-70b-versatile` or `nvidia/moonshotai/kimi-k2.6`. The platform is the segment before the first slash, so model ids that themselves contain slashes stay intact. Anything else — a bare id, an unknown platform, a disabled model — is rejected with `400 model_not_found`; nothing is silently re-routed. The OMP extension's `api-gateway/` envelope (`api-gateway/groq/llama-3.3-70b-versatile`) is unwrapped once at ingress, so its advertised ids work unchanged.
+
+A pinned request never falls through to a different model, and the dashboard and live terminal display every accepted spelling as one canonical `platform/model_id`.
 
 ### Embeddings
 
