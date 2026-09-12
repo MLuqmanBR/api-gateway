@@ -35,6 +35,8 @@ describe('resolvePinnedModel', () => {
       expect(resolvePinnedModel(db, 'deepseek/deepseek-v4-flash')).toEqual({
         kind: 'resolved',
         modelDbId: mma,
+        platform: 'deepseek',
+        modelId: 'deepseek-v4-flash',
       });
     });
 
@@ -75,7 +77,7 @@ describe('resolvePinnedModel', () => {
   describe('Path B: bare id (no slash) — backward-compat shorthand', () => {
     it('resolves when exactly one enabled platform serves the bare id', () => {
       const sole = addModel('groq', 'llama-3.3-70b');
-      expect(resolvePinnedModel(db, 'llama-3.3-70b')).toEqual({ kind: 'resolved', modelDbId: sole });
+      expect(resolvePinnedModel(db, 'llama-3.3-70b')).toEqual({ kind: 'resolved', modelDbId: sole, platform: 'groq', modelId: 'llama-3.3-70b' });
     });
 
     it('returns ambiguous when two-or-more enabled platforms share the bare id', () => {
@@ -103,7 +105,17 @@ describe('resolvePinnedModel', () => {
       const mma = addModel('commandcode', 'MiniMaxAI/MiniMax-M3');
       addModel('huggingface', 'MiniMaxAI/MiniMax-M3');
       const r = resolvePinnedModel(db, 'api-gateway/commandcode/MiniMaxAI/MiniMax-M3');
-      expect(r).toEqual({ kind: 'resolved', modelDbId: mma });
+      expect(r).toEqual({ kind: 'resolved', modelDbId: mma, platform: 'commandcode', modelId: 'MiniMaxAI/MiniMax-M3' });
+    });
+
+    it('resolves the api-gateway/model_id form (extension prefix + bare id)', () => {
+      const sole = addModel('groq', 'llama-3.3-70b');
+      expect(resolvePinnedModel(db, 'api-gateway/llama-3.3-70b')).toEqual({
+        kind: 'resolved',
+        modelDbId: sole,
+        platform: 'groq',
+        modelId: 'llama-3.3-70b',
+      });
     });
   });
 });

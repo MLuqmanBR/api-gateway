@@ -3,7 +3,10 @@ import type { DatabasePort } from '../db/types.js';
 /** Discriminated result of resolving a client-pinned `model` field to a
  *  concrete `models.id`. The chat (`/v1/chat/completions`) and responses
  *  (`/v1/responses`) routes both call this so resolution stays in one place.
- *  - `resolved`     → exactly one enabled model row matched. Use `modelDbId`.
+ *  - `resolved`     → exactly one enabled model row matched. Use `modelDbId`;
+ *                    `platform`/`modelId` are the row's canonical identity —
+ *                    `${platform}/${modelId}` is the display form consumers
+ *                    should render in place of the raw (client-spelled) pin.
  *  - `not_found`    → no enabled row, and no disabled row either. The id is
  *                    genuinely absent from the catalog.
  *  - `disabled`     → no enabled row, but a disabled row exists (so the
@@ -13,7 +16,7 @@ import type { DatabasePort } from '../db/types.js';
  *                    and surface `platforms` so the client can re-pin with a
  *                    `platform/model_id` prefix. */
 export type PinnedModelResolution =
-  | { kind: 'resolved'; modelDbId: number }
+  | { kind: 'resolved'; modelDbId: number; platform: string; modelId: string }
   | { kind: 'not_found' }
   | { kind: 'disabled' }
   | { kind: 'ambiguous'; platforms: string[] };
@@ -53,7 +56,7 @@ export function resolvePinnedModel(db: DatabasePort, requestedModel: string): Pi
     const enabled = db.prepare(
       'SELECT id FROM models WHERE platform = ? AND model_id = ? AND enabled = 1',
     ).get(platform, modelId) as { id: number } | undefined;
-    if (enabled) return { kind: 'resolved', modelDbId: enabled.id };
+    if (enabled) return { kind: 'resolved', modelDbId: enabled.id, platform, modelId };
     const disabled = db.prepare(
       'SELECT id FROM models WHERE platform = ? AND model_id = ?',
     ).get(platform, modelId) as { id: number } | undefined;
@@ -70,9 +73,12 @@ export function resolvePinnedModel(db: DatabasePort, requestedModel: string): Pi
   // the request to a platform with zero healthy keys and spin the recovery
   // loop forever).
   const enabledRows = db.prepare(
-    'SELECT id, platform FROM models WHERE model_id = ? AND enabled = 1',
-  ).all(workingModel) as Array<{ id: number; platform: string }>;
-  if (enabledRows.length === 1) return { kind: 'resolved', modelDbId: enabledRows[0]!.id };
+    'SELECT id, platform, model_id FROM models WHERE model_id = ? AND enabled = 1',
+  ).all(workingModel) as Array<{ id: number; platform: string; model_id: string }>;
+  if (enabledRows.length === 1) {
+    const row = enabledRows[0]!;
+    return { kind: 'resolved', modelDbId: row.id, platform: row.platform, modelId: row.model_id };
+  }
   if (enabledRows.length >= 2) {
     return { kind: 'ambiguous', platforms: enabledRows.map(r => r.platform) };
   }
