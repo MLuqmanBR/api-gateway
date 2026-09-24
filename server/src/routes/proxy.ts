@@ -371,10 +371,14 @@ const toolCallArgsToString = (args: string | Record<string, unknown>): string =>
 // OpenAI multimodal envelope. Clients like opencode / continue.dev send
 // content as an array of typed blocks even when only text is present, and
 // Gemini-lineage agents send part-style blocks like `{ "text": "..." }` with
-// no `type` at all. Accept any object (or bare string) as a block; flatten to
-// string for providers that don't support arrays (Cohere, Cloudflare).
-// Non-text blocks pass z validation but get dropped by contentToString —
-// vision/audio still isn't supported. (#200)
+// no `type` at all. Accept any object (or bare string) as a block.
+//
+// The schema is intentionally permissive: block SHAPE is validated by
+// lib/content.ts's classifier (blockMediaKind/mediaUrlOf) at the point of use,
+// so a new provider spelling does not require a schema change here. Media
+// blocks are preserved end-to-end for providers whose wire format can express
+// them, and the router only sends them to models flagged for that modality.
+// (#200)
 const contentBlockSchema = z.union([z.string(), z.record(z.string(), z.unknown())]);
 const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
 

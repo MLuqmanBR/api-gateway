@@ -60,7 +60,7 @@ Whether you're stacking free tiers from 18+ providers (~1.7 billion tokens per m
 | **Signed async webhooks** | Register webhook receivers for routing events. HMAC-SHA256 signed payloads. | Build automations around key exhaustion, model switches, and routing decisions. |
 | **Request queueing** | Per-provider concurrency queue with fair scheduling. Configurable via `/api/queue`. | Burst traffic is queued, not dropped. Slow providers don't starve fast ones. |
 | **Circuit breaker** | Per-provider circuit breaker with configurable thresholds. Open/half-open/closed states via `/api/circuits`. | Failing providers are tripped automatically, reducing wasted upstream calls. |
-| **WebSocket Realtime API** | `/v1/realtime` WebSocket endpoint for OpenAI Realtime API sessions. | Audio and streaming conversations through one gateway endpoint. |
+| **WebSocket Realtime API** | `/v1/realtime` relays a session to a real upstream realtime websocket. Requires a realtime model in the catalog (`/api/realtime`), which is seeded empty because availability is per-provider-account. Without one the connection fails with `no_realtime_model`. | Audio and streaming conversations through one gateway endpoint. |
 | **Spend-cap budgets** | Set monthly spend limits per client key, or one global cap across all requests. `/api/budgets` for management. | Never exceed your budget. Alerts and auto-cutoff when the cap is reached. |
 | **Tag/metadata filtering** | `X-API-Gateway-Tags` header filters the routing chain to models with matching tags. | Route to specific model subsets (e.g. "coding only", "fast only") per request. |
 | **TTFT-per-token routing** | Scoring blends time-to-first-token and per-token latency, not just total time. Anti-herd randomization prevents all clients choosing the same model. | Better latency for streaming. Natural load distribution across providers. |
@@ -216,13 +216,13 @@ final = client.chat.completions.create(
 print(final.choices[0].message.content)
 ```
 
-**Vision / image input**
+**Image, audio and video input**
 
-Send images with the standard OpenAI `image_url` content blocks (base64 `data:` URLs or `http(s)` URLs). When a request contains an image, the router restricts itself to **vision-capable models** and ignores text-only ones. Vision models are tagged with a **Vision** badge on the cascade page.
+Send media with the standard OpenAI content blocks. Each model carries three independent input flags — image, audio, video — shown as an icon row on the cascade page and in the model edit dialog, where you can toggle them per model.
 
 ```python
 resp = client.chat.completions.create(
-    model="auto",  # auto-routes to a vision model
+    model="auto",  # auto-routes to a model that accepts the media you sent
     messages=[{
         "role": "user",
         "content": [
@@ -234,7 +234,19 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-If no vision-capable model is enabled in your cascade, an image request returns a clear `422` (`code: "no_vision_model"`) rather than silently dropping the image.
+| Modality | Request block | Notes |
+|---|---|---|
+| Image | `{"type":"image_url","image_url":{"url":"..."}}` | `data:` or `http(s)` URLs. |
+| Audio | `{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}` | `<base64>` is the raw payload, not a data URL. |
+| Video | `{"type":"video_url","video_url":{"url":"..."}}` | `data:` or `http(s)` URLs. Provider support is the narrowest. |
+
+When a request contains media, the router restricts itself to models flagged for **every** modality it carries, and ignores models that cannot express them. If none is enabled you get a clear `422` naming the modality — `no_vision_model` (kept for compatibility with earlier releases), `no_audio_model`, or `no_video_model`. Pinning a model that cannot accept the media you sent returns `400 model_capability_mismatch` rather than silently answering from a different model.
+
+The per-model flags come from a generated index built offline from the public model catalogs (`node scripts/gen-modalities.mjs`), so they reflect what each model actually accepts rather than a name pattern. Platforms whose wire format cannot express a modality are forced to `0` (Cloudflare, Cohere for audio/video, and Anthropic-format providers for audio/video). Edits you make in the dashboard set `modalities_manual` on that row and are never overwritten by the index.
+
+Provider translation: OpenAI-compatible endpoints receive the blocks verbatim; Gemini receives `inlineData` parts (and `fileData` for YouTube URLs); Anthropic receives `image`/`document` blocks; Cohere receives `image_url` blocks. Requests are only routed to a provider that can express the media they carry.
+
+`/v1` accepts request bodies up to 64 MB so base64 media fits; `/api/*` keeps its 10 MB limit.
 
 Every response carries an `X-Routed-Via: <platform>/<model>` header so you can see which provider actually served each call. The `/v1/responses` route also sets `X-Fallback-Attempts: N` when it cascaded between providers.
 
