@@ -165,7 +165,16 @@ function handleConnection(ws: WebSocket, token: string): void {
   });
   session.upstream = upstream;
 
+  // Frames that arrive before the upstream socket is OPEN. A real client sends
+  // `session.update` (and often the first audio append) the moment IT sees a
+  // connection, which is well before the gateway's own upstream handshake
+  // finishes — dropping those frames would silently discard the start of every
+  // session.
+  const pending: string[] = [];
+
   upstream.on('open', () => {
+    for (const frame of pending) upstream.send(frame);
+    pending.length = 0;
     send(ws, {
       type: 'realtime.connected',
       session_id: session.requestId,
@@ -211,6 +220,8 @@ function handleConnection(ws: WebSocket, token: string): void {
       // must see, and inventing one here is what made the old implementation
       // look functional while dropping every audio byte.
       if (upstream.readyState === WebSocket.OPEN) upstream.send(raw);
+      else if (upstream.readyState === WebSocket.CONNECTING) pending.push(raw);
+      // CLOSING/CLOSED: the close handler already told the client.
     } catch (err) {
       console.error('[Realtime] relay error:', err instanceof Error ? err.message : err);
     }
