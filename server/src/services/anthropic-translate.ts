@@ -24,6 +24,10 @@ export interface AnthropicInboundMessage {
     | { type: 'text'; text: string }
     | { type: 'tool_use'; id: string; name: string; input: unknown }
     | { type: 'tool_result'; tool_use_id: string; content: string | Array<{ type: 'text'; text: string }> }
+    // Image input. `base64` sources convert to an OpenAI data URL; `url`
+    // sources pass through as the URL.
+    | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } }
+    | { type: 'document'; source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } }
   >;
 }
 
@@ -107,8 +111,11 @@ export function anthropicToChatMessages(req: AnthropicInboundRequest): {
         continue;
       }
       // Separate text from tool_result blocks. tool_result blocks become
-      // separate 'tool' messages; remaining text stays as one user message.
+      // separate 'tool' messages. Images become OpenAI image_url blocks, which
+      // forces the message into the array envelope — a text-only message keeps
+      // the simpler string form.
       const textParts: string[] = [];
+      const mediaBlocks: Array<{ type: 'image_url'; image_url: { url: string } }> = [];
       for (const block of m.content) {
         if (block.type === 'text') {
           textParts.push(block.text);
@@ -121,9 +128,20 @@ export function anthropicToChatMessages(req: AnthropicInboundRequest): {
             content: resultContent,
             tool_call_id: block.tool_use_id,
           } as ChatMessage);
+        } else if (block.type === 'image' || block.type === 'document') {
+          const url = block.source.type === 'base64'
+            ? `data:${block.source.media_type};base64,${block.source.data}`
+            : block.source.url;
+          mediaBlocks.push({ type: 'image_url', image_url: { url } });
         }
       }
-      if (textParts.length > 0) {
+      if (mediaBlocks.length > 0) {
+        // Array envelope: text first, then the media blocks.
+        const parts: Array<{ type: string; text?: string } | { type: 'image_url'; image_url: { url: string } }> = [];
+        if (textParts.length > 0) parts.push({ type: 'text', text: textParts.join('\n') });
+        parts.push(...mediaBlocks);
+        messages.push({ role: 'user', content: parts } as unknown as ChatMessage);
+      } else if (textParts.length > 0) {
         messages.push({ role: 'user', content: textParts.join('\n') });
       }
     } else if (m.role === 'assistant') {

@@ -31,6 +31,11 @@ import { attachClientAbort } from '../lib/abort.js';
 
 export const messagesRouter = Router();
 
+const anthropicSourceSchema = z.union([
+  z.object({ type: z.literal('base64'), media_type: z.string(), data: z.string() }),
+  z.object({ type: z.literal('url'), url: z.string() }),
+]);
+
 const anthropicMessageSchema = z.object({
   model: z.string().optional(),
   messages: z.array(z.object({
@@ -45,6 +50,10 @@ const anthropicMessageSchema = z.object({
           tool_use_id: z.string(),
           content: z.union([z.string(), z.array(z.object({ type: z.literal('text'), text: z.string() }))]).optional(),
         }),
+        // Image / PDF input. Without these the schema rejected any multimodal
+        // Anthropic request with a validation error before routing saw it.
+        z.object({ type: z.literal('image'), source: anthropicSourceSchema }),
+        z.object({ type: z.literal('document'), source: anthropicSourceSchema }),
       ])),
     ]),
   })).min(1),

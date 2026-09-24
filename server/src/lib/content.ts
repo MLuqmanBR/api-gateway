@@ -84,6 +84,12 @@ export function mediaUrlOf(block: unknown, kind: MediaKind): string | null {
     if (typeof url === 'string' && url.length > 0) return url;
   }
 
+  // Bare field spelling: `{ type: 'image', image: url }` (Google-lineage
+  // clients). The old per-adapter extractors accepted this shape, so the
+  // shared classifier must too or those requests lose their media.
+  const bare = stringField(holder, kind);
+  if (bare) return bare;
+
   // `{ input_audio: { data, format } }` on the Responses API spelling.
   if (kind === 'audio') {
     const inputAudio = holder.input_audio;
