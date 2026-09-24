@@ -57,6 +57,41 @@ export function messageHasImage(messages: ChatMessage[]): boolean {
   return messages.some((m) => contentHasImage(m.content));
 }
 
+// Provider reasoning wire-keys observed in the wild. LogFare, Ollama, and
+// OpenRouter use `reasoning`; CommandCode uses `reasoningContent` on its SSE
+// event shape. The gateway's canonical outbound field is `reasoning_content`
+// (ChatCompletionChunk.choices[].delta.reasoning_content in shared/types.ts).
+export const REASONING_ALIAS_KEYS = ['reasoning', 'reasoningContent'] as const;
+
+/**
+ * Move any non-empty reasoning alias on `holder` to `reasoning_content` and
+ * delete the aliases. Mutates in place, idempotent. Does nothing when no alias
+ * and no `reasoning_content` are present, so a provider that sends only
+ * `reasoning: ''` on its role preamble keeps its exact current shape.
+ *
+ * Preference: an existing non-empty `reasoning_content` wins; aliases are
+ * stripped even in that case so downstream sees exactly one reasoning field.
+ */
+export function canonicalizeReasoningFields(
+  holder: Record<string, unknown> | undefined | null,
+): void {
+  if (!holder || typeof holder !== 'object') return;
+  const canonical = holder.reasoning_content;
+  const hasCanonical = typeof canonical === 'string' && canonical.length > 0;
+  let promoted: string | undefined;
+  if (!hasCanonical) {
+    for (const k of REASONING_ALIAS_KEYS) {
+      const v = holder[k];
+      if (typeof v === 'string' && v.length > 0) { promoted = v; break; }
+    }
+    if (promoted === undefined) return; // nothing real to canonicalize
+    holder.reasoning_content = promoted;
+  }
+  for (const k of REASONING_ALIAS_KEYS) {
+    if (k in holder) delete holder[k];
+  }
+}
+
 // Normalize the OUTBOUND (provider → client) shape so we honor the OpenAI
 // contract on the response path the same way `contentToString` does on the
 // request path. Per spec, `choices[].delta.content` (streaming) and

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent } from '../../lib/content.js';
+import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent, canonicalizeReasoningFields } from '../../lib/content.js';
 
 describe('contentToString', () => {
   it('passes strings through', () => {
@@ -122,5 +122,48 @@ describe('normalizeOutboundContent (#166)', () => {
     expect(() => normalizeOutboundContent({ usage: { prompt_tokens: 1 } })).not.toThrow();
     expect(() => normalizeOutboundContent(null as unknown)).not.toThrow();
     expect(() => normalizeOutboundContent({} as unknown)).not.toThrow();
+  });
+});
+
+describe('canonicalizeReasoningFields', () => {
+  it('moves a non-empty delta.reasoning to delta.reasoning_content and deletes the alias', () => {
+    const delta: Record<string, unknown> = { role: 'assistant', reasoning: 'step one' };
+    canonicalizeReasoningFields(delta);
+    expect(delta.reasoning_content).toBe('step one');
+    expect('reasoning' in delta).toBe(false);
+    expect(delta.role).toBe('assistant');
+  });
+
+  it('moves a non-empty message.reasoning to message.reasoning_content', () => {
+    const msg: Record<string, unknown> = { reasoning: 'thinking hard', content: '' };
+    canonicalizeReasoningFields(msg);
+    expect(msg.reasoning_content).toBe('thinking hard');
+    expect('reasoning' in msg).toBe(false);
+  });
+
+  it('prefers an existing reasoning_content and still deletes the alias', () => {
+    const holder: Record<string, unknown> = { reasoning_content: 'canonical wins', reasoning: 'alias loses' };
+    canonicalizeReasoningFields(holder);
+    expect(holder.reasoning_content).toBe('canonical wins');
+    expect('reasoning' in holder).toBe(false);
+  });
+
+  it('leaves an empty-string reasoning alias in place when nothing is being promoted', () => {
+    // OpenRouter's role-preamble frame: { role, reasoning: '', tool_calls }.
+    // The empty alias must survive untouched so the proxy's raw-preamble
+    // branch keeps its current shape (proxy-stream-integrity.test.ts:229).
+    const delta: Record<string, unknown> = { role: 'assistant', reasoning: '' };
+    canonicalizeReasoningFields(delta);
+    expect(delta.reasoning).toBe('');
+    expect('reasoning_content' in delta).toBe(false);
+  });
+
+  it('is idempotent and a no-op on an object with no reasoning fields', () => {
+    const holder: Record<string, unknown> = { content: 'hi' };
+    canonicalizeReasoningFields(holder);
+    expect(holder).toEqual({ content: 'hi' });
+    canonicalizeReasoningFields(undefined);
+    canonicalizeReasoningFields(null);
+    expect(() => canonicalizeReasoningFields(undefined)).not.toThrow();
   });
 });
