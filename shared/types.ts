@@ -95,6 +95,8 @@ export interface CustomModelCreate {
   speedRank?: number;
   sizeLabel?: string;
   supportsVision?: boolean;
+  supportsAudioInput?: boolean;
+  supportsVideoInput?: boolean;
   monthlyTokenBudget?: string;
   rpmLimit?: number | null;
   rpdLimit?: number | null;
@@ -109,6 +111,8 @@ export interface CustomModelUpdate {
   speedRank?: number;
   sizeLabel?: string;
   supportsVision?: boolean;
+  supportsAudioInput?: boolean;
+  supportsVideoInput?: boolean;
   monthlyTokenBudget?: string;
   rpmLimit?: number | null;
   rpdLimit?: number | null;
@@ -135,7 +139,12 @@ export interface Model {
   monthlyTokenBudget: string;
   contextWindow: number | null;
   enabled: boolean;
+  // Input modalities. `supportsVision` keeps its upstream-owned name; its
+  // meaning is "accepts image input". The other two were added with the
+  // generated modality index (db/modality-index.ts).
   supportsVision: boolean;
+  supportsAudioInput: boolean;
+  supportsVideoInput: boolean;
 }
 
 export interface ModelListRow {
