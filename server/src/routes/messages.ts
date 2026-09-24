@@ -194,17 +194,32 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
         },
       })}\n\n`);
 
-      // content_block_start (text block at index 0)
-      res.write(`event: content_block_start\ndata: ${JSON.stringify({
-        type: 'content_block_start',
-        index: 0,
-        content_block: { type: 'text', text: '' },
-      })}\n\n`);
+      // Block bookkeeping: at most one content block is open at a time.
+      // Thinking (reasoning_content), text, and tool_use blocks are opened
+      // lazily on the first delta of their kind and closed before the next
+      // kind opens. No block is opened upfront so a reasoning-only or
+      // tool-only turn never emits an empty text block.
+      type OpenBlockKind = 'thinking' | 'text' | 'tool_use';
+      let nextBlockIndex = 0;
+      let openKind: OpenBlockKind | null = null;
+      let openIndex = -1;
+      const closeOpenBlock = () => {
+        if (openKind === null) return;
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: 'content_block_stop', index: openIndex,
+        })}\n\n`);
+        openKind = null;
+        openIndex = -1;
+      };
+      const openBlock = (kind: OpenBlockKind, block: Record<string, unknown>) => {
+        closeOpenBlock();
+        openIndex = nextBlockIndex++;
+        openKind = kind;
+        res.write(`event: content_block_start\ndata: ${JSON.stringify({
+          type: 'content_block_start', index: openIndex, content_block: block,
+        })}\n\n`);
+      };
 
-      let blockIndex = 0;
-      // M06: text deltas always belong to this block index; it stays 0
-      // until a tool_use block opens, then a new text block may open later.
-      let textBlockIndex = 0;
       let finishReason: string | undefined;
       let outputTokens = 0;
 
@@ -239,32 +254,28 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
           try {
             const chunk = JSON.parse(data);
             const delta = chunk.choices?.[0]?.delta;
-            if (delta?.content) {
-              // M06: text always belongs to the current text block (index 0
-              // or, if a tool call already ended it, a new text block).
-              // Track whether the block-0 text block is still open so we
-              // never emit a text delta at index 0 after a tool_use block
-              // opened at a higher index.
+            if (delta?.reasoning_content) {
+              if (openKind !== 'thinking') openBlock('thinking', { type: 'thinking', thinking: '' });
               res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-                type: 'content_block_delta',
-                index: textBlockIndex,
+                type: 'content_block_delta', index: openIndex,
+                delta: { type: 'thinking_delta', thinking: delta.reasoning_content },
+              })}\n\n`);
+            }
+            if (delta?.content) {
+              if (openKind !== 'text') openBlock('text', { type: 'text', text: '' });
+              res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+                type: 'content_block_delta', index: openIndex,
                 delta: { type: 'text_delta', text: delta.content },
               })}\n\n`);
             }
             if (delta?.tool_calls) {
               for (const tc of delta.tool_calls) {
                 if (tc.id) {
-                  blockIndex++;
-                  res.write(`event: content_block_start\ndata: ${JSON.stringify({
-                    type: 'content_block_start',
-                    index: blockIndex,
-                    content_block: { type: 'tool_use', id: tc.id, name: tc.function?.name ?? '', input: {} },
-                  })}\n\n`);
+                  openBlock('tool_use', { type: 'tool_use', id: tc.id, name: tc.function?.name ?? '', input: {} });
                 }
-                if (tc.function?.arguments) {
+                if (tc.function?.arguments && openKind === 'tool_use') {
                   res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-                    type: 'content_block_delta',
-                    index: blockIndex,
+                    type: 'content_block_delta', index: openIndex,
                     delta: { type: 'input_json_delta', partial_json: tc.function.arguments },
                   })}\n\n`);
                 }
@@ -280,19 +291,8 @@ messagesRouter.post('/messages', async (req: Request, res: Response) => {
         }
       }
 
-      // Close text block
-      res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-        type: 'content_block_stop',
-        index: 0,
-      })}\n\n`);
-
-      // Close any tool_use blocks
-      for (let i = 1; i <= blockIndex; i++) {
-        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-          type: 'content_block_stop',
-          index: i,
-        })}\n\n`);
-      }
+      // Close whichever block (thinking, text, or last tool_use) is open.
+      closeOpenBlock();
 
       const stopMap: Record<string, 'end_turn' | 'max_tokens' | 'tool_use'> = {
         stop: 'end_turn', length: 'max_tokens', tool_calls: 'tool_use',

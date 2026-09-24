@@ -306,6 +306,15 @@ export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  // Upstream-provided breakdown. OpenAI emits `reasoning_tokens` here when
+  // the model metered thinking; the gateway forwards it verbatim on
+  // /v1/chat/completions (streaming + non-streaming) and threads it into
+  // /v1/responses (non-streaming). Optional — providers that don't emit it
+  // leave the field absent and clients that don't read it are unaffected.
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+    [key: string]: unknown;
+  };
 }
 
 export interface ChatCompletionResponse {

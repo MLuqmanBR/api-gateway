@@ -27,6 +27,10 @@ export class OpenAICompatProvider extends BaseProvider {
    *   {account_id} in baseUrl substituted at request time.
    *   'simple' (default) → full string is the bearer token, no substitution. */
   private readonly keyFormat: string;
+  /** Whether to ask upstream for the OpenAI streaming usage frame
+   *  (stream_options.include_usage). Strict wrappers that reject unknown
+   *  body fields can opt out via the constructor. */
+  private readonly supportsStreamUsage: boolean;
 
   constructor(opts: {
     platform: string;
@@ -38,6 +42,7 @@ export class OpenAICompatProvider extends BaseProvider {
     keyless?: boolean;
     forceSingleToolCall?: boolean;
     keyFormat?: string;
+    supportsStreamUsage?: boolean;
   }) {
     super();
     this.platform = opts.platform;
@@ -49,6 +54,7 @@ export class OpenAICompatProvider extends BaseProvider {
     this.keyless = opts.keyless ?? false;
     this.forceSingleToolCall = opts.forceSingleToolCall ?? false;
     this.keyFormat = opts.keyFormat ?? 'simple';
+    this.supportsStreamUsage = opts.supportsStreamUsage ?? true;
   }
 
   /** Build the outbound thinking fields. Emits a single `reasoning_effort`
@@ -94,7 +100,14 @@ export class OpenAICompatProvider extends BaseProvider {
     const parallel = this.resolveParallelToolCalls(options);
     if (parallel !== undefined) body.parallel_tool_calls = parallel;
     Object.assign(body, this.buildThinkingFields(options));
-    if (stream) body.stream = true;
+    if (stream) {
+      body.stream = true;
+      // OpenAI's streaming spec gates the final usage frame behind
+      // stream_options.include_usage. Without it a provider that meters
+      // reasoning (LogFare's grok-4.6) never surfaces
+      // completion_tokens_details.reasoning_tokens to the client.
+      if (this.supportsStreamUsage) body.stream_options = { include_usage: true };
+    }
     return body;
   }
 

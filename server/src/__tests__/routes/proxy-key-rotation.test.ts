@@ -24,7 +24,9 @@ vi.mock('../../providers/index.js', async (importOriginal) => {
 const { createApp } = await import('../../app.js');
 const { initDb, getDb, getUnifiedApiKey } = await import('../../db/index.js');
 const { encrypt } = await import('../../lib/crypto.js');
-const { setRoutingStrategy, setGlobalRetryLimit } = await import('../../services/router.js');
+const { setRoutingStrategy, setGlobalRetryLimit, clearRoundRobinIndex } = await import('../../services/router.js');
+const { clearExhaustedForKey } = await import('../../services/key-exhaustion.js');
+const { clearKeyRuntimeState } = await import('../../services/ratelimit.js');
 
 async function post(app: Express, path: string, body: any, key: string) {
   const server = app.listen(0);
@@ -79,6 +81,17 @@ describe('Proxy key rotation on per-key 400 failures (#293)', () => {
     chatCompletion.mockReset();
     streamChatCompletion.mockReset();
     getDb().prepare('DELETE FROM rate_limit_cooldowns').run();
+    // markExhausted() state lives in an in-memory map that survives the
+    // rate_limit_cooldowns wipe above — without this, a key burned by one
+    // test stays exhausted for the rest of the file and the router silently
+    // never picks it again.
+    for (const row of getDb().prepare('SELECT id FROM api_keys').all() as Array<{ id: number }>) {
+      clearExhaustedForKey(row.id);
+      clearKeyRuntimeState(row.id); // also the in-memory cooldowns Map — survives the SQL wipe
+    }
+    // The round-robin cursor points at whichever key last succeeded; reset it
+    // so each test deterministically starts on the first (dead) key.
+    clearRoundRobinIndex('groq');
     setGlobalRetryLimit(20);
   });
 
@@ -108,5 +121,107 @@ describe('Proxy key rotation on per-key 400 failures (#293)', () => {
     // If the dead key was tried first, it must have been retried up to
     // PER_KEY_RETRIES then rotated away from. Either way the healthy key
     // eventually answered (status 200 above), which is the core assertion.
+  });
+
+  it('rotates to the next key on a structured 402 and publishes exhaust + switch events', async () => {
+    // Token Harbor's paid model: key #1's account has a $0 balance (402 with a
+    // STRUCTURED status, as providerHttpError attaches), key #2 is funded.
+    // Before the fix the structured-status branch classified 402 as
+    // non-retryable, so the request died on key #1 with a bare
+    // "Provider error" line — no rotation, no cooldown, and with sticky
+    // selection the model stayed pinned to the broke key forever.
+    // Narrow the chain to a single groq model so the exercise is exactly
+    // "same model, next KEY" — the user-visible ⇄ rotation. With multiple
+    // groq models, the penalty entry (recordRateLimitHit on exhaustion)
+    // demotes the failed model and the router hops MODEL-to-model on the
+    // same broke key, so the feed shows '→ switching model' lines instead
+    // of the ⇄ key rotation we're pinning here.
+    const modelRow = getDb()
+      .prepare("SELECT model_id FROM models WHERE platform = 'groq' AND enabled = 1 ORDER BY intelligence_rank ASC LIMIT 1")
+      .get() as { model_id: string };
+    const onlyModel = modelRow.model_id;
+    getDb()
+      .prepare("UPDATE models SET enabled = 0 WHERE platform = 'groq' AND model_id != ?")
+      .run(onlyModel);
+
+    const PAYMENT_ERROR = Object.assign(
+      new Error('tokenharbor API error 402: Your Token Harbor balance is at $0. Top up to keep using paid models.'),
+      { status: 402 },
+    );
+
+    chatCompletion.mockImplementation(async (apiKey: string) => {
+      if (apiKey === 'dead-key') throw PAYMENT_ERROR;
+      return GOOD_RESULT;
+    });
+
+    const { subscribe } = await import('../../services/events.js');
+    const events: any[] = [];
+    const unsub = subscribe((e) => events.push(e));
+    let status: number;
+    let body: any;
+    try {
+      ({ status, body } = await post(app, '/v1/chat/completions', {
+        messages: [{ role: 'user', content: 'hi' }],
+      }, key));
+    } finally {
+      unsub();
+    }
+
+    expect(status).toBe(200);
+    expect(body.choices[0].message.content).toBe('answer from the healthy key');
+
+    // The broke key is probed AT MOST ONCE per (key, model) pair — never the
+    // old PER_KEY_RETRIES burst on an account that cannot recover mid-request —
+    // and the funded key answers. chatCompletion(apiKey, messages, modelId, …).
+    const probeKey = (c: unknown[]) => `${String(c[0])}|${String(c[2])}`;
+    const perPair = new Map<string, number>();
+    for (const c of chatCompletion.mock.calls) {
+      const k = probeKey(c);
+      perPair.set(k, (perPair.get(k) ?? 0) + 1);
+    }
+    for (const [pair, n] of perPair) {
+      expect(n, `key|model ${pair} probed ${n} times`).toBe(1);
+    }
+    expect(chatCompletion.mock.calls.some(c => c[0] === 'dead-key')).toBe(true);
+    expect(chatCompletion.mock.calls.some(c => c[0] === 'healthy-key')).toBe(true);
+
+    // The live feed shows the rotation: ⚠ exhausted then ⇄ rotating key.
+    expect(events.some(e => e.type === 'routing.key_exhausted' && e.reason.includes('402'))).toBe(true);
+    const sw = events.find(e => e.type === 'routing.key_switch');
+    expect(sw).toBeTruthy();
+    expect(sw.fromKeyId).not.toBe(sw.toKeyId);
+
+    // Benched for the flat 90s (X1), classified as payment_required — a pause,
+    // never a permanent bench: no key/status change, and the entry expires.
+    const row = getDb().prepare(
+      "SELECT reason, expires_at_ms - ? AS ttl FROM rate_limit_cooldowns WHERE model_id IN (SELECT model_id FROM requests ORDER BY id DESC LIMIT 1)",
+    ).get(Date.now()) as { reason: string; ttl: number } | undefined;
+    expect(row?.reason).toBe('payment_required');
+    expect(row!.ttl).toBeLessThanOrEqual(90_000);
+    const keyRow = getDb().prepare("SELECT status, enabled FROM api_keys WHERE label = 'dead'").get() as { status: string; enabled: number };
+    expect(keyRow.enabled).toBe(1);
+    expect(keyRow.status).toBe('healthy');
+  });
+
+  it('benches a NON-retryable failure so sticky selection cannot pin a dead key', async () => {
+    // A 401 is non-retryable: the request surfaces the error immediately. It
+    // must still cool the (platform, model, key) pair, otherwise sticky key
+    // selection keeps choosing the same rejected key for every later request
+    // on that model. The second request must therefore land on the healthy key.
+    chatCompletion.mockImplementation(async (apiKey: string) => {
+      if (apiKey === 'dead-key') {
+        throw Object.assign(new Error('401 Unauthorized: invalid api key'), { status: 401 });
+      }
+      return GOOD_RESULT;
+    });
+
+    const first = await post(app, '/v1/chat/completions', { messages: [{ role: 'user', content: 'hi' }] }, key);
+    expect(first.status).toBe(502);
+
+    const second = await post(app, '/v1/chat/completions', { messages: [{ role: 'user', content: 'hi' }] }, key);
+    expect(second.status).toBe(200);
+    expect(second.body.choices[0].message.content).toBe('answer from the healthy key');
+    const deadCallsAfter = chatCompletion.mock.calls.filter((c: unknown[]) => c[0] === 'dead-key').length;
+    expect(deadCallsAfter).toBe(1); // not re-probed once cooled
   });
 });

@@ -16,7 +16,7 @@ import { setRetryAfter } from '../lib/http-headers.js';
 import { getDb, getUnifiedApiKey, cachedPrepare } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { checkAndReserve, recordSpend, releaseBudget, estimateCostCents } from '../services/budgets.js';
-import { contentToString, messageHasImage, normalizeOutboundContent } from '../lib/content.js';
+import { contentToString, messageHasImage, normalizeOutboundContent, canonicalizeReasoningFields, REASONING_ALIAS_KEYS } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -34,7 +34,6 @@ registerBuiltInHooks();
 import { publish } from '../services/events.js';
 import { attachClientAbort, abortableSleep, isAbortError } from '../lib/abort.js';
 import { resolvePinnedModel, formatPinnedModelRejection } from '../lib/pinned-model.js';
-import { isReasoningModelId } from '../lib/reasoning-model.js';
 import { logger } from '../lib/logger.js';
 
 export const proxyRouter = Router();
@@ -513,12 +512,21 @@ export function isRetryableError(err: any): boolean {
     // 400 is included because providers often return 400 for bad API keys
     // (per-key error) — the key rotation logic expects this to be retryable
     // so it can cycle to the next key on the same model.
-    if (err.status === 400 || err.status === 429 || err.status === 408 || err.status === 425 ||
+    // 402 (payment required / out of balance) is included for the SAME
+    // reason: it is a PER-KEY condition (that account is broke, the sibling
+    // key's account may be funded), so the request must rotate to the next
+    // key on the model instead of dying on the broke one. This matches the
+    // message heuristic below (isPaymentRequiredError) — before this, a
+    // structured status:402 short-circuited here and returned false, so
+    // Token Harbor / HuggingFace-style 402s surfaced to the client with no
+    // key rotation and no ⚠/⇄ live-feed events at all. (#402-cycle)
+    if (err.status === 400 || err.status === 402 || err.status === 429 || err.status === 408 || err.status === 425 ||
         err.status === 500 || err.status === 502 || err.status === 503 || err.status === 504 ||
         err.status === 403 || err.status === 404) {
       return true;
     }
-    // Non-retryable statuses: 401 (auth), 402 (payment - handled by isPaymentRequiredError), etc.
+    // Non-retryable statuses: 401 (auth), and other 4xx we have no
+    // per-key story for, etc.
     return false;
   }
   // Fallback: message-based heuristics (legacy path, keeps existing behavior).
@@ -1267,14 +1275,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const catalogCap = route.maxOutputTokens ?? undefined;
     const effectiveMaxTokens = max_tokens ?? catalogCap;
 
-    // MiniMax M2.x/M3 on openrouter / nvidia and similar aggregators returns reasoning
-    // inline in `content` wrapped in `<think>` tags instead of using a separate
-    // `reasoning_content` field. The api-gateway splits that into the
-    // `reasoning_content` transport field so clients see a clean answer. The
-    // gate shares the family detector with `buildModelCapabilities`
-    // (deepseek-r1, kimi-k2-thinking, etc. match the same pattern; if any of
-    // them ever emits the same tag the proxy handles it the same way).
-    const isReasoningModel = isReasoningModelId(route.modelId);
+    // Some upstreams return reasoning inline in `content` wrapped in a
+    // reasoning tag pair instead of using a separate `reasoning_content`
+    // field. The api-gateway splits that into the `reasoning_content`
+    // transport field so clients see a clean answer. This runs for EVERY
+    // model: any model id may inline a reasoning block, and a model-id
+    // heuristic cannot know about a model added later.
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
     let keySucceeded = false;
@@ -1435,7 +1441,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               // B2-6 R2: un-redact native reasoning_content through the
               // streaming un-redactor (placeholders → real values).
               const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(reasoningText) : reasoningText;
-              if (safeReasoning.length > 0) writeChunk(mkChunk({ reasoning_content: safeReasoning }, null));
+              if (safeReasoning.length > 0) {
+                writeChunk(mkChunk({
+                  ...(choice.delta?.role ? { role: choice.delta.role } : {}),
+                  reasoning_content: safeReasoning,
+                }, null));
+              }
             }
             if (text.length === 0) {
               // Role preamble / keep-alive: hold until first payload decides
@@ -1464,28 +1475,21 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             totalOutputTokens += Math.ceil(text.length / 4);
 
             if (mode === 'passthrough') {
-              // Strip `<think>` tags from the chunk in-flight, emit any
+              // Strip reasoning tags from the chunk in-flight, emit any
               // extracted reasoning as a `reasoning_content` delta, and
               // forward the visible remainder. Reasoning arrives ahead of
               // the visible text it described — typical for a long-form
-              // think block that closes before the answer begins.
-              if (isReasoningModel) {
-                const think = thinkStream.feed(text);
-                // B2-6 R2: un-redact visible and reasoning through separate
-                // streaming un-redactors (independent buffers).
-                const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(think.reasoning) : think.reasoning;
-                if (safeReasoning.length > 0) {
-                  writeChunk(mkChunk({ reasoning_content: safeReasoning }, null));
-                }
-                text = visibleUnredactor ? visibleUnredactor.feed(think.visible) : think.visible;
-                if (text.length === 0) continue;
+              // reasoning block that closes before the answer begins.
+              // Model-agnostic: any model id may inline a reasoning block.
+              const think = thinkStream.feed(text);
+              // B2-6 R2: un-redact visible and reasoning through separate
+              // streaming un-redactors (independent buffers).
+              const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(think.reasoning) : think.reasoning;
+              if (safeReasoning.length > 0) {
+                writeChunk(mkChunk({ reasoning_content: safeReasoning }, null));
               }
-              // B2-6 R2: un-redact visible content for non-reasoning models
-              // (reasoning models already un-redacted inside the block above).
-              if (!isReasoningModel) {
-                text = visibleUnredactor ? visibleUnredactor.feed(text) : text;
-                if (text.length === 0) continue;
-              }
+              text = visibleUnredactor ? visibleUnredactor.feed(think.visible) : think.visible;
+              if (text.length === 0) continue;
               // reasoning_content is stripped here: any reasoning on this
               // chunk was already forwarded by the native reasoning_content
               // block above, so leaving it in the spread would re-emit it if
@@ -1496,24 +1500,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             }
 
             // mode is 'undecided' or 'dialect'. Route the chunk through the
-            // think extractor first so the dialect detector only ever sees
-            // visible text. Pure-reasoning chunks (visible==='') bypass
+            // reasoning-tag extractor first so the dialect detector only ever
+            // sees visible text. Pure-reasoning chunks (visible==='') bypass
             // the dialect detector entirely — nothing to feed.
-            if (isReasoningModel) {
-              const think = thinkStream.feed(text);
-              // B2-6 R2: un-redact visible and reasoning (undecided/dialect).
-              const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(think.reasoning) : think.reasoning;
-              if (safeReasoning.length > 0) {
-                bufferedReasoning += safeReasoning;
-              }
-              text = visibleUnredactor ? visibleUnredactor.feed(think.visible) : think.visible;
-              if (text.length === 0) continue;
+            const think = thinkStream.feed(text);
+            // B2-6 R2: un-redact visible and reasoning (undecided/dialect).
+            const safeReasoning = reasoningUnredactor ? reasoningUnredactor.feed(think.reasoning) : think.reasoning;
+            if (safeReasoning.length > 0) {
+              bufferedReasoning += safeReasoning;
             }
-            // B2-6 R2: un-redact visible content for non-reasoning models.
-            if (!isReasoningModel) {
-              text = visibleUnredactor ? visibleUnredactor.feed(text) : text;
-              if (text.length === 0) continue;
-            }
+            text = visibleUnredactor ? visibleUnredactor.feed(think.visible) : think.visible;
+            if (text.length === 0) continue;
             heldText += text;
             if (mode === 'dialect') continue;
 
@@ -1673,12 +1670,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             abortSignal,
           },
         );
-        // Empty completion (no text, no tool calls) → fail over rather than
-        // return a transport-level "success" the caller can't act on. Mirrors
-        // the zero-chunk streaming case above.
+        // Empty completion (no text, no tool calls, no reasoning) → fail over
+        // rather than return a transport-level "success" the caller can't act
+        // on. Mirrors the zero-chunk streaming case above, whose hasText check
+        // also counts bufferedReasoning — a reasoning-only turn IS a success.
         const respMsg = result.choices?.[0]?.message;
         const respText = contentToString(respMsg?.content ?? '');
-        if (!respText && (respMsg?.tool_calls?.length ?? 0) === 0) {
+        const respReasoning = [respMsg?.reasoning_content, ...REASONING_ALIAS_KEYS.map(k => (respMsg as unknown as Record<string, unknown> | undefined)?.[k])]
+          .find((v): v is string => typeof v === 'string' && v.trim().length > 0);
+        if (!respText && (respMsg?.tool_calls?.length ?? 0) === 0 && !respReasoning) {
           throw new Error(`empty completion from ${route.displayName}`);
         }
 
@@ -1693,7 +1693,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             content: respText,
             reasoning: respMsg.reasoning_content ?? '',
             toolNames: new Set((tools ?? []).map(t => t.function.name)),
-            isReasoningModel,
             wantsTools: (tools?.length ?? 0) > 0,
             hasExistingToolCalls: (respMsg.tool_calls?.length ?? 0) > 0,
           });
@@ -1751,6 +1750,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // so those see the placeholder text the model produced. Then run
         // the inbound interceptor (non-streaming only, per D2) to catch
         // new secrets the model emitted.
+        // Canonicalize provider reasoning wire-keys BEFORE un-redaction so
+        // aliases (LogFare/Ollama `reasoning`, CommandCode `reasoningContent`)
+        // land in `reasoning_content` and the un-redact block below covers
+        // them. Must run before the un-redact pass — canonicalizing after
+        // would leak redaction placeholders into the client's thinking
+        // stream. See lib/content.ts canonicalizeReasoningFields.
+        if (respMsg) {
+          canonicalizeReasoningFields(respMsg as unknown as Record<string, unknown>);
+        }
         if (middleSession && respMsg) {
           if (typeof respMsg.content === 'string') {
             respMsg.content = unredactResponseText(respMsg.content, middleSession);
@@ -1898,6 +1906,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         }
 
         if (keyAttempt < PER_KEY_RETRIES - 1) {
+          // Payment-required (402 / out of balance) cannot recover within this
+          // request — the account has no funds and that won't change in the
+          // next second. Burn the key on the FIRST probe so the router rotates
+          // to the next key on the same model immediately, instead of spending
+          // PER_KEY_RETRIES identical 402s on the same broke account. Falls
+          // into the same exhaustion block below: markExhausted + flat 90s
+          // cooldown (X1) + the ⚠ event, and the ⇄ key_switch on the next
+          // routeRequest. Never a permanent bench — the entry clears on that
+          // key's first success (1-RPM recovery) or on restart.
+          if (err?.status === 402 || isPaymentRequiredError(err)) {
+            lastError = err;
+            break keyRetry;
+          }
           // Genuine upstream rate-limit 429: don't retry same key immediately.
           // The old behavior fired 3 real upstream calls (PER_KEY_RETRIES) in
           // <1.5s on the SAME key with zero backoff — and that burst burns the
@@ -1931,6 +1952,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         break keyRetry;
       } else {
         // Non-retryable error (auth, 4xx, etc.): don't retry.
+        // Still bench this (platform, model, key) for the flat 90s cooldown:
+        // without it, sticky key selection would stay pinned to a key that
+        // cannot serve this model at all (a 401 key, an off-plan key), and
+        // every later request would die on it again. The cooldown is
+        // self-expiring, so this is a pause, not a permanent bench — the
+        // attempt loop skips the key while cooled and retries it afterwards.
+        const cool = classifyCooldownReason(err);
+        setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(isPaymentRequiredError(err)), cool.reason, cool.statusCode);
         const errorMsg = `Provider error (${route.displayName}): ${safeError}`;
         publish({ type: 'request.error', id: requestId, error: errorMsg, at: Date.now() });
         res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);

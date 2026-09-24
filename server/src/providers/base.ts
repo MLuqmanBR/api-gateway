@@ -6,6 +6,7 @@ import type {
   ChatToolChoice,
 } from '@api-gateway/shared/types.js';
 import { createAbortRace } from '../lib/abort.js';
+import { canonicalizeReasoningFields } from '../lib/content.js';
 
 /** A provider HTTP error carrying the upstream status. The router decides
  *  cooldown duration independently (flat 90s via X1) — upstream Retry-After
@@ -289,6 +290,13 @@ export abstract class BaseProvider {
           try {
             const chunk = JSON.parse(data) as ChatCompletionChunk;
             if (chunk.choices?.some(c => c.finish_reason != null)) sawFinishReason = true;
+            // Canonicalize provider reasoning wire-keys (LogFare/Ollama
+            // `reasoning`, CommandCode `reasoningContent`) to the gateway's
+            // canonical `reasoning_content` before any consumer sees the
+            // chunk. See lib/content.ts.
+            for (const c of chunk.choices ?? []) {
+              canonicalizeReasoningFields(c.delta as unknown as Record<string, unknown> | undefined);
+            }
             yield chunk;
           } catch {
             // Skip malformed chunks
@@ -306,6 +314,9 @@ export abstract class BaseProvider {
         try {
           const chunk = JSON.parse(data) as ChatCompletionChunk;
           if (chunk.choices?.some(c => c.finish_reason != null)) sawFinishReason = true;
+          for (const c of chunk.choices ?? []) {
+            canonicalizeReasoningFields(c.delta as unknown as Record<string, unknown> | undefined);
+          }
           yield chunk;
         } catch {
           // Skip malformed trailing frame

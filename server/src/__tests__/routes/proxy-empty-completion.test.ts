@@ -198,4 +198,89 @@ describe('Empty-completion failover', () => {
     expect(body.choices[0].message.tool_calls).toHaveLength(1);
     expect(chatCompletion).toHaveBeenCalledTimes(1);
   });
+
+  describe('reasoning-only completions are successes, not dead turns', () => {
+    beforeEach(() => {
+      getDb().prepare('DELETE FROM requests').run();
+    });
+
+    const expectNoBench = () => {
+      const db = getDb();
+      const cooldowns = db.prepare('SELECT COUNT(*) AS n FROM rate_limit_cooldowns').get() as { n: number };
+      expect(cooldowns.n).toBe(0);
+      const rows = db.prepare('SELECT status, error FROM requests ORDER BY id').all() as Array<{ status: string; error: string | null }>;
+      expect(rows.length).toBe(1);
+      expect(rows[0].status).toBe('success');
+    };
+
+    it('/v1/chat/completions (non-stream): reasoning_content-only is served, not failed over', async () => {
+      chatCompletion.mockResolvedValueOnce({
+        choices: [{ message: { role: 'assistant', content: '', reasoning_content: 'thinking…' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+      });
+
+      const { status, body } = await post(app, '/v1/chat/completions', {
+        messages: [{ role: 'user', content: 'hi' }],
+      }, key);
+
+      expect(status).toBe(200);
+      expect(chatCompletion).toHaveBeenCalledTimes(1);
+      expect(body.choices[0].message.reasoning_content).toBe('thinking…');
+      expectNoBench();
+    });
+
+    it('/v1/chat/completions (non-stream): the `reasoning` alias also rescues the turn', async () => {
+      chatCompletion.mockResolvedValueOnce({
+        choices: [{ message: { role: 'assistant', content: '', reasoning: 'alias thinking' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+      });
+
+      const { status, body } = await post(app, '/v1/chat/completions', {
+        messages: [{ role: 'user', content: 'hi' }],
+      }, key);
+
+      expect(status).toBe(200);
+      expect(chatCompletion).toHaveBeenCalledTimes(1);
+      // canonicalizeReasoningFields (runs later in the success path) promotes
+      // the alias to reasoning_content in the emitted body.
+      expect(body.choices[0].message.reasoning_content).toBe('alias thinking');
+      expectNoBench();
+    });
+
+    it('/v1/responses (non-stream): reasoning-only is served, not failed over', async () => {
+      chatCompletion.mockResolvedValueOnce({
+        choices: [{ message: { role: 'assistant', content: '', reasoning_content: 'thinking…' } }],
+        usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 },
+      });
+
+      const { status, body } = await post(app, '/v1/responses', {
+        input: 'hi',
+      }, key);
+
+      expect(status).toBe(200);
+      expect(chatCompletion).toHaveBeenCalledTimes(1);
+      expect(body.output_text ?? '').toBe('');
+      expect(body.status).toBe('completed');
+      expectNoBench();
+    });
+
+    it('/v1/responses (stream): a reasoning-only stream completes instead of failing over', async () => {
+      async function* reasoningOnlyStream() {
+        yield { choices: [{ delta: { reasoning_content: 'thinking ' } }] };
+        yield { choices: [{ delta: { reasoning_content: 'more' } }] };
+      }
+      streamChatCompletion.mockReturnValueOnce(reasoningOnlyStream());
+
+      const { status, raw } = await post(app, '/v1/responses', {
+        input: 'hi',
+        stream: true,
+      }, key);
+
+      expect(status).toBe(200);
+      expect(raw).toContain('response.completed');
+      expect(raw).not.toContain('response.failed');
+      expect(streamChatCompletion).toHaveBeenCalledTimes(1);
+      expectNoBench();
+    });
+  });
 });

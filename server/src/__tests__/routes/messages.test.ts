@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
 import type { Express } from 'express';
 import type { Server } from 'http';
 
@@ -95,6 +95,12 @@ describe('Anthropic /v1/messages inbound (F6)', () => {
     setMessagesHttpServer(null as unknown as Server);
   });
 
+  afterEach(() => {
+    // The streaming test installs a generator on streamChatCompletion; reset
+    // it so it can't leak into any later case in this file.
+    streamChatCompletion.mockReset();
+  });
+
   it('accepts x-api-key auth (Anthropic convention)', async () => {
     const res = await postMessages(app, key, {
       model: 'auto',
@@ -176,5 +182,64 @@ describe('Anthropic /v1/messages inbound (F6)', () => {
     expect(toolUseBlock).toEqual({
       type: 'tool_use', id: 'call_1', name: 'get_weather', input: { city: 'SF' },
     });
+  });
+
+  it('emits a thinking content block before the text block when upstream streams reasoning_content', async () => {
+    // The /v1/messages SSE translator must forward the canonical
+    // reasoning_content channel as Anthropic thinking_delta blocks — without
+    // this, Anthropic-format clients (Claude Code) lose the whole thinking
+    // stream. The non-streaming path already maps reasoning_content → a
+    // `thinking` block (anthropic-translate.ts), so this pins the streaming
+    // side to the same shape.
+    streamChatCompletion.mockImplementation(async function* () {
+      const chunk = (delta: Record<string, unknown>, finish: string | null = null) => ({
+        id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm',
+        choices: [{ index: 0, delta, finish_reason: finish }],
+      });
+      yield chunk({ reasoning_content: 'step one' });
+      yield chunk({ reasoning_content: 'step two' });
+      yield chunk({ content: 'answer' });
+      yield chunk({}, 'stop');
+    });
+
+    const server = app.listen(0);
+    const addr = server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${addr.port}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': key },
+      body: JSON.stringify({
+        model: 'auto', max_tokens: 100, stream: true,
+        messages: [{ role: 'user', content: 'Hi' }],
+      }),
+    });
+    const text = await res.text();
+    server.close();
+
+    const events = text.split('\n\n').filter(Boolean).map(block => {
+      const evLine = block.split('\n').find(l => l.startsWith('event: '));
+      const dataLine = block.split('\n').find(l => l.startsWith('data: '));
+      return {
+        event: evLine?.slice(7),
+        data: dataLine ? JSON.parse(dataLine.slice(6)) : null,
+      };
+    });
+
+    // Thinking block opens first, text block opens after it closes.
+    const blockStarts = events
+      .filter(e => e.event === 'content_block_start')
+      .map(e => e.data.content_block.type);
+    expect(blockStarts).toEqual(['thinking', 'text']);
+
+    // Every reasoning token is forwarded in order, exactly once.
+    const thinkingDeltas = events
+      .filter(e => e.data?.delta?.type === 'thinking_delta')
+      .map(e => e.data.delta.thinking);
+    expect(thinkingDeltas).toEqual(['step one', 'step two']);
+
+    // Visible content rides its own text_delta after the thinking block closed.
+    const textDeltas = events
+      .filter(e => e.data?.delta?.type === 'text_delta')
+      .map(e => e.data.delta.text);
+    expect(textDeltas).toEqual(['answer']);
   });
 });

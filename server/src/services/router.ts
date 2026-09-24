@@ -844,7 +844,14 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
       // We found a working key for this model!
       if (!oneRPM && !(stickyEnabled && options?.stickySessionKey)) {
-        roundRobinIndex.set(rrKey, (idx + attempt + 1) % keyOrder.length);
+        // Sticky selection: persist the SELECTED key's position so subsequent
+        // requests keep starting from the key that is actually working, instead
+        // of round-robinning to the next key on every request. Rotation now
+        // happens only when the current key fails a pre-check mid-loop
+        // (cooldown / rpm-tpm ledger / provider-minute cap): then `attempt`
+        // advances past it and the newly selected key's position is persisted,
+        // so the router sticks to the new key until IT fails a gate too.
+        roundRobinIndex.set(rrKey, (idx + attempt) % keyOrder.length);
       }
 
       // ── Parallel request gating (provider-level) ──

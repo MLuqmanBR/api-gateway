@@ -7,6 +7,7 @@ import {
   routeRequest,
   setRoutingStrategy,
 } from '../../services/router.js';
+import { setCooldown } from '../../services/ratelimit.js';
 
 describe('Router', () => {
   beforeAll(() => {
@@ -180,6 +181,51 @@ describe('Router', () => {
       modelDbId,
       count: 2,
       penalty: 3,
+    });
+  });
+
+  describe('sticky key selection', () => {
+    const insertGroqKey = (label: string) => {
+      const db = getDb();
+      const { encrypted, iv, authTag } = encrypt(`key-${label}`);
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run('groq', label, encrypted, iv, authTag, 'healthy', 1);
+    };
+
+    it('reuses the same key across consecutive routings while it stays healthy', () => {
+      insertGroqKey('s1');
+      insertGroqKey('s2');
+
+      const r1 = routeRequest();
+      r1.release();
+      const r2 = routeRequest();
+      r2.release();
+      const r3 = routeRequest();
+      r3.release();
+
+      expect(r1.platform).toBe('groq');
+      expect(r2.keyId).toBe(r1.keyId);
+      expect(r3.keyId).toBe(r1.keyId);
+    });
+
+    it('rotates when the current key is gated, then sticks to the new key', () => {
+      insertGroqKey('s1');
+      insertGroqKey('s2');
+
+      const first = routeRequest();
+      first.release();
+
+      setCooldown('groq', first.modelId, first.keyId, 60_000);
+
+      const second = routeRequest();
+      second.release();
+      expect(second.keyId).not.toBe(first.keyId);
+
+      const third = routeRequest();
+      third.release();
+      expect(third.keyId).toBe(second.keyId);
     });
   });
 });

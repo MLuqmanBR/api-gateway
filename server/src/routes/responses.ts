@@ -13,9 +13,8 @@ import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from
 import { clearExhausted } from '../services/key-exhaustion.js';
 import { recordCircuitSuccess } from '../services/circuit-breaker.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, REASONING_ALIAS_KEYS } from '../lib/content.js';
 import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
-import { isReasoningModelId } from '../lib/reasoning-model.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
@@ -237,6 +236,7 @@ export function buildResponseObject(opts: {
   toolCalls: ChatToolCall[];
   promptTokens: number;
   completionTokens: number;
+  reasoningTokens?: number;
 }) {
   const output: any[] = [];
   if (opts.text.length > 0) {
@@ -271,7 +271,7 @@ export function buildResponseObject(opts: {
       input_tokens: opts.promptTokens,
       input_tokens_details: { cached_tokens: 0 },
       output_tokens: opts.completionTokens,
-      output_tokens_details: { reasoning_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: opts.reasoningTokens ?? 0 },
       total_tokens: opts.promptTokens + opts.completionTokens,
     },
   };
@@ -446,14 +446,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     }
 
     let attemptEmitted = false; // per-attempt: true when real output emitted beyond the skeleton
-    // CoT families (MiniMax M2.x/M3, DeepSeek-R1, QwQ, …) return reasoning
-    // inline in `content` wrapped in `<think>` tags, or in a dedicated
-    // `reasoning_content` delta field. Same family gate as routes/proxy.ts —
-    // shared detector, see lib/reasoning-model.ts. Reasoning must never reach
-    // Codex's visible output_text; the Responses shim has no reasoning side
-    // channel, so extracted reasoning is dropped deliberately (the proxy maps
-    // it to `reasoning_content`, which has no equivalent here).
-    const isReasoningModel = isReasoningModelId(route.modelId);
+    // Some upstreams return reasoning inline in `content` wrapped in a
+    // reasoning tag pair, or in a dedicated `reasoning_content` delta field.
+    // Extraction runs for EVERY model: any model id may inline a reasoning
+    // block, and a model-id heuristic cannot know about a model added later.
+    // Reasoning must never reach Codex's visible output_text; the Responses
+    // shim has no reasoning side channel, so extracted reasoning is dropped
+    // deliberately (the proxy maps it to `reasoning_content`, which has no
+    // equivalent here).
     try {
       if (stream) {
         let outputIndex = 0;
@@ -489,13 +489,16 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // streamed normally). Mirrors the /chat/completions stream loop.
         let dialectMode: 'undecided' | 'passthrough' | 'dialect' = 'undecided';
         let heldText = '';
-        // Reasoning-family gate (C08): CoT models inline <think>…</think> in
-        // `content`. Strip it before the text reaches the dialect window or
-        // the client — the shim has no reasoning side channel, so extracted
-        // reasoning is dropped deliberately (same policy as the comment
-        // above). Null for non-reasoning models: zero overhead, no behavior
-        // change for models that never emit the tags.
-        const thinkStream = isReasoningModel ? new ThinkTagStream() : null;
+        // Inline-reasoning extraction. Strip a complete reasoning-tag pair
+        // before the text reaches the dialect window or the client — the shim
+        // has no reasoning side channel, so extracted reasoning is dropped
+        // deliberately (same policy as the comment above). Runs for every
+        // model: any model id may inline a reasoning block.
+        const thinkStream = new ThinkTagStream();
+        // Classification-only: a turn whose deltas carry ONLY reasoning is
+        // still a success (mirrors the proxy stream's hasText, which counts
+        // bufferedReasoning). Reasoning is never emitted as events.
+        let sawStreamReasoning = false;
 
         // Open the text output item and stream `text` as its first delta.
         const openTextItem = (text: string) => {
@@ -562,10 +565,19 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           if (!delta) continue;
 
           // Text deltas → output_text events on a single message item, after
-          // think-tag extraction (reasoning models) and the dialect hold
+          // inline-reasoning extraction and the dialect hold
           // window has decided the text is real prose.
           const rawText = delta.content ?? '';
-          const text = thinkStream && rawText ? thinkStream.feed(rawText).visible : rawText;
+          if (typeof (delta as Record<string, unknown>).reasoning_content === 'string'
+              && ((delta as Record<string, unknown>).reasoning_content as string).length > 0) {
+            sawStreamReasoning = true;
+          }
+          let text = rawText;
+          if (rawText) {
+            const fed = thinkStream.feed(rawText);
+            if (fed.reasoning.length > 0) sawStreamReasoning = true;
+            text = fed.visible;
+          }
           if (text) {
             totalOutputTokens += Math.ceil(text.length / 4);
             if (dialectMode === 'passthrough') {
@@ -635,11 +647,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           }
         }
 
-        // End-of-stream think flush: an unclosed <think> opener leaves its
-        // tail buffered; policy (lib/think-tags.ts) treats it as visible so
-        // the answer is never dropped. Feed it into the same dialect window
-        // the streamed text went through.
-        if (thinkStream) {
+        // End-of-stream extraction flush: an unclosed opener leaves its tail
+        // buffered; policy (lib/think-tags.ts) treats it as visible so the
+        // answer is never dropped. Feed it into the same dialect window the
+        // streamed text went through.
+        {
           const { residual } = thinkStream.flush();
           if (residual) heldText += residual;
         }
@@ -735,7 +747,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // calls (no matching `.done` — same as a truncated stream the client
         // already has to tolerate), so it's safe to fail over to the next
         // model on the same SSE stream.
-        if (msgText.length === 0 && finalToolCalls.length === 0) {
+        if (msgText.length === 0 && finalToolCalls.length === 0 && !sawStreamReasoning) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no valid tool_calls)', null, pinnedModelId, streamStarted);
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
           setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false), 'empty_completion');
@@ -767,10 +779,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         const msg = result.choices[0]?.message;
         let text = contentToString(msg?.content ?? '');
-        // C08: reasoning models may inline <think>…</think> in content —
-        // strip it so reasoning never reaches Codex's visible output_text.
-        if (isReasoningModel) {
-          text = extractThinkTags(text).visible;
+        // Reasoning may be inlined in content — strip it so reasoning never
+        // reaches Codex's visible output_text. A turn carrying ONLY reasoning
+        // is still a success (mirrors the proxy's streaming hasText, which
+        // counts bufferedReasoning): capture it for the dead-turn check below
+        // without changing what we emit. Runs for every model.
+        const ex = extractThinkTags(text);
+        text = ex.visible;
+        let sawReasoning = ex.reasoning.trim().length > 0;
+        if (!sawReasoning) {
+          sawReasoning = [msg?.reasoning_content, ...REASONING_ALIAS_KEYS.map(k => (msg as unknown as Record<string, unknown> | undefined)?.[k])]
+            .some((v): v is string => typeof v === 'string' && v.trim().length > 0);
         }
         let toolCalls = (msg?.tool_calls ?? []).map((tc) => ({
           ...tc,
@@ -797,7 +816,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         const completionTokens = result.usage?.completion_tokens ?? Math.ceil(text.length / 4);
 
         // Empty completion → fail over (see the streaming-path comment above).
-        if (!text && toolCalls.length === 0) {
+        if (!text && toolCalls.length === 0 && !sawReasoning) {
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId);
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
           setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(false), 'empty_completion');
@@ -839,6 +858,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         res.json(buildResponseObject({
           id: responseId, model: route.modelId, text, toolCalls,
           promptTokens, completionTokens,
+          reasoningTokens: result.usage?.completion_tokens_details?.reasoning_tokens ?? 0,
         }));
         publish({ type: 'request.done', id: responseId, model: route.modelId, provider: route.platform, keyId: route.keyId, latencyMs: Date.now() - start, tokens: { in: promptTokens, out: completionTokens }, at: Date.now() });
 
@@ -900,6 +920,12 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         continue;
       }
 
+      // Non-retryable: don't retry, but still cooldown this (platform, model,
+      // key) for the flat 90s. Sticky key selection would otherwise pin this
+      // key for every later request on this model; the cooldown lets the
+      // attempt loop skip it and self-expires (never a permanent bench).
+      const cool = classifyCooldownReason(err);
+      setCooldown(route.platform, route.modelId, route.keyId, computeRetryCooldownMs(isPaymentRequiredError(err)), cool.reason, cool.statusCode);
       res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type: 'provider_error' } });
       publish({ type: 'request.error', id: responseId, error: safeError.slice(0, 300), at: Date.now() });
       return;

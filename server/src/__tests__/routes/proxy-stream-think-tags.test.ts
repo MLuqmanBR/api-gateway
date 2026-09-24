@@ -4,17 +4,16 @@ import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { mintDashboardToken } from '../helpers/auth.js';
 
-// `` tag extraction integration (proxy.ts hold-window): the proxy
-// must split inline `` reasoning from the visible answer for
-// models that match the reasoning-pattern gate. Non-reasoning
-// models pass through unchanged.
+// Inline-reasoning tag extraction integration (proxy.ts hold-window): the
+// proxy must split an inline reasoning block from the visible answer for
+// EVERY model — extraction is not gated on the model id.
 //
 // The mock upstream intercepts provider URLs (cerebras, mistral,
 // groq, etc.). We pin each test to a model id that exists in the
 // seeded catalog and add a key for the platform so the route has a
 // real (mocked) target. Reasoning tests use mistral/magistral-*
 // (matches the 'magistral' gate); the negative test uses
-// groq/llama-3.3-70b-versatile (does not match the gate).
+// groq/llama-3.3-70b-versatile (no reasoning-family match).
 
 async function request(app: Express, path: string, body: Record<string, unknown>, extraHeaders: Record<string, string> = {}) {
   const server = app.listen(0);
@@ -131,15 +130,12 @@ describe('proxy stream think-tag extraction', () => {
     expect(reasoningDeltas.join('')).toContain('The user wants a simple answer.');
   });
 
-  it('passes literal `` tags through unchanged for a non-reasoning model', async () => {
-    // groq/llama-3.3-70b-versatile does not match the gate. The gate
-    // is on model id, not on content presence. A non-reasoning model
-    // that produces a literal tag in its answer (synthetic) is left
-    // alone.
+  it('extracts a long-form reasoning block for a model id outside any reasoning-family heuristic', async () => {
     mockUpstream([{
       body: sse(
         roleChunk,
-        textChunk('hello world <think>not extracted</think> done'),
+        textChunk('<thinking>Weighing options.</thinking>The answer'),
+        textChunk(' is 42.'),
         finishChunk('stop'),
         '[DONE]',
       ),
@@ -147,17 +143,39 @@ describe('proxy stream think-tag extraction', () => {
     const r = await request(app, '/v1/chat/completions', {
       stream: true,
       model: 'groq/llama-3.3-70b-versatile',
-      messages: [{ role: 'user', content: 'tag passthrough test' }],
+      messages: [{ role: 'user', content: 'long-form tag stream test' }],
     });
     expect(r.status).toBe(200);
     const fs = frames(r.text);
     const textContent = fs.map(f => f.choices?.[0]?.delta?.content ?? '').join('');
-    // The literal tags survive.
-    expect(textContent).toContain('<think>');
-    expect(textContent).toContain('</think>');
-    // No reasoning_content delta is emitted.
-    const reasoningDeltas = fs.map(f => f.choices?.[0]?.delta?.reasoning_content ?? '').filter(s => s.length > 0);
-    expect(reasoningDeltas).toHaveLength(0);
+    expect(textContent).not.toContain('<thinking>');
+    expect(textContent).not.toContain('</thinking>');
+    expect(textContent).toBe('The answer is 42.');
+    const reasoningJoined = fs.map(f => f.choices?.[0]?.delta?.reasoning_content ?? '').join('');
+    expect(reasoningJoined).toBe('Weighing options.');
+  });
+
+  it('holds a partial long-form opener split across chunks', async () => {
+    mockUpstream([{
+      body: sse(
+        roleChunk,
+        textChunk('answer <thi'),
+        textChunk('nking>r</thinking>done'),
+        finishChunk('stop'),
+        '[DONE]',
+      ),
+    }]);
+    const r = await request(app, '/v1/chat/completions', {
+      stream: true,
+      model: 'groq/llama-3.3-70b-versatile',
+      messages: [{ role: 'user', content: 'split long-form opener test' }],
+    });
+    expect(r.status).toBe(200);
+    const fs = frames(r.text);
+    const textContent = fs.map(f => f.choices?.[0]?.delta?.content ?? '').join('');
+    expect(textContent).toBe('answer done');
+    const reasoningJoined = fs.map(f => f.choices?.[0]?.delta?.reasoning_content ?? '').join('');
+    expect(reasoningJoined).toBe('r');
   });
 
   it('extracts a think block split across multiple chunks', async () => {
