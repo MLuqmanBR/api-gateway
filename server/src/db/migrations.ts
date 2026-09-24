@@ -88,6 +88,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV48ModelCacheTelemetry(db);
   migrateSchemaV49ModelModalities(db);
   migrateSchemaV50TranscriptionShape(db);
+  migrateSchemaV51RealtimeModels(db);
   // Unguarded every-boot pass: writes the generated modality index onto model
   // rows that are not operator-owned (modalities_manual = 0). Runs AFTER the
   // schema migration so the columns exist, and is idempotent — a second boot
@@ -2175,6 +2176,16 @@ function migrateEmbeddingsV1(db: DatabasePort) {
 // and is NOT seeded; voxtral-mini-2602 is the sole Mistral entry.
 function migrateTranscriptionsV1(db: DatabasePort) {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS realtime_models (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 1,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(platform, model_id)
+    );
+
     CREATE TABLE IF NOT EXISTS transcription_models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       family TEXT NOT NULL,
@@ -2865,6 +2876,21 @@ function migrateSchemaV49ModelModalities(db: DatabasePort) {
 // provider registry at any moment (`resolveAudioEndpoint`), and a stored copy
 // would go stale the moment an operator edits a base URL. The dashboard asks
 // the service for it live.
+// V51 (2026-09-24): the realtime catalog.
+//
+// /v1/realtime proxies a genuine upstream Realtime websocket, so it needs to
+// know WHICH upstream: a (platform, model) pair whose provider has an enabled
+// key. The table exists (createTables above) but is seeded EMPTY on purpose —
+// a realtime model is only usable if the operator has a provider that actually
+// serves it, and guessing catalog rows for a protocol whose availability
+// changes per account would produce rows that look configured and then fail.
+// The dashboard's Realtime tab adds rows; the relay reports a clear error when
+// none exist.
+function migrateSchemaV51RealtimeModels(_db: DatabasePort) {
+  // Schema only — createTables owns the DDL. Kept as a named step so the
+  // version history is readable and a future data seed has an obvious home.
+}
+
 function migrateSchemaV50TranscriptionShape(db: DatabasePort) {
   const columns = db.prepare('PRAGMA table_info(transcription_models)').all() as { name: string }[];
   if (!columns.some(col => col.name === 'shape')) {

@@ -1,15 +1,18 @@
 /**
  * F11: WebSocket Realtime API ingress (/v1/realtime).
  *
- * Accepts WebSocket upgrades on /v1/realtime, translates inbound Realtime
- * API events to chat completions, and streams responses back as Realtime
- * envelope events (response.created → response.output_text.delta →
- * response.completed).
+ * Proxies a client's Realtime session to a REAL upstream Realtime websocket.
+ * The gateway is a relay, not an implementation: it resolves which upstream
+ * serves the session, opens the upstream socket, and forwards frames in both
+ * directions.
+ *
+ * An earlier version answered `input_audio_buffer.append` with a canned
+ * `input_audio_buffer.committed` ack and looped `response.create` back through
+ * the gateway's own /v1/chat/completions. That made realtime audio look like
+ * it worked while silently discarding every audio byte, so the ack is gone and
+ * the audio path is now a straight relay.
  *
  * Transport: raw `ws` package (per walkthrough D-FEATURES-2).
- * Audio: 16kHz PCM (not yet — text-only for now; audio passthrough is a
- * future extension via contentToString).
- *
  * Auth: unified bearer OR x-api-key header (same as /v1/messages).
  *
  * Attribution: concept from codex-proxy (MIT, server.py::responses_ws).
@@ -19,16 +22,17 @@ import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
 import type { Request } from 'express';
 import { extractApiToken, authenticateRequest } from '../routes/proxy.js';
+import { getDb } from '../db/index.js';
+import { buildProviderFor } from '../providers/index.js';
+import { decrypt } from '../lib/crypto.js';
 import { publish } from './events.js';
 import crypto from 'crypto';
 
 let wss: WebSocketServer | null = null;
-let httpServer: Server | null = null;
 
 /** Attach the WebSocket server to an HTTP server. Call once at startup. */
 export function attachRealtimeServer(server: Server): void {
   wss = new WebSocketServer({ noServer: true });
-  httpServer = server;
 
   server.on('upgrade', (req, socket, head) => {
     // Only handle /v1/realtime upgrades — any other upgrade request MUST be
@@ -54,237 +58,171 @@ export function attachRealtimeServer(server: Server): void {
   });
 }
 
+// ── Catalog ────────────────────────────────────────────────────────────────
+
+export interface RealtimeModelRow {
+  id: number;
+  platform: string;
+  model_id: string;
+  display_name: string;
+  priority: number;
+  enabled: number;
+}
+
+export function listRealtimeModels(): RealtimeModelRow[] {
+  return getDb().prepare(
+    'SELECT * FROM realtime_models ORDER BY priority, id',
+  ).all() as RealtimeModelRow[];
+}
+
+/**
+ * Resolve the upstream Realtime endpoint for a catalog row.
+ *
+ * OpenAI-shaped providers put realtime at `${ws(s) base}/realtime?model=...`.
+ * Deriving it from the provider's base URL (rather than storing a second URL)
+ * means an operator who fixes a provider's base URL fixes chat, audio and
+ * realtime in one edit.
+ *
+ * Returns null when the platform has no resolvable base URL.
+ */
+export function resolveRealtimeUrl(platform: string, modelId: string): string | null {
+  const provider = buildProviderFor(platform);
+  const base = provider?.baseUrl?.replace(/\/+$/, '');
+  if (!base) return null;
+  const wsBase = base.replace(/^http:/, 'ws:').replace(/^https:/, 'wss:');
+  return `${wsBase}/realtime?model=${encodeURIComponent(modelId)}`;
+}
+
+/** First enabled catalog row whose platform has an enabled key, or null. */
+function pickRealtimeTarget(): { row: RealtimeModelRow; apiKey: string } | null {
+  const db = getDb();
+  for (const row of listRealtimeModels()) {
+    if (row.enabled !== 1) continue;
+    if (!resolveRealtimeUrl(row.platform, row.model_id)) continue;
+    const keyRow = db.prepare(
+      "SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY id LIMIT 1",
+    ).get(row.platform) as { encrypted_key: string; iv: string; auth_tag: string } | undefined;
+    if (!keyRow) continue;
+    try {
+      return { row, apiKey: decrypt(keyRow.encrypted_key, keyRow.iv, keyRow.auth_tag) };
+    } catch {
+      continue; // undecryptable — try the next row
+    }
+  }
+  return null;
+}
+
+// ── Session ────────────────────────────────────────────────────────────────
+
 interface RealtimeSession {
   ws: WebSocket;
-  token: string;
   requestId: string;
+  upstream: WebSocket | null;
+  target: { row: RealtimeModelRow; apiKey: string } | null;
+}
+
+function send(ws: WebSocket, payload: Record<string, unknown>): void {
+  if (ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ event_id: crypto.randomUUID(), ...payload }));
 }
 
 function handleConnection(ws: WebSocket, token: string): void {
+  void token;
   const session: RealtimeSession = {
     ws,
-    token,
     requestId: crypto.randomUUID(),
+    upstream: null,
+    target: pickRealtimeTarget(),
   };
 
-  // Send initial connection event
-  ws.send(JSON.stringify({
-    type: 'realtime.connected',
-    event_id: crypto.randomUUID(),
-    session_id: session.requestId,
-  }));
+  // Connect to the upstream BEFORE announcing readiness, so a client that
+  // starts appending audio immediately is not racing a socket that does not
+  // exist yet.
+  const target = session.target;
+  if (!target) {
+    // No realtime upstream is configured. Say so plainly: this is the honest
+    // failure mode, and it must NOT look like a working session.
+    send(ws, {
+      type: 'error',
+      error: {
+        type: 'invalid_request_error',
+        code: 'no_realtime_model',
+        message:
+          'No realtime model is configured. Add a realtime-capable provider and model '
+          + 'in the dashboard (Realtime tab) and ensure its platform has an enabled API key. '
+          + '/v1/realtime proxies a real upstream session; it does not synthesize audio.',
+      },
+    });
+    ws.close();
+    return;
+  }
 
-  ws.on('message', async (data) => {
-    // H20: any throw inside this async handler becomes an unhandled
-    // rejection, and index.ts exits the process on those — one bad client
-    // message (e.g. a send on a half-closed socket) must never kill the
-    // gateway. Contain everything; report and close on unexpected errors.
+  const url = resolveRealtimeUrl(target.row.platform, target.row.model_id)!;
+  const upstream = new WebSocket(url, {
+    // OpenAI-style realtime auth. Providers that want a different header can
+    // be added by extending this object — the relay itself is header-agnostic.
+    headers: { Authorization: `Bearer ${target.apiKey}` },
+  });
+  session.upstream = upstream;
+
+  upstream.on('open', () => {
+    send(ws, {
+      type: 'realtime.connected',
+      session_id: session.requestId,
+      model: `${target.row.platform}/${target.row.model_id}`,
+    });
+  });
+
+  upstream.on('message', (data) => {
+    // Relay frames verbatim: the upstream speaks the same Realtime protocol
+    // the client does, so any translation here would only lose information.
+    if (ws.readyState === WebSocket.OPEN) ws.send(data.toString());
+  });
+
+  upstream.on('error', (err: Error) => {
+    send(ws, {
+      type: 'error',
+      error: { type: 'server_error', message: `upstream realtime error: ${err.message}` },
+    });
+  });
+
+  upstream.on('close', (code: number, reason: Buffer) => {
+    send(ws, {
+      type: 'session.closed',
+      upstream_code: code,
+      upstream_reason: reason.toString().slice(0, 200),
+    });
+    if (ws.readyState === WebSocket.OPEN) ws.close();
+  });
+
+  ws.on('message', (data) => {
     try {
-      let event: any;
+      const raw = data.toString();
+      // Validate it is JSON so a malformed frame is reported to the client
+      // rather than forwarded upstream as garbage.
       try {
-        event = JSON.parse(data.toString());
+        JSON.parse(raw);
       } catch {
-        ws.send(JSON.stringify({
-          type: 'error',
-          error: { type: 'invalid_request', message: 'Invalid JSON' },
-        }));
+        send(ws, { type: 'error', error: { type: 'invalid_request', message: 'Invalid JSON' } });
         return;
       }
-
-    // Handle the main event types
-    switch (event.type) {
-      case 'session.update':
-        // Acknowledge session config update
-        ws.send(JSON.stringify({
-          type: 'session.updated',
-          event_id: crypto.randomUUID(),
-          session: event.session ?? {},
-        }));
-        break;
-
-      case 'response.create':
-        await handleResponseCreate(session, event);
-        break;
-
-      case 'response.cancel':
-        ws.send(JSON.stringify({
-          type: 'response.cancelled',
-          event_id: crypto.randomUUID(),
-          response_id: event.response_id ?? '',
-        }));
-        break;
-
-      case 'input_audio_buffer.append':
-        // Audio buffer append — for now, acknowledge (text-only mode)
-        ws.send(JSON.stringify({
-          type: 'input_audio_buffer.committed',
-          event_id: crypto.randomUUID(),
-          audio_end_ms: 0,
-        }));
-        break;
-
-      default:
-        // Unknown event — acknowledge silently
-        break;
-    }
+      // Forward verbatim — including input_audio_buffer.append. No canned ack:
+      // the upstream's own commit/acknowledgement events are what the client
+      // must see, and inventing one here is what made the old implementation
+      // look functional while dropping every audio byte.
+      if (upstream.readyState === WebSocket.OPEN) upstream.send(raw);
     } catch (err) {
-      // Contained (H20): log and close the offending socket — the server
-      // keeps serving every other connection.
-      console.error('[Realtime] message handler error:', err instanceof Error ? err.message : err);
-      try {
-        ws.send(JSON.stringify({
-          type: 'error',
-          error: { type: 'server_error', message: 'Internal realtime error' },
-        }));
-      } catch { /* socket already gone */ }
-      ws.close();
+      console.error('[Realtime] relay error:', err instanceof Error ? err.message : err);
+    }
+  });
+
+  ws.on('close', () => {
+    if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) {
+      upstream.close();
     }
   });
 
   ws.on('error', () => {
-    // Swallow — the close handler will clean up
+    // Swallow — the close handler cleans up.
   });
-}
-
-async function handleResponseCreate(session: RealtimeSession, event: any): Promise<void> {
-  const responseId = crypto.randomUUID();
-  // One output item per response — every text event for this response must
-  // carry the SAME item_id so clients can correlate item-scoped events
-  // (regenerating it per delta made each delta look like a new item).
-  const itemId = crypto.randomUUID();
-  const { ws, token } = session;
-
-  // Extract the conversation context from the event
-  const input = event.response?.input ?? [];
-  const instructions = event.response?.instructions ?? '';
-
-  // Build messages for the chat completions request
-  const messages: any[] = [];
-  if (instructions) {
-    messages.push({ role: 'system', content: instructions });
-  }
-  for (const item of input) {
-    if (item.type === 'message' && item.role && item.content) {
-      const text = typeof item.content === 'string'
-        ? item.content
-        : Array.isArray(item.content)
-          ? item.content.map((c: any) => c.text ?? '').join('')
-          : '';
-      messages.push({ role: item.role, content: text });
-    }
-  }
-
-  if (messages.length === 0) {
-    ws.send(JSON.stringify({
-      type: 'error',
-      error: { type: 'invalid_request', message: 'No input provided' },
-    }));
-    return;
-  }
-
-  // Emit response.created
-  ws.send(JSON.stringify({
-    type: 'response.created',
-    event_id: crypto.randomUUID(),
-    response: {
-      id: responseId,
-      object: 'realtime.response',
-      status: 'in_progress',
-      output: [],
-    },
-  }));
-
-  // Announce the output item before streaming deltas into it.
-  ws.send(JSON.stringify({
-    type: 'response.output_text.started',
-    event_id: crypto.randomUUID(),
-    response_id: responseId,
-    item_id: itemId,
-    output_index: 0,
-    content_index: 0,
-  }));
-
-  try {
-    // Dispatch through the internal chat completions endpoint (streaming)
-    const port = (() => {
-      const addr = httpServer?.address();
-      return addr && typeof addr === 'object' ? addr.port : 3001;
-    })();
-    const subRes = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        model: 'auto',
-        messages,
-        stream: true,
-      }),
-    });
-
-    if (!subRes.ok) {
-      const errBody = await subRes.json().catch(() => ({})) as { error?: { message?: string } };
-      ws.send(JSON.stringify({
-        type: 'error',
-        error: {
-          type: 'server_error',
-          message: errBody?.error?.message ?? `Upstream error ${subRes.status}`,
-        },
-      }));
-      return;
-    }
-
-    // Stream the response text as Realtime events
-    const reader = subRes.body!.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const data = line.slice(6).trim();
-        if (data === '[DONE]') continue;
-
-        try {
-          const chunk = JSON.parse(data);
-          const delta = chunk.choices?.[0]?.delta;
-          if (delta?.content) {
-            ws.send(JSON.stringify({
-              type: 'response.output_text.delta',
-              event_id: crypto.randomUUID(),
-              response_id: responseId,
-              item_id: itemId,
-              delta: delta.content,
-              output_index: 0,
-              content_index: 0,
-            }));
-          }
-        } catch { /* skip */ }
-      }
-    }
-
-    // Emit response.completed
-    ws.send(JSON.stringify({
-      type: 'response.completed',
-      event_id: crypto.randomUUID(),
-      response: {
-        id: responseId,
-        object: 'realtime.response',
-        status: 'completed',
-        output: [],
-      },
-    }));
-  } catch (err: any) {
-    ws.send(JSON.stringify({
-      type: 'error',
-      error: { type: 'server_error', message: err.message ?? 'Internal error' },
-    }));
-  }
 }

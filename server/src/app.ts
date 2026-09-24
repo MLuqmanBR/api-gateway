@@ -19,6 +19,7 @@ import { messagesRouter } from './routes/messages.js';
 import { fallbackRouter } from './routes/fallback.js';
 import { embeddingsRouter } from './routes/embeddings.js';
 import { transcriptionsRouter } from './routes/transcriptions.js';
+import { realtimeRouter } from './routes/realtime.js';
 import { audioRouter } from './routes/audio.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
@@ -128,6 +129,7 @@ export function createApp() {
   app.use('/api/fallback', fallbackRouter);
   app.use('/api/embeddings', embeddingsRouter);
   app.use('/api/transcriptions', transcriptionsRouter);
+  app.use('/api/realtime', realtimeRouter);
   app.use('/api/events', eventsRouter);
   app.use('/api/analytics', analyticsRouter);
   app.use('/api/health', healthRouter);
