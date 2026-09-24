@@ -357,6 +357,61 @@ describe('Custom providers (#230)', () => {
     expect(model?.context_window).toBe(65536);
   });
 
+  it('PATCH /api/custom-models/:id resetModalities hands the row back to the catalog index', async () => {
+    // Ownership has to be reversible: the dashboard sets modalities_manual on
+    // any toggle, and without this an operator who toggled a modality by
+    // mistake could never get catalog data back for that row.
+    await request(app, 'POST', '/api/custom-providers', {
+      slug: 'resettable', displayName: 'R', baseUrl: 'http://r.example.com/v1',
+    });
+    const { body: created } = await request(app, 'POST', '/api/custom-providers/resettable/models', {
+      modelId: 'a-model-the-index-does-not-know', displayName: 'Unknown Model',
+    });
+
+    // Toggle a modality: this must set the ownership flag.
+    await request(app, 'PATCH', `/api/custom-models/${created.id}`, {
+      supportsAudioInput: true,
+      supportsVideoInput: true,
+    });
+    const owned = getDb().prepare(
+      'SELECT supports_audio_input a, supports_video_input d, modalities_manual m FROM models WHERE id = ?',
+    ).get(created.id) as { a: number; d: number; m: number };
+    expect(owned.m).toBe(1);
+
+    // Reset: the flag clears and the flags are recomputed from the index (this
+    // model is absent from the index, so they fall back to the row's own
+    // values with the adapter cap applied — the point is that the flag clears
+    // and the recompute actually runs).
+    const { status } = await request(app, 'PATCH', `/api/custom-models/${created.id}`, {
+      resetModalities: true,
+    });
+    expect(status).toBe(200);
+
+    const after = getDb().prepare(
+      'SELECT supports_audio_input a, supports_video_input d, modalities_manual m FROM models WHERE id = ?',
+    ).get(created.id) as { a: number; d: number; m: number };
+    expect(after.m).toBe(0);
+  });
+
+  it('PATCH without resetModalities keeps a row operator-owned', async () => {
+    // The flag must NOT be cleared by an ordinary edit, or every unrelated
+    // save would silently hand the row back to the boot-time index.
+    await request(app, 'POST', '/api/custom-providers', {
+      slug: 'stillowned', displayName: 'S', baseUrl: 'http://s.example.com/v1',
+    });
+    const { body: created } = await request(app, 'POST', '/api/custom-providers/stillowned/models', {
+      modelId: 'owned-model', displayName: 'Owned',
+    });
+    await request(app, 'PATCH', `/api/custom-models/${created.id}`, { supportsAudioInput: true });
+    await request(app, 'PATCH', `/api/custom-models/${created.id}`, { displayName: 'Owned (renamed)' });
+
+    const row = getDb().prepare(
+      'SELECT supports_audio_input a, modalities_manual m FROM models WHERE id = ?',
+    ).get(created.id) as { a: number; m: number };
+    expect(row.m).toBe(1);
+    expect(row.a).toBe(1);
+  });
+
   it('DELETE /api/custom-models/:id archives the model and removes its fallback entry', async () => {
     await request(app, 'POST', '/api/custom-providers', {
       slug: 'removable', displayName: 'R', baseUrl: 'http://r.example.com/v1',
