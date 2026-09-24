@@ -383,8 +383,9 @@ function applyModels(
           `SELECT display_name, intelligence_rank, speed_rank, size_label,
                   rpm_limit, rpd_limit, tpm_limit, tpd_limit,
                   monthly_token_budget, context_window, enabled,
-                  supports_vision, max_output_tokens,
-                  paid_input_per_m, paid_output_per_m, pricing_manual
+                  supports_vision, supports_audio_input, supports_video_input,
+                  modalities_manual,
+                  max_output_tokens, paid_input_per_m, paid_output_per_m, pricing_manual
            FROM models WHERE id = ?`,
         ).get(existing.id) as {
           display_name: string; intelligence_rank: number; speed_rank: number;
@@ -392,6 +393,8 @@ function applyModels(
           tpm_limit: number | null; tpd_limit: number | null;
           monthly_token_budget: string; context_window: number | null;
           enabled: number; supports_vision: number;
+          supports_audio_input: number; supports_video_input: number;
+          modalities_manual: number;
           max_output_tokens: number | null; paid_input_per_m: number | null;
           paid_output_per_m: number | null; pricing_manual: number;
         };
@@ -415,6 +418,13 @@ function applyModels(
           sameAsRow(current.context_window, m.contextWindow) &&
           current.enabled === (m.enabled ? 1 : 0) &&
           current.supports_vision === (m.supportsVision ? 1 : 0) &&
+          // A file with no modality fields (exported before the columns
+          // existed) is not "identical" — fall through to UPDATE so the
+          // destination keeps its own flags and the manual marker is set.
+          m.supportsAudioInput !== undefined &&
+          m.supportsVideoInput !== undefined &&
+          current.supports_audio_input === (m.supportsAudioInput ? 1 : 0) &&
+          current.supports_video_input === (m.supportsVideoInput ? 1 : 0) &&
           sameAsRow(current.max_output_tokens, m.maxOutputTokens) &&
           sameAsRow(current.paid_input_per_m, m.paidInputPerM) &&
           sameAsRow(current.paid_output_per_m, m.paidOutputPerM) &&
@@ -429,12 +439,17 @@ function applyModels(
           diff.skipped++;
           continue;
         }
+        // Modality fields are OPTIONAL in the file. Absent means "no opinion":
+        // keep the destination's own flags rather than zeroing them, and leave
+        // modalities_manual alone. Present means the file is authoritative.
+        const hasModalityData = m.supportsAudioInput !== undefined || m.supportsVideoInput !== undefined;
         db.prepare(`
           UPDATE models SET
             display_name = ?, intelligence_rank = ?, speed_rank = ?,
             size_label = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?,
             monthly_token_budget = ?, context_window = ?, enabled = ?,
             supports_vision = ?, max_output_tokens = ?,
+            supports_audio_input = ?, supports_video_input = ?, modalities_manual = ?,
             paid_input_per_m = ?, paid_output_per_m = ?, pricing_manual = 1
           WHERE id = ?
         `).run(
@@ -442,6 +457,13 @@ function applyModels(
           m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,
           m.monthlyTokenBudget, m.contextWindow, m.enabled ? 1 : 0,
           m.supportsVision ? 1 : 0, m.maxOutputTokens,
+          m.supportsAudioInput === undefined
+            ? current.supports_audio_input
+            : (m.supportsAudioInput ? 1 : 0),
+          m.supportsVideoInput === undefined
+            ? current.supports_video_input
+            : (m.supportsVideoInput ? 1 : 0),
+          hasModalityData ? 1 : current.modalities_manual,
           m.paidInputPerM, m.paidOutputPerM,
           existing.id,
         );
@@ -453,13 +475,19 @@ function applyModels(
           INSERT INTO models (platform, model_id, display_name, intelligence_rank,
             speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit,
             monthly_token_budget, context_window, enabled, supports_vision,
+            supports_audio_input, supports_video_input, modalities_manual,
             max_output_tokens, paid_input_per_m, paid_output_per_m, pricing_manual)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         `).run(
           m.platform, m.modelId, m.displayName, m.intelligenceRank,
           m.speedRank, m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,
           m.monthlyTokenBudget, m.contextWindow, m.enabled ? 1 : 0,
-          m.supportsVision ? 1 : 0, m.maxOutputTokens,
+          m.supportsVision ? 1 : 0,
+          m.supportsAudioInput ? 1 : 0,
+          m.supportsVideoInput ? 1 : 0,
+          // A file with no modality data leaves the row to the boot index.
+          m.supportsAudioInput !== undefined || m.supportsVideoInput !== undefined ? 1 : 0,
+          m.maxOutputTokens,
           m.paidInputPerM, m.paidOutputPerM,
         );
         diff.added++;

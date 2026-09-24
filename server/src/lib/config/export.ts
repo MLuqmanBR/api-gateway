@@ -67,6 +67,7 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
         SELECT platform, model_id, display_name, intelligence_rank, speed_rank,
                size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit,
                monthly_token_budget, context_window, enabled, supports_vision,
+               supports_audio_input, supports_video_input, modalities_manual,
                max_output_tokens, paid_input_per_m, paid_output_per_m
         FROM models
       `).all() as Array<{
@@ -76,6 +77,8 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
         tpm_limit: number | null; tpd_limit: number | null;
         monthly_token_budget: string; context_window: number | null;
         enabled: number; supports_vision: number;
+        supports_audio_input: number; supports_video_input: number;
+        modalities_manual: number;
         max_output_tokens: number | null;
         paid_input_per_m: number | null; paid_output_per_m: number | null;
       }>;
@@ -94,6 +97,9 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
         contextWindow: r.context_window,
         enabled: r.enabled === 1,
         supportsVision: r.supports_vision === 1,
+        supportsAudioInput: r.supports_audio_input === 1,
+        supportsVideoInput: r.supports_video_input === 1,
+        modalitiesManual: r.modalities_manual === 1,
         maxOutputTokens: r.max_output_tokens,
         paidInputPerM: r.paid_input_per_m,
         paidOutputPerM: r.paid_output_per_m,

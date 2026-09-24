@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, contentHasMedia } from '../lib/content.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 /**
  * Cloudflare Workers AI provider.
@@ -35,8 +35,20 @@ export class CloudflareProvider extends BaseProvider {
   //   - rejects `content: null` on assistant messages that carry tool_calls,
   //     even though the OpenAI spec allows it (collapse to '');
   //   - doesn't accept the array content envelope, so flatten to string.
+  //
+  // That flattening DESTROYS media blocks, which is why every Cloudflare
+  // modality flag is forced to 0 by applyModalityIndex's adapter cap — the
+  // router never routes image/audio/video here in the first place. If a media
+  // block does arrive, warn instead of dropping it silently: that means the
+  // cap was bypassed (a manual operator edit on the flag).
   private normalizeMessages(messages: ChatMessage[]): ChatMessage[] {
-    return messages.map(m => ({ ...m, content: contentToString(m.content) }));
+    const out = messages.map(m => ({ ...m, content: contentToString(m.content) }));
+    if (messages.some(m => contentHasMedia(m.content, 'image')
+      || contentHasMedia(m.content, 'audio')
+      || contentHasMedia(m.content, 'video'))) {
+      console.warn('[cloudflare] dropping media content block(s): the compat endpoint cannot express them');
+    }
+    return out;
   }
 
   /** Assemble the request body shared by both call paths. Thinking knobs

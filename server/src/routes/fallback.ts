@@ -73,7 +73,8 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.tpm_limit, m.tpd_limit, m.monthly_token_budget,
-           m.context_window, m.max_output_tokens, m.supports_vision, m.thinking_levels
+           m.context_window, m.max_output_tokens, m.supports_vision,
+           m.supports_audio_input, m.supports_video_input, m.thinking_levels
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     WHERE m.enabled = 1
@@ -115,6 +116,8 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       contextWindow: r.context_window,
       maxOutputTokens: r.max_output_tokens,
       supportsVision: r.supports_vision === 1,
+      supportsAudioInput: r.supports_audio_input === 1,
+      supportsVideoInput: r.supports_video_input === 1,
       thinkingLevels: parseStoredThinkingLevels(r.thinking_levels),
       keyCount: keyCountMap.get(r.platform) ?? 0,
     };

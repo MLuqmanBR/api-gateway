@@ -197,14 +197,17 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
 //                              chat-completions `max_tokens` request param
 //                              semantics (clients read it from the listing
 //                              rather than probing).
-//   - `modalities.input`       ["text"] by default; ["text","image"] when
-//                              `supports_vision=1`.
+//   - `modalities.input`       ["text"] plus "image"/"audio"/"video" for each
+//                              modality flag set on the row. The flags are
+//                              real per-model data (see db/modality-index.ts
+//                              and migrations.ts applyModalityIndex), not id
+//                              patterns, so a client can trust them.
 //   - `modalities.output`      ["text"] — none of the catalog models emit
-//                              image/audio, so clients only need image-input
-//                              awareness, not image-generation output flags.
+//                              image/audio/video, so output is always text.
 //   - `capabilities.tool_calls` is always true: tool calling is assumed
 //                              for every catalog model.
-//   - `capabilities.vision`    mirrors `supports_vision` rule-based flag.
+//   - `capabilities.vision` / `audio_input` / `video_input` mirror the three
+//                              modality columns.
 //   - `capabilities.json_mode` true: every chat-completions model here
 //                              accepts OpenAI `response_format` (the proxy
 //                              already translates that for non-OpenAI
@@ -222,6 +225,8 @@ function buildModelCapabilities(
   maxOutputTokens: number | null,
   supportsVision: boolean,
   thinkingLevelsRaw: string | null,
+  supportsAudioInput = false,
+  supportsVideoInput = false,
 ) {
   // Thinking capability is DATA-DRIVEN, never id-pattern-matched: the
   // dashboard is the single source of truth. Untouched rows (NULL column)
@@ -230,14 +235,19 @@ function buildModelCapabilities(
   // non-reasoning, no efforts field).
   const policy = resolveThinkingPolicy(thinkingLevelsRaw);
 
-  const modalities: { input: string[]; output: string[] } = {
-    input: supportsVision ? ['text', 'image'] : ['text'],
-    output: ['text'],
-  };
+  // Stable order so a client can rely on the sequence: text first, then the
+  // media modalities in the order the dashboard displays them.
+  const input: string[] = ['text'];
+  if (supportsVision) input.push('image');
+  if (supportsAudioInput) input.push('audio');
+  if (supportsVideoInput) input.push('video');
+  const modalities: { input: string[]; output: string[] } = { input, output: ['text'] };
 
   const capabilities: {
     tool_calls: boolean;
     vision: boolean;
+    audio_input: boolean;
+    video_input: boolean;
     json_mode: boolean;
     streaming: boolean;
     reasoning: boolean;
@@ -245,6 +255,8 @@ function buildModelCapabilities(
   } = {
     tool_calls: true,
     vision: supportsVision,
+    audio_input: supportsAudioInput,
+    video_input: supportsVideoInput,
     json_mode: true,
     streaming: true,
     reasoning: policy.kind !== 'off',
@@ -278,7 +290,8 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   const models = db.prepare(`
     SELECT
       m.id, m.platform, m.model_id, m.display_name, m.context_window,
-      m.max_output_tokens, m.supports_vision, m.thinking_levels,
+      m.max_output_tokens, m.supports_vision,
+      m.supports_audio_input, m.supports_video_input, m.thinking_levels,
       m.intelligence_rank
     FROM models m
     WHERE m.enabled = 1
@@ -310,6 +323,8 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
           m.max_output_tokens,
           m.supports_vision === 1,
           m.thinking_levels,
+          m.supports_audio_input === 1,
+          m.supports_video_input === 1,
         );
         return {
           id: `${m.platform}/${m.model_id}`,

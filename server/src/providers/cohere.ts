@@ -4,9 +4,50 @@ import type {
   ChatCompletionChunk,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
-import { flattenMessageContent } from '../lib/content.js';
+import { contentToString, blockMediaKind, mediaUrlOf } from '../lib/content.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 const API_BASE = 'https://api.cohere.ai/compatibility/v1';
+
+/**
+ * Cohere's compatibility endpoint accepts `{type:'image_url', image_url:{url}}`
+ * blocks for image input, and both `data:` and http(s) URLs natively (it does
+ * not need the URL fetched for it). Audio and video have no representation in
+ * this wire format — those blocks are dropped, and the router's
+ * adapter-capability cap keeps them from being routed here at all.
+ *
+ * Messages with no media stay plain strings: Cohere accepts either form, and
+ * the string form is what its API documents for text-only turns.
+ */
+function toCohereMessages(messages: ChatMessage[]): Array<{ role: string; content: unknown }> {
+  return messages.map((m) => {
+    if (!Array.isArray(m.content)) {
+      return { ...m, content: contentToString(m.content) };
+    }
+    const parts: Array<Record<string, unknown>> = [];
+    let droppedMedia = false;
+    for (const block of m.content) {
+      const kind = blockMediaKind(block);
+      if (!kind) {
+        const text = contentToString([block]);
+        if (text.length > 0) parts.push({ type: 'text', text });
+        continue;
+      }
+      if (kind !== 'image') { droppedMedia = true; continue; }
+      const url = mediaUrlOf(block, kind);
+      if (!url) { droppedMedia = true; continue; }
+      parts.push({ type: 'image_url', image_url: { url } });
+    }
+    if (droppedMedia) {
+      console.warn(`[cohere] dropped audio/video content block(s) — Cohere supports image input only`);
+    }
+    // No media survived: fall back to the plain-string form rather than
+    // sending an array Cohere has no reason to see.
+    if (!parts.some(p => p.type === 'image_url')) {
+      return { ...m, content: contentToString(m.content) };
+    }
+    return { ...m, content: parts };
+  });
+}
 
 export class CohereProvider extends BaseProvider {
   readonly platform = 'cohere' as const;
@@ -25,7 +66,7 @@ export class CohereProvider extends BaseProvider {
   ): Record<string, unknown> {
     const body: Record<string, unknown> = {
       model: modelId,
-      messages: flattenMessageContent(messages),
+      messages: toCohereMessages(messages),
     };
     if (options?.temperature !== undefined) body.temperature = options.temperature;
     if (options?.max_tokens !== undefined && options.max_tokens > 0) body.max_tokens = options.max_tokens;

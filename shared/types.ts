@@ -155,6 +155,8 @@ export interface ModelListRow {
   // when never customized; parsed server-side by parseStoredThinkingLevels.
   thinking_levels: string | null;
   supports_vision: number;
+  supports_audio_input: number;
+  supports_video_input: number;
 }
 
 export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unknown';
@@ -486,6 +488,15 @@ export interface ConfigModel {
   contextWindow: number | null;
   enabled: boolean;
   supportsVision: boolean;
+  /** Audio/video input flags. Optional so config files exported before these
+   * columns existed still parse; a missing value leaves the destination row's
+   * own flags alone (see import.ts). */
+  supportsAudioInput?: boolean;
+  supportsVideoInput?: boolean;
+  /** When true the imported modality values become operator-owned
+   * (models.modalities_manual = 1) and stop being rewritten by the boot
+   * modality index — the pricing_manual pattern. */
+  modalitiesManual?: boolean;
   maxOutputTokens: number | null;
   paidInputPerM: number | null;
   paidOutputPerM: number | null;

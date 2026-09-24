@@ -44,6 +44,13 @@ const modelSchema = z.object({
   contextWindow: z.number().int().nullable(),
   enabled: z.boolean(),
   supportsVision: z.boolean(),
+  // Input modality flags beyond vision. OPTIONAL (no default) on purpose: a
+  // config file exported before these columns existed must not be read as
+  // "audio=false, video=false", which would silently disable both on import.
+  // Absent means "this file has no opinion" and the destination row's own
+  // flags survive. Present means the file is authoritative for all three.
+  supportsAudioInput: z.boolean().optional(),
+  supportsVideoInput: z.boolean().optional(),
   maxOutputTokens: z.number().int().nullable(),
   paidInputPerM: z.number().nullable(),
   paidOutputPerM: z.number().nullable(),
