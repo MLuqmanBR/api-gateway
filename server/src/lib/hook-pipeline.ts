@@ -47,8 +47,6 @@ export interface PostCallSuccessContext {
   reasoning: string;
   /** Tool names for dialect rescue detection. */
   toolNames: Set<string>;
-  /** Whether the model is a reasoning model (gates think-tag extraction). */
-  isReasoningModel: boolean;
   /** Whether the request bears tools (gates tool-rescue). */
   wantsTools: boolean;
   /** Whether the response already has structured tool_calls (skip rescue). */

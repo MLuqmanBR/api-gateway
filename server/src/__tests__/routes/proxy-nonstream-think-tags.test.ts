@@ -4,10 +4,9 @@ import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { mintDashboardToken } from '../helpers/auth.js';
 
-// `` tag extraction integration (proxy.ts non-streaming path): the
-// proxy must split inline `` reasoning from the visible answer
-// for models that match the reasoning-pattern gate. Non-reasoning
-// models pass through unchanged.
+// Inline-reasoning tag extraction integration (proxy.ts non-streaming
+// path): the proxy must split an inline reasoning block from the visible
+// answer for EVERY model — extraction is not gated on the model id.
 
 async function request(app: Express, path: string, body: Record<string, unknown>, extraHeaders: Record<string, string> = {}) {
   const server = app.listen(0);
@@ -101,12 +100,14 @@ describe('proxy non-stream think-tag extraction', () => {
     expect(msg.reasoning_content).toBe('The user wants the answer.');
   });
 
-  it('passes literal `` tags through unchanged for a non-reasoning model', async () => {
+  it('extracts a long-form reasoning block for a model id outside any reasoning-family heuristic', async () => {
+    // The model id is deliberately one that no model-id heuristic matches:
+    // extraction must be model-agnostic.
     mockUpstreamJson({
       id: 'r1', object: 'chat.completion', created: 1, model: 'llama-3.3-70b-versatile',
       choices: [{
         index: 0,
-        message: { role: 'assistant', content: 'hello world <think>not extracted</think> done' },
+        message: { role: 'assistant', content: '<thinking>Weighing options.</thinking>The answer is 42.' },
         finish_reason: 'stop',
       }],
       usage: { prompt_tokens: 5, completion_tokens: 8, total_tokens: 13 },
@@ -114,14 +115,12 @@ describe('proxy non-stream think-tag extraction', () => {
     const r = await request(app, '/v1/chat/completions', {
       stream: false,
       model: 'groq/llama-3.3-70b-versatile',
-      messages: [{ role: 'user', content: 'tag passthrough test' }],
+      messages: [{ role: 'user', content: 'long-form tag test' }],
     });
     expect(r.status).toBe(200);
     const msg = r.body.choices[0].message;
-    expect(msg.content).toContain('<think>');
-    expect(msg.content).toContain('</think>');
-    // The reasoning field is not added for non-reasoning models.
-    expect(msg.reasoning_content ?? null).toBeNull();
+    expect(msg.content).toBe('The answer is 42.');
+    expect(msg.reasoning_content).toBe('Weighing options.');
   });
 
   it('extracts every complete block in a multi-block response', async () => {

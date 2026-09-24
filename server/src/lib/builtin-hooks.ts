@@ -40,10 +40,10 @@ export function registerBuiltInHooks(): void {
 
   // Post-call-success: tool-rescue runs FIRST so it sees the FULL response —
   // including any dialect blocks a model emitted mid-reasoning — before the
-  // think-tag extractor moves <think>…</think> out of content. Extraction is
-  // not confused by dialect tokens either way: only the literal `<think>`
-  // opener triggers it, never other angle-bracket markup
-  // (think-tags.ts:11-12, rule 1).
+  // think-tag extractor moves reasoning blocks out of content. Extraction is
+  // not confused by dialect tokens either way: only a complete literal tag
+  // pair from think-tags.ts `THINK_TAGS` triggers it, never other
+  // angle-bracket markup.
   pipeline.registerPostCallSuccess({
     id: 'tool-rescue',
     run(ctx) {
@@ -63,13 +63,13 @@ export function registerBuiltInHooks(): void {
     },
   });
 
-  // Post-call-success: think-tags runs AFTER tool-rescue. Moves <think> blocks
-  // from content to reasoning_content so clients see a clean answer + a
-  // separate reasoning trace. Only runs on reasoning models.
+  // Post-call-success: think-tags runs AFTER tool-rescue. Moves reasoning
+  // blocks from content to reasoning_content so clients see a clean answer +
+  // a separate reasoning trace. Runs for EVERY model: a model id is not
+  // evidence about what a model inlines in `content`.
   pipeline.registerPostCallSuccess({
     id: 'think-tags',
     run(ctx) {
-      if (!ctx.isReasoningModel) return undefined;
       if (ctx.content.length === 0) return undefined;
       const think = extractThinkTags(ctx.content);
       if (!think.extracted) return undefined;

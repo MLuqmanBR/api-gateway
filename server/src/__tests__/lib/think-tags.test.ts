@@ -3,6 +3,8 @@ import { extractThinkTags, ThinkTagStream } from '../../lib/think-tags.js';
 
 const OPEN = '<think>';
 const CLOSE = '</think>';
+const OPEN_LONG = '<thinking>';
+const CLOSE_LONG = '</thinking>';
 
 describe('extractThinkTags', () => {
   it('returns empty result for empty input', () => {
@@ -80,6 +82,39 @@ describe('extractThinkTags', () => {
     expect(r.reasoning).toBe('meta');
     expect(r.extracted).toBe(true);
     expect(r.visible).toBe('\n# Step-by-Step\nbody');
+  });
+
+  it('extracts a long-form reasoning block', () => {
+    const r = extractThinkTags(OPEN_LONG + 'r' + CLOSE_LONG + 'v');
+    expect(r).toEqual({ reasoning: 'r', visible: 'v', extracted: true });
+  });
+
+  it('extracts both opener families in one response', () => {
+    const r = extractThinkTags(OPEN + 'a' + CLOSE + 'x' + OPEN_LONG + 'b' + CLOSE_LONG + 'y');
+    expect(r).toEqual({ reasoning: 'ab', visible: 'xy', extracted: true });
+  });
+
+  it('does not pair a long-form opener with the short closer', () => {
+    const input = OPEN_LONG + 'r' + CLOSE;
+    const r = extractThinkTags(input);
+    expect(r.reasoning).toBe('');
+    expect(r.visible).toBe(input);
+    expect(r.extracted).toBe(false);
+  });
+
+  it('leaves a closer with no opener visible', () => {
+    const input = 'a' + CLOSE_LONG + 'b';
+    const r = extractThinkTags(input);
+    expect(r.visible).toBe(input);
+    expect(r.reasoning).toBe('');
+    expect(r.extracted).toBe(false);
+  });
+
+  it('extracts the reasoning block inside an unknown wrapper tag and leaves the wrapper visible', () => {
+    const r = extractThinkTags('<construction>' + OPEN_LONG + 'r' + CLOSE_LONG + 'a</construction>');
+    expect(r.reasoning).toBe('r');
+    expect(r.visible).toBe('<construction>a</construction>');
+    expect(r.extracted).toBe(true);
   });
 });
 
@@ -189,6 +224,28 @@ describe('ThinkTagStream', () => {
     expect(tail).toEqual({ visible: 'plain prose', reasoning: '' });
     // Nothing left to hold at end-of-stream.
     expect(s.flush().residual).toBe('');
+  });
+
+  it('holds a partial long-form opener split across feeds', () => {
+    const s = new ThinkTagStream();
+    const first = s.feed('answer <thi');
+    expect(first).toEqual({ visible: 'answer ', reasoning: '' });
+    const second = s.feed('nking>r</thin');
+    expect(second).toEqual({ visible: '', reasoning: '' });
+    const third = s.feed('king>done');
+    expect(third).toEqual({ visible: 'done', reasoning: 'r' });
+    const f = s.flush();
+    expect(f.residual).toBe('');
+    expect(f.reasoning).toBe('');
+  });
+
+  it('emits a genuine partial long-form opener tail as residual at flush', () => {
+    const s = new ThinkTagStream();
+    const first = s.feed('hello <thinki');
+    expect(first).toEqual({ visible: 'hello ', reasoning: '' });
+    const f = s.flush();
+    expect(f.residual).toBe('<thinki');
+    expect(f.reasoning).toBe('');
   });
 
   it('returns empty result for an empty feed', () => {
