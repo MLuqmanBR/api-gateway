@@ -380,16 +380,27 @@ export async function runTranscription(request: TranscriptionCall): Promise<Tran
     }
   }
 
+  // Track the most INFORMATIVE failure, not simply the last one walked.
+  //
+  // The chain routinely ends with rows whose platform has no key (or no
+  // endpoint). Reporting that as the summary hides the real reason the request
+  // failed: a provider that was actually called and answered "429 quota
+  // exhausted" or "403 model not available" tells the operator what to fix,
+  // while "no usable key for platform 'ovh'" describes a row that was never
+  // reachable in the first place. Prefer any error from a provider that
+  // actually responded, and only fall back to the chain-walk errors.
   let lastError: TranscriptionError | null = null;
+  let sawProviderError = false;
   for (const row of effectiveChain) {
     const keys = getPlatformKeys(row.platform);
     if (keys.length === 0) {
-      // Distinguish "no key" from "no endpoint" in the final error: an
-      // operator who forgot the key needs a different action than one whose
-      // provider has no audio route.
-      lastError = resolveAudioEndpoint(row.platform, kind) === null
+      // Distinguish "no key" from "no endpoint": an operator who forgot the
+      // key needs a different action than one whose provider has no audio
+      // route. Recorded, but never allowed to overwrite a provider error.
+      const chainError = resolveAudioEndpoint(row.platform, kind) === null
         ? new TranscriptionError(`no audio endpoint for platform '${row.platform}'`, 500)
         : new TranscriptionError(`no usable key for platform '${row.platform}'`, 503);
+      if (!sawProviderError) lastError = chainError;
       continue;
     }
     for (const { id: keyId, key } of keys) {
@@ -405,6 +416,7 @@ export async function runTranscription(request: TranscriptionCall): Promise<Tran
           : new TranscriptionError(err instanceof Error ? err.message : String(err), 502);
         logTranscriptionRequest(row, 'error', { inputTokens: 0, outputTokens: 0, audioSeconds: null }, Date.now() - started, e.message, keyId);
         lastError = e;
+        sawProviderError = true;
         // try the next key for this provider
       }
     }

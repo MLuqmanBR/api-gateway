@@ -103,6 +103,11 @@ const createModelSchema = z.object({
 
 const updateModelSchema = createModelSchema.partial().extend({
   enabled: z.boolean().optional(),
+  /** true = clear modalities_manual and recompute this row from the generated
+   *  catalog index (see applyModalityIndex). Omit to leave ownership alone.
+   *  Without this the flag would be a one-way door: an operator who toggled a
+   *  modality by mistake could never get catalog data back for that row. */
+  resetModalities: z.boolean().optional(),
 });
 
 /** Normalizes a client-supplied thinking-levels array for storage. 'off' is
@@ -1003,6 +1008,14 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
     // pattern).
     updates.push('modalities_manual = 1');
   }
+  if (d.resetModalities === true) {
+    // Hand the row back to the generated index: clear the ownership flag and
+    // immediately recompute from the catalog data, so the response reflects
+    // the change rather than waiting for the next boot. Without this the flag
+    // is a one-way door — an operator who toggled a modality by mistake could
+    // never get catalog data back for that row.
+    updates.push('modalities_manual = 0');
+  }
   if (d.monthlyTokenBudget !== undefined) { updates.push('monthly_token_budget = ?'); values.push(d.monthlyTokenBudget); }
   if (d.rpmLimit !== undefined) { updates.push('rpm_limit = ?'); values.push(d.rpmLimit); }
   if (d.rpdLimit !== undefined) { updates.push('rpd_limit = ?'); values.push(d.rpdLimit); }
@@ -1026,6 +1039,12 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
 
   values.push(id);
   db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+  // A reset must be visible in this response, not at the next boot.
+  if (d.resetModalities === true) {
+    applyModalityIndex(db, [id]);
+  }
+
   res.json({ success: true, id });
 });
 
