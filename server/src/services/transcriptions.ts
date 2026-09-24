@@ -30,9 +30,6 @@ export interface TranscriptionModelRow {
   /** Wire shape this provider expects: multipart (OpenAI default) or a
    *  base64 JSON body. */
   shape: string;
-  /** 1 when this row has a resolvable audio endpoint. 0 renders a badge in
-   *  the dashboard instead of failing at request time. */
-  audio_endpoint: number;
 }
 
 export class TranscriptionError extends Error {
