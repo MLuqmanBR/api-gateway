@@ -12,6 +12,8 @@
 import { getDb, getSetting } from '../db/index.js';
 import { decrypt } from '../lib/crypto.js';
 import { isModelAllowed } from '../lib/client-keys.js';
+import { buildProviderFor } from '../providers/index.js';
+import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 
 export interface TranscriptionModelRow {
   id: number;
@@ -25,6 +27,12 @@ export interface TranscriptionModelRow {
   priority: number;
   enabled: number;
   quota_label: string;
+  /** Wire shape this provider expects: multipart (OpenAI default) or a
+   *  base64 JSON body. */
+  shape: string;
+  /** 1 when this row has a resolvable audio endpoint. 0 renders a badge in
+   *  the dashboard instead of failing at request time. */
+  audio_endpoint: number;
 }
 
 export class TranscriptionError extends Error {
@@ -77,14 +85,23 @@ export function estimateTranscriptionCostCents(usdPerHour: number, seconds: numb
   return Math.ceil((seconds / 3600) * usdPerHour * 100);
 }
 
-function getPlatformKeys(platform: string): string[] {
+/**
+ * Usable keys for a platform, with their row ids.
+ *
+ * The id travels with the secret so the request log can attribute the call
+ * (`requests.key_id`) — chat does this and audio previously did not, which
+ * made per-key audio spend invisible. Keyless providers store a `'no-key'`
+ * sentinel row (routes/keys.ts), which this query returns like any other, so
+ * keyless audio platforms resolve a key instead of silently skipping.
+ */
+function getPlatformKeys(platform: string): Array<{ id: number; key: string }> {
   const rows = getDb().prepare(
-    "SELECT encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY id",
-  ).all(platform) as { encrypted_key: string; iv: string; auth_tag: string }[];
-  const keys: string[] = [];
+    "SELECT id, encrypted_key, iv, auth_tag FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown') ORDER BY id",
+  ).all(platform) as { id: number; encrypted_key: string; iv: string; auth_tag: string }[];
+  const keys: Array<{ id: number; key: string }> = [];
   for (const row of rows) {
     try {
-      keys.push(decrypt(row.encrypted_key, row.iv, row.auth_tag));
+      keys.push({ id: row.id, key: decrypt(row.encrypted_key, row.iv, row.auth_tag) });
     } catch {
       // skip undecryptable rows
     }
@@ -159,8 +176,47 @@ export async function parseAudioRequest(contentType: string, body: Buffer): Prom
   return { fields, file, model, stream };
 }
 
-/** Fields mistral rejects even though groq accepts them. */
-const MISTRAL_STRIPPED: Record<string, true> = { prompt: true, response_format: true };
+/**
+ * Fields a platform rejects even though the OpenAI audio spec allows them.
+ * Keyed by platform so one table covers every provider without a code branch.
+ */
+const STRIPPED_FIELDS: Record<string, Record<string, true>> = {
+  mistral: { prompt: true, response_format: true },
+};
+
+/**
+ * Resolve the audio endpoint for a platform from its provider base URL.
+ *
+ * Audio is OpenAI-shaped on almost every provider the catalog knows, so the
+ * endpoint is simply `${baseUrl}/audio/${kind}` — and every base URL in the
+ * live catalog already carries its `/v1` segment (logfare, tokenrouter,
+ * aihubmix, unorouter; openrouter, ovh, zhipu, groq, mistral), because chat
+ * needs it too. `normalizeOpenAiBaseUrl` guarantees that invariant at every
+ * write site, so no per-platform endpoint table is needed and a newly added
+ * provider becomes audio-capable by being discoverable.
+ *
+ * Returns null when the platform has no resolvable base URL (a bespoke
+ * adapter with no HTTP endpoint, or an unregistered slug).
+ */
+export function resolveAudioEndpoint(platform: string, kind: 'transcriptions' | 'translations'): string | null {
+  const provider = buildProviderFor(platform);
+  const base = provider?.baseUrl?.replace(/\/+$/, '');
+  if (!base) return null;
+  return `${base}/audio/${kind}`;
+}
+
+/** The request body shapes the catalog knows how to speak. */
+export type TranscriptionShape = 'multipart' | 'base64-json';
+
+/** Narrow a stored shape string to a known shape (defaults to multipart). */
+export function shapeOf(row: { shape?: string }): TranscriptionShape {
+  return row.shape === 'base64-json' ? 'base64-json' : 'multipart';
+}
+
+/** Sentence-case the shape for an error message. */
+function shapeLabel(shape: string): string {
+  return shape === 'base64-json' ? 'base64 JSON' : shape;
+}
 
 async function callTranscription(
   platform: string,
@@ -169,41 +225,66 @@ async function callTranscription(
   kind: 'transcriptions' | 'translations',
   fields: Array<[string, MultipartValue]>,
   file: File,
+  shape: TranscriptionShape = 'multipart',
 ): Promise<{ status: number; body: string }> {
-  let url: string;
-  switch (platform) {
-    case 'groq':
-      url = `https://api.groq.com/openai/v1/audio/${kind}`;
-      break;
-    case 'mistral':
-      // Mistral exposes transcriptions only — the translations gate (route
-      // step) rejects mistral translation requests before we get here.
-      url = 'https://api.mistral.ai/v1/audio/transcriptions';
-      break;
-    default:
-      throw new TranscriptionError(`no transcription adapter for platform '${platform}'`, 500);
+  const url = resolveAudioEndpoint(platform, kind);
+  if (!url) {
+    throw new TranscriptionError(
+      `no audio endpoint configured for platform '${platform}' — set its base URL or disable this catalog row`,
+      500,
+    );
   }
 
-  // Rebuild the outbound body from the parsed entries — never trust the
-  // client's model value on the wire; the catalog row is authoritative.
-  const form = new FormData();
-  form.append('model', row.model_id);
-  for (const [key, value] of fields) {
-    if (platform === 'mistral' && MISTRAL_STRIPPED[key] === true) continue;
-    form.append(key, value);
-  }
-  form.append(
-    'file',
-    new Blob([await file.arrayBuffer()], { type: file.type || 'application/octet-stream' }),
-    file.name,
-  );
+  // Never trust the client's model value on the wire; the catalog row is
+  // authoritative.
+  const stripped = STRIPPED_FIELDS[platform] ?? {};
+  const passthrough = fields.filter(([key]) => stripped[key] !== true);
+  const bytes = await file.arrayBuffer();
 
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
+  let init: RequestInit;
+  if (shape === 'base64-json') {
+    // Some providers take the audio inline as base64 JSON instead of
+    // multipart (zenmux 415s on multipart). One shape per catalog row.
+    const body: Record<string, unknown> = {
+      model: row.model_id,
+      input_audio: {
+        data: Buffer.from(bytes).toString('base64'),
+        format: file.name.includes('.') ? file.name.split('.').pop() : 'wav',
+      },
+    };
+    for (const [key, value] of passthrough) {
+      if (typeof value === 'string') body[key] = value;
+    }
+    init = {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    };
+  } else {
+    const form = new FormData();
+    form.append('model', row.model_id);
+    for (const [key, value] of passthrough) form.append(key, value);
+    form.append('file', new Blob([bytes], { type: file.type || 'application/octet-stream' }), file.name);
+    init = {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: form,
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    };
+  }
+
+  let r: Response;
+  try {
+    r = await fetch(url, init);
+  } catch (err) {
+    // A transport failure is not an HTTP status; surface it as a 502 so the
+    // failover loop treats it like any other provider error.
+    throw new TranscriptionError(
+      `${shapeLabel(shape)} request to ${new URL(url).host} failed: ${err instanceof Error ? err.message : String(err)}`,
+      502,
+    );
+  }
   const text = await r.text();
   if (!r.ok) {
     throw new TranscriptionError(`upstream ${r.status}: ${text.slice(0, 200)}`, r.status);
@@ -217,13 +298,18 @@ function logTranscriptionRequest(
   tokens: { inputTokens: number; outputTokens: number; audioSeconds: number | null },
   latencyMs: number,
   error: string | null,
+  keyId: number | null = null,
 ): void {
   try {
+    // key_id is threaded through from the failover loop so audio spend is
+    // attributable per key, the same way chat requests are. It was a
+    // hardcoded NULL, which made per-key audio cost invisible.
+    const safeError = error === null ? null : sanitizeProviderErrorMessage(error).slice(0, 300);
     getDb().prepare(`
       INSERT INTO requests
         (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, request_type, audio_seconds)
-      VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'transcription', ?)
-    `).run(row.platform, row.model_id, status, tokens.inputTokens, tokens.outputTokens, latencyMs, error, tokens.audioSeconds);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'transcription', ?)
+    `).run(row.platform, row.model_id, keyId, status, tokens.inputTokens, tokens.outputTokens, latencyMs, safeError, tokens.audioSeconds);
   } catch (e) {
     console.error('Failed to log transcription request:', e);
   }
@@ -297,19 +383,27 @@ export async function runTranscription(request: TranscriptionCall): Promise<Tran
   let lastError: TranscriptionError | null = null;
   for (const row of effectiveChain) {
     const keys = getPlatformKeys(row.platform);
-    if (keys.length === 0) continue; // no usable key for this provider — try the next one
-    for (const key of keys) {
+    if (keys.length === 0) {
+      // Distinguish "no key" from "no endpoint" in the final error: an
+      // operator who forgot the key needs a different action than one whose
+      // provider has no audio route.
+      lastError = resolveAudioEndpoint(row.platform, kind) === null
+        ? new TranscriptionError(`no audio endpoint for platform '${row.platform}'`, 500)
+        : new TranscriptionError(`no usable key for platform '${row.platform}'`, 503);
+      continue;
+    }
+    for (const { id: keyId, key } of keys) {
       const started = Date.now();
       try {
-        const out = await callTranscription(row.platform, key, row, kind, fields, file);
+        const out = await callTranscription(row.platform, key, row, kind, fields, file, shapeOf(row));
         const usage = parseUsage(out.body);
-        logTranscriptionRequest(row, 'success', usage, Date.now() - started, null);
+        logTranscriptionRequest(row, 'success', usage, Date.now() - started, null, keyId);
         return { status: out.status, body: out.body, row, actualSeconds: usage.audioSeconds };
       } catch (err: unknown) {
         const e = err instanceof TranscriptionError
           ? err
           : new TranscriptionError(err instanceof Error ? err.message : String(err), 502);
-        logTranscriptionRequest(row, 'error', { inputTokens: 0, outputTokens: 0, audioSeconds: null }, Date.now() - started, e.message.slice(0, 300));
+        logTranscriptionRequest(row, 'error', { inputTokens: 0, outputTokens: 0, audioSeconds: null }, Date.now() - started, e.message, keyId);
         lastError = e;
         // try the next key for this provider
       }

@@ -87,6 +87,7 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV47ModelThinkingLevels(db);
   migrateSchemaV48ModelCacheTelemetry(db);
   migrateSchemaV49ModelModalities(db);
+  migrateSchemaV50TranscriptionShape(db);
   // Unguarded every-boot pass: writes the generated modality index onto model
   // rows that are not operator-owned (modalities_manual = 0). Runs AFTER the
   // schema migration so the columns exist, and is idempotent — a second boot
@@ -2186,6 +2187,7 @@ function migrateTranscriptionsV1(db: DatabasePort) {
       priority INTEGER NOT NULL DEFAULT 1,
       enabled INTEGER NOT NULL DEFAULT 1,
       quota_label TEXT NOT NULL DEFAULT '',
+      shape TEXT NOT NULL DEFAULT 'multipart',
       UNIQUE(platform, model_id)
     );
   `);
@@ -2850,6 +2852,23 @@ function migrateSchemaV49ModelModalities(db: DatabasePort) {
   }
   if (!columns.some(col => col.name === 'modalities_manual')) {
     db.prepare('ALTER TABLE models ADD COLUMN modalities_manual INTEGER NOT NULL DEFAULT 0').run();
+  }
+}
+
+// V50 (2026-09-24): the batch audio pipeline resolves its endpoint from the
+// provider's base URL (`${baseUrl}/audio/<kind>`), so the catalog no longer
+// needs a per-platform endpoint table. What it DOES need is the request body
+// shape: multipart is the OpenAI default, but some providers accept the audio
+// only as base64 JSON.
+//
+// Endpoint AVAILABILITY is deliberately not a column: it is derivable from the
+// provider registry at any moment (`resolveAudioEndpoint`), and a stored copy
+// would go stale the moment an operator edits a base URL. The dashboard asks
+// the service for it live.
+function migrateSchemaV50TranscriptionShape(db: DatabasePort) {
+  const columns = db.prepare('PRAGMA table_info(transcription_models)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'shape')) {
+    db.prepare("ALTER TABLE transcription_models ADD COLUMN shape TEXT NOT NULL DEFAULT 'multipart'").run();
   }
 }
 
