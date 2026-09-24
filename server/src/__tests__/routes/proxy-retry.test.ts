@@ -74,6 +74,20 @@ describe('isRetryableError', () => {
       expect(isRetryableError(new Error('HuggingFace Router API error 402: Payment required'))).toBe(true);
     });
 
+    it('treats a STRUCTURED status:402 as retryable so the request cycles keys', () => {
+      // Regression: the structured-status branch returned false for 402 before
+      // reaching the message heuristic, so Token Harbor's real 402
+      // (`providerHttpError` attaches status=402) surfaced to the client with
+      // no key rotation, no cooldown and no ⚠/ live-feed events — the paid
+      // model stayed pinned to the broke key on every request.
+      const err = Object.assign(
+        new Error('tokenharbor API error 402: Your Token Harbor balance is at $0. Top up to keep using paid models.'),
+        { status: 402 },
+      );
+      expect(isRetryableError(err)).toBe(true);
+      expect(isPaymentRequiredError(err)).toBe(true);
+    });
+
     it('catches common out-of-credits phrasings', () => {
       expect(isRetryableError(new Error('Payment Required'))).toBe(true);
       expect(isRetryableError(new Error('You exceeded your current quota: insufficient_quota'))).toBe(true);
