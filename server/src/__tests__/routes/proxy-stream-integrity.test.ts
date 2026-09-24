@@ -329,6 +329,33 @@ describe('proxy stream turn-integrity', () => {
     expect(msg.content).toBeNull();
     expect(r.body.choices[0].finish_reason).toBe('tool_calls');
   });
+
+  it('promotes a streamed delta.reasoning chunk to delta.reasoning_content, preserving role', async () => {
+    mockUpstream([
+      { body: sse(
+        { id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm',
+          choices: [{ index: 0, delta: { role: 'assistant', reasoning: 'step one' }, finish_reason: null }] },
+        { id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm',
+          choices: [{ index: 0, delta: { reasoning: 'step two' }, finish_reason: null }] },
+        { id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm',
+          choices: [{ index: 0, delta: { content: 'answer' }, finish_reason: null }] },
+        finishChunk('stop'),
+        '[DONE]',
+      ) },
+    ]);
+    const r = await request(app, '/v1/chat/completions', {
+      stream: true, messages: [{ role: 'user', content: 'reasoning key translation' }],
+    });
+    expect(r.status).toBe(200);
+    const fs = frames(r.text);
+    const reasoning = fs
+      .map(f => f.choices?.[0]?.delta)
+      .filter(d => typeof d?.reasoning_content === 'string' && d.reasoning_content.length > 0);
+    expect(reasoning.map(d => d.reasoning_content)).toEqual(['step one', 'step two']);
+    expect(reasoning[0].role).toBe('assistant'); // role preserved on the promote path
+    expect(fs.some(f => f.choices?.[0]?.delta?.reasoning !== undefined)).toBe(false);
+    expect(fs.some(f => f.choices?.[0]?.delta?.content === 'answer')).toBe(true);
+  });
 });
 
 describe('sticky session integrity', () => {

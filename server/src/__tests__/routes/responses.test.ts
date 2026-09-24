@@ -13,8 +13,8 @@ import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { subscribe } from '../../services/events.js';
 
-function fakeRoute(provider: any) {
-  return { provider, modelId: 'fake-model', modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model', release: () => {} };
+function fakeRoute(provider: any, modelId = 'fake-model') {
+  return { provider, modelId, modelDbId: 9999, apiKey: 'k', keyId: 1, platform: 'fake', displayName: 'Fake Model', release: () => {} };
 }
 
 async function post(app: Express, path: string, body: any, key?: string) {
@@ -240,5 +240,45 @@ describe('POST /v1/responses (#96)', () => {
     const start = events.find(e => e.type === 'request.start');
     expect(start).toBeDefined();
     expect(start.model).toBeUndefined();
+  });
+
+  // Inline-reasoning extraction must be model-agnostic: this route previously
+  // ran it only for model ids matching a reasoning-family heuristic, so an id
+  // outside that list leaked raw reasoning tags into output_text.
+  it('non-stream: strips an inline reasoning block from output_text', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() {
+        return {
+          id: 'c', object: 'chat.completion', created: 0, model: 'kimi-k3',
+          choices: [{ index: 0, message: { role: 'assistant', content: '<thinking>Weighing options.</thinking>The answer is 42.' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+        };
+      },
+      async *streamChatCompletion() { /* unused */ },
+    }, 'kimi-k3'));
+
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi', stream: false }, key);
+    expect(status).toBe(200);
+    const body = JSON.parse(text);
+    expect(body.status).toBe('completed');
+    expect(body.output_text).toBe('The answer is 42.');
+  });
+
+  it('stream: strips an inline reasoning block from output_text deltas', async () => {
+    mockRouteRequest.mockReturnValue(fakeRoute({
+      async chatCompletion() { throw new Error('should not be called'); },
+      async *streamChatCompletion() {
+        yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'kimi-k3', choices: [{ index: 0, delta: { role: 'assistant', content: '<thinking>Weighing' }, finish_reason: null }] };
+        yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'kimi-k3', choices: [{ index: 0, delta: { content: ' options.</thinking>The answer is 42.' }, finish_reason: null }] };
+        yield { id: 'c', object: 'chat.completion.chunk', created: 0, model: 'kimi-k3', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+      },
+    }, 'kimi-k3'));
+
+    const { status, text } = await post(app, '/v1/responses', { input: 'hi', stream: true }, key);
+    expect(status).toBe(200);
+    expect(text).not.toContain('<thinking>');
+    expect(text).not.toContain('</thinking>');
+    const completed = text.split('event: response.completed')[1];
+    expect(completed).toContain('"output_text":"The answer is 42."');
   });
 });
