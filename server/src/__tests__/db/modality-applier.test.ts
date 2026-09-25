@@ -146,6 +146,33 @@ describe('applyModalityIndex: adapter cap and operator ownership', () => {
     expect(flagsOf(id).a).toBe(0);
   });
 
+  it('treats an all-false index entry as authoritative and clears a stale flag', () => {
+    // The general contract behind the ASR case: a PRESENT index entry with
+    // empty flags must be able to LOWER a flag, not merely raise one. Used by a
+    // catalog-seeded row rather than an aggregator row, so the fixture is
+    // stable — an earlier draft depended on an unorouter row the in-memory seed
+    // does not contain, which made it pass vacuously.
+    const row = getDb().prepare(
+      "SELECT id FROM models WHERE platform = 'openrouter' AND model_id = 'qwen/qwen3-coder:free'",
+    ).get() as { id: number } | undefined;
+    expect(row).toBeTruthy(); // fail loudly if the seeded catalog changes
+
+    const indexed = MODALITY_INDEX.get(modalityIndexKey('openrouter', 'qwen/qwen3-coder:free'));
+    expect(indexed).toBeDefined();
+    // Present but carrying no modality — the shape under test.
+    expect(indexed!.image).toBeUndefined();
+    expect(indexed!.audio).toBeUndefined();
+    expect(indexed!.video).toBeUndefined();
+
+    // Hand-set a stale audio flag exactly as an old boot would have left it.
+    getDb().prepare(
+      'UPDATE models SET supports_audio_input = 1, modalities_manual = 0 WHERE id = ?',
+    ).run(row!.id);
+
+    applyModalityIndex(getDb(), [row!.id]);
+    expect(flagsOf(row!.id).a).toBe(0);
+  });
+
   it('leaves rows outside the requested scope untouched', () => {
     const inside = seedModel('cloudflare', '@cf/scoped/inside');
     const outside = seedModel('cloudflare', '@cf/scoped/outside');
