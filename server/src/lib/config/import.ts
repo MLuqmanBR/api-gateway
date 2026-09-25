@@ -811,21 +811,22 @@ function applyTranscriptions(
       for (const p of fam.providers) {
         db.prepare(`
           INSERT INTO transcription_models (family, platform, model_id, display_name,
-            max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label, shape)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(fam.family, p.platform, p.modelId, fam.displayName,
           fam.maxFileMb, fam.supportsTranslations ? 1 : 0, p.pricePerHourUsd,
-          p.priority, p.enabled ? 1 : 0, fam.quotaLabel);
+          p.priority, p.enabled ? 1 : 0, fam.quotaLabel, p.shape ?? 'multipart');
         diff.added++;
       }
       continue;
     }
     for (const p of fam.providers) {
       try {
-        const existing = db.prepare('SELECT id, priority, enabled, max_file_mb, supports_translations, price_per_hour_usd, display_name, quota_label FROM transcription_models WHERE family = ? AND platform = ? AND model_id = ?').get(fam.family, p.platform, p.modelId) as {
+        const existing = db.prepare('SELECT id, priority, enabled, max_file_mb, supports_translations, price_per_hour_usd, display_name, quota_label, shape FROM transcription_models WHERE family = ? AND platform = ? AND model_id = ?').get(fam.family, p.platform, p.modelId) as {
           id: number; priority: number; enabled: number;
           max_file_mb: number; supports_translations: number;
           price_per_hour_usd: number | null; display_name: string; quota_label: string;
+          shape: string;
         } | undefined;
         if (existing) {
           if (mode === 'skip-existing') { diff.skipped++; continue; }
@@ -836,6 +837,9 @@ function applyTranscriptions(
             existing.enabled === enabledNext &&
             existing.max_file_mb === fam.maxFileMb &&
             existing.supports_translations === supportsNext &&
+            // A file with no shape predates the column, so it has no opinion:
+            // treat that as identical rather than forcing a rewrite.
+            (p.shape === undefined || existing.shape === p.shape) &&
             (existing.price_per_hour_usd ?? null) === (p.pricePerHourUsd ?? null) &&
             existing.display_name === fam.displayName &&
             existing.quota_label === fam.quotaLabel;
@@ -846,18 +850,19 @@ function applyTranscriptions(
           db.prepare(`
             UPDATE transcription_models SET priority = ?, enabled = ?,
               max_file_mb = ?, supports_translations = ?, price_per_hour_usd = ?,
-              display_name = ?, quota_label = ?
+              display_name = ?, quota_label = ?, shape = ?
             WHERE id = ?
-          `).run(p.priority, enabledNext, fam.maxFileMb, supportsNext, p.pricePerHourUsd, fam.displayName, fam.quotaLabel, existing.id);
+          `).run(p.priority, enabledNext, fam.maxFileMb, supportsNext, p.pricePerHourUsd,
+            fam.displayName, fam.quotaLabel, p.shape ?? existing.shape, existing.id);
           diff.updated++;
         } else {
           db.prepare(`
             INSERT INTO transcription_models (family, platform, model_id, display_name,
-              max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label, shape)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(fam.family, p.platform, p.modelId, fam.displayName,
             fam.maxFileMb, fam.supportsTranslations ? 1 : 0, p.pricePerHourUsd,
-            p.priority, p.enabled ? 1 : 0, fam.quotaLabel);
+            p.priority, p.enabled ? 1 : 0, fam.quotaLabel, p.shape ?? 'multipart');
           diff.added++;
         }
       } catch (err) {

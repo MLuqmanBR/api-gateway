@@ -857,7 +857,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     if (!hasEnabledModelFor(kind)) {
       res.status(422).json({
         error: {
-          message: `This request includes ${kind} input, but no model that accepts ${kind} is enabled. Enable a ${kind}-capable model in the Fallback Chain.`,
+          message: `This request includes ${kind} input, but no model that accepts ${kind} is enabled. Enable a model that accepts ${kind} in the Fallback Chain.`,
           type: 'invalid_request_error',
           code: NO_MODEL_ERROR_CODE[kind],
         },

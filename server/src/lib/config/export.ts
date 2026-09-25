@@ -288,6 +288,7 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
         display_name: string; dimensions: number;
         max_input_tokens: number | null; priority: number;
         enabled: number; quota_label: string;
+        shape: string;
       }>;
       const byFamily = new Map<string, ConfigEmbeddingFamily>();
       for (const r of familyRows) {
@@ -322,14 +323,14 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
       ).get() as { value: string } | undefined;
       const familyRows = db.prepare(`
         SELECT family, platform, model_id, display_name, max_file_mb,
-               supports_translations, price_per_hour_usd, priority, enabled, quota_label
+               supports_translations, price_per_hour_usd, priority, enabled, quota_label, shape
         FROM transcription_models
         ORDER BY family ASC, priority ASC
       `).all() as Array<{
         family: string; platform: string; model_id: string;
         display_name: string; max_file_mb: number;
         supports_translations: number; price_per_hour_usd: number | null;
-        priority: number; enabled: number; quota_label: string;
+        priority: number; enabled: number; quota_label: string; shape: string;
       }>;
       const byFamily = new Map<string, ConfigTranscriptionFamily>();
       for (const r of familyRows) {
@@ -351,6 +352,11 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
           priority: r.priority,
           enabled: r.enabled === 1,
           pricePerHourUsd: r.price_per_hour_usd,
+          // Round-trips the request-body shape: without it an import resets a
+          // base64-json row to the multipart default and the provider 415s on
+          // the next request. 15 of the 18 live catalog rows arrived via config
+          // import, so this path is the normal way rows are created.
+          shape: (r.shape === 'base64-json' ? 'base64-json' : 'multipart'),
         });
       }
       out.transcriptions = {

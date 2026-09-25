@@ -126,6 +126,11 @@ const transcriptionProviderSchema = z.object({
   priority: z.number().int().min(0),
   enabled: z.boolean(),
   pricePerHourUsd: z.number().nullable(),
+  // Request-body shape this provider expects. Optional by design: a config
+  // file exported before the column existed has no opinion, and the importer
+  // treats "absent" as "leave the destination's value alone" rather than
+  // forcing the multipart default onto a base64-json row.
+  shape: z.enum(['multipart', 'base64-json']).optional(),
 });
 
 const transcriptionFamilySchema = z.object({

@@ -632,7 +632,11 @@ export interface ConfigTranscriptionFamily {
     modelId: string;
     priority: number;
     enabled: boolean;
+    /** Cost per audio hour, or null when unknown / unenforced (self-hosted NIM). */
     pricePerHourUsd: number | null;
+    /** Request-body shape this provider expects. Optional so config files
+     * exported before the column existed still parse. */
+    shape?: 'multipart' | 'base64-json';
   }>;
   maxFileMb: number;
   supportsTranslations: boolean;

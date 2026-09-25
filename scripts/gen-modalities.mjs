@@ -130,6 +130,20 @@ function flagsFromInputList(list) {
   return { image: set.has('image'), audio: set.has('audio'), video: set.has('video') };
 }
 
+/**
+ * True when this entry describes a model that accepts chat input at all.
+ *
+ * Some catalog entries are not chat models: Whisper, Voxtral-mini, qwen3-asr
+ * and friends declare `input: ["audio"]` with no `"text"`. They take audio on a
+ * dedicated transcription endpoint, not as an audio part inside a chat request,
+ * so indexing them as `audio: true` would advertise a chat capability the model
+ * does not have — the gateway would happily route a chat+audio request to a
+ * model with no chat endpoint. Every real chat model accepts text.
+ */
+function isChatModel(inputList) {
+  return Array.isArray(inputList) && inputList.includes('text');
+}
+
 function mergeFlags(a, b) {
   return {
     image: Boolean(a?.image || b?.image),
@@ -203,7 +217,12 @@ function buildIndexes(modelsDev, openRouter) {
 
   for (const [providerId, provider] of Object.entries(modelsDev ?? {})) {
     for (const model of Object.values(provider?.models ?? {})) {
-      const flags = flagsFromInputList(model?.modalities?.input);
+      const input = model?.modalities?.input;
+      // Skip non-chat models (audio-in/text-out ASR): their `audio` flag means
+      // "takes audio on a transcription endpoint", not "accepts audio parts in
+      // a chat request". Indexing them would advertise a capability they lack.
+      if (!isChatModel(input)) continue;
+      const flags = flagsFromInputList(input);
       const ids = new Set([model?.id, lastSegment(model?.id)]);
       for (const id of ids) addScoped('modelsdev', providerId, id, flags);
       addGlobal(model?.id, flags);
@@ -211,7 +230,9 @@ function buildIndexes(modelsDev, openRouter) {
   }
 
   for (const model of openRouter?.data ?? []) {
-    const flags = flagsFromInputList(model?.architecture?.input_modalities);
+    const input = model?.architecture?.input_modalities;
+    if (!isChatModel(input)) continue; // see the models.dev pass above
+    const flags = flagsFromInputList(input);
     const vendor = typeof model?.id === 'string' ? model.id.split('/')[0] : null;
     const ids = new Set([model?.id, lastSegment(model?.id)]);
     for (const id of ids) addScoped('openrouter', vendor, id, flags);
