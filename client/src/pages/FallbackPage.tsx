@@ -582,6 +582,7 @@ function RowContent({
           <span className="font-medium text-sm">{row.displayName}</span>
           <span className="text-xs text-muted-foreground">{row.platform}</span>
           <ModalityRow
+            hideUnsupported
             modalities={[
               ...(row.supportsVision ? (['image'] as const) : []),
               ...(row.supportsAudioInput ? (['audio'] as const) : []),

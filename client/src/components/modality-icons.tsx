@@ -33,6 +33,16 @@ export interface ModalityRowProps {
   onToggle?: (kind: ModalityKind) => void
   /** Disable all toggles (e.g. while saving). */
   disabled?: boolean
+  /**
+   * Omit input icons for modalities the model does NOT support, instead of
+   * rendering them dimmed.
+   *
+   * Use in read-only summaries (the fallback table), where a dimmed icon is
+   * noise the operator has to filter out on every row. Leave `false` wherever
+   * the icon is a control (the edit dialogs): there the disabled icon IS the
+   * affordance — it shows what can be switched on.
+   */
+  hideUnsupported?: boolean
 }
 
 /**
@@ -51,17 +61,24 @@ export function ModalityRow({
   interactive = false,
   onToggle,
   disabled = false,
+  hideUnsupported = false,
 }: ModalityRowProps) {
   const active = new Set(modalities)
   // `text` is always supported; a caller listing only media still gets it.
   active.add('text')
+
+  // Read-only summaries show only what the model accepts (see hideUnsupported).
+  // Never applied when `interactive`: there a hidden icon is an unreachable
+  // control — toggling a modality off would remove the only way to toggle it
+  // back on.
+  const inputKinds = hideUnsupported && !interactive ? INPUT_ORDER.filter(k => active.has(k)) : INPUT_ORDER
 
   const outputSet = new Set(output.map(o => o.toLowerCase()))
 
   if (variant === 'colored') {
     return (
       <div className="flex flex-wrap items-center gap-[5px]">
-        {INPUT_ORDER.map(kind => {
+        {inputKinds.map(kind => {
           const on = active.has(kind)
           const { label, hue } = MODALITY_STYLE[kind]
           const Icon = kind === 'text' ? Type : kind === 'audio' ? AudioLines : kind === 'image' ? ImageIcon : Video
@@ -121,7 +138,7 @@ export function ModalityRow({
 
   return (
     <div className="flex items-center gap-1">
-      {INPUT_ORDER.map(kind => {
+      {inputKinds.map(kind => {
         const on = active.has(kind)
         const { label } = MODALITY_STYLE[kind]
         // The monochrome row uses a microphone for audio (the reference table
