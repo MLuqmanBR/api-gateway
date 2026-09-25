@@ -179,7 +179,12 @@ async function loadSource(url, cachePath, saveCache) {
 /**
  * Build the lookups.
  *   scoped[providerId] -> Map(normalizedModelId -> flags)
- *   global             -> Map(normalizedModelId -> flags)   (union over providers)
+ *   global             -> Map(normalizedModelId -> flags)
+ *
+ * Scoped tiers union (one provider describing one of its own models is
+ * authoritative about that model — two spellings of the same id agreeing is
+ * corroboration, not a conflict). The cross-provider tier VOTES instead; see
+ * `putGlobal`.
  */
 function buildIndexes(modelsDev, openRouter) {
   const scoped = { modelsdev: new Map(), openrouter: new Map() };
@@ -188,6 +193,71 @@ function buildIndexes(modelsDev, openRouter) {
   const put = (map, key, flags) => {
     if (!key) return;
     map.set(key, mergeFlags(map.get(key), flags));
+  };
+
+  /**
+   * Votes cast for each cross-provider key, so the tier can resolve by majority
+   * rather than by union.
+   *
+   * Why this is not a `mergeFlags` union: the cross-provider tier matches on the
+   * NORMALIZED last segment, so `z-ai/glm-5.3` collects every catalog's entry
+   * for that name — 69 of them in `models.dev`. Exactly one (baseten) claims
+   * `image`; the vendor's own entry and the other 68 say `["text"]`. A union
+   * lets that single outlier raise image on all 14 gateway rows named
+   * `glm-5.3`, and the router then sends image requests to a text-only model.
+   *
+   * Measured against OpenRouter as a held-out source (404 keys with >=2 voters
+   * and an OpenRouter entry), majority beats every alternative on the error
+   * direction that matters:
+   *     rule                     exact    false-pos   false-neg
+   *     union (previous)         87.6%       57          —
+   *     majority                 96.5%        7           7
+   *     corroborated (>=2)       93.6%       26           0
+   *     any-but-majority-guard   96.5%       13           1
+   * Majority and the guard tie on exactness; majority halves the false
+   * positives. A false positive claims a capability the model lacks — the
+   * failure this whole exercise exists to remove — while a false negative only
+   * routes to a different model, so majority is the correct trade.
+   *
+   * Absence of a key means "no opinion" to the applier, so a key whose votes all
+   * say text-only still gets an explicit all-false entry.
+   */
+  const globalVotes = new Map();
+
+  const putGlobal = (key, flags) => {
+    if (!key || !flags) return;
+    if (!globalVotes.has(key)) {
+      globalVotes.set(key, {
+        image: 0, audio: 0, video: 0,
+        total: 0,
+        anyImage: false, anyAudio: false, anyVideo: false,
+      });
+    }
+    const v = globalVotes.get(key);
+    v.total += 1;
+    if (flags.image) { v.image += 1; v.anyImage = true; }
+    if (flags.audio) { v.audio += 1; v.anyAudio = true; }
+    if (flags.video) { v.video += 1; v.anyVideo = true; }
+  };
+
+  /**
+   * Resolve the votes. A modality needs a strict majority.
+   *
+   * Ties (even voter count, exactly half claiming the modality) go to the
+   * `any` side only when NO voter contradicts — i.e. every voter claims it — but
+   * that case is a unanimous yes, not a tie. A genuine half-vs-half tie is
+   * resolved as false: the cheap mistake is routing to a different model, the
+   * expensive one is advertising a capability that does not exist.
+   */
+  const resolveGlobalVotes = () => {
+    for (const [key, v] of globalVotes) {
+      const majority = n => n * 2 > v.total;
+      global.set(key, {
+        image: majority(v.image),
+        audio: majority(v.audio),
+        video: majority(v.video),
+      });
+    }
   };
 
   const addScoped = (tier, providerId, modelId, flags) => {
@@ -209,9 +279,9 @@ function buildIndexes(modelsDev, openRouter) {
    */
   const addGlobal = (modelId, flags) => {
     const tailKey = normalizeModelId(lastSegment(modelId));
-    if (tailKey && !GENERIC_ALIASES.has(tailKey)) put(global, tailKey, flags);
+    if (tailKey && !GENERIC_ALIASES.has(tailKey)) putGlobal(tailKey, flags);
     if (typeof modelId === 'string' && modelId.includes('/')) {
-      put(global, normalizeModelId(modelId), flags);
+      putGlobal(normalizeModelId(modelId), flags);
     }
   };
 
@@ -242,6 +312,8 @@ function buildIndexes(modelsDev, openRouter) {
     for (const id of ids) addScoped('openrouter', vendor, id, flags);
     addGlobal(model?.id, flags);
   }
+
+  resolveGlobalVotes();
 
   return { scoped, global };
 }

@@ -104,6 +104,40 @@ describe('applyModalityIndex: adapter cap and operator ownership', () => {
     expect(flags.v).toBe(1);
   });
 
+  it('keeps a text-only base model text-only when a variant of it is multimodal', () => {
+    // Regression for a real mis-flag reported by the operator (2026-09-25):
+    // `GLM 5.3` was marked image-capable on 14 gateway rows. GLM 5.3 Flash is
+    // multimodal; GLM 5.3 itself is text-only.
+    //
+    // Cause: the cross-provider tier matched on the NORMALIZED last segment and
+    // unioned the flags of every catalog entry sharing that key. OpenRouter and
+    // models.dev both give `z-ai/glm-5.3` as ["text"], but of the 69 models.dev
+    // entries named `glm-5.3`, one (baseten) claims `image` — and a union lets
+    // that single outlier raise the flag everywhere.
+    //
+    // The tier now resolves by MAJORITY (see putGlobal in gen-modalities.mjs).
+    // Assert both halves: the base loses image, the flash variant keeps it. A
+    // rule that simply dropped cross-provider media flags would pass the first
+    // assertion and fail the second.
+    const base = MODALITY_INDEX.get(modalityIndexKey('logfare', 'glm-5.3'));
+    const flash = MODALITY_INDEX.get(modalityIndexKey('logfare', 'glm-5.3-flash'));
+    expect(flash).toBeDefined();
+
+    // An all-false entry is stored as an EMPTY flag set, not as explicit falses
+    // (see the generator's write-out), so assert on the absent/undefined value
+    // rather than a literal `false`. Either shape means "no media".
+    expect(base?.image ?? false).toBe(false);
+    expect(base?.video ?? false).toBe(false);
+    expect(base?.audio ?? false).toBe(false);
+    expect(flash!.image).toBe(true);
+    expect(flash!.video).toBe(true);
+
+    // And the applier writes those through to the row.
+    const id = seedModel('logfare', 'glm-5.3', { manual: 0 });
+    applyModalityIndex(getDb(), [id]);
+    expect(flagsOf(id)).toMatchObject({ v: 0, a: 0, d: 0 });
+  });
+
   it('never rewrites a row the operator owns', () => {
     // Start the row contradicting both the index and the cap, with the
     // ownership flag set: the applier must leave all three flags exactly as-is.
