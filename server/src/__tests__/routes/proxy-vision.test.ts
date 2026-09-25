@@ -157,42 +157,24 @@ describe('Modality-aware routing (audio + video)', () => {
     getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_video_input = 1').run();
   });
 
-  it('DOCUMENTS A GAP: a chain-disabled pinned model is not capability-checked', async () => {
-    // A pin resolves against `models.enabled = 1` (lib/pinned-model.ts:59) but
-    // the routing chain is built from `fallback_config ... WHERE fc.enabled = 1`
-    // (router.ts:668), and the modality guard only fires for a model the loop
-    // VISITS (router.ts:706). So a pin that resolves but is chain-disabled is
-    // never checked: a text-only chain-disabled pin on an image request routes
-    // to whatever vision model is in the chain, silently.
-    //
-    // Observed live on the copy (not inferred):
-    //   pin=logfare/deepseek-v4-pro-0813 (models.enabled=1, fc.enabled=0, vision=0)
-    //   -> HTTP 200, X-Routed-Via: logfare/qwen-3.8-27b
-    //
-    // This test asserts the CURRENT behaviour so the gap is visible and cannot
-    // regress silently into "fixed". When the underlying pin-resolution bug is
-    // fixed on its own branch, this test SHOULD fail and be updated to expect a
-    // 4xx. Report: local://pin-fallthrough-bug.md
-    // Create the exact condition rather than hoping the seed contains it:
-    // a text-only model left enabled in `models` while its fallback entry is
-    // switched off.
-    const db = getDb();
-    const anyTextOnly = db.prepare(
-      'SELECT id, platform, model_id FROM models WHERE supports_vision = 0 LIMIT 1',
-    ).get() as { id: number; platform: string; model_id: string } | undefined;
-    expect(anyTextOnly).toBeTruthy();
-    db.prepare('UPDATE fallback_config SET enabled = 0 WHERE model_db_id = ?').run(anyTextOnly!.id);
-    const chainDisabled = anyTextOnly!;
-
-    const { status, body } = await post(app, '/v1/chat/completions', {
-      model: `${chainDisabled.platform}/${chainDisabled.model_id}`,
-      messages: IMAGE_MESSAGE.messages,
-    }, key);
-
-    // NOT a capability error: the request is served by some other model.
-    expect(body?.error?.code).not.toBe('model_capability_mismatch');
-    expect([200, 429, 502, 503]).toContain(status);
-  });
+  // A chain-disabled pinned model on a modality request is NOT capability
+  // checked: the guard fires inside the chain loop (router.ts:706), so a pin
+  // that resolves (lib/pinned-model.ts accepts any `models.enabled = 1` row)
+  // but is absent from the chain is never visited and silently reroutes.
+  //
+  // Deliberately NOT asserted as passing behaviour. Pinning the current 200
+  // would encode the bug as a contract: whoever fixes the pin fallthrough later
+  // would get a red test and have to delete it. Written up instead in
+  // local://pin-fallthrough-bug.md, with a ready-made regression test.
+  //
+  // SCOPE of the guarantee the test below does establish: this branch NARROWED
+  // the silent-reroute hole, it did not close it. Before this branch the filter
+  // was `if (requireVision && !entry.supports_vision) continue;` with no pin
+  // check at all, so a CHAIN-ENABLED pinned non-vision model on an image
+  // request also rerouted silently. The ModalityMismatchError throw closed that
+  // case. Chain-disabled pins still reroute, exactly as they did before,
+  // because such a pin never matches a chain entry in either version.
+  it.todo('rejects a CHAIN-DISABLED pinned model that cannot express the modality (see local://pin-fallthrough-bug.md)');
 
   it('leaves a text-only request untouched by the modality gate', async () => {
     getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_audio_input = 1 OR supports_video_input = 1').run();
@@ -221,10 +203,13 @@ describe('Modality-aware routing (audio + video)', () => {
     // `models.enabled = 1` alone (as an earlier revision did) can pick a
     // chain-disabled row, in which case this test passes for the wrong reason.
     const db = getDb();
+    // Chain membership is in the JOIN CONDITION, not a WHERE filter, so the
+    // requirement cannot be accidentally relaxed by a later edit to the WHERE
+    // clause — this test is only valid for a row the router will actually visit.
     const textOnly = db.prepare(`
       SELECT m.id, m.platform, m.model_id FROM models m
-      JOIN fallback_config fc ON fc.model_db_id = m.id
-      WHERE m.supports_vision = 0 AND m.enabled = 1 AND fc.enabled = 1
+      JOIN fallback_config fc ON fc.model_db_id = m.id AND fc.enabled = 1
+      WHERE m.supports_vision = 0 AND m.enabled = 1
       LIMIT 1
     `).get() as { id: number; platform: string; model_id: string } | undefined;
     expect(textOnly).toBeTruthy();
