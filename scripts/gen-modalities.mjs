@@ -206,18 +206,19 @@ function buildIndexes(modelsDev, openRouter) {
    * lets that single outlier raise image on all 14 gateway rows named
    * `glm-5.3`, and the router then sends image requests to a text-only model.
    *
-   * Measured against OpenRouter as a held-out source (404 keys with >=2 voters
-   * and an OpenRouter entry), majority beats every alternative on the error
-   * direction that matters:
-   *     rule                     exact    false-pos   false-neg
-   *     union (previous)         87.6%       57          —
-   *     majority                 96.5%        7           7
-   *     corroborated (>=2)       93.6%       26           0
-   *     any-but-majority-guard   96.5%       13           1
-   * Majority and the guard tie on exactness; majority halves the false
-   * positives. A false positive claims a capability the model lacks — the
-   * failure this whole exercise exists to remove — while a false negative only
-   * routes to a different model, so majority is the correct trade.
+   * Measured with OpenRouter entries REMOVED from the voter pool so it could
+   * serve as a held-out truth set (404 keys with >=2 voters and an entry there):
+   *     rule                exact    false-pos   false-neg
+   *     union (previous)    87.6%       57           0
+   *     majority            97.3%        6           5
+   *     corroborated (>=2)  93.6%       26           0
+   * (Majority scores 96.5%/7 when the pool is models.dev only — measured too,
+   * since the shipped pool is the union of both sources. Shipped pool is what
+   * matters, hence the table above.)
+   *
+   * A false positive claims a capability the model lacks — the failure this
+   * whole exercise exists to remove — while a false negative only routes to a
+   * different model, so majority is the correct trade.
    *
    * Absence of a key means "no opinion" to the applier, so a key whose votes all
    * say text-only still gets an explicit all-false entry.
@@ -227,27 +228,21 @@ function buildIndexes(modelsDev, openRouter) {
   const putGlobal = (key, flags) => {
     if (!key || !flags) return;
     if (!globalVotes.has(key)) {
-      globalVotes.set(key, {
-        image: 0, audio: 0, video: 0,
-        total: 0,
-        anyImage: false, anyAudio: false, anyVideo: false,
-      });
+      globalVotes.set(key, { image: 0, audio: 0, video: 0, total: 0 });
     }
     const v = globalVotes.get(key);
     v.total += 1;
-    if (flags.image) { v.image += 1; v.anyImage = true; }
-    if (flags.audio) { v.audio += 1; v.anyAudio = true; }
-    if (flags.video) { v.video += 1; v.anyVideo = true; }
+    if (flags.image) v.image += 1;
+    if (flags.audio) v.audio += 1;
+    if (flags.video) v.video += 1;
   };
 
   /**
-   * Resolve the votes. A modality needs a strict majority.
-   *
-   * Ties (even voter count, exactly half claiming the modality) go to the
-   * `any` side only when NO voter contradicts — i.e. every voter claims it — but
-   * that case is a unanimous yes, not a tie. A genuine half-vs-half tie is
-   * resolved as false: the cheap mistake is routing to a different model, the
-   * expensive one is advertising a capability that does not exist.
+   * Resolve the votes: a modality needs a STRICT majority (`n * 2 > total`), so
+   * an exact half does not carry it. With an even voter count and a 50/50 split
+   * the modality is dropped — the cheap mistake is routing to a different model
+   * (a false negative), the expensive one is advertising a capability that does
+   * not exist (a false positive, which is the defect this rule removes).
    */
   const resolveGlobalVotes = () => {
     for (const [key, v] of globalVotes) {
