@@ -125,6 +125,27 @@ describe('applyModalityIndex: adapter cap and operator ownership', () => {
     expect(first).toMatchObject({ v: 1, a: 1, d: 1 });
   });
 
+  it('retracts an audio flag from a non-chat (ASR) model the index covers with empty flags', () => {
+    // Whisper-style models are indexed with an EXPLICIT empty flag set, not
+    // omitted. That distinction is load-bearing: an absent key means "no
+    // opinion" so a stale audio:true written by an earlier boot would survive
+    // forever, while a present-but-empty entry makes the applier write 0. This
+    // pins the retraction so removing an entry from the index cannot silently
+    // leave the gate advertising a chat capability the model lacks.
+    //
+    // The row is seeded HERE rather than relying on the catalog: the in-memory
+    // test DB does not contain the unorouter rows, and an earlier version of
+    // this test had an early `return` guard that made it pass without ever
+    // running — a vacuous green.
+    const indexed = MODALITY_INDEX.get(modalityIndexKey('unorouter', 'whisper-large-v3-turbo:free'));
+    expect(indexed).toBeDefined();
+    expect(indexed!.audio).toBeUndefined();
+
+    const id = seedModel('unorouter', 'whisper-large-v3-turbo:free', { vision: 0, audio: 1, video: 0, manual: 0 });
+    applyModalityIndex(getDb(), [id]);
+    expect(flagsOf(id).a).toBe(0);
+  });
+
   it('leaves rows outside the requested scope untouched', () => {
     const inside = seedModel('cloudflare', '@cf/scoped/inside');
     const outside = seedModel('cloudflare', '@cf/scoped/outside');

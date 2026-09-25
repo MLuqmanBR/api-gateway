@@ -21,7 +21,7 @@ export function modalityIndexKey(platform: string, modelId: string): string {
   return `${platform}\u0000${modelId}`;
 }
 
-/** 3176 of 3761 catalog rows resolved to a source entry. */
+/** 3178 of 3761 catalog rows resolved to a source entry. */
 export const MODALITY_INDEX: ReadonlyMap<string, ModalityFlags> = new Map([
   [modalityIndexKey("abovedev", "deepseek-v4-flash"), { image: true }],
   [modalityIndexKey("abovedev", "deepseek-v4-flash-vision-exp"), { image: true }],
@@ -2867,6 +2867,8 @@ export const MODALITY_INDEX: ReadonlyMap<string, ModalityFlags> = new Map([
   [modalityIndexKey("unorouter", "sonar:free"), { image: true }],
   [modalityIndexKey("unorouter", "step-3.7-flash:free"), { image: true, video: true }],
   [modalityIndexKey("unorouter", "text-embedding-3-large"), {  }],
+  [modalityIndexKey("unorouter", "whisper-large-v3-turbo:free"), {  }],
+  [modalityIndexKey("unorouter", "whisper-large-v3:free"), {  }],
   [modalityIndexKey("vk-temp", "gpt-5.6-sol"), { image: true }],
   [modalityIndexKey("xkiro", "anthropic/claude-fable-5"), { image: true }],
   [modalityIndexKey("xkiro", "anthropic/claude-fable-5-1"), { image: true }],

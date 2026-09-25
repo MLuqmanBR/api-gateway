@@ -218,11 +218,14 @@ function buildIndexes(modelsDev, openRouter) {
   for (const [providerId, provider] of Object.entries(modelsDev ?? {})) {
     for (const model of Object.values(provider?.models ?? {})) {
       const input = model?.modalities?.input;
-      // Skip non-chat models (audio-in/text-out ASR): their `audio` flag means
-      // "takes audio on a transcription endpoint", not "accepts audio parts in
-      // a chat request". Indexing them would advertise a capability they lack.
-      if (!isChatModel(input)) continue;
-      const flags = flagsFromInputList(input);
+      // Non-chat models (audio-in/text-out ASR) get an EMPTY flag set rather
+      // than being skipped. Skipping would leave them absent from the index,
+      // and the applier treats absence as "no opinion" — so a stale
+      // audio:true written by an earlier boot would survive forever. An
+      // explicit all-false entry keeps the row covered and makes the applier
+      // write 0. (Whisper takes audio on a transcription endpoint, not as a
+      // part inside a chat request, so it must not advertise chat audio input.)
+      const flags = isChatModel(input) ? flagsFromInputList(input) : {};
       const ids = new Set([model?.id, lastSegment(model?.id)]);
       for (const id of ids) addScoped('modelsdev', providerId, id, flags);
       addGlobal(model?.id, flags);
@@ -231,8 +234,9 @@ function buildIndexes(modelsDev, openRouter) {
 
   for (const model of openRouter?.data ?? []) {
     const input = model?.architecture?.input_modalities;
-    if (!isChatModel(input)) continue; // see the models.dev pass above
-    const flags = flagsFromInputList(input);
+    // Empty flags for non-chat entries — see the models.dev pass above for why
+    // absence is not good enough.
+    const flags = isChatModel(input) ? flagsFromInputList(input) : {};
     const vendor = typeof model?.id === 'string' ? model.id.split('/')[0] : null;
     const ids = new Set([model?.id, lastSegment(model?.id)]);
     for (const id of ids) addScoped('openrouter', vendor, id, flags);

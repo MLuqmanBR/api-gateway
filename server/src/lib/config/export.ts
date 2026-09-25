@@ -288,7 +288,6 @@ function readSection(db: DatabasePort, sections: Record<ConfigSection, true>): C
         display_name: string; dimensions: number;
         max_input_tokens: number | null; priority: number;
         enabled: number; quota_label: string;
-        shape: string;
       }>;
       const byFamily = new Map<string, ConfigEmbeddingFamily>();
       for (const r of familyRows) {
