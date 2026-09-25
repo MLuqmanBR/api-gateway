@@ -48,7 +48,16 @@ describe('realtime relay', () => {
     send: (write: (obj: unknown) => void, on: (type: string, cb: () => void) => void) => void,
     done: (events: Array<Record<string, unknown>>) => boolean,
   ): Promise<Array<Record<string, unknown>>> {
-    const { promise, resolve, reject } = Promise.withResolvers<Array<Record<string, unknown>>>();
+    // Manual executor form (not Promise.withResolvers): CI's Node 20 leg lacks
+    // it (Node 22+ only). Same reason as waitForDelivery in webhooks.test.ts —
+    // except that helper has no error path, so it binds only `resolve`. This one
+    // rejects from the socket's error handler and must bind both.
+    let resolve!: (v: Array<Record<string, unknown>>) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<Array<Record<string, unknown>>>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
     const ws = new WebSocket(`ws://127.0.0.1:${appPort}/v1/realtime`, {
       headers: { Authorization: 'Bearer test-token' },
     });
