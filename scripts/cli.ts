@@ -213,7 +213,11 @@ async function ensureBuilt() {
 // EADDRINUSE and prints a misleading crash message, so probe the port
 // first and refuse cleanly when something unmanaged is already listening.
 function portInUse(port) {
-  const { promise, resolve } = Promise.withResolvers();
+  // Manual executor form (not Promise.withResolvers): that is Node 22+ only, and
+  // this CLI is run by whatever `node` is on PATH — CI's Node 20 leg and older
+  // user installs included.
+  let resolve!: (v: boolean) => void;
+  const promise = new Promise<boolean>((r) => { resolve = r; });
   const socket = new net.Socket();
   socket.setTimeout(1000);
   socket.once('connect', () => { socket.destroy(); resolve(true); });
@@ -230,9 +234,8 @@ function portInUse(port) {
 // are bounded so a stuck process can only add `timeoutMs` before
 // stop/restart proceed anyway.
 function sleep(ms) {
-  const { promise, resolve } = Promise.withResolvers();
-  setTimeout(resolve, ms);
-  return promise;
+  // See portInUse: Promise.withResolvers is Node 22+ only.
+  return new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 }
 
 async function waitPidGone(pid, timeoutMs = 5000) {
