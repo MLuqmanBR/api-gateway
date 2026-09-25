@@ -4,7 +4,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { classifyError, type ErrorClass } from '../lib/error-class.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledModelFor, NO_MODEL_ERROR_CODE, ModalityMismatchError, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledModelFor, NO_MODEL_ERROR_CODE, ModalityMismatchError, PinnedModelNotRoutableError, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
@@ -1179,6 +1179,21 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             message: err.message,
             type: 'invalid_request_error',
             code: 'model_capability_mismatch',
+          },
+        });
+        return;
+      }
+      // Pinned model exists and is enabled in the catalog, but is not in the
+      // enabled fallback chain, so there is no route to it. Failing here is the
+      // whole point: entering the recovery loop would iterate the chain and
+      // eventually answer from a DIFFERENT model, which is precisely the silent
+      // reroute a pin must prevent.
+      if (err instanceof PinnedModelNotRoutableError) {
+        res.status(400).json({
+          error: {
+            message: err.message,
+            type: 'invalid_request_error',
+            code: err.code,
           },
         });
         return;

@@ -42,6 +42,37 @@ function modelSupportsModalities(row: ChainRow, required: ReadonlySet<MediaKind>
 }
 
 /**
+ * A pinned model is not in the ENABLED fallback chain, so the router has no
+ * route to it.
+ *
+ * Distinct from the pin-resolution verdicts in `lib/pinned-model.ts`: those
+ * answer "does this model exist and is it switched on in the catalog", against
+ * `models`. This answers "will the router actually try it", against
+ * `fallback_config` — a model can be enabled in the catalog and absent from the
+ * chain, and pinning such a model previously routed the request to a DIFFERENT
+ * model with no error, which contradicts the pin contract stated at
+ * routes/proxy.ts ("silently auto-routing to a different model would be
+ * surprising to OpenAI-compatible clients").
+ *
+ * Checked against the built chain rather than by a second query, so the two can
+ * never disagree about what is routable.
+ */
+export class PinnedModelNotRoutableError extends Error {
+  readonly modelDbId: number;
+  readonly code = 'model_not_routable';
+  /** Consumed by callers that map a routing throw to an HTTP status. */
+  readonly status = 400;
+  constructor(modelDbId: number) {
+    super(
+      'Pinned model is not in the enabled fallback chain. Enable it in the Fallback Chain, '
+      + "or use 'auto' (or omit the 'model' field) to auto-route.",
+    );
+    this.name = 'PinnedModelNotRoutableError';
+    this.modelDbId = modelDbId;
+  }
+}
+
+/**
  * A pinned model cannot express a modality the request needs. Distinct from
  * PINNED_MODEL_EXHAUSTED (no keys): here the model is reachable but the wrong
  * shape, and falling through to another model would silently break the pin
@@ -687,6 +718,21 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
   const pinMode = options?.pinMode ?? false;
   const oneRPM = options?.oneRPM ?? false;
+
+  // A PINNED model that is enabled in the catalog but absent from the enabled
+  // chain has no route. Fail loudly instead of iterating the chain and answering
+  // from an unrelated model — the client asked for a specific model, and a
+  // different one's output is not an acceptable substitute.
+  //
+  // Checked against the ACTUAL chain the loop is about to use (rather than by
+  // re-querying `fallback_config`), so this can never disagree with what is
+  // routable. Exempt when oneRPM is set: the 1-RPM recovery path intentionally
+  // re-enters with the pin as a preference.
+  if (pinMode && preferredModelDbId && !oneRPM) {
+    if (!sortedChain.some(e => e.model_db_id === preferredModelDbId)) {
+      throw new PinnedModelNotRoutableError(preferredModelDbId);
+    }
+  }
 
   for (const entry of sortedChain) {
     // Models the caller has ruled out for this request — e.g. a 404

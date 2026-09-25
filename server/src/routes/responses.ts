@@ -483,17 +483,28 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, requiredModalities.size > 0 ? requiredModalities : undefined, skipModels.size > 0 ? skipModels : undefined, { pinMode: isPinned });
     } catch (err: unknown) {
       // routeRequest throws Error with { status?, code? } — see router.ts
-      const routingErr = err as Error & { status?: number };
+      const routingErr = err as Error & { status?: number; code?: string };
       const status = lastError ? 429 : (routingErr.status ?? 503);
       const message = lastError
         ? `All models rate-limited. Last error: ${sanitizeProviderErrorMessage(lastError.message)}`
         : routingErr.message;
-      const type = lastError ? 'rate_limit_error' : 'routing_error';
+      // A pin that exists but has no route is a CLIENT error, not a routing
+      // failure: report it as such, matching the chat route's shape
+      // (400 / invalid_request_error / code model_not_routable). Only a genuine
+      // upstream routing failure keeps the generic type.
+      const isPinRejection = routingErr.code === 'model_not_routable';
+      const type = lastError ? 'rate_limit_error' : (isPinRejection ? 'invalid_request_error' : 'routing_error');
+      // The code is included for pre-routing rejections so a client can branch
+      // on it (matching /v1/chat/completions, which returns code
+      // model_not_routable / model_capability_mismatch for the same cases).
+      const errorBody = isPinRejection
+        ? { message, type, code: routingErr.code }
+        : { message, type };
       if (streamStarted) {
-        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message, type } } });
+        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: errorBody } });
         res.end();
       } else {
-        res.status(status).json({ error: { message, type } });
+        res.status(status).json({ error: errorBody });
       }
       return;
     }

@@ -2926,6 +2926,17 @@ function migrateSchemaV50TranscriptionShape(db: DatabasePort) {
 const ADAPTER_CAPABILITY: Record<string, { image?: boolean; audio?: boolean; video?: boolean }> = {
   cohere: { audio: false, video: false },
   cloudflare: { image: false, audio: false, video: false },
+  // CommandCode's /alpha/generate validates message content against a Zod union
+  // whose accepted part types are, verbatim from its own validation error:
+  //   text, image, document, thinking, redacted_thinking, reasoning,
+  //   tool-call, tool-result, tool_use, tool_result, search_result,
+  //   server_tool_use, web_search_tool_result, web_fetch_tool_result
+  // There is no audio and no video part. Live-measured: sending
+  // {type:'audio',audio:...} or {type:'video',video:...} returns
+  // 400 BAD_REQUEST "Invalid input: expected "image" at
+  // params.messages[0].content[1].type". Image IS accepted and works (live:
+  // 1x1 red PNG -> content "Red"). So only image is expressible here.
+  commandcode: { audio: false, video: false },
 };
 
 /** Anthropic-format platforms get no audio and no video. */

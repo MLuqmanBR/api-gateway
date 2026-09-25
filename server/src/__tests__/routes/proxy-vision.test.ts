@@ -157,24 +157,58 @@ describe('Modality-aware routing (audio + video)', () => {
     getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_video_input = 1').run();
   });
 
-  // A chain-disabled pinned model on a modality request is NOT capability
-  // checked: the guard fires inside the chain loop (router.ts:706), so a pin
-  // that resolves (lib/pinned-model.ts accepts any `models.enabled = 1` row)
-  // but is absent from the chain is never visited and silently reroutes.
-  //
-  // Deliberately NOT asserted as passing behaviour. Pinning the current 200
-  // would encode the bug as a contract: whoever fixes the pin fallthrough later
-  // would get a red test and have to delete it. Written up instead in
-  // local://pin-fallthrough-bug.md, with a ready-made regression test.
-  //
-  // SCOPE of the guarantee the test below does establish: this branch NARROWED
-  // the silent-reroute hole, it did not close it. Before this branch the filter
-  // was `if (requireVision && !entry.supports_vision) continue;` with no pin
-  // check at all, so a CHAIN-ENABLED pinned non-vision model on an image
-  // request also rerouted silently. The ModalityMismatchError throw closed that
-  // case. Chain-disabled pins still reroute, exactly as they did before,
-  // because such a pin never matches a chain entry in either version.
-  it.todo('rejects a CHAIN-DISABLED pinned model that cannot express the modality (see local://pin-fallthrough-bug.md)');
+  it('rejects a CHAIN-DISABLED pinned model instead of silently rerouting', async () => {
+    // The bug this pins (reproduced live before the fix): a pin resolves against
+    // `models.enabled = 1` (lib/pinned-model.ts) but the routing chain is built
+    // from `fallback_config ... WHERE fc.enabled = 1`. A model enabled in the
+    // catalog but absent from the chain resolved as a pin and then routed
+    // ANYWHERE — measured live as HTTP 200 from a different model:
+    //   pin=logfare/deepseek-v4-pro-0813 (models.enabled=1, fc.enabled=0)
+    //   -> HTTP 200, X-Routed-Via: logfare/qwen-3.8-27b
+    //
+    // A pin names a specific model; another model's answer is not a substitute.
+    // Now a 400 model_not_routable, from routeRequest, checked against the
+    // actual built chain so it cannot disagree with what is routable.
+    const db = getDb();
+    const anyTextOnly = db.prepare(
+      'SELECT id, platform, model_id FROM models WHERE supports_vision = 0 LIMIT 1',
+    ).get() as { id: number; platform: string; model_id: string } | undefined;
+    expect(anyTextOnly).toBeTruthy();
+
+    // Catalog-enabled, chain-disabled: exactly the gap.
+    db.prepare('UPDATE fallback_config SET enabled = 0 WHERE model_db_id = ?').run(anyTextOnly!.id);
+
+    const { status, body } = await post(app, '/v1/chat/completions', {
+      model: `${anyTextOnly!.platform}/${anyTextOnly!.model_id}`,
+      messages: [{ role: 'user', content: 'hello' }],
+    }, key);
+
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('model_not_routable');
+    expect(body.error.type).toBe('invalid_request_error');
+    expect(body.error.message).toMatch(/not in the enabled fallback chain/i);
+  });
+
+  it('still routes a pin that IS in the enabled chain', async () => {
+    // The guard must not reject legitimate pins. Re-enable the row the previous
+    // test disabled and confirm the same pin now routes.
+    const db = getDb();
+    const row = db.prepare(
+      'SELECT m.id, m.platform, m.model_id FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id LIMIT 1',
+    ).get() as { id: number; platform: string; model_id: string } | undefined;
+    expect(row).toBeTruthy();
+    db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(row!.id);
+
+    const { status, body } = await post(app, '/v1/chat/completions', {
+      model: `${row!.platform}/${row!.model_id}`,
+      messages: [{ role: 'user', content: 'hello' }],
+    }, key);
+
+    // Not a pin rejection. (Status may be 200 or an exhaustion status — this DB
+    // has no provider keys — but never the not-routable error.)
+    expect(body?.error?.code).not.toBe('model_not_routable');
+    expect(status).not.toBe(400);
+  });
 
   it('leaves a text-only request untouched by the modality gate', async () => {
     getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_audio_input = 1 OR supports_video_input = 1').run();

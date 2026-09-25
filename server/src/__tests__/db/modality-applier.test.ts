@@ -78,6 +78,32 @@ describe('applyModalityIndex: adapter cap and operator ownership', () => {
     expect(flags.v).toBe(1);
   });
 
+  it('forces CommandCode audio and video to 0 but leaves image alone', () => {
+    // Live-measured 2026-09-25 against api.commandcode.ai/alpha/generate:
+    // sending {type:'audio',audio:...} or {type:'video',video:...} returns
+    //   400 BAD_REQUEST "Invalid input: expected \"image\" at
+    //                      params.messages[0].content[1].type"
+    // because the endpoint validates content against a Zod union whose accepted
+    // part types are text, image, document, thinking, redacted_thinking,
+    // reasoning, tool-call, tool-result, tool_use, tool_result, search_result,
+    // server_tool_use, web_search_tool_result, web_fetch_tool_result — no audio
+    // and no video. Image IS accepted (live: 1x1 red PNG -> content "Red").
+    //
+    // Without this cap the catalog advertised audio/video on 33 CommandCode rows
+    // (xiaomi/mimo-v2.5 and Qwen3.8-Omni-Flash among them) and every such
+    // request died upstream with an opaque validation error instead of being
+    // routed to a model that can actually serve it.
+    const id = seedModel('commandcode', 'xiaomi/mimo-v2.5-probe');
+    applyModalityIndex(getDb(), [id]);
+    const flags = flagsOf(id);
+    expect(flags.a).toBe(0);
+    expect(flags.d).toBe(0);
+    // Image must survive the cap — a cap that zeroed all three flags would make
+    // the two assertions above pass while silently disabling image input, which
+    // is verified working on this exact provider.
+    expect(flags.v).toBe(1);
+  });
+
   it('never rewrites a row the operator owns', () => {
     // Start the row contradicting both the index and the cap, with the
     // ownership flag set: the applier must leave all three flags exactly as-is.

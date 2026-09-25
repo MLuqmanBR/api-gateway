@@ -774,10 +774,14 @@ export class CommandCodeProvider extends BaseProvider {
           //    models silently drop it upstream (their documented behavior,
           //    verified live) — we must not mangle it into text.
           //
-          //    Audio/video use the same pattern with `type:'audio'` /
-          //    `type:'video'`. Those flags default OFF (applyModalityIndex's
-          //    adapter cap) because no live evidence exists that upstream
-          //    accepts them; an operator can turn them on per model. ──
+          //
+          //    Audio and video are NOT expressible: upstream's content union
+          //    accepts only text/image/document/thinking/tool-*/search_result
+          //    (read from its own validation error), so `type:'audio'` and
+          //    `type:'video'` come back as 400 BAD_REQUEST. ADAPTER_CAPABILITY
+          //    (db/migrations.ts) forces those flags off for this platform, and
+          //    the branch below degrades to a text placeholder rather than
+          //    letting upstream's Zod error surface as a confusing 400. ──
           if (typ === 'image_url' || typ === 'input_image' || typ === 'image' ||
               typ === 'audio_url' || typ === 'input_audio' || typ === 'audio' ||
               typ === 'video_url' || typ === 'input_video' || typ === 'video') {
@@ -785,8 +789,14 @@ export class CommandCodeProvider extends BaseProvider {
             const url = kind ? mediaUrlOf(b, kind) : null;
             if (kind && url) {
               if (kind === 'image') return { type: 'image', image: url };
-              if (kind === 'audio') return { type: 'audio', audio: url };
-              return { type: 'video', video: url };
+              // Audio/video have no representation in upstream's content union.
+              // Degrade to text so the request still succeeds (the model simply
+              // cannot hear/see it) instead of failing with an opaque
+              // "expected image at content[1].type" validation error. The
+              // modality caps keep requests from reaching here in the first
+              // place; this is the belt-and-braces path for a manual override.
+              console.warn(`[commandcode] ${kind} input is not supported by this provider; sending a placeholder instead`);
+              return { type: 'text', text: `[${kind} input omitted: CommandCode accepts text and image only]` };
             }
             return { type: 'text', text: `[${typ} part without url]` };
           }
