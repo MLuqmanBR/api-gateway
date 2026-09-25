@@ -383,8 +383,9 @@ function applyModels(
           `SELECT display_name, intelligence_rank, speed_rank, size_label,
                   rpm_limit, rpd_limit, tpm_limit, tpd_limit,
                   monthly_token_budget, context_window, enabled,
-                  supports_vision, max_output_tokens,
-                  paid_input_per_m, paid_output_per_m, pricing_manual
+                  supports_vision, supports_audio_input, supports_video_input,
+                  modalities_manual,
+                  max_output_tokens, paid_input_per_m, paid_output_per_m, pricing_manual
            FROM models WHERE id = ?`,
         ).get(existing.id) as {
           display_name: string; intelligence_rank: number; speed_rank: number;
@@ -392,6 +393,8 @@ function applyModels(
           tpm_limit: number | null; tpd_limit: number | null;
           monthly_token_budget: string; context_window: number | null;
           enabled: number; supports_vision: number;
+          supports_audio_input: number; supports_video_input: number;
+          modalities_manual: number;
           max_output_tokens: number | null; paid_input_per_m: number | null;
           paid_output_per_m: number | null; pricing_manual: number;
         };
@@ -415,6 +418,13 @@ function applyModels(
           sameAsRow(current.context_window, m.contextWindow) &&
           current.enabled === (m.enabled ? 1 : 0) &&
           current.supports_vision === (m.supportsVision ? 1 : 0) &&
+          // A file with no modality fields (exported before the columns
+          // existed) is not "identical" — fall through to UPDATE so the
+          // destination keeps its own flags and the manual marker is set.
+          m.supportsAudioInput !== undefined &&
+          m.supportsVideoInput !== undefined &&
+          current.supports_audio_input === (m.supportsAudioInput ? 1 : 0) &&
+          current.supports_video_input === (m.supportsVideoInput ? 1 : 0) &&
           sameAsRow(current.max_output_tokens, m.maxOutputTokens) &&
           sameAsRow(current.paid_input_per_m, m.paidInputPerM) &&
           sameAsRow(current.paid_output_per_m, m.paidOutputPerM) &&
@@ -429,12 +439,17 @@ function applyModels(
           diff.skipped++;
           continue;
         }
+        // Modality fields are OPTIONAL in the file. Absent means "no opinion":
+        // keep the destination's own flags rather than zeroing them, and leave
+        // modalities_manual alone. Present means the file is authoritative.
+        const hasModalityData = m.supportsAudioInput !== undefined || m.supportsVideoInput !== undefined;
         db.prepare(`
           UPDATE models SET
             display_name = ?, intelligence_rank = ?, speed_rank = ?,
             size_label = ?, rpm_limit = ?, rpd_limit = ?, tpm_limit = ?, tpd_limit = ?,
             monthly_token_budget = ?, context_window = ?, enabled = ?,
             supports_vision = ?, max_output_tokens = ?,
+            supports_audio_input = ?, supports_video_input = ?, modalities_manual = ?,
             paid_input_per_m = ?, paid_output_per_m = ?, pricing_manual = 1
           WHERE id = ?
         `).run(
@@ -442,6 +457,13 @@ function applyModels(
           m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,
           m.monthlyTokenBudget, m.contextWindow, m.enabled ? 1 : 0,
           m.supportsVision ? 1 : 0, m.maxOutputTokens,
+          m.supportsAudioInput === undefined
+            ? current.supports_audio_input
+            : (m.supportsAudioInput ? 1 : 0),
+          m.supportsVideoInput === undefined
+            ? current.supports_video_input
+            : (m.supportsVideoInput ? 1 : 0),
+          hasModalityData ? 1 : current.modalities_manual,
           m.paidInputPerM, m.paidOutputPerM,
           existing.id,
         );
@@ -453,13 +475,19 @@ function applyModels(
           INSERT INTO models (platform, model_id, display_name, intelligence_rank,
             speed_rank, size_label, rpm_limit, rpd_limit, tpm_limit, tpd_limit,
             monthly_token_budget, context_window, enabled, supports_vision,
+            supports_audio_input, supports_video_input, modalities_manual,
             max_output_tokens, paid_input_per_m, paid_output_per_m, pricing_manual)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
         `).run(
           m.platform, m.modelId, m.displayName, m.intelligenceRank,
           m.speedRank, m.sizeLabel, m.rpmLimit, m.rpdLimit, m.tpmLimit, m.tpdLimit,
           m.monthlyTokenBudget, m.contextWindow, m.enabled ? 1 : 0,
-          m.supportsVision ? 1 : 0, m.maxOutputTokens,
+          m.supportsVision ? 1 : 0,
+          m.supportsAudioInput ? 1 : 0,
+          m.supportsVideoInput ? 1 : 0,
+          // A file with no modality data leaves the row to the boot index.
+          m.supportsAudioInput !== undefined || m.supportsVideoInput !== undefined ? 1 : 0,
+          m.maxOutputTokens,
           m.paidInputPerM, m.paidOutputPerM,
         );
         diff.added++;
@@ -783,21 +811,22 @@ function applyTranscriptions(
       for (const p of fam.providers) {
         db.prepare(`
           INSERT INTO transcription_models (family, platform, model_id, display_name,
-            max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label, shape)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(fam.family, p.platform, p.modelId, fam.displayName,
           fam.maxFileMb, fam.supportsTranslations ? 1 : 0, p.pricePerHourUsd,
-          p.priority, p.enabled ? 1 : 0, fam.quotaLabel);
+          p.priority, p.enabled ? 1 : 0, fam.quotaLabel, p.shape ?? 'multipart');
         diff.added++;
       }
       continue;
     }
     for (const p of fam.providers) {
       try {
-        const existing = db.prepare('SELECT id, priority, enabled, max_file_mb, supports_translations, price_per_hour_usd, display_name, quota_label FROM transcription_models WHERE family = ? AND platform = ? AND model_id = ?').get(fam.family, p.platform, p.modelId) as {
+        const existing = db.prepare('SELECT id, priority, enabled, max_file_mb, supports_translations, price_per_hour_usd, display_name, quota_label, shape FROM transcription_models WHERE family = ? AND platform = ? AND model_id = ?').get(fam.family, p.platform, p.modelId) as {
           id: number; priority: number; enabled: number;
           max_file_mb: number; supports_translations: number;
           price_per_hour_usd: number | null; display_name: string; quota_label: string;
+          shape: string;
         } | undefined;
         if (existing) {
           if (mode === 'skip-existing') { diff.skipped++; continue; }
@@ -808,6 +837,9 @@ function applyTranscriptions(
             existing.enabled === enabledNext &&
             existing.max_file_mb === fam.maxFileMb &&
             existing.supports_translations === supportsNext &&
+            // A file with no shape predates the column, so it has no opinion:
+            // treat that as identical rather than forcing a rewrite.
+            (p.shape === undefined || existing.shape === p.shape) &&
             (existing.price_per_hour_usd ?? null) === (p.pricePerHourUsd ?? null) &&
             existing.display_name === fam.displayName &&
             existing.quota_label === fam.quotaLabel;
@@ -818,18 +850,19 @@ function applyTranscriptions(
           db.prepare(`
             UPDATE transcription_models SET priority = ?, enabled = ?,
               max_file_mb = ?, supports_translations = ?, price_per_hour_usd = ?,
-              display_name = ?, quota_label = ?
+              display_name = ?, quota_label = ?, shape = ?
             WHERE id = ?
-          `).run(p.priority, enabledNext, fam.maxFileMb, supportsNext, p.pricePerHourUsd, fam.displayName, fam.quotaLabel, existing.id);
+          `).run(p.priority, enabledNext, fam.maxFileMb, supportsNext, p.pricePerHourUsd,
+            fam.displayName, fam.quotaLabel, p.shape ?? existing.shape, existing.id);
           diff.updated++;
         } else {
           db.prepare(`
             INSERT INTO transcription_models (family, platform, model_id, display_name,
-              max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              max_file_mb, supports_translations, price_per_hour_usd, priority, enabled, quota_label, shape)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(fam.family, p.platform, p.modelId, fam.displayName,
             fam.maxFileMb, fam.supportsTranslations ? 1 : 0, p.pricePerHourUsd,
-            p.priority, p.enabled ? 1 : 0, fam.quotaLabel);
+            p.priority, p.enabled ? 1 : 0, fam.quotaLabel, p.shape ?? 'multipart');
           diff.added++;
         }
       } catch (err) {

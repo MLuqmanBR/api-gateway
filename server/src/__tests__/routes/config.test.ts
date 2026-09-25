@@ -1373,6 +1373,66 @@ describe('Config API', () => {
     expect(imp.body.sections.embeddings?.skipped).toBe(1);
   });
 
+  it('round-trips a base64-json transcription provider shape through export and import', async () => {
+    // `shape` was added for providers that take the audio inline as base64 JSON
+    // instead of multipart (zenmux 415s on multipart). It sat outside the
+    // config round-trip, so an export/import cycle silently reset such a row to
+    // the multipart default and the provider 415'd on the next request. Most
+    // catalog rows arrive via config import, so this path is the normal way a
+    // row is created, not an edge case.
+    // Use a unique family rather than wiping the table: sibling tests in this
+    // file assert on the seeded catalog rows, and a DELETE here would make them
+    // fail for reasons unrelated to what they test.
+    const db = getDb();
+    db.prepare('DELETE FROM transcription_models WHERE family = ?').run('zenfam-shape-roundtrip');
+    db.prepare(`
+      INSERT INTO transcription_models
+        (family, platform, model_id, display_name, max_file_mb, supports_translations,
+         price_per_hour_usd, priority, enabled, quota_label, shape)
+      VALUES ('zenfam-shape-roundtrip', 'zenmux', 'some-asr', 'Some ASR', 25, 0, 0.1, 99, 1, '', 'base64-json')
+    `).run();
+
+    // Export carries the shape out. The route returns the envelope itself
+    // (routes/config.ts:86 `res.send(body)`), not a wrapper.
+    const exp = await request(app, 'POST', '/api/config/export', { sections: ['transcriptions'] });
+    expect(exp.status).toBe(200);
+    const exportedFam = exp.body?.sections?.transcriptions?.families
+      ?.find((f: { family: string }) => f.family === 'zenfam-shape-roundtrip');
+    expect(exportedFam?.providers?.[0]?.shape).toBe('base64-json');
+
+    // And an import puts it back rather than defaulting to multipart.
+    db.prepare("UPDATE transcription_models SET shape = 'multipart' WHERE family = 'zenfam-shape-roundtrip'").run();
+    const imp = await request(app, 'POST', '/api/config/import', {
+      envelope: {
+        schemaVersion: 1,
+        generator: 'api-gateway',
+        exportedAt: new Date().toISOString(),
+        sections: {
+          transcriptions: {
+            families: [{
+              family: 'zenfam-shape-roundtrip',
+              providers: [{
+                platform: 'zenmux', modelId: 'some-asr', priority: 1, enabled: true,
+                pricePerHourUsd: 0.1, shape: 'base64-json',
+              }],
+              maxFileMb: 25,
+              supportsTranslations: false,
+              displayName: 'Some ASR',
+              quotaLabel: '',
+            }],
+          },
+        },
+      },
+      options: { mode: 'overwrite', dryRun: false },
+    });
+    expect(imp.status).toBe(200);
+
+    const row = db.prepare("SELECT shape FROM transcription_models WHERE family = 'zenfam-shape-roundtrip'").get() as { shape: string };
+    expect(row.shape).toBe('base64-json');
+
+    db.prepare('DELETE FROM transcription_models WHERE family = ?').run('zenfam-shape-roundtrip');
+  });
+
   it('re-importing an unchanged transcription family row produces zero updates', async () => {
     const env: ConfigEnvelope = {
       schemaVersion: 1,

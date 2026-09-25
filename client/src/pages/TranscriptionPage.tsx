@@ -1,6 +1,6 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useRef, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowDown, ArrowUp } from 'lucide-react'
+import { ArrowDown, ArrowUp, Upload } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
@@ -21,6 +21,10 @@ interface ProviderEntry {
   quotaLabel: string
   keyCount: number
   pricePerHourUsd: number | null
+  /** Wire shape this provider expects. */
+  shape: string
+  /** Whether the gateway can resolve an endpoint for this provider right now. */
+  audioEndpoint: boolean
 }
 
 interface Family {
@@ -48,6 +52,86 @@ function formatPrice(usd: number | null): string {
 function formatMinutes(mins: number): string {
   if (mins >= 60) return `${(mins / 60).toFixed(1)}h`
   return `${Math.round(mins)}m`
+}
+
+/**
+ * Try a real transcription through the proxy.
+ *
+ * Needs a real dashboard session: it reads the unified API key from
+ * /api/settings/api-key, which is behind `requireSession` (LAN trust alone is
+ * not enough), then POSTs multipart to /v1/audio/transcriptions.
+ */
+function TranscribeTester() {
+  const [busy, setBusy] = useState(false)
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  const { data: keyData } = useQuery<{ apiKey: string }>({
+    queryKey: ['unified-key'],
+    queryFn: () => apiFetch('/api/settings/api-key'),
+  })
+
+  async function run() {
+    const file = fileRef.current?.files?.[0]
+    if (!file) {
+      addToast({ kind: 'warning', title: 'Pick a file', description: 'Choose an audio file to transcribe.' })
+      return
+    }
+    if (!keyData?.apiKey) {
+      addToast({ kind: 'warning', title: 'Not signed in', description: 'Transcribing needs a dashboard session (the API key endpoint is session-gated).' })
+      return
+    }
+    setBusy(true)
+    setResult(null)
+    try {
+      const form = new FormData()
+      form.append('model', 'auto')
+      form.append('file', file)
+      const base = import.meta.env.BASE_URL.replace(/\/$/, '')
+      const res = await fetch(`${base}/v1/audio/transcriptions`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${keyData.apiKey}` },
+        body: form,
+      })
+      const body = await res.json().catch(() => ({})) as { text?: string; error?: { message?: string } }
+      if (!res.ok) {
+        setResult({ ok: false, text: body.error?.message ?? `HTTP ${res.status}` })
+      } else {
+        setResult({ ok: true, text: body.text ?? '(empty transcript)' })
+      }
+    } catch (err) {
+      setResult({ ok: false, text: (err as Error).message })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section className="rounded-xl border bg-card p-4">
+      <h2 className="text-sm font-medium">Try a transcription</h2>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Sends the file to <code className="rounded bg-muted px-1 font-mono">POST /v1/audio/transcriptions</code> with{' '}
+        <code className="rounded bg-muted px-1 font-mono">model: "auto"</code>, so it exercises the same chain this page configures.
+      </p>
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <input
+          ref={fileRef}
+          type="file"
+          accept="audio/*"
+          className="text-xs file:mr-2 file:rounded-md file:border file:bg-background file:px-2 file:py-1 file:text-xs"
+        />
+        <Button size="sm" onClick={run} disabled={busy}>
+          <Upload className="mr-1.5 size-3.5" />
+          {busy ? 'Transcribing…' : 'Transcribe'}
+        </Button>
+      </div>
+      {result && (
+        <pre className={`mt-3 whitespace-pre-wrap rounded-lg border p-3 text-xs ${result.ok ? 'bg-muted/40' : 'border-destructive/40 text-destructive'}`}>
+          {result.text}
+        </pre>
+      )}
+    </section>
+  )
 }
 
 export default function TranscriptionPage() {
@@ -232,6 +316,22 @@ export default function TranscriptionPage() {
                                   no key
                                 </span>
                               )}
+                              {!p.audioEndpoint && (
+                                <span
+                                  title="No audio endpoint can be resolved for this provider — requests to this row fail. Set its base URL (chat needs one too) or disable the row."
+                                  className="text-[10px] rounded-full px-1.5 py-0.5 bg-destructive/15 text-destructive"
+                                >
+                                  no endpoint
+                                </span>
+                              )}
+                              {p.shape && p.shape !== 'multipart' && (
+                                <span
+                                  title={`This provider expects the ${p.shape} request body instead of multipart.`}
+                                  className="text-[10px] rounded-full px-1.5 py-0.5 bg-muted text-muted-foreground"
+                                >
+                                  {p.shape}
+                                </span>
+                              )}
                             </div>
                             <div className="text-[11px] text-muted-foreground/70">{p.quotaLabel}</div>
                           </div>
@@ -271,6 +371,8 @@ export default function TranscriptionPage() {
             })}
           </>
         )}
+
+        <TranscribeTester />
 
         <FloatingBar show={hasChanges}>
           <span className="text-xs text-muted-foreground">Unsaved changes</span>

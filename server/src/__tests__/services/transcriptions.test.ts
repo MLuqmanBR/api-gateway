@@ -213,7 +213,12 @@ describe('transcriptions service', () => {
           fields: [],
           file: wavFile(),
         }),
-      ).rejects.toMatchObject({ status: 502, message: expect.stringContaining('(no usable keys)') });
+      ).rejects.toMatchObject({
+        status: 502,
+        // The message now names the platform and distinguishes "no key" from
+        // "no endpoint" — the operator's next action differs between the two.
+        message: expect.stringContaining('no usable key for platform'),
+      });
       expect(fetchMock).not.toHaveBeenCalled();
     });
 

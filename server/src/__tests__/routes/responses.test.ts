@@ -50,9 +50,30 @@ describe('POST /v1/responses (#96)', () => {
     expect((await post(app, '/v1/responses', { model: 'auto' }, key)).status).toBe(400);
   });
 
-  // #118: image input isn't carried through the Responses translation yet, so
-  // it must hard-fail clearly rather than silently answer blind to the image.
-  it('rejects image input with a clear 422 pointing at /v1/chat/completions', async () => {
+  // #118 was the inverse of this: image input used to hard-fail because the
+  // translation flattened media to text. The translation now preserves it, so
+  // an image-bearing Responses request routes normally and the provider
+  // receives the image as an OpenAI image_url block. The 422 only survives for
+  // the case where NO enabled model can accept the modality.
+  it('carries image input through to the provider instead of rejecting it', async () => {
+    let sentBody: any = null;
+    mockRouteRequest.mockImplementation((...args: unknown[]) => {
+      return fakeRoute({
+        async chatCompletion(_key: string, messages: unknown) {
+          sentBody = messages;
+          return {
+            id: 'img-test',
+            object: 'chat.completion',
+            created: 0,
+            model: 'fake-model',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'image accepted' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          };
+        },
+        async *streamChatCompletion() { /* unused */ },
+      });
+    });
+
     const { status, text } = await post(app, '/v1/responses', {
       input: [{
         role: 'user',
@@ -62,8 +83,13 @@ describe('POST /v1/responses (#96)', () => {
         ],
       }],
     }, key);
-    expect(status).toBe(422);
-    expect(JSON.parse(text).error.code).toBe('no_vision_model');
+
+    expect(status).toBe(200);
+    // The image reached the provider as an image_url block, not flattened text.
+    expect(JSON.stringify(sentBody)).toContain('data:image/png;base64,iVBORw0KGgo=');
+    expect(text).toContain('image accepted');
+    // And the modality requirement reached the router.
+    expect(mockRouteRequest.mock.calls.at(-1)?.[3]).toEqual(new Set(['image']));
   });
 
   // #103: the x-api-key header (Anthropic wire format) must authenticate here

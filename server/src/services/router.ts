@@ -16,6 +16,83 @@ import type { BaseProvider } from '../providers/base.js';
 import type { DatabasePort } from '../db/types.js';
 import { isModelAllowed } from '../lib/client-keys.js';
 import { resolveThinkingPolicy, type ThinkingPolicy } from '../lib/thinking.js';
+import type { MediaKind } from '../lib/content.js';
+
+/**
+ * DB column backing each input modality (`supports_vision` keeps its
+ * upstream-owned name; its meaning is "accepts image input").
+ */
+const MODALITY_COLUMN: Record<MediaKind, string> = {
+  image: 'supports_vision',
+  audio: 'supports_audio_input',
+  video: 'supports_video_input',
+};
+
+/** True when this chain row declares `kind` as a supported input modality. */
+function modelSupportsModality(row: ChainRow, kind: MediaKind): boolean {
+  return row[MODALITY_COLUMN[kind] as keyof ChainRow] === 1;
+}
+
+/** True when this chain row declares every modality in `required`. */
+function modelSupportsModalities(row: ChainRow, required: ReadonlySet<MediaKind>): boolean {
+  for (const kind of required) {
+    if (!modelSupportsModality(row, kind)) return false;
+  }
+  return true;
+}
+
+/**
+ * A pinned model is not in the ENABLED fallback chain, so the router has no
+ * route to it.
+ *
+ * Distinct from the pin-resolution verdicts in `lib/pinned-model.ts`: those
+ * answer "does this model exist and is it switched on in the catalog", against
+ * `models`. This answers "will the router actually try it", against
+ * `fallback_config` — a model can be enabled in the catalog and absent from the
+ * chain, and pinning such a model previously routed the request to a DIFFERENT
+ * model with no error, which contradicts the pin contract stated at
+ * routes/proxy.ts ("silently auto-routing to a different model would be
+ * surprising to OpenAI-compatible clients").
+ *
+ * Checked against the built chain rather than by a second query, so the two can
+ * never disagree about what is routable.
+ */
+export class PinnedModelNotRoutableError extends Error {
+  readonly modelDbId: number;
+  readonly code = 'model_not_routable';
+  /** Consumed by callers that map a routing throw to an HTTP status. */
+  readonly status = 400;
+  constructor(modelDbId: number) {
+    super(
+      'Pinned model is not in the enabled fallback chain. Enable it in the Fallback Chain, '
+      + "or use 'auto' (or omit the 'model' field) to auto-route.",
+    );
+    this.name = 'PinnedModelNotRoutableError';
+    this.modelDbId = modelDbId;
+  }
+}
+
+/**
+ * A pinned model cannot express a modality the request needs. Distinct from
+ * PINNED_MODEL_EXHAUSTED (no keys): here the model is reachable but the wrong
+ * shape, and falling through to another model would silently break the pin
+ * contract.
+ */
+export class ModalityMismatchError extends Error {
+  readonly modelId: string;
+  readonly missing: MediaKind[];
+  readonly code = 'model_capability_mismatch';
+  /** Consumed by callers that map a routing throw to an HTTP status
+   *  (responses.ts uses `routingErr.status ?? 503`). */
+  readonly status = 400;
+  constructor(modelId: string, missing: MediaKind[]) {
+    super(`Pinned model '${modelId}' does not accept ${missing.join(', ')} input`);
+    this.name = 'ModalityMismatchError';
+    this.modelId = modelId;
+    this.missing = missing;
+  }
+}
+
 
 interface KeyRow {
   id: number;
@@ -44,6 +121,8 @@ interface ChainRow {
   tpm_limit: number | null;
   tpd_limit: number | null;
   supports_vision: number;
+  supports_audio_input: number;
+  supports_video_input: number;
   context_window: number | null;
   /** Hard upper bound on output tokens the provider/upstream enforces. Used
    * as the default `max_tokens` when the caller doesn't supply one — some
@@ -608,7 +687,7 @@ export interface RouteOptions {
 }
 
 
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requiredModalities?: ReadonlySet<MediaKind>, skipModels?: Set<number>, options?: RouteOptions): RouteResult {
   const db = getDb();
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
@@ -619,6 +698,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
+           m.supports_audio_input, m.supports_video_input,
            m.context_window, m.max_output_tokens, m.key_id, m.tags, m.thinking_levels
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
@@ -639,6 +719,21 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   const pinMode = options?.pinMode ?? false;
   const oneRPM = options?.oneRPM ?? false;
 
+  // A PINNED model that is enabled in the catalog but absent from the enabled
+  // chain has no route. Fail loudly instead of iterating the chain and answering
+  // from an unrelated model — the client asked for a specific model, and a
+  // different one's output is not an acceptable substitute.
+  //
+  // Checked against the ACTUAL chain the loop is about to use (rather than by
+  // re-querying `fallback_config`), so this can never disagree with what is
+  // routable. Exempt when oneRPM is set: the 1-RPM recovery path intentionally
+  // re-enters with the pin as a preference.
+  if (pinMode && preferredModelDbId && !oneRPM) {
+    if (!sortedChain.some(e => e.model_db_id === preferredModelDbId)) {
+      throw new PinnedModelNotRoutableError(preferredModelDbId);
+    }
+  }
+
   for (const entry of sortedChain) {
     // Models the caller has ruled out for this request — e.g. a 404
     // "model removed upstream" already seen this request: trying the same
@@ -646,9 +741,20 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     // same dead route (PR #111, credits @barbotkonv).
     if (skipModels?.has(entry.model_db_id)) continue;
 
-    // Vision requests skip text-only models — including a sticky/preferred one,
-    // which is correct: don't pin an image turn to a model that can't see it.
-    if (requireVision && !entry.supports_vision) continue;
+    // Modality requests skip models that cannot express them — including a
+    // sticky/preferred one, which is correct: don't pin an image turn to a
+    // model that can't see it.
+    //
+    // A PINNED model that cannot express the modality is different: silently
+    // falling through to another model would violate the strict pin contract,
+    // so it fails loudly below instead of skipping.
+    if (requiredModalities && requiredModalities.size > 0 && !modelSupportsModalities(entry, requiredModalities)) {
+      if (pinMode && preferredModelDbId === entry.model_db_id) {
+        const missing = [...requiredModalities].filter(k => !modelSupportsModality(entry, k));
+        throw new ModalityMismatchError(entry.model_id, missing);
+      }
+      continue;
+    }
 
 
     // C3: tag/metadata-based filtering. When reqTags is non-empty, skip
@@ -1043,14 +1149,29 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
 // Whether at least one vision-capable model is enabled in the fallback chain.
 // Used to give image requests a clear "enable a vision model" error instead of
 // the generic exhaustion message when none is configured (#118, #125).
-export function hasEnabledVisionModel(): boolean {
+/**
+ * True when at least one enabled, routable model can accept `kind` as input.
+ * The proxy uses this to fail fast with a specific 422 instead of letting the
+ * router exhaust every model and return a generic "all exhausted" error.
+ */
+export function hasEnabledModelFor(kind: MediaKind): boolean {
   const db = getDb();
+  const column = MODALITY_COLUMN[kind];
   const row = db.prepare(`
     SELECT COUNT(*) as cnt
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
-    WHERE fc.enabled = 1 AND m.enabled = 1 AND m.supports_vision = 1
+    WHERE fc.enabled = 1 AND m.enabled = 1 AND m.${column} = 1
   `).get() as { cnt: number };
   return row.cnt > 0;
 }
+
+/** Agent-facing 422 code per modality. `image` keeps the historically
+ *  documented `no_vision_model` (README: "an image request returns a clear 422
+ *  (code: no_vision_model)"); the other two are new. */
+export const NO_MODEL_ERROR_CODE: Record<MediaKind, string> = {
+  image: 'no_vision_model',
+  audio: 'no_audio_model',
+  video: 'no_video_model',
+};
 

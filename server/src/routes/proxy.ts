@@ -4,7 +4,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { classifyError, type ErrorClass } from '../lib/error-class.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledModelFor, NO_MODEL_ERROR_CODE, ModalityMismatchError, PinnedModelNotRoutableError, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
 import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
@@ -16,7 +16,7 @@ import { setRetryAfter } from '../lib/http-headers.js';
 import { getDb, getUnifiedApiKey, cachedPrepare } from '../db/index.js';
 import { authenticateClientKey, type AuthenticatedClientKey } from '../lib/client-keys.js';
 import { checkAndReserve, recordSpend, releaseBudget, estimateCostCents } from '../services/budgets.js';
-import { contentToString, messageHasImage, normalizeOutboundContent, canonicalizeReasoningFields, REASONING_ALIAS_KEYS } from '../lib/content.js';
+import { contentToString, blockMediaKind, mediaUrlOf, collectRequiredModalities, normalizeOutboundContent, canonicalizeReasoningFields, REASONING_ALIAS_KEYS } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -197,14 +197,17 @@ export function setStickyModel(apiKey: string | undefined, messages: ChatMessage
 //                              chat-completions `max_tokens` request param
 //                              semantics (clients read it from the listing
 //                              rather than probing).
-//   - `modalities.input`       ["text"] by default; ["text","image"] when
-//                              `supports_vision=1`.
+//   - `modalities.input`       ["text"] plus "image"/"audio"/"video" for each
+//                              modality flag set on the row. The flags are
+//                              real per-model data (see db/modality-index.ts
+//                              and migrations.ts applyModalityIndex), not id
+//                              patterns, so a client can trust them.
 //   - `modalities.output`      ["text"] — none of the catalog models emit
-//                              image/audio, so clients only need image-input
-//                              awareness, not image-generation output flags.
+//                              image/audio/video, so output is always text.
 //   - `capabilities.tool_calls` is always true: tool calling is assumed
 //                              for every catalog model.
-//   - `capabilities.vision`    mirrors `supports_vision` rule-based flag.
+//   - `capabilities.vision` / `audio_input` / `video_input` mirror the three
+//                              modality columns.
 //   - `capabilities.json_mode` true: every chat-completions model here
 //                              accepts OpenAI `response_format` (the proxy
 //                              already translates that for non-OpenAI
@@ -222,6 +225,8 @@ function buildModelCapabilities(
   maxOutputTokens: number | null,
   supportsVision: boolean,
   thinkingLevelsRaw: string | null,
+  supportsAudioInput = false,
+  supportsVideoInput = false,
 ) {
   // Thinking capability is DATA-DRIVEN, never id-pattern-matched: the
   // dashboard is the single source of truth. Untouched rows (NULL column)
@@ -230,14 +235,19 @@ function buildModelCapabilities(
   // non-reasoning, no efforts field).
   const policy = resolveThinkingPolicy(thinkingLevelsRaw);
 
-  const modalities: { input: string[]; output: string[] } = {
-    input: supportsVision ? ['text', 'image'] : ['text'],
-    output: ['text'],
-  };
+  // Stable order so a client can rely on the sequence: text first, then the
+  // media modalities in the order the dashboard displays them.
+  const input: string[] = ['text'];
+  if (supportsVision) input.push('image');
+  if (supportsAudioInput) input.push('audio');
+  if (supportsVideoInput) input.push('video');
+  const modalities: { input: string[]; output: string[] } = { input, output: ['text'] };
 
   const capabilities: {
     tool_calls: boolean;
     vision: boolean;
+    audio_input: boolean;
+    video_input: boolean;
     json_mode: boolean;
     streaming: boolean;
     reasoning: boolean;
@@ -245,6 +255,8 @@ function buildModelCapabilities(
   } = {
     tool_calls: true,
     vision: supportsVision,
+    audio_input: supportsAudioInput,
+    video_input: supportsVideoInput,
     json_mode: true,
     streaming: true,
     reasoning: policy.kind !== 'off',
@@ -278,7 +290,8 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   const models = db.prepare(`
     SELECT
       m.id, m.platform, m.model_id, m.display_name, m.context_window,
-      m.max_output_tokens, m.supports_vision, m.thinking_levels,
+      m.max_output_tokens, m.supports_vision,
+      m.supports_audio_input, m.supports_video_input, m.thinking_levels,
       m.intelligence_rank
     FROM models m
     WHERE m.enabled = 1
@@ -310,6 +323,8 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
           m.max_output_tokens,
           m.supports_vision === 1,
           m.thinking_levels,
+          m.supports_audio_input === 1,
+          m.supports_video_input === 1,
         );
         return {
           id: `${m.platform}/${m.model_id}`,
@@ -356,10 +371,14 @@ const toolCallArgsToString = (args: string | Record<string, unknown>): string =>
 // OpenAI multimodal envelope. Clients like opencode / continue.dev send
 // content as an array of typed blocks even when only text is present, and
 // Gemini-lineage agents send part-style blocks like `{ "text": "..." }` with
-// no `type` at all. Accept any object (or bare string) as a block; flatten to
-// string for providers that don't support arrays (Cohere, Cloudflare).
-// Non-text blocks pass z validation but get dropped by contentToString —
-// vision/audio still isn't supported. (#200)
+// no `type` at all. Accept any object (or bare string) as a block.
+//
+// The schema is intentionally permissive: block SHAPE is validated by
+// lib/content.ts's classifier (blockMediaKind/mediaUrlOf) at the point of use,
+// so a new provider spelling does not require a schema change here. Media
+// blocks are preserved end-to-end for providers whose wire format can express
+// them, and the router only sends them to models flagged for that modality.
+// (#200)
 const contentBlockSchema = z.union([z.string(), z.record(z.string(), z.unknown())]);
 const contentSchema = z.union([z.string(), z.array(contentBlockSchema)]);
 
@@ -827,26 +846,48 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     return sum + Math.ceil(text.length / 4);
   }, 0);
 
-  // Image requests must route to a vision-capable model. Reject up front with a
-  // clear message when none is enabled, rather than silently dropping the image
-  // or surfacing the generic "all models exhausted" error (#118, #125). Add a
-  // rough per-image token cost so budget routing isn't skewed by content the
-  // heuristic above (text-only) can't see.
-  const hasImage = messageHasImage(messages);
-  if (hasImage && !hasEnabledVisionModel()) {
-    res.status(422).json({
-      error: {
-        message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model (e.g. Gemini 2.5 Flash, Llama 4 Scout) in the Fallback Chain.',
-        type: 'invalid_request_error',
-        code: 'no_vision_model',
-      },
-    });
-    return;
+  // Media requests must route to a model that can express the modality.
+  // Reject up front with a clear, modality-specific message when none is
+  // enabled, rather than silently dropping the media or surfacing the generic
+  // "all models exhausted" error (#118, #125). Add a rough per-modality token
+  // cost so budget routing isn't skewed by content the text heuristic above
+  // cannot see.
+  const requiredModalities = collectRequiredModalities(messages);
+  for (const kind of requiredModalities) {
+    if (!hasEnabledModelFor(kind)) {
+      res.status(422).json({
+        error: {
+          message: `This request includes ${kind} input, but no model that accepts ${kind} is enabled. Enable a model that accepts ${kind} in the Fallback Chain.`,
+          type: 'invalid_request_error',
+          code: NO_MODEL_ERROR_CODE[kind],
+        },
+      });
+      return;
+    }
   }
+  // Token weights per modality. Images are a flat estimate (the real cost is
+  // tiles-based and model-specific); audio scales with its encoded size
+  // because a long clip genuinely costs more than a short one; video is a
+  // flat high estimate. These only need to be directionally right — they feed
+  // budget routing, not billing.
   const IMAGE_TOKEN_ESTIMATE = 1000;
-  const imageCount = messages.reduce((n, m) =>
-    n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
-  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + (max_tokens ?? 1000);
+  const AUDIO_TOKEN_ESTIMATE = 2000;
+  const VIDEO_TOKEN_ESTIMATE = 8000;
+  let mediaTokens = 0;
+  for (const m of messages) {
+    if (!Array.isArray(m.content)) continue;
+    for (const block of m.content) {
+      const kind = blockMediaKind(block);
+      if (!kind) continue;
+      if (kind === 'image') { mediaTokens += IMAGE_TOKEN_ESTIMATE; continue; }
+      if (kind === 'video') { mediaTokens += VIDEO_TOKEN_ESTIMATE; continue; }
+      // Audio: scale with the base64 payload when we can measure it.
+      const url = mediaUrlOf(block, kind);
+      const base64 = url?.startsWith('data:') ? url.slice(url.indexOf(',') + 1) : null;
+      mediaTokens += base64 ? Math.max(AUDIO_TOKEN_ESTIMATE, Math.ceil(base64.length / 1600)) : AUDIO_TOKEN_ESTIMATE;
+    }
+  }
+  const estimatedTotal = estimatedInputTokens + mediaTokens + (max_tokens ?? 1000);
 
 
 
@@ -1107,7 +1148,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         routingEstimate,
         skipKeys.size > 0 ? skipKeys : undefined,
         preferredModel,
-        hasImage,
+        requiredModalities.size > 0 ? requiredModalities : undefined,
         skipModels.size > 0 ? skipModels : undefined,
         { pinMode: isPinned, oneRPM: inOneRPMMode, stickySessionKey: sessionKey || undefined, triggeringClass, failedContextWindow, failedModelDbId, clientKeyId: auth.clientKey?.id ?? null, clientModelAllowlist: auth.clientKey?.modelAllowlist ?? null, reqTags },
       );
@@ -1127,6 +1168,36 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // budgets table means no enforcement (today's behavior). The estimate
       // uses the selected model's pricing: actual_cost ?? paid ?? FALLBACK.
     } catch (err: any) {
+      // Pinned model cannot express a modality the request needs. Failing the
+      // request is the whole point: entering 1-RPM recovery would eventually
+      // route to a DIFFERENT model, silently breaking the pin contract. A
+      // non-pinned request never reaches here (the filter just skips such
+      // models).
+      if (err instanceof ModalityMismatchError) {
+        res.status(400).json({
+          error: {
+            message: err.message,
+            type: 'invalid_request_error',
+            code: 'model_capability_mismatch',
+          },
+        });
+        return;
+      }
+      // Pinned model exists and is enabled in the catalog, but is not in the
+      // enabled fallback chain, so there is no route to it. Failing here is the
+      // whole point: entering the recovery loop would iterate the chain and
+      // eventually answer from a DIFFERENT model, which is precisely the silent
+      // reroute a pin must prevent.
+      if (err instanceof PinnedModelNotRoutableError) {
+        res.status(400).json({
+          error: {
+            message: err.message,
+            type: 'invalid_request_error',
+            code: err.code,
+          },
+        });
+        return;
+      }
       // Pinned model has no more keys — enter 1 RPM mode.
       if (err.code === 'PINNED_MODEL_EXHAUSTED') {
         const firstEntry = !inOneRPMMode;

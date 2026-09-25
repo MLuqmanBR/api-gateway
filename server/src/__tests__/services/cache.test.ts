@@ -50,6 +50,47 @@ describe('Response cache service (F5)', () => {
     expect(k1).not.toBe(k2);
   });
 
+  it('computeCacheKey does not collide a media request with a text-only one', () => {
+    // A cached text-only response must never be served to a media request that
+    // happens to share its text. The key hashes the whole `messages` array, so
+    // the image/audio/video blocks are part of the signature — this pins that,
+    // because a future "hash only the text" optimization would silently serve
+    // media requests answers produced without seeing the media.
+    const textOnly = {
+      model: 'auto',
+      messages: [{ role: 'user', content: 'describe this' }],
+      temperature: 0,
+    };
+    const withImage = {
+      model: 'auto',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'describe this' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+        ],
+      }],
+      temperature: 0,
+    };
+    const withDifferentImage = {
+      model: 'auto',
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'describe this' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } },
+        ],
+      }],
+      temperature: 0,
+    };
+
+    const kText = computeCacheKey(textOnly);
+    const kImg = computeCacheKey(withImage);
+    const kImg2 = computeCacheKey(withDifferentImage);
+    expect(kImg).not.toBe(kText);
+    expect(kImg2).not.toBe(kImg);
+  });
+
   it('computeCacheKey differs when output-affecting fields differ', () => {
     // Every field in the signature object must change the key — including
     // fields the chat schema does not parse yet (stop, response_format,

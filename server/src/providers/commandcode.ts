@@ -8,6 +8,7 @@ import type {
 import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions, type DiscoveredModel } from './base.js';
 import { fetchCommandCodeCatalog } from './commandcode-models.js';
 import { createAbortRace } from '../lib/abort.js';
+import { blockMediaKind, mediaUrlOf } from '../lib/content.js';
 import { createHash, randomBytes } from 'node:crypto';
 
 const NPM_VERSION_URL = 'https://registry.npmjs.org/command-code/latest';
@@ -344,17 +345,6 @@ function mapToolChoice(toolChoice: NonNullable<CompletionOptions['tool_choice']>
  *  OpenAI object form ({image_url:{url}}), the shorthand string form
  *  ({image_url:'…'}), google-style ({type:'image', image:'…'}), and
  *  Responses-style ({type:'input_image', image_url:'…'}). */
-function extractImageUrl(b: Record<string, unknown>): string | null {
-  const iu = b['image_url'];
-  if (typeof iu === 'string' && iu.length > 0) return iu;
-  if (iu && typeof iu === 'object' && typeof (iu as Record<string, unknown>)['url'] === 'string') {
-    return (iu as Record<string, unknown>)['url'] as string;
-  }
-  if (typeof b['image'] === 'string' && b['image'].length > 0) return b['image'];
-  if (typeof b['url'] === 'string' && b['url'].length > 0) return b['url'];
-  return null;
-}
-
 /** Anti false-billing (reference proxy normalizeUsage): a finish event with
  *  no output tokens is a glitched response — zero the input tokens too so
  *  spend accounting never charges a prompt for a response that produced
@@ -370,6 +360,12 @@ interface CCContentBlock {
   type: string;
   text?: string;
   image?: string;
+  // Media parts. CommandCode's wire type gains these so an operator who
+  // enables the audio/video modality flags gets a native part instead of a
+  // flattened text marker. Off by default (see applyModalityIndex's adapter
+  // cap) because no live evidence exists that upstream accepts them.
+  audio?: string;
+  video?: string;
   id?: string;
   name?: string;
   input?: unknown;
@@ -773,14 +769,36 @@ export class CommandCodeProvider extends BaseProvider {
             return { type: 'text', text: this.blockText(b) };
           }
 
-          // ── image-like blocks → CC's native image part. Vision-capable
-          //    models (deepseek-v4.1-flash, mimo-v2.5) see the image;
-          //    non-vision models silently drop it upstream (their documented
-          //    behavior, verified live) — we must not mangle it into text. ──
-          if (typ === 'image_url' || typ === 'input_image' || typ === 'image') {
-            const url = extractImageUrl(b);
-            if (url) return { type: 'image', image: url };
-            return { type: 'text', text: '[image part without url]' };
+          // ── media blocks → CC's native parts. Vision-capable models
+          //    (deepseek-v4.1-flash, mimo-v2.5) see the image; non-vision
+          //    models silently drop it upstream (their documented behavior,
+          //    verified live) — we must not mangle it into text.
+          //
+          //
+          //    Audio and video are NOT expressible: upstream's content union
+          //    accepts only text/image/document/thinking/tool-*/search_result
+          //    (read from its own validation error), so `type:'audio'` and
+          //    `type:'video'` come back as 400 BAD_REQUEST. ADAPTER_CAPABILITY
+          //    (db/migrations.ts) forces those flags off for this platform, and
+          //    the branch below degrades to a text placeholder rather than
+          //    letting upstream's Zod error surface as a confusing 400. ──
+          if (typ === 'image_url' || typ === 'input_image' || typ === 'image' ||
+              typ === 'audio_url' || typ === 'input_audio' || typ === 'audio' ||
+              typ === 'video_url' || typ === 'input_video' || typ === 'video') {
+            const kind = blockMediaKind(b);
+            const url = kind ? mediaUrlOf(b, kind) : null;
+            if (kind && url) {
+              if (kind === 'image') return { type: 'image', image: url };
+              // Audio/video have no representation in upstream's content union.
+              // Degrade to text so the request still succeeds (the model simply
+              // cannot hear/see it) instead of failing with an opaque
+              // "expected image at content[1].type" validation error. The
+              // modality caps keep requests from reaching here in the first
+              // place; this is the belt-and-braces path for a manual override.
+              console.warn(`[commandcode] ${kind} input is not supported by this provider; sending a placeholder instead`);
+              return { type: 'text', text: `[${kind} input omitted: CommandCode accepts text and image only]` };
+            }
+            return { type: 'text', text: `[${typ} part without url]` };
           }
 
           // ── tool-call blocks (Go: tool_use, tool-call) ──

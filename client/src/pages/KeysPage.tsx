@@ -1,5 +1,6 @@
 import { addToast } from '@/lib/toast'
 import { THINKING_LEVELS, THINKING_OFF, toggleThinkingLevel } from '@/lib/thinking-levels'
+import { ModalityRow } from '@/components/modality-icons'
 import { useState, useRef, useEffect } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
@@ -434,6 +435,8 @@ function ClientKeysSection() {
       contextWindow: null,
       enabled: t.enabled,
       supportsVision: false,
+      supportsAudioInput: false,
+      supportsVideoInput: false,
     }))
 
   const mint = useMutation({
@@ -1129,7 +1132,7 @@ function EditPlatformModal({
 // the model id and display name; the rest of the form's "advanced" fields
 // take sensible defaults and can be edited later from the Fallback page.
 //   contextWindow = 128_000  (matches the modern LLM ceiling)
-//   supportsVision = false   (text-only is the safe default)
+//   modalities = text only   (the safe default; edit per model later)
 //   ranks = 50 / 50          (middle of the bandit scoring range)
 //   sizeLabel = 'Custom'     (sorts below named tiers)
 
@@ -1152,6 +1155,8 @@ function CustomModelsSection() {
   const [contextWindow, setContextWindow] = useState(128000)
   const [maxOutputTokens, setMaxOutputTokens] = useState(null as number | null)
   const [supportsVision, setSupportsVision] = useState(false)
+  const [supportsAudioInput, setSupportsAudioInput] = useState(false)
+  const [supportsVideoInput, setSupportsVideoInput] = useState(false)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [intelligenceRank, setIntelligenceRank] = useState(50)
   const [speedRank, setSpeedRank] = useState(50)
@@ -1258,6 +1263,8 @@ function CustomModelsSection() {
       contextWindow: contextWindow || null,
       maxOutputTokens: maxOutputTokens,
       supportsVision,
+      supportsAudioInput,
+      supportsVideoInput,
     }
     if (showAdvanced) {
       fields.intelligenceRank = intelligenceRank
@@ -1363,11 +1370,25 @@ function CustomModelsSection() {
             />
           </div>
         </div>
-        <div className="flex items-center gap-6 text-xs">
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <Switch checked={supportsVision} onCheckedChange={setSupportsVision} />
-            Supports vision
-          </label>
+        <div className="rounded-2xl bg-muted/40 p-4">
+          <div className="mb-3 text-[10px] uppercase tracking-wider text-muted-foreground">
+            Modalities
+          </div>
+          <ModalityRow
+            variant="colored"
+            interactive
+            modalities={[
+              ...(supportsVision ? (['image'] as const) : []),
+              ...(supportsAudioInput ? (['audio'] as const) : []),
+              ...(supportsVideoInput ? (['video'] as const) : []),
+            ]}
+            onToggle={(kind) => {
+              if (kind === 'text') return // text is always supported
+              if (kind === 'image') setSupportsVision(v => !v)
+              else if (kind === 'audio') setSupportsAudioInput(v => !v)
+              else setSupportsVideoInput(v => !v)
+            }}
+          />
         </div>
         <button
           type="button"

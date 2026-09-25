@@ -33,6 +33,7 @@ import { FloatingBar } from '@/components/floating-bar'
 import { ModelsTabs } from '@/components/models-tabs'
 import { Tooltip } from '@/components/tooltip'
 import { ModelSearchBox } from '@/components/model-search-box'
+import { ModalityRow } from '@/components/modality-icons'
 import { matchesModelQuery } from '@/lib/model-search'
 import { THINKING_LEVELS, THINKING_OFF, toggleThinkingLevel } from '@/lib/thinking-levels'
 
@@ -57,6 +58,8 @@ interface FallbackEntry {
   contextWindow: number | null
   maxOutputTokens: number | null
   supportsVision: boolean
+  supportsAudioInput: boolean
+  supportsVideoInput: boolean
   thinkingLevels: string[]
   keyCount: number
 }
@@ -357,6 +360,8 @@ function EditModelModal({
   const [speedRank, setSpeedRank] = useState(model.speedRank)
   const [sizeLabel, setSizeLabel] = useState(model.sizeLabel)
   const [supportsVision, setSupportsVision] = useState(model.supportsVision)
+  const [supportsAudioInput, setSupportsAudioInput] = useState(model.supportsAudioInput)
+  const [supportsVideoInput, setSupportsVideoInput] = useState(model.supportsVideoInput)
   const [monthlyTokenBudget, setMonthlyTokenBudget] = useState(model.monthlyTokenBudget)
   const [rpmLimit, setRpmLimit] = useState(model.rpmLimit ?? null)
   const [rpdLimit, setRpdLimit] = useState(model.rpdLimit ?? null)
@@ -373,6 +378,8 @@ function EditModelModal({
     speedRank !== model.speedRank ||
     sizeLabel !== model.sizeLabel ||
     supportsVision !== model.supportsVision ||
+    supportsAudioInput !== model.supportsAudioInput ||
+    supportsVideoInput !== model.supportsVideoInput ||
     monthlyTokenBudget !== model.monthlyTokenBudget ||
     rpmLimit !== (model.rpmLimit ?? null) ||
     rpdLimit !== (model.rpdLimit ?? null) ||
@@ -391,6 +398,8 @@ function EditModelModal({
       speedRank,
       sizeLabel,
       supportsVision,
+      supportsAudioInput,
+      supportsVideoInput,
       monthlyTokenBudget,
       rpmLimit,
       rpdLimit,
@@ -447,11 +456,25 @@ function EditModelModal({
               <Input value={sizeLabel} onChange={e => setSizeLabel(e.target.value)} className="font-mono text-xs" />
             </div>
           </div>
-          <div className="flex items-center gap-6 text-xs">
-            <label className="flex items-center gap-1.5 cursor-pointer">
-              <Switch checked={supportsVision} onCheckedChange={setSupportsVision} />
-              Supports vision
-            </label>
+          <div className="rounded-2xl bg-muted/40 p-4">
+            <div className="mb-3 text-[10px] uppercase tracking-wider text-muted-foreground">
+              Modalities
+            </div>
+            <ModalityRow
+              variant="colored"
+              interactive
+              modalities={[
+                ...(supportsVision ? (['image'] as const) : []),
+                ...(supportsAudioInput ? (['audio'] as const) : []),
+                ...(supportsVideoInput ? (['video'] as const) : []),
+              ]}
+              onToggle={(kind) => {
+                if (kind === 'text') return // text is always supported
+                if (kind === 'image') setSupportsVision(v => !v)
+                else if (kind === 'audio') setSupportsAudioInput(v => !v)
+                else setSupportsVideoInput(v => !v)
+              }}
+            />
           </div>
           <div className="space-y-1.5">
             <Label className="text-xs">Monthly token budget</Label>
@@ -558,14 +581,14 @@ function RowContent({
         <div className="flex items-center gap-2 flex-wrap">
           <span className="font-medium text-sm">{row.displayName}</span>
           <span className="text-xs text-muted-foreground">{row.platform}</span>
-          {row.supportsVision && (
-            <span
-              title="Accepts image input"
-              className="text-[10px] rounded-full px-1.5 py-0.5 bg-cyan-600/15 text-cyan-700 dark:bg-cyan-400/15 dark:text-cyan-400"
-            >
-              Vision
-            </span>
-          )}
+          <ModalityRow
+            hideUnsupported
+            modalities={[
+              ...(row.supportsVision ? (['image'] as const) : []),
+              ...(row.supportsAudioInput ? (['audio'] as const) : []),
+              ...(row.supportsVideoInput ? (['video'] as const) : []),
+            ]}
+          />
           {(row.penalty ?? 0) > 0 && (
             <span className="text-[10px] text-amber-600 dark:text-amber-400">−{row.penalty} penalty</span>
           )}

@@ -243,7 +243,12 @@ describe('Migration idempotency', () => {
     expect(added.map(r => [r.model_id, r.enabled, r.supports_vision])).toEqual([
       ['cognitivecomputations/dolphin-mistral-24b-venice-edition:free', 1, 0],
       ['meta-llama/llama-3.2-3b-instruct:free',                         1, 0],
-      ['moonshotai/kimi-k2.6:free',                                     1, 0],
+      // kimi-k2.6 IS image-capable: 57 of 58 catalog entries for this model
+      // across models.dev (incl. the `openrouter` and `moonshotai` providers)
+      // plus OpenRouter's own listing declare image input, so the generated
+      // modality index raises this flag. The pre-index V16 heuristic keyed on
+      // model-id patterns and never covered it.
+      ['moonshotai/kimi-k2.6:free',                                     1, 1],
       ['nvidia/nemotron-3-ultra-550b-a55b:free',                        0, 0], // hangs 180s+; seeded disabled
       ['nvidia/nemotron-nano-12b-v2-vl:free',                           1, 1],
       ['glm-4.6v-flash',                                                1, 1],
@@ -316,10 +321,15 @@ describe('Migration idempotency', () => {
     // Scoping guard: a scoped helper call touches ONLY the given ids.
     // The manual row below matches an EARLIER OR branch of its rule chain
     // than the appended id-IN clause — SQL precedence bugs would clobber it.
+    //
+    // The UPDATE sets modalities_manual = 1 alongside the flag: that marker
+    // IS the operator-edit contract (same as pricing_manual at the pricing
+    // test). Without it the row is still index-owned, and the boot pass is
+    // entitled to correct it back — the marker is what makes the edit stick.
     const glm = db.prepare(
       "SELECT id FROM models WHERE LOWER(model_id) LIKE '%glm-4.6v%' LIMIT 1",
     ).get() as { id: number };
-    db.prepare('UPDATE models SET supports_vision = 0 WHERE id IN (?, ?)').run(glm.id, gemini.id);
+    db.prepare('UPDATE models SET supports_vision = 0, modalities_manual = 1 WHERE id IN (?, ?)').run(glm.id, gemini.id);
     const ins = db.prepare(`
       INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled)
       VALUES ('google', 'gemini-9.9-test', 'Gemini 9.9 Test', 10, 10, '', 1)

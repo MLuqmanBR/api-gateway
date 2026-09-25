@@ -14,12 +14,31 @@ type RouteEntry = { method: string; path: string; router: string };
 
 function collectRoutes(app: Express): RouteEntry[] {
   const routes: RouteEntry[] = [];
-  function walk(stack: any[], prefix = '', routerId = '') {
+  // Namespace sub-routers by OBJECT IDENTITY, not by mount path.
+  //
+  // Express 5 compiles a mount pattern into a closure: `layer.path` is
+  // undefined, `layer.regexp` is undefined, and each entry of `layer.matchers`
+  // is a bare `match(input)` function with no introspectable pattern.
+  // Reconstructing the mount string is therefore impossible, and the previous
+  // `layer.regexp ?? layer.path ?? ''` silently collapsed EVERY sub-router into
+  // one namespace — which reported the `/usage` route in the embeddings router
+  // as a duplicate of the `/usage` route in the transcriptions router.
+  //
+  // Identity also states the invariant this test defends more faithfully:
+  // "no path is registered twice in the SAME router".
+  const routerIds = new WeakMap<object, string>();
+  let nextRouterId = 0;
+  function walk(stack: any[], prefix = '', routerId = '<root>') {
     for (const layer of stack) {
       if (layer.name === 'router' && layer.handle?.stack) {
         // Each mounted sub-router is its own namespace: same-path routes in
         // different sub-routers are distinct endpoints, not duplicates.
-        walk(layer.handle.stack, prefix, `${routerId}/${layer.regexp ?? layer.path ?? ''}`);
+        let id = routerIds.get(layer.handle);
+        if (id === undefined) {
+          id = `r${nextRouterId++}`;
+          routerIds.set(layer.handle, id);
+        }
+        walk(layer.handle.stack, prefix, id);
       } else if (layer.route) {
         const path = prefix + layer.route.path;
         for (const method of Object.keys(layer.route.methods)) {
@@ -78,6 +97,7 @@ describe('route-map regression (Issue 11 — dead/duplicate routes)', () => {
       { method: 'POST', path: '/v1/audio/transcriptions' },
       { method: 'POST', path: '/v1/audio/translations' },
       { method: 'GET', path: '/api/transcriptions' },
+      { method: 'GET', path: '/api/realtime' },
     ];
     for (const { method, path } of probes) {
       const status = await probe(app, method, path, token);

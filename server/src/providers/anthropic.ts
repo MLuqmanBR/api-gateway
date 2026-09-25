@@ -8,7 +8,7 @@ import type {
   TokenUsage,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
-import { contentToString, normalizeOutboundContent } from '../lib/content.js';
+import { contentToString, normalizeOutboundContent, blockMediaKind, mediaUrlOf } from '../lib/content.js';
 import { anthropicThinking, normalizeThinking } from '../lib/thinking.js';
 import { createAbortRace } from '../lib/abort.js';
 
@@ -21,6 +21,78 @@ import { createAbortRace } from '../lib/abort.js';
 // and https://docs.anthropic.com/en/docs/tool-use.
 const ANTHROPIC_VERSION = '2023-06-01';
 const ANTHROPIC_BETA = 'tools-2025-05-14';
+
+/** Split a `data:<mime>;base64,<payload>` URL into Anthropic's source shape. */
+function dataUrlToSource(url: string): AnthropicBase64Source | null {
+  const match = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
+  if (!match) return null;
+  return {
+    type: 'base64',
+    media_type: match[1] || 'application/octet-stream',
+    data: match[3] ?? '',
+  };
+}
+
+/**
+ * Convert a user message's content into Anthropic content blocks.
+ *
+ * Returns null when the message carries no media — the caller then uses the
+ * plain-string form, which is what every text-only path expects and what
+ * Anthropic documents for simple turns.
+ *
+ * Audio and video are dropped with a warning: Anthropic has no content block
+ * for either. `document` blocks (PDF) are handled as their own path below,
+ * because `blockMediaKind` classifies only image/audio/video — a PDF is not a
+ * media modality, and routing it through that classifier dropped it silently.
+ */
+function toAnthropicUserBlocks(content: ChatMessage['content']): AnthropicUserContentBlock[] | null {
+  if (!Array.isArray(content)) return null;
+  const blocks: AnthropicUserContentBlock[] = [];
+  let sawMedia = false;
+  let droppedMedia = false;
+
+  for (const raw of content) {
+    // A `document` block is passed through as-is. It carries Anthropic's own
+    // source shape already (the inbound route builds it), so no conversion is
+    // needed — but it must be detected BEFORE the media classifier, which
+    // returns null for it and would otherwise flatten the PDF into empty text.
+    if (raw !== null && typeof raw === 'object' && 'type' in raw && raw.type === 'document') {
+      const source = 'source' in raw ? raw.source : undefined;
+      if (source && typeof source === 'object') {
+        blocks.push({ type: 'document', source } as AnthropicUserContentBlock);
+        sawMedia = true;
+        continue;
+      }
+      droppedMedia = true;
+      continue;
+    }
+
+    const kind = blockMediaKind(raw);
+    if (!kind) {
+      const text = contentToString([raw]);
+      if (text.length > 0) blocks.push({ type: 'text', text });
+      continue;
+    }
+    if (kind !== 'image') {
+      droppedMedia = true;
+      continue;
+    }
+    const url = mediaUrlOf(raw, kind);
+    if (!url) { droppedMedia = true; continue; }
+    const inline = dataUrlToSource(url);
+    blocks.push({
+      type: 'image',
+      source: inline ?? { type: 'url', url },
+    });
+    sawMedia = true;
+  }
+
+  if (droppedMedia) {
+    console.warn('[anthropic] dropped audio/video content block(s) — Anthropic supports image and PDF input only');
+  }
+  return sawMedia ? blocks : null;
+}
+
 
 // Anthropic requires `max_tokens` on every request; the API rejects calls that
 // omit it with 400 "max_tokens is required". The proxy accepts OpenAI-shaped
@@ -54,7 +126,15 @@ type AnthropicWireMessage =
 
 type AnthropicUserContentBlock =
   | { type: 'text'; text: string }
-  | { type: 'tool_result'; tool_use_id: string; content: string };
+  | { type: 'tool_result'; tool_use_id: string; content: string }
+  // Image input. A `data:` URL becomes an inline base64 source; an http(s)
+  // URL uses the URL source form (GA — no beta header needed).
+  | { type: 'image'; source: AnthropicBase64Source | AnthropicUrlSource }
+  // PDF input. Passed through unchanged from the inbound request.
+  | { type: 'document'; source: AnthropicBase64Source | AnthropicUrlSource };
+
+type AnthropicBase64Source = { type: 'base64'; media_type: string; data: string };
+type AnthropicUrlSource = { type: 'url'; url: string };
 
 type AnthropicAssistantContentBlock =
   | { type: 'text'; text: string }
@@ -280,10 +360,19 @@ export class AnthropicCompatProvider extends BaseProvider {
         continue;
       }
 
-      // 'user' (or any future role we don't recognize). Flatten to a string;
-      // Anthropic accepts both a string and a content-block array, and the
-      // string form is what every non-multimodal code path uses.
-      result.push({ role: 'user', content: contentToString(m.content) });
+      // 'user' (or any future role we don't recognize). Text-only content
+      // collapses to a string (what every non-multimodal path uses); media
+      // blocks become the Anthropic content-block array.
+      //
+      // Anthropic has no audio or video content block at all, so those are
+      // dropped with a warning. The router's adapter-capability cap also keeps
+      // such requests from being routed here.
+      const blocks = toAnthropicUserBlocks(m.content);
+      if (blocks === null) {
+        result.push({ role: 'user', content: contentToString(m.content) });
+      } else {
+        result.push({ role: 'user', content: blocks });
+      }
     }
 
     return { system, messages: result };

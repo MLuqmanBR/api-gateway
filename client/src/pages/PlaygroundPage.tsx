@@ -5,6 +5,8 @@ import { Button } from '@/components/ui/button'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader } from '@/components/page-header'
 import { Markdown } from '@/components/markdown'
+import { addToast } from '@/lib/toast'
+import { Paperclip } from 'lucide-react'
 
 interface FallbackEntry {
   modelDbId: number
@@ -17,11 +19,19 @@ interface FallbackEntry {
   keyCount: number
 }
 
+/** A file the user attached to their turn. */
+interface Attachment {
+  kind: 'image' | 'audio' | 'video'
+  dataUrl: string
+  name: string
+}
+
 interface ChatMessage {
   /** Stable identity for React keys — the list mutates while streaming. */
   id: string
   role: 'user' | 'assistant'
   content: string
+  attachments?: Attachment[]
   meta?: {
     platform?: string
     model?: string
@@ -43,10 +53,55 @@ interface StreamChunk {
 }
 
 // Request body sent to /v1/chat/completions from the playground.
+type ContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+  | { type: 'input_audio'; input_audio: { data: string; format: string } }
+  | { type: 'video_url'; video_url: { url: string } }
+
 interface ChatRequestBody {
-  messages: { role: string; content: string }[]
+  messages: { role: string; content: string | ContentPart[] }[]
   stream: boolean
   model?: string
+}
+
+/** Max attachment size. Base64 inflates by ~4/3, so 15 MB stays well under the
+ *  server's 64 MB /v1 body limit even with several attachments. */
+const MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
+
+/** Map a file's MIME type to the modality the gateway routes on. */
+function attachmentKind(file: File): Attachment['kind'] | null {
+  if (file.type.startsWith('image/')) return 'image'
+  if (file.type.startsWith('audio/')) return 'audio'
+  if (file.type.startsWith('video/')) return 'video'
+  return null
+}
+
+/**
+ * Build the OpenAI content envelope for one turn: a text part (when non-empty)
+ * followed by one part per attachment in the modality's native spelling.
+ */
+function buildContentParts(text: string, attachments: Attachment[]): ContentPart[] {
+  const parts: ContentPart[] = []
+  if (text) parts.push({ type: 'text', text })
+  for (const att of attachments) {
+    if (att.kind === 'image') {
+      parts.push({ type: 'image_url', image_url: { url: att.dataUrl } })
+    } else if (att.kind === 'video') {
+      parts.push({ type: 'video_url', video_url: { url: att.dataUrl } })
+    } else {
+      // The audio envelope wants the base64 payload and a format, not a data
+      // URL — split them back out of what FileReader produced.
+      const match = /^data:audio\/([^;,]+)?;base64,(.*)$/s.exec(att.dataUrl)
+      parts.push({
+        type: 'input_audio',
+        input_audio: match
+          ? { data: match[2] ?? '', format: match[1] || 'wav' }
+          : { data: att.dataUrl, format: 'wav' },
+      })
+    }
+  }
+  return parts
 }
 
 // Mirrors the id generator in lib/toast.ts: crypto.randomUUID where the
@@ -60,6 +115,8 @@ const newMessageId = (): string =>
 export default function PlaygroundPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
+  const [attachments, setAttachments] = useState<Attachment[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const [loading, setLoading] = useState(false)
   const [selectedModel, setSelectedModel] = useState<string>('auto')
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -108,12 +165,21 @@ export default function PlaygroundPage() {
   // ── Streaming send (Fixes 3, 4, 6) ────────────────────────────────────────
   const handleSend = useCallback(async () => {
     const text = input.trim()
-    if (!text || loading) return
+    const sending = attachments
+    // An attachment-only turn is valid: a picture with no caption is a normal
+    // thing to send to a multimodal model.
+    if ((!text && sending.length === 0) || loading) return
 
-    const userMsg: ChatMessage = { id: newMessageId(), role: 'user', content: text }
+    const userMsg: ChatMessage = {
+      id: newMessageId(),
+      role: 'user',
+      content: text,
+      attachments: sending.length > 0 ? sending : undefined,
+    }
     const assistantMsg: ChatMessage = { id: newMessageId(), role: 'assistant', content: '' }
     setMessages(prev => [...prev, userMsg, assistantMsg])
     setInput('')
+    setAttachments([])
     setLoading(true)
     inputRef.current?.focus()
 
@@ -162,7 +228,14 @@ export default function PlaygroundPage() {
       if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
 
       const body: ChatRequestBody = {
-        messages: [...messages, userMsg].map(m => ({ role: m.role, content: m.content })),
+        // Media turns use the array envelope; plain text stays a string so the
+        // request shape is unchanged for the common case.
+        messages: [...messages, userMsg].map(m => ({
+          role: m.role,
+          content: m.attachments?.length
+            ? buildContentParts(m.content, m.attachments)
+            : m.content,
+        })),
         stream: true,
       }
       if (selectedModel !== 'auto') body.model = selectedModel
@@ -299,7 +372,7 @@ export default function PlaygroundPage() {
         setTimeout(() => inputRef.current?.focus(), 0)
       }
     }
-  }, [input, loading, messages, keyData, selectedModel])
+  }, [input, loading, messages, keyData, selectedModel, attachments])
 
   const handleCancel = () => {
     abortRef.current?.abort()
@@ -384,7 +457,30 @@ export default function PlaygroundPage() {
                         )}
                       </span>
                     ) : (
-                      <div className="whitespace-pre-wrap">{msg.content}</div>
+                      <div className="space-y-2">
+                        {msg.attachments && msg.attachments.length > 0 && (
+                          <div className="flex flex-wrap gap-2">
+                            {msg.attachments.map((att, i) => (
+                              att.kind === 'image' ? (
+                                <img
+                                  key={`${msg.id}-att-${i}`}
+                                  src={att.dataUrl}
+                                  alt={att.name}
+                                  className="max-h-40 rounded-lg border object-contain"
+                                />
+                              ) : (
+                                <span
+                                  key={`${msg.id}-att-${i}`}
+                                  className="rounded-lg border border-primary-foreground/30 px-2 py-1 text-[11px]"
+                                >
+                                  {att.kind}: {att.name}
+                                </span>
+                              )
+                            ))}
+                          </div>
+                        )}
+                        {msg.content && <div className="whitespace-pre-wrap">{msg.content}</div>}
+                      </div>
                     )}
                     {msg.meta && !msg.meta.streaming && (
                       <div className="flex items-center gap-2 mt-2 flex-wrap text-[11px] opacity-70 tabular-nums">
@@ -416,7 +512,70 @@ export default function PlaygroundPage() {
         </div>
 
         <div className="border-t bg-background/50 p-3">
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {attachments.map((att, i) => (
+                <span
+                  key={`${att.name}-${i}`}
+                  className="flex items-center gap-1.5 rounded-lg border bg-muted/40 px-2 py-1 text-xs"
+                >
+                  {att.kind === 'image' ? (
+                    <img src={att.dataUrl} alt={att.name} className="size-6 rounded object-cover" />
+                  ) : (
+                    <span className="font-mono uppercase text-[10px] text-muted-foreground">{att.kind}</span>
+                  )}
+                  <span className="max-w-[10rem] truncate">{att.name}</span>
+                  <button
+                    type="button"
+                    aria-label={`Remove ${att.name}`}
+                    className="text-muted-foreground hover:text-foreground"
+                    onClick={() => setAttachments(prev => prev.filter((_, j) => j !== i))}
+                  >
+                    ×
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
           <div className="flex gap-2 items-end">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*,audio/*,video/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                const files = Array.from(e.target.files ?? [])
+                e.target.value = '' // allow re-picking the same file
+                for (const file of files) {
+                  const kind = attachmentKind(file)
+                  if (!kind) {
+                    addToast({ kind: 'warning', title: 'Unsupported file', description: `${file.name}: only image, audio and video files are supported` })
+                    continue
+                  }
+                  if (file.size > MAX_ATTACHMENT_BYTES) {
+                    addToast({ kind: 'warning', title: 'File too large', description: `${file.name} exceeds the 15 MB attachment limit` })
+                    continue
+                  }
+                  const reader = new FileReader()
+                  reader.onload = () => {
+                    const dataUrl = String(reader.result ?? '')
+                    if (dataUrl) setAttachments(prev => [...prev, { kind, dataUrl, name: file.name }])
+                  }
+                  reader.onerror = () => addToast({ kind: 'warning', title: 'Read failed', description: `could not read ${file.name}` })
+                  reader.readAsDataURL(file)
+                }
+              }}
+            />
+            <Button
+              type="button"
+              variant="outline"
+              size="default"
+              aria-label="Attach files"
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Paperclip className="size-4" />
+            </Button>
             <textarea
               ref={inputRef}
               value={input}
@@ -437,7 +596,7 @@ export default function PlaygroundPage() {
                 Cancel
               </Button>
             ) : (
-              <Button onClick={handleSend} disabled={!input.trim()} size="default">
+              <Button onClick={handleSend} disabled={(!input.trim() && attachments.length === 0)} size="default">
                 Send
               </Button>
             )}

@@ -3,6 +3,7 @@ import type { DatabasePort } from './types.js';
 import { initEncryptionKey } from '../lib/crypto.js';
 import { applyModelPricing, applyActualCostPricing } from './model-pricing.js';
 import { THINKING_LEVELS } from '../lib/thinking.js';
+import { MODALITY_INDEX, modalityIndexKey } from './modality-index.js';
 
 // FROZEN — do NOT bump. All new model-seed migrations MUST be idempotent and
 // unguarded (outside the `version < CURRENT_DATA_VERSION` transaction) so they
@@ -85,6 +86,14 @@ export function migrateDbSchema(db: DatabasePort) {
   migrateSchemaV46DropSupportsTools(db);
   migrateSchemaV47ModelThinkingLevels(db);
   migrateSchemaV48ModelCacheTelemetry(db);
+  migrateSchemaV49ModelModalities(db);
+  migrateSchemaV50TranscriptionShape(db);
+  migrateSchemaV51RealtimeModels(db);
+  // Unguarded every-boot pass: writes the generated modality index onto model
+  // rows that are not operator-owned (modalities_manual = 0). Runs AFTER the
+  // schema migration so the columns exist, and is idempotent — a second boot
+  // writes identical values.
+  applyModalityIndex(db);
   // AFTER all schema migrations — needs client_keys (V39) + final models state.
   normalizeClientKeyAllowlists(db);
 }
@@ -107,6 +116,9 @@ function createTables(db: DatabasePort) {
       context_window INTEGER,
       enabled INTEGER NOT NULL DEFAULT 1,
       supports_vision INTEGER NOT NULL DEFAULT 0,
+      supports_audio_input INTEGER NOT NULL DEFAULT 0,
+      supports_video_input INTEGER NOT NULL DEFAULT 0,
+      modalities_manual INTEGER NOT NULL DEFAULT 0,
       UNIQUE(platform, model_id)
     );
 
@@ -2164,6 +2176,16 @@ function migrateEmbeddingsV1(db: DatabasePort) {
 // and is NOT seeded; voxtral-mini-2602 is the sole Mistral entry.
 function migrateTranscriptionsV1(db: DatabasePort) {
   db.exec(`
+    CREATE TABLE IF NOT EXISTS realtime_models (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      platform TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      display_name TEXT NOT NULL,
+      priority INTEGER NOT NULL DEFAULT 1,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      UNIQUE(platform, model_id)
+    );
+
     CREATE TABLE IF NOT EXISTS transcription_models (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       family TEXT NOT NULL,
@@ -2176,6 +2198,7 @@ function migrateTranscriptionsV1(db: DatabasePort) {
       priority INTEGER NOT NULL DEFAULT 1,
       enabled INTEGER NOT NULL DEFAULT 1,
       quota_label TEXT NOT NULL DEFAULT '',
+      shape TEXT NOT NULL DEFAULT 'multipart',
       UNIQUE(platform, model_id)
     );
   `);
@@ -2810,6 +2833,204 @@ function migrateSchemaV47ModelThinkingLevels(db: DatabasePort) {
   }
   if (!columns.some(col => col.name === 'thinking_levels_manual')) {
     db.prepare('ALTER TABLE models ADD COLUMN thinking_levels_manual INTEGER NOT NULL DEFAULT 0').run();
+  }
+}
+
+// V49 (2026-09-24): per-model INPUT modality flags beyond vision. The gateway
+// advertised image input through a single `supports_vision` boolean and had no
+// representation at all for audio or video input, so the router could not gate
+// on them and /v1/models could not report them.
+//
+//   supports_vision       (existing) — image input
+//   supports_audio_input  (new)      — audio input
+//   supports_video_input  (new)      — video input
+//   modalities_manual     (new)      — operator-ownership flag, the
+//                                      `thinking_levels_manual` /
+//                                      `pricing_manual` pattern: once set, the
+//                                      generated modality index stops writing
+//                                      to that row.
+//
+// The column name `supports_vision` is kept deliberately: it is upstream-owned
+// in this fork and renaming it to `supports_image` would re-conflict on every
+// future upstream sync. Its MEANING is "accepts image input".
+function migrateSchemaV49ModelModalities(db: DatabasePort) {
+  const columns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'supports_audio_input')) {
+    db.prepare('ALTER TABLE models ADD COLUMN supports_audio_input INTEGER NOT NULL DEFAULT 0').run();
+  }
+  if (!columns.some(col => col.name === 'supports_video_input')) {
+    db.prepare('ALTER TABLE models ADD COLUMN supports_video_input INTEGER NOT NULL DEFAULT 0').run();
+  }
+  if (!columns.some(col => col.name === 'modalities_manual')) {
+    db.prepare('ALTER TABLE models ADD COLUMN modalities_manual INTEGER NOT NULL DEFAULT 0').run();
+  }
+}
+
+// V50 (2026-09-24): the batch audio pipeline resolves its endpoint from the
+// provider's base URL (`${baseUrl}/audio/<kind>`), so the catalog no longer
+// needs a per-platform endpoint table. What it DOES need is the request body
+// shape: multipart is the OpenAI default, but some providers accept the audio
+// only as base64 JSON.
+//
+// Endpoint AVAILABILITY is deliberately not a column: it is derivable from the
+// provider registry at any moment (`resolveAudioEndpoint`), and a stored copy
+// would go stale the moment an operator edits a base URL. The dashboard asks
+// the service for it live.
+// V51 (2026-09-24): the realtime catalog.
+//
+// /v1/realtime proxies a genuine upstream Realtime websocket, so it needs to
+// know WHICH upstream: a (platform, model) pair whose provider has an enabled
+// key. The table exists (createTables above) but is seeded EMPTY on purpose —
+// a realtime model is only usable if the operator has a provider that actually
+// serves it, and guessing catalog rows for a protocol whose availability
+// changes per account would produce rows that look configured and then fail.
+// The dashboard's Realtime tab adds rows; the relay reports a clear error when
+// none exist.
+function migrateSchemaV51RealtimeModels(_db: DatabasePort) {
+  // Schema only — createTables owns the DDL. Kept as a named step so the
+  // version history is readable and a future data seed has an obvious home.
+}
+
+function migrateSchemaV50TranscriptionShape(db: DatabasePort) {
+  const columns = db.prepare('PRAGMA table_info(transcription_models)').all() as { name: string }[];
+  if (!columns.some(col => col.name === 'shape')) {
+    db.prepare("ALTER TABLE transcription_models ADD COLUMN shape TEXT NOT NULL DEFAULT 'multipart'").run();
+  }
+}
+
+// ── Modality index (2026-09-24) ────────────────────────────────────────────
+//
+// `db/modality-index.ts` is generated offline from models.dev + OpenRouter and
+// is AUTHORITATIVE for the rows it covers: the applier writes all three flags,
+// including an explicit 0 for a modality the catalogs say the model does not
+// take. That is deliberate — it lets the index correct a stale heuristic flag
+// from `applyVisionRules` rather than only adding flags.
+//
+// Rows the index does not cover keep whatever they already have (heuristic
+// seed or operator edit). Rows with `modalities_manual = 1` are never touched.
+
+/**
+ * Platforms whose ADAPTER cannot express a modality, regardless of what the
+ * underlying model supports. Kept here rather than in the generator because it
+ * is a property of this gateway's code, not of the model.
+ *
+ *   - `anthropic` wire format: no audio and no video content block exists.
+ *   - `cohere`: image_url only; audio/video have no representation.
+ *   - `cloudflare`: its OpenAI-compat endpoint's multimodal behaviour is
+ *     undocumented and community-reported broken, so every flag is forced off
+ *     until a native /ai/run adapter exists.
+ *
+ * `anthropic` is matched by api_format rather than slug: the live catalog has
+ * custom providers (aerolink, freemodelcc, agentroutercc) using that format.
+ */
+const ADAPTER_CAPABILITY: Record<string, { image?: boolean; audio?: boolean; video?: boolean }> = {
+  cohere: { audio: false, video: false },
+  cloudflare: { image: false, audio: false, video: false },
+  // CommandCode's /alpha/generate validates message content against a Zod union
+  // whose accepted part types are, verbatim from its own validation error:
+  //   text, image, document, thinking, redacted_thinking, reasoning,
+  //   tool-call, tool-result, tool_use, tool_result, search_result,
+  //   server_tool_use, web_search_tool_result, web_fetch_tool_result
+  // There is no audio and no video part. Live-measured: sending
+  // {type:'audio',audio:...} or {type:'video',video:...} returns
+  // 400 BAD_REQUEST "Invalid input: expected "image" at
+  // params.messages[0].content[1].type". Image IS accepted and works (live:
+  // 1x1 red PNG -> content "Red"). So only image is expressible here.
+  commandcode: { audio: false, video: false },
+};
+
+/** Anthropic-format platforms get no audio and no video. */
+const ANTHROPIC_CAPABILITY = { audio: false, video: false };
+
+/**
+ * Write the generated modality index onto model rows.
+ *
+ * @param db   database handle
+ * @param ids  optional row-id scope. Runtime ingest (routes/custom.ts) passes
+ *             exactly the ids it just inserted so existing rows are never
+ *             revisited; omitted = whole table (boot).
+ */
+export function applyModalityIndex(db: DatabasePort, ids?: number[]): void {
+  const scope = ids && ids.length > 0 ? ` AND id IN (${ids.map(() => '?').join(',')})` : '';
+  const params: number[] = ids && ids.length > 0 ? ids : [];
+
+  // Platform -> capability cap. Resolve the anthropic-format set once so the
+  // per-row check is a Set lookup, not a query.
+  let anthropicPlatforms = new Set<string>();
+  try {
+    const rows = db
+      .prepare("SELECT slug FROM custom_providers WHERE api_format = 'anthropic'")
+      .all() as { slug: string }[];
+    anthropicPlatforms = new Set(rows.map(r => r.slug));
+  } catch {
+    // custom_providers may not exist on a very old DB; the cap is best-effort.
+  }
+  // The built-in anthropic platform is always anthropic-format when present.
+  anthropicPlatforms.add('anthropic');
+
+  const selectRows = db.prepare(
+    `SELECT id, platform, model_id, supports_vision, supports_audio_input, supports_video_input
+       FROM models
+      WHERE modalities_manual = 0${scope}`,
+  );
+  const rows = selectRows.all(...params) as Array<{
+    id: number;
+    platform: string;
+    model_id: string;
+    supports_vision: number;
+    supports_audio_input: number;
+    supports_video_input: number;
+  }>;
+
+  const update = db.prepare(
+    'UPDATE models SET supports_vision = ?, supports_audio_input = ?, supports_video_input = ? WHERE id = ?',
+  );
+
+  let updated = 0;
+  let capped = 0;
+  let changed = 0;
+
+  const apply = db.transaction(() => {
+    for (const row of rows) {
+      const indexed = MODALITY_INDEX.get(modalityIndexKey(row.platform, row.model_id));
+      // Adapter cap: a modality the adapter cannot express is forced off.
+      const cap = {
+        ...(ADAPTER_CAPABILITY[row.platform] ?? {}),
+        ...(anthropicPlatforms.has(row.platform) ? ANTHROPIC_CAPABILITY : {}),
+      };
+
+      // Start from the row's current values (uncovered rows keep them), then
+      // let the index overwrite when it has an opinion.
+      let image = row.supports_vision === 1;
+      let audio = row.supports_audio_input === 1;
+      let video = row.supports_video_input === 1;
+      if (indexed) {
+        image = indexed.image === true;
+        audio = indexed.audio === true;
+        video = indexed.video === true;
+        updated += 1;
+      }
+      if (cap.image === false && image) { image = false; capped += 1; }
+      if (cap.audio === false && audio) { audio = false; capped += 1; }
+      if (cap.video === false && video) { video = false; capped += 1; }
+
+      const next = { image: image ? 1 : 0, audio: audio ? 1 : 0, video: video ? 1 : 0 };
+      if (
+        next.image !== row.supports_vision ||
+        next.audio !== row.supports_audio_input ||
+        next.video !== row.supports_video_input
+      ) {
+        update.run(next.image, next.audio, next.video, row.id);
+        changed += 1;
+      }
+    }
+  });
+  apply();
+
+  if (rows.length > 0) {
+    console.log(
+      `[modalities] index applied: ${updated} rows matched the index, ${changed} written, ${capped} capped by adapter`,
+    );
   }
 }
 

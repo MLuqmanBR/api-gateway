@@ -2,7 +2,10 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb, setSetting } from '../db/index.js';
-import { listTranscriptionModels, getDefaultFamily, type TranscriptionModelRow } from '../services/transcriptions.js';
+import {
+  listTranscriptionModels, getDefaultFamily, resolveAudioEndpoint,
+  type TranscriptionModelRow,
+} from '../services/transcriptions.js';
 
 export const transcriptionsRouter = Router();
 
@@ -40,6 +43,14 @@ transcriptionsRouter.get('/', (_req: Request, res: Response) => {
         quotaLabel: r.quota_label,
         keyCount: keyCounts.get(r.platform) ?? 0,
         pricePerHourUsd: r.price_per_hour_usd,
+        // The wire shape this provider expects; the dashboard labels a
+        // non-default shape so an operator can see why it behaves differently.
+        shape: r.shape ?? 'multipart',
+        // Computed live from the provider registry rather than stored: a
+        // stored copy would go stale the moment a base URL is edited. False
+        // renders a "no endpoint" badge instead of a silent 500 at request
+        // time.
+        audioEndpoint: resolveAudioEndpoint(r.platform, 'transcriptions') !== null,
       })),
     })),
   });

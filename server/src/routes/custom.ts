@@ -7,7 +7,7 @@ import { clearPlatformCaches } from '../services/ratelimit.js';
 import { hasProvider, buildProviderFor, BUILTIN_PLATFORM_SLUGS } from '../providers/index.js';
 import { normalizeOpenAiBaseUrl } from '../lib/base-url.js';
 import { decrypt } from '../lib/crypto.js';
-import { applyTierRules, applyVisionRules } from '../db/migrations.js';
+import { applyTierRules, applyVisionRules, applyModalityIndex } from '../db/migrations.js';
 import type { DiscoveredModel } from '../providers/base.js';
 import { THINKING_LEVELS, THINKING_OFF } from '../lib/thinking.js';
 
@@ -76,6 +76,8 @@ const MODEL_DEFAULTS = {
   tpmLimit: null,
   tpdLimit: null,
   supportsVision: false,
+  supportsAudioInput: false,
+  supportsVideoInput: false,
 };
 
 const createModelSchema = z.object({
@@ -86,6 +88,8 @@ const createModelSchema = z.object({
   speedRank: z.number().int().min(1).max(100).optional(),
   sizeLabel: z.string().max(40).optional(),
   supportsVision: z.boolean().optional(),
+  supportsAudioInput: z.boolean().optional(),
+  supportsVideoInput: z.boolean().optional(),
   monthlyTokenBudget: z.string().max(40).optional(),
   rpmLimit: z.number().int().positive().nullable().optional(),
   rpdLimit: z.number().int().positive().nullable().optional(),
@@ -99,6 +103,11 @@ const createModelSchema = z.object({
 
 const updateModelSchema = createModelSchema.partial().extend({
   enabled: z.boolean().optional(),
+  /** true = clear modalities_manual and recompute this row from the generated
+   *  catalog index (see applyModalityIndex). Omit to leave ownership alone.
+   *  Without this the flag would be a one-way door: an operator who toggled a
+   *  modality by mistake could never get catalog data back for that row. */
+  resetModalities: z.boolean().optional(),
 });
 
 /** Normalizes a client-supplied thinking-levels array for storage. 'off' is
@@ -221,6 +230,10 @@ export function insertDiscoveredModels(slug: string, rows: DiscoveredModel[]): P
   // (scraped) rows already carry their benchmark tier; pattern rules only
   // apply to the unscored remainder.
   if (addedIds.length > 0) applyVisionRules(db, addedIds);
+  // The generated modality index is authoritative for the rows it covers, so
+  // run it after the heuristic vision rule: discovered models get real
+  // image/audio/video flags immediately instead of waiting for the next boot.
+  if (addedIds.length > 0) applyModalityIndex(db, addedIds);
   const unscoredIds = addedIds.filter(id => !scoredIds.has(id));
   if (unscoredIds.length > 0) applyTierRules(db, unscoredIds);
 
@@ -828,6 +841,8 @@ customRouter.get('/api/custom-providers/:slug/models', (req: Request, res: Respo
     maxOutputTokens: m.max_output_tokens,
     enabled: m.enabled === 1,
     supportsVision: m.supports_vision === 1,
+    supportsAudioInput: m.supports_audio_input === 1,
+    supportsVideoInput: m.supports_video_input === 1,
     priority: m.priority,
     fallbackEnabled: m.fallback_enabled === 1,
   })));
@@ -902,9 +917,10 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, max_output_tokens, key_id,
+         enabled, supports_vision, supports_audio_input, supports_video_input, modalities_manual,
+         max_output_tokens, key_id,
          thinking_levels, thinking_levels_manual)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, NULL, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NULL, NULL, ?, ?)
     `).run(
       slug, modelId, displayName,
       d.intelligenceRank ?? MODEL_DEFAULTS.intelligenceRank,
@@ -917,6 +933,10 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
       d.monthlyTokenBudget ?? MODEL_DEFAULTS.monthlyTokenBudget,
       d.contextWindow ?? null,
       d.supportsVision ?? MODEL_DEFAULTS.supportsVision ? 1 : 0,
+      d.supportsAudioInput ?? MODEL_DEFAULTS.supportsAudioInput ? 1 : 0,
+      d.supportsVideoInput ?? MODEL_DEFAULTS.supportsVideoInput ? 1 : 0,
+      // Operator supplied any modality explicitly -> own all three from now on.
+      d.supportsVision !== undefined || d.supportsAudioInput !== undefined || d.supportsVideoInput !== undefined ? 1 : 0,
       d.thinkingLevels ? JSON.stringify(canonicalizeThinkingLevels(d.thinkingLevels)) : JSON.stringify([...THINKING_LEVELS]),
       d.thinkingLevels ? 1 : 0,
     );
@@ -931,8 +951,14 @@ customRouter.post('/api/custom-providers/:slug/models', (req: Request, res: Resp
   });
   const modelDbId = tx();
   // Apply catalog rules ONLY for fields the operator left unspecified — an
-  // explicit supportsVision/sizeLabel in the request body wins.
-  if (d.supportsVision === undefined) applyVisionRules(db, [modelDbId]);
+  // explicit modality or sizeLabel in the request body wins.
+  // Order matters: the heuristic vision rule runs first as the baseline for
+  // rows the modality index does not cover, then the index (authoritative for
+  // the rows it does cover) overwrites it.
+  const operatorOwnsModalities =
+    d.supportsVision !== undefined || d.supportsAudioInput !== undefined || d.supportsVideoInput !== undefined;
+  if (!operatorOwnsModalities) applyVisionRules(db, [modelDbId]);
+  applyModalityIndex(db, [modelDbId]);
   if (d.sizeLabel === undefined) applyTierRules(db, [modelDbId]);
   res.status(201).json({
     success: true,
@@ -974,6 +1000,22 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   if (d.speedRank !== undefined) { updates.push('speed_rank = ?'); values.push(d.speedRank); }
   if (d.sizeLabel !== undefined) { updates.push('size_label = ?'); values.push(d.sizeLabel); }
   if (d.supportsVision !== undefined) { updates.push('supports_vision = ?'); values.push(d.supportsVision ? 1 : 0); }
+  if (d.supportsAudioInput !== undefined) { updates.push('supports_audio_input = ?'); values.push(d.supportsAudioInput ? 1 : 0); }
+  if (d.supportsVideoInput !== undefined) { updates.push('supports_video_input = ?'); values.push(d.supportsVideoInput ? 1 : 0); }
+  if (d.supportsVision !== undefined || d.supportsAudioInput !== undefined || d.supportsVideoInput !== undefined) {
+    // Any modality write makes this row operator-owned: no future boot rule
+    // pass may overwrite it (the pricing_manual / thinking_levels_manual
+    // pattern).
+    updates.push('modalities_manual = 1');
+  }
+  if (d.resetModalities === true) {
+    // Hand the row back to the generated index: clear the ownership flag and
+    // immediately recompute from the catalog data, so the response reflects
+    // the change rather than waiting for the next boot. Without this the flag
+    // is a one-way door — an operator who toggled a modality by mistake could
+    // never get catalog data back for that row.
+    updates.push('modalities_manual = 0');
+  }
   if (d.monthlyTokenBudget !== undefined) { updates.push('monthly_token_budget = ?'); values.push(d.monthlyTokenBudget); }
   if (d.rpmLimit !== undefined) { updates.push('rpm_limit = ?'); values.push(d.rpmLimit); }
   if (d.rpdLimit !== undefined) { updates.push('rpd_limit = ?'); values.push(d.rpdLimit); }
@@ -997,6 +1039,12 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
 
   values.push(id);
   db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+  // A reset must be visible in this response, not at the next boot.
+  if (d.resetModalities === true) {
+    applyModalityIndex(db, [id]);
+  }
+
   res.json({ success: true, id });
 });
 

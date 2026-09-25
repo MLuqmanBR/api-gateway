@@ -19,6 +19,7 @@ import { messagesRouter } from './routes/messages.js';
 import { fallbackRouter } from './routes/fallback.js';
 import { embeddingsRouter } from './routes/embeddings.js';
 import { transcriptionsRouter } from './routes/transcriptions.js';
+import { realtimeRouter } from './routes/realtime.js';
 import { audioRouter } from './routes/audio.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
@@ -72,6 +73,17 @@ export function createApp() {
       callback(null, !origin || allowedCorsOrigins.has(origin));
     },
   }));
+  // Media-bearing proxy requests carry base64 data URLs: a 15 MB video becomes
+  // ~20 MB once base64-encoded, and a multi-part message can hold several.
+  //
+  // This parser MUST be mounted BEFORE the global one below. Express runs
+  // middleware in order and body-parser only skips when the request stream is
+  // already consumed (onFinished.isFinished), which is false while the body is
+  // still streaming in — so a later, larger parser never gets a chance: the
+  // global 10mb limit trips first and the request dies with a 413. Mounting on
+  // /v1 first means these requests are parsed here and the global parser then
+  // sees a consumed stream and no-ops, while /api/* keeps its 10mb cap.
+  app.use('/v1', express.json({ limit: '64mb' }));
   // 10mb: code agents (OpenCode, AionUI, Qwen Code) ship very large system
   // prompts + tool schemas + repo context; 1mb cut their sessions off
   // mid-conversation with an opaque 413. (#200)
@@ -117,6 +129,7 @@ export function createApp() {
   app.use('/api/fallback', fallbackRouter);
   app.use('/api/embeddings', embeddingsRouter);
   app.use('/api/transcriptions', transcriptionsRouter);
+  app.use('/api/realtime', realtimeRouter);
   app.use('/api/events', eventsRouter);
   app.use('/api/analytics', analyticsRouter);
   app.use('/api/health', healthRouter);

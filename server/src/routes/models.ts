@@ -45,6 +45,8 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     maxOutputTokens: m.max_output_tokens,
     enabled: m.enabled === 1,
     supportsVision: m.supports_vision === 1,
+    supportsAudioInput: m.supports_audio_input === 1,
+    supportsVideoInput: m.supports_video_input === 1,
     priority: m.priority,
     fallbackEnabled: m.fallback_enabled === 1,
     hasProvider: hasProvider(m.platform),

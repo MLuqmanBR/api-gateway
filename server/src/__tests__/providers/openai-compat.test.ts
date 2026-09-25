@@ -514,3 +514,47 @@ describe('OpenAICompatProvider - platform instances', () => {
     });
   }
 });
+
+// The OpenAI-compatible adapter forwards `messages` verbatim, which is the
+// whole point: it is the one adapter that can carry any media shape upstream
+// without a translation step. If a future change starts normalizing content
+// here, every media modality silently regresses for the majority of
+// providers — so pin the byte-identical passthrough.
+describe('OpenAICompatProvider media passthrough', () => {
+  it('forwards every media block spelling verbatim', async () => {
+    const provider = new OpenAICompatProvider({
+      platform: 'openrouter',
+      name: 'PassThrough',
+      baseUrl: 'https://api.test.com/v1',
+    });
+
+    const content = [
+      { type: 'text', text: 'look at these' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+      { type: 'input_image', image_url: 'https://example.com/b.png' },
+      { type: 'input_audio', input_audio: { data: 'BBBB', format: 'wav' } },
+      { type: 'video_url', video_url: { url: 'data:video/mp4;base64,CCCC' } },
+    ];
+
+    let capturedBody: { messages?: unknown } | null = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as { body: string }).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          id: 'id', object: 'chat.completion', created: 1, model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        }),
+      } as unknown as Response;
+    });
+
+    await provider.chatCompletion('key', [{ role: 'user', content }], 'm');
+
+    const sent = (capturedBody as unknown as { messages: Array<{ content: unknown }> }).messages;
+    expect(sent).toHaveLength(1);
+    // Byte-for-byte identical — no flattening, no re-encoding, no reordering.
+    expect(sent[0].content).toEqual(content);
+    vi.restoreAllMocks();
+  });
+});

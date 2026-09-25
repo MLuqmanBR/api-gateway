@@ -8,12 +8,12 @@ import type {
   ChatToolDefinition,
   ChatToolChoice,
 } from '@api-gateway/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
+import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledModelFor, NO_MODEL_ERROR_CODE, type RouteResult } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { clearExhausted } from '../services/key-exhaustion.js';
 import { recordCircuitSuccess } from '../services/circuit-breaker.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
-import { contentToString, REASONING_ALIAS_KEYS } from '../lib/content.js';
+import { contentToString, blockMediaKind, mediaUrlOf, REASONING_ALIAS_KEYS, type MediaKind } from '../lib/content.js';
 import { ThinkTagStream, extractThinkTags } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -142,22 +142,70 @@ function partsToString(content: string | Array<{ type: string; text?: unknown }>
     .join('');
 }
 
-// Image input via the Responses API isn't carried through translation yet
-// (partsToString flattens to text). Detect it so we can hard-fail with a clear
-// pointer to /v1/chat/completions rather than silently dropping the image
-// (#118, #125). Recognizes the Responses `input_image` part plus the
-// chat-style `image_url` / `image` parts some clients reuse here.
-export function responsesInputHasImage(req: ResponsesRequest): boolean {
-  if (typeof req.input === 'string') return false;
+/**
+ * Convert a Responses content array to internal chat content, PRESERVING
+ * media. Returns a plain string when nothing but text is present (the common
+ * case, and the shape every text-only code path expects), and the array
+ * envelope when a media part is found.
+ *
+ * Responses spellings carry straight over: `input_image` → `image_url`,
+ * `input_audio` → `input_audio` (already `{data, format}`), `input_video` /
+ * `video_url` → `video_url`. `mediaUrlOf` normalizes the payload shape, and
+ * `input_audio` is re-emitted in the chat-completions `{data, format}` form.
+ */
+function partsToContent(
+  content: string | Array<{ type: string; text?: unknown }>,
+): ChatMessage['content'] {
+  if (typeof content === 'string') return content;
+  const parts: Array<Record<string, unknown>> = [];
+  let sawMedia = false;
+
+  for (const part of content) {
+    const kind = blockMediaKind(part);
+    if (!kind) {
+      if (typeof part.text === 'string') parts.push({ type: 'text', text: part.text });
+      continue;
+    }
+    const url = mediaUrlOf(part, kind);
+    if (!url) continue;
+    sawMedia = true;
+    if (kind === 'image') parts.push({ type: 'image_url', image_url: { url } });
+    else if (kind === 'video') parts.push({ type: 'video_url', video_url: { url } });
+    else {
+      // Audio: the chat envelope wants `{ input_audio: { data, format } }`.
+      // mediaUrlOf synthesizes a data URL from that pair, so invert it here.
+      const dataMatch = /^data:audio\/([^;,]+)?(;base64)?,(.*)$/s.exec(url);
+      parts.push({
+        type: 'input_audio',
+        input_audio: dataMatch
+          ? { data: dataMatch[3] ?? '', format: dataMatch[1] || 'wav' }
+          : { url },
+      });
+    }
+  }
+
+  if (!sawMedia) return partsToString(content as Array<{ type: string; text?: unknown }>);
+  return parts as ChatMessage['content'];
+}
+
+/**
+ * The modalities a Responses request requires, or an empty set.
+ *
+ * Replaces the old `responsesInputHasImage`, which could only answer a yes/no
+ * question about images because nothing else was carried through translation.
+ */
+export function responsesInputModalities(req: ResponsesRequest): Set<MediaKind> {
+  const required = new Set<MediaKind>();
+  if (typeof req.input === 'string') return required;
   for (const item of req.input) {
     const content = (item as { content?: unknown }).content;
     if (!Array.isArray(content)) continue;
-    if (content.some((p) => {
-      const type = (p as { type?: string })?.type;
-      return type === 'input_image' || type === 'image_url' || type === 'image';
-    })) return true;
+    for (const part of content) {
+      const kind = blockMediaKind(part);
+      if (kind) required.add(kind);
+    }
   }
-  return false;
+  return required;
 }
 
 // ── Translate a Responses request → internal chat messages + options ──────
@@ -196,7 +244,7 @@ export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
       const m = item as z.infer<typeof messageItemSchema>;
       // 'developer' is the Responses-era system role.
       const role = m.role === 'developer' ? 'system' : m.role;
-      messages.push({ role, content: partsToString(m.content) });
+      messages.push({ role, content: partsToContent(m.content) });
     }
   }
 
@@ -308,16 +356,21 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     ? reqData.max_output_tokens
     : undefined;
 
-  // Vision isn't carried through the Responses translation yet — fail clearly
-  if (responsesInputHasImage(reqData)) {
-    res.status(422).json({
-      error: {
-        message: 'Image input is not yet supported on /v1/responses. Use /v1/chat/completions with an image_url content part instead.',
-        type: 'invalid_request_error',
-        code: 'no_vision_model',
-      },
-    });
-    return;
+  // Media input IS carried through the translation now (see partsToContent),
+  // so the request is routed to a model that can express each required
+  // modality — the same contract /v1/chat/completions uses.
+  const requiredModalities = responsesInputModalities(reqData);
+  for (const kind of requiredModalities) {
+    if (!hasEnabledModelFor(kind)) {
+      res.status(422).json({
+        error: {
+          message: `This request includes ${kind} input, but no model that accepts ${kind} is enabled. Enable a model that accepts ${kind} in the Fallback Chain.`,
+          type: 'invalid_request_error',
+          code: NO_MODEL_ERROR_CODE[kind],
+        },
+      });
+      return;
+    }
   }
   const responseId = newId('resp');
   // Strict pin contract (mirrors /chat/completions): resolve BEFORE the
@@ -427,20 +480,31 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     if (upstreamAttempts >= attemptLimit) break;
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, skipModels.size > 0 ? skipModels : undefined, { pinMode: isPinned });
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, requiredModalities.size > 0 ? requiredModalities : undefined, skipModels.size > 0 ? skipModels : undefined, { pinMode: isPinned });
     } catch (err: unknown) {
       // routeRequest throws Error with { status?, code? } — see router.ts
-      const routingErr = err as Error & { status?: number };
+      const routingErr = err as Error & { status?: number; code?: string };
       const status = lastError ? 429 : (routingErr.status ?? 503);
       const message = lastError
         ? `All models rate-limited. Last error: ${sanitizeProviderErrorMessage(lastError.message)}`
         : routingErr.message;
-      const type = lastError ? 'rate_limit_error' : 'routing_error';
+      // A pin that exists but has no route is a CLIENT error, not a routing
+      // failure: report it as such, matching the chat route's shape
+      // (400 / invalid_request_error / code model_not_routable). Only a genuine
+      // upstream routing failure keeps the generic type.
+      const isPinRejection = routingErr.code === 'model_not_routable';
+      const type = lastError ? 'rate_limit_error' : (isPinRejection ? 'invalid_request_error' : 'routing_error');
+      // The code is included for pre-routing rejections so a client can branch
+      // on it (matching /v1/chat/completions, which returns code
+      // model_not_routable / model_capability_mismatch for the same cases).
+      const errorBody = isPinRejection
+        ? { message, type, code: routingErr.code }
+        : { message, type };
       if (streamStarted) {
-        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message, type } } });
+        sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: errorBody } });
         res.end();
       } else {
-        res.status(status).json({ error: { message, type } });
+        res.status(status).json({ error: errorBody });
       }
       return;
     }

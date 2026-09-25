@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent, canonicalizeReasoningFields } from '../../lib/content.js';
+import { contentToString, messageHasImage, normalizeOutboundContent, canonicalizeReasoningFields } from '../../lib/content.js';
 
 describe('contentToString', () => {
   it('passes strings through', () => {
@@ -43,28 +43,15 @@ describe('contentToString', () => {
   });
 });
 
-describe('flattenMessageContent', () => {
+describe('flatten-to-string behavior is covered by contentToString', () => {
   it('converts every message content to a string', () => {
-    const out = flattenMessageContent([
-      { role: 'user', content: 'plain' },
-      { role: 'user', content: [{ type: 'text', text: 'array' }] },
-      { role: 'assistant', content: null, tool_calls: [{ id: 'x', type: 'function', function: { name: 'f', arguments: '{}' } }] },
-    ]);
-    expect(out[0].content).toBe('plain');
-    expect(out[1].content).toBe('array');
-    expect(out[2].content).toBe('');
-  });
-
-  it('preserves other message fields (tool_calls, name, tool_call_id)', () => {
-    const out = flattenMessageContent([
-      { role: 'tool', content: 'result', tool_call_id: 'call-1', name: 'fn' },
-    ]);
-    expect(out[0]).toMatchObject({
-      role: 'tool',
-      content: 'result',
-      tool_call_id: 'call-1',
-      name: 'fn',
-    });
+    // The former flattenMessageContent helper was deleted (its only production
+    // caller, the Cohere adapter, now emits real image blocks). The text
+    // extraction it delegated to is asserted directly.
+    expect(contentToString('plain')).toBe('plain');
+    expect(contentToString([{ type: 'text', text: 'array' }])).toBe('array');
+    expect(contentToString(null)).toBe('');
+    expect(contentToString([{ type: 'image_url', image_url: { url: 'data:x' } }])).toBe('');
   });
 });
 

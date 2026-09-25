@@ -44,6 +44,13 @@ const modelSchema = z.object({
   contextWindow: z.number().int().nullable(),
   enabled: z.boolean(),
   supportsVision: z.boolean(),
+  // Input modality flags beyond vision. OPTIONAL (no default) on purpose: a
+  // config file exported before these columns existed must not be read as
+  // "audio=false, video=false", which would silently disable both on import.
+  // Absent means "this file has no opinion" and the destination row's own
+  // flags survive. Present means the file is authoritative for all three.
+  supportsAudioInput: z.boolean().optional(),
+  supportsVideoInput: z.boolean().optional(),
   maxOutputTokens: z.number().int().nullable(),
   paidInputPerM: z.number().nullable(),
   paidOutputPerM: z.number().nullable(),
@@ -119,6 +126,11 @@ const transcriptionProviderSchema = z.object({
   priority: z.number().int().min(0),
   enabled: z.boolean(),
   pricePerHourUsd: z.number().nullable(),
+  // Request-body shape this provider expects. Optional by design: a config
+  // file exported before the column existed has no opinion, and the importer
+  // treats "absent" as "leave the destination's value alone" rather than
+  // forcing the multipart default onto a base64-json row.
+  shape: z.enum(['multipart', 'base64-json']).optional(),
 });
 
 const transcriptionFamilySchema = z.object({

@@ -126,7 +126,7 @@ describe('tools requests respect strict pinning (supports_tools removed)', () =>
   }
 
   it('router-level: pinMode keeps the route on the pinned model for a tool-bearing request', () => {
-    const route = routeRequest(1000, undefined, pinnedDbId, false, undefined, { pinMode: true });
+    const route = routeRequest(1000, undefined, pinnedDbId, undefined, undefined, { pinMode: true });
     expect(route.modelDbId).toBe(pinnedDbId);
     expect(`${route.platform}/${route.modelId}`).toBe(pinnedModelId);
   });

@@ -161,7 +161,9 @@ describe('/v1/audio routes', () => {
     const fd = multipartBody({ model: 'whisper-large-v3-turbo' }, { name: 'clip.wav', bytes: 4096 });
     const { status, body } = await postAudio(app, '/v1/audio/transcriptions', getUnifiedApiKey(), fd);
     expect(status).toBe(502);
-    expect(body.error.message).toContain('(no usable keys)');
+    // The message now names the platform and distinguishes "no key" from "no
+    // endpoint" — the operator's next action differs between the two.
+    expect(body.error.message).toMatch(/no usable key for platform/);
     expect(upstreamCalls()).toBe(0);
   });
 

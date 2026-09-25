@@ -95,6 +95,8 @@ export interface CustomModelCreate {
   speedRank?: number;
   sizeLabel?: string;
   supportsVision?: boolean;
+  supportsAudioInput?: boolean;
+  supportsVideoInput?: boolean;
   monthlyTokenBudget?: string;
   rpmLimit?: number | null;
   rpdLimit?: number | null;
@@ -109,6 +111,8 @@ export interface CustomModelUpdate {
   speedRank?: number;
   sizeLabel?: string;
   supportsVision?: boolean;
+  supportsAudioInput?: boolean;
+  supportsVideoInput?: boolean;
   monthlyTokenBudget?: string;
   rpmLimit?: number | null;
   rpdLimit?: number | null;
@@ -135,7 +139,12 @@ export interface Model {
   monthlyTokenBudget: string;
   contextWindow: number | null;
   enabled: boolean;
+  // Input modalities. `supportsVision` keeps its upstream-owned name; its
+  // meaning is "accepts image input". The other two were added with the
+  // generated modality index (db/modality-index.ts).
   supportsVision: boolean;
+  supportsAudioInput: boolean;
+  supportsVideoInput: boolean;
 }
 
 export interface ModelListRow {
@@ -155,6 +164,8 @@ export interface ModelListRow {
   // when never customized; parsed server-side by parseStoredThinkingLevels.
   thinking_levels: string | null;
   supports_vision: number;
+  supports_audio_input: number;
+  supports_video_input: number;
 }
 
 export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unknown';
@@ -486,6 +497,15 @@ export interface ConfigModel {
   contextWindow: number | null;
   enabled: boolean;
   supportsVision: boolean;
+  /** Audio/video input flags. Optional so config files exported before these
+   * columns existed still parse; a missing value leaves the destination row's
+   * own flags alone (see import.ts). */
+  supportsAudioInput?: boolean;
+  supportsVideoInput?: boolean;
+  /** When true the imported modality values become operator-owned
+   * (models.modalities_manual = 1) and stop being rewritten by the boot
+   * modality index — the pricing_manual pattern. */
+  modalitiesManual?: boolean;
   maxOutputTokens: number | null;
   paidInputPerM: number | null;
   paidOutputPerM: number | null;
@@ -612,7 +632,11 @@ export interface ConfigTranscriptionFamily {
     modelId: string;
     priority: number;
     enabled: boolean;
+    /** Cost per audio hour, or null when unknown / unenforced (self-hosted NIM). */
     pricePerHourUsd: number | null;
+    /** Request-body shape this provider expects. Optional so config files
+     * exported before the column existed still parse. */
+    shape?: 'multipart' | 'base64-json';
   }>;
   maxFileMb: number;
   supportsTranslations: boolean;

@@ -170,4 +170,96 @@ describe('AnthropicCompatProvider', () => {
     expect(result.choices[0].message.content).toBe('Part one. Part two.');
     expect(result.choices[0].finish_reason).toBe('stop');
   });
+
+  // Media conversion outbound: an OpenAI image_url block becomes an Anthropic
+  // image block, with a data URL split into a base64 source (Anthropic has no
+  // object-URL concept) and an http URL kept as a url source.
+  it('converts image_url blocks to Anthropic image blocks (base64 and url sources)', async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as { body: string }).body) as Record<string, unknown>;
+      return okResponse() as unknown as Response;
+    });
+
+    await provider.chatCompletion('key', [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'what is this?' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw==' } },
+        { type: 'image_url', image_url: { url: 'https://example.com/pic.png' } },
+      ],
+    }], 'claude-sonnet-4-20250514');
+
+    const messages = (capturedBody as unknown as {
+      messages: Array<{ role: string; content: unknown }>;
+    }).messages;
+    const blocks = messages[0].content as Array<{ type: string; source: Record<string, string> }>;
+
+    expect(blocks[0]).toMatchObject({ type: 'text', text: 'what is this?' });
+    // A data URL is split into Anthropic's base64 source shape.
+    expect(blocks[1]).toMatchObject({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/png', data: 'iVBORw==' },
+    });
+    // An http URL keeps the URL source form.
+    expect(blocks[2]).toMatchObject({
+      type: 'image',
+      source: { type: 'url', url: 'https://example.com/pic.png' },
+    });
+  });
+
+  it('passes a document block through unchanged', async () => {
+    // The inbound Anthropic route accepts `document` (PDF) blocks; the outbound
+    // adapter must forward them rather than flattening to text, or a
+    // Claude-to-gateway-to-Claude round trip loses the PDF.
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as { body: string }).body) as Record<string, unknown>;
+      return okResponse() as unknown as Response;
+    });
+
+    await provider.chatCompletion('key', [{
+      role: 'user',
+      content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } }],
+    }], 'claude-sonnet-4-20250514');
+
+    const blocks = (capturedBody as unknown as {
+      messages: Array<{ content: Array<Record<string, unknown>> }>;
+    }).messages[0].content;
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      type: 'document',
+      source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' },
+    });
+  });
+
+  it('warns and drops audio/video rather than mangling them into text', async () => {
+    // Anthropic has no audio or video content block. Dropping with a warning is
+    // honest; converting to text would silently change the request's meaning.
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as { body: string }).body) as Record<string, unknown>;
+      return okResponse() as unknown as Response;
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    await provider.chatCompletion('key', [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'listen' },
+        { type: 'input_audio', input_audio: { data: 'UklGRg==', format: 'wav' } },
+        { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAA' } },
+      ],
+    }], 'claude-sonnet-4-20250514');
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('dropped audio/video'));
+    // The text survived and no media block was invented.
+    const content = (capturedBody as unknown as {
+      messages: Array<{ content: unknown }>;
+    }).messages[0].content;
+    expect(JSON.stringify(content)).toContain('listen');
+    expect(JSON.stringify(content)).not.toContain('UklGRg==');
+    expect(JSON.stringify(content)).not.toContain('AAAA');
+    warn.mockRestore();
+  });
 });

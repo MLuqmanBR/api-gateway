@@ -10,7 +10,22 @@ export function errorHandler(err: Error, _req: Request, res: Response, next: Nex
 
   if (res.headersSent) return next(err);
 
-  const status = (err as any).status ?? 500;
+  // Body-parser's limit error sets status 413 and name PayloadTooLargeError.
+  // Clients (and the dashboard upload path) key off `type`, so report the
+  // OpenAI-compatible marker rather than the internal error name.
+  const rawStatus = (err as Error & { status?: number }).status;
+  if (rawStatus === 413) {
+    res.status(413).json({
+      error: {
+        message: `Request body too large. The limit is 64mb for /v1 (media attachments) and 10mb elsewhere.`,
+        type: 'invalid_request_error',
+        code: 'request_too_large',
+      },
+    });
+    return;
+  }
+
+  const status = rawStatus ?? 500;
   res.status(status).json({
     error: {
       message: sanitizeProviderErrorMessage(err.message),

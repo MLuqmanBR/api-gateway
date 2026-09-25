@@ -10,7 +10,7 @@ import type {
   ThinkingEffort,
 } from '@api-gateway/shared/types.js';
 import { BaseProvider, providerHttpError, RequestAbortError, type CompletionOptions } from './base.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, blockMediaKind, mediaUrlOf, type MediaKind } from '../lib/content.js';
 import { extractErrorMessage } from '../lib/error-body.js';
 import { geminiThinkingConfig, normalizeThinking } from '../lib/thinking.js';
 import { createAbortRace } from '../lib/abort.js';
@@ -62,6 +62,12 @@ interface GeminiPart {
   inlineData?: {
     mimeType: string;
     data: string;
+  };
+  // Gemini fetches these itself. Used for YouTube URLs, which exceed the
+  // inline cap and are accepted directly by the API.
+  fileData?: {
+    mimeType?: string;
+    fileUri: string;
   };
   // True when this part holds the model's reasoning trace (Gemini 3 +
   // thinking-enabled 2.5). We fold these into `reasoning_content` on the
@@ -192,27 +198,31 @@ function toGeminiToolConfig(toolChoice?: ChatToolChoice): { functionCallingConfi
   };
 }
 
-const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8 MB cap on fetched/inlined images
+const MAX_INLINE_BYTES = 20 * 1024 * 1024; // 20 MB cap on fetched/inlined media
 
-// Pull the URL out of an OpenAI image content block. Accepts both the object
-// form `{ image_url: { url } }` and the shorthand `{ image_url: '...' }`.
-function extractImageUrl(block: unknown): string | undefined {
-  const iu = (block as { image_url?: unknown })?.image_url;
-  if (typeof iu === 'string') return iu;
-  if (iu && typeof (iu as { url?: unknown }).url === 'string') return (iu as { url: string }).url;
-  return undefined;
+/**
+ * YouTube URLs Gemini accepts directly via `fileData` — it fetches the video
+ * itself, and a video is far past the inline cap. Detected on video/audio
+ * blocks only; an image block never takes this path.
+ */
+function isYouTubeUrl(url: string): boolean {
+  return /^https?:\/\/(www\.)?(youtube\.com\/watch\?|youtu\.be\/)/i.test(url);
 }
 
-// Convert an image URL to a Gemini inlineData part. Handles base64 `data:` URLs
-// directly; for `http(s)` URLs we fetch and inline because the Gemini API does
-// not fetch external URLs itself. Fetching a user-supplied URL is a minor SSRF
-// surface, acceptable for a single-user self-hosted proxy; we still restrict to
-// http/https and cap the size. Returns null (part skipped) on any failure.
-
-async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; data: string } | null> {
+/**
+ * Convert a media URL to a Gemini inlineData part. Handles base64 `data:` URLs
+ * directly; for `http(s)` URLs we fetch and inline because the Gemini API does
+ * not fetch external URLs itself. Fetching a user-supplied URL is a minor SSRF
+ * surface, acceptable for a single-user self-hosted proxy; we still restrict to
+ * http/https and cap the size. Returns null (part skipped) on any failure.
+ */
+async function mediaUrlToInlineData(
+  url: string,
+  fallbackMime: string,
+): Promise<{ mimeType: string; data: string } | null> {
   const dataMatch = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(url);
   if (dataMatch) {
-    const mimeType = dataMatch[1] || 'application/octet-stream';
+    const mimeType = dataMatch[1] || fallbackMime;
     const isBase64 = Boolean(dataMatch[2]);
     const payload = dataMatch[3] ?? '';
     const data = isBase64
@@ -254,8 +264,8 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
       }
       if (!res || !res.ok) return null;
       const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
-      const mimeType = res.headers.get('content-type')?.split(';')[0]?.trim() || 'image/jpeg';
+      if (buf.length === 0 || buf.length > MAX_INLINE_BYTES) return null;
+      const mimeType = res.headers.get('content-type')?.split(';')[0]?.trim() || fallbackMime;
       return { mimeType, data: buf.toString('base64') };
     } catch {
       return null;
@@ -264,21 +274,48 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
   return null;
 }
 
-// Build Gemini parts for a user message: joined text first, then any images as
-// inlineData. Non-array content (string/null) collapses to a single text part.
-async function userContentToParts(content: ChatMessage['content']): Promise<GeminiPart[]> {
+/** Default MIME per modality when a data URL or upstream response omits one. */
+const FALLBACK_MIME: Record<MediaKind, string> = {
+  image: 'image/jpeg',
+  audio: 'audio/wav',
+  video: 'video/mp4',
+};
+
+/**
+ * Build Gemini parts for a user message: joined text first, then every media
+ * block as inlineData (or fileData for a YouTube video/audio URL, which Gemini
+ * fetches itself and which exceeds the inline cap). Non-array content
+ * (string/null) collapses to a single text part.
+ *
+ * Media the adapter cannot express is reported through `dropped` rather than
+ * silently discarded, so the caller can warn.
+ */
+async function userContentToParts(
+  content: ChatMessage['content'],
+  dropped?: MediaKind[],
+): Promise<GeminiPart[]> {
   const parts: GeminiPart[] = [];
   const text = contentToString(content);
   if (text.length > 0) parts.push({ text });
 
   if (Array.isArray(content)) {
     for (const block of content) {
-      const type = (block as { type?: string })?.type;
-      if (type !== 'image_url' && type !== 'image') continue;
-      const url = extractImageUrl(block);
-      if (!url) continue;
-      const inlineData = await imageUrlToInlineData(url);
+      const kind = blockMediaKind(block);
+      if (!kind) continue;
+      const url = mediaUrlOf(block, kind);
+      if (!url) {
+        dropped?.push(kind);
+        continue;
+      }
+      // Gemini fetches YouTube URLs itself, and a video blows past the inline
+      // cap — emit fileData instead of downloading it.
+      if ((kind === 'video' || kind === 'audio') && isYouTubeUrl(url)) {
+        parts.push({ fileData: { fileUri: url } });
+        continue;
+      }
+      const inlineData = await mediaUrlToInlineData(url, FALLBACK_MIME[kind]);
       if (inlineData) parts.push({ inlineData });
+      else dropped?.push(kind);
     }
   }
 
