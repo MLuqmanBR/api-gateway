@@ -332,4 +332,76 @@ describe('GoogleProvider', () => {
     expect(toolDeltas[0].function.arguments).toBe('{"city":"Karachi"}');
     expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('tool_calls');
   });
+
+  // Media conversion: the three input modalities must reach Gemini as the
+  // right part kind with the mimeType taken from the data URL, not a hardcoded
+  // image type. Audio converted as image/* would either 400 upstream or, worse,
+  // be silently misparsed.
+  it('emits inlineData with the data URL mimeType for image, audio and video', async () => {
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as { body: string }).body) as Record<string, unknown>;
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+        }),
+      } as unknown as Response;
+    });
+
+    await provider.chatCompletion('test-key', [{
+      role: 'user',
+      content: [
+        { type: 'text', text: 'describe' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw==' } },
+        { type: 'input_audio', input_audio: { data: 'UklGRg==', format: 'wav' } },
+        { type: 'video_url', video_url: { url: 'data:video/mp4;base64,AAAA' } },
+      ],
+    }], 'gemini-2.5-flash');
+
+    const parts = (capturedBody as unknown as {
+      contents: Array<{ parts: Array<{ inlineData?: { mimeType: string; data: string } }> }>;
+    }).contents[0].parts;
+    const inline = parts.flatMap(p => (p.inlineData ? [p.inlineData] : []));
+
+    expect(inline).toHaveLength(3);
+    // MimeType is derived per-kind from the data URL — the regression guard is
+    // that audio is NOT image/*.
+    expect(inline[0]).toMatchObject({ mimeType: 'image/png', data: 'iVBORw==' });
+    expect(inline[1]).toMatchObject({ mimeType: 'audio/wav', data: 'UklGRg==' });
+    expect(inline[2]).toMatchObject({ mimeType: 'video/mp4', data: 'AAAA' });
+  });
+
+  it('sends a YouTube URL as fileData instead of inlining it', async () => {
+    // Gemini fetches YouTube itself and a video exceeds the inline cap, so the
+    // adapter must not try to download it.
+    let capturedBody: Record<string, unknown> | null = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as { body: string }).body) as Record<string, unknown>;
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+        }),
+      } as unknown as Response;
+    });
+
+    await provider.chatCompletion('test-key', [{
+      role: 'user',
+      content: [{
+        type: 'video_url',
+        video_url: { url: 'https://www.youtube.com/watch?v=abc123' },
+      }],
+    }], 'gemini-2.5-flash');
+
+    const parts = (capturedBody as unknown as {
+      contents: Array<{ parts: Array<Record<string, unknown>> }>;
+    }).contents[0].parts;
+    const file = parts.find(p => p.fileData) as { fileData: { fileUri: string } } | undefined;
+    expect(file?.fileData.fileUri).toBe('https://www.youtube.com/watch?v=abc123');
+    // Nothing was inlined — no download was attempted.
+    expect(parts.some(p => p.inlineData)).toBe(false);
+  });
 });

@@ -41,7 +41,9 @@ function dataUrlToSource(url: string): AnthropicBase64Source | null {
  * Anthropic documents for simple turns.
  *
  * Audio and video are dropped with a warning: Anthropic has no content block
- * for either. `document` blocks (PDF) pass through unchanged.
+ * for either. `document` blocks (PDF) are handled as their own path below,
+ * because `blockMediaKind` classifies only image/audio/video — a PDF is not a
+ * media modality, and routing it through that classifier dropped it silently.
  */
 function toAnthropicUserBlocks(content: ChatMessage['content']): AnthropicUserContentBlock[] | null {
   if (!Array.isArray(content)) return null;
@@ -50,6 +52,21 @@ function toAnthropicUserBlocks(content: ChatMessage['content']): AnthropicUserCo
   let droppedMedia = false;
 
   for (const raw of content) {
+    // A `document` block is passed through as-is. It carries Anthropic's own
+    // source shape already (the inbound route builds it), so no conversion is
+    // needed — but it must be detected BEFORE the media classifier, which
+    // returns null for it and would otherwise flatten the PDF into empty text.
+    if (raw !== null && typeof raw === 'object' && 'type' in raw && raw.type === 'document') {
+      const source = 'source' in raw ? raw.source : undefined;
+      if (source && typeof source === 'object') {
+        blocks.push({ type: 'document', source } as AnthropicUserContentBlock);
+        sawMedia = true;
+        continue;
+      }
+      droppedMedia = true;
+      continue;
+    }
+
     const kind = blockMediaKind(raw);
     if (!kind) {
       const text = contentToString([raw]);
