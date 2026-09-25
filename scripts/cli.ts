@@ -262,6 +262,21 @@ async function waitPortFree(port, timeoutMs = 5000) {
   }
 }
 
+/**
+ * Is `systemd-run --user` usable here? Cached: this is asked once per start.
+ * Returns false on non-systemd hosts, in containers, and when the user manager
+ * is unreachable — the caller then falls back to a plain detached spawn.
+ */
+let systemdRunOk: boolean | null = null;
+function systemdRunAvailable(): boolean {
+  if (systemdRunOk !== null) return systemdRunOk;
+  try {
+    const res = spawnSync('systemd-run', ['--user', '--version'], { encoding: 'utf8', timeout: 5000 });
+    systemdRunOk = res.status === 0 && !res.error;
+  } catch { systemdRunOk = false; }
+  return systemdRunOk;
+}
+
 const SYSTEMD_UNIT = 'api-gateway.service';
 
 // The systemd user unit (api-gateway.service) runs server/dist/index.js on
@@ -348,10 +363,36 @@ async function startServer(port) {
   // stderr is bound to the log fd for the child's whole lifetime: with a
   // 'pipe' the stream dies when this CLI exits, and every post-startup crash
   // message (uncaughtException/unhandledRejection handlers) was silently lost.
-  const child = spawn('node', ['server/dist/index.js'], {
-    cwd: ROOT, detached: true, stdio: ['ignore', out, out],
-    env: { ...process.env, PORT: String(port) },
-  });
+  //
+  // startedTerminalIndependent(): `detached: true` alone only calls setsid(),
+  // which detaches the session but NOT the cgroup. The child therefore stayed
+  // inside the terminal's systemd transient scope, and closing that terminal
+  // killed the whole scope — taking the gateway with it. Launching through
+  // `systemd-run --user --scope` puts the server in its own scope, so it
+  // survives its launching terminal and is stopped only by `api stop`.
+  //
+  // The scope is deliberately NOT tied to the CLI process (no --wait): `api
+  // start` returns while the server keeps running, exactly as before. Falls back
+  // to a plain detached spawn when systemd-run is unavailable, so this still
+  // works on hosts without systemd.
+  //
+  // Measured: with `--scope` the spawned PID *is* the scope leader and *is* the
+  // server process (verified — the child landed in its own
+  // `api-gateway-port-<port>.scope`, distinct from the launching terminal's
+  // scope), so the registry records the right PID with no extra probing.
+  const useScope = systemdRunAvailable();
+  const child = useScope
+    ? spawn('systemd-run', [
+        '--user', '--scope', '--collect', '--quiet',
+        '--unit', `api-gateway-port-${port}`,
+        '--description', `api-gateway server (port ${port}, CLI-managed)`,
+        '--setenv', `PORT=${port}`,
+        'node', 'server/dist/index.js',
+      ], { cwd: ROOT, detached: true, stdio: ['ignore', out, out], env: { ...process.env } })
+    : spawn('node', ['server/dist/index.js'], {
+        cwd: ROOT, detached: true, stdio: ['ignore', out, out],
+        env: { ...process.env, PORT: String(port) },
+      });
 
   // No exit-handler cleanup here: this process exits right after start,
   // while the detached child keeps running, so an 'exit' listener could
@@ -359,12 +400,14 @@ async function startServer(port) {
   // cleanInstances() at the start of every CLI command instead (M68).
 
   child.on('error', (err) => {
-    console.error('Failed to start server:', err.message);
+    console.error(useScope ? `Failed to launch scope via systemd-run: ${err.message}` : `Failed to start server: ${err.message}`);
     process.exit(1);
   });
 
   child.unref();
 
+  // Under `--scope` this PID is the scope leader AND the server process
+  // (measured), so it is exactly what stop/status must later signal.
   updateInstances((cur) => { cur[String(port)] = child.pid!; }); // fresh read under the lock — concurrent starts can't clobber each other
 
   console.log(`Starting server on port ${port} (PID ${child.pid})…`);

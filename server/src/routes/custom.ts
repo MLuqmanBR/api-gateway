@@ -1040,6 +1040,29 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   values.push(id);
   db.prepare(`UPDATE models SET ${updates.join(', ')} WHERE id = ?`).run(...values);
 
+  // Enabling a model must ALSO put it back in the fallback chain.
+  //
+  // Archiving (DELETE /api/custom-models/:id) deletes the fallback_config row,
+  // so the two states could drift one way only: re-enabling set models.enabled=1
+  // and nothing ever re-created the chain row. The model then looked enabled in
+  // the dashboard while the router ignored it entirely, and pinning it returned
+  // 400 model_not_routable. The live catalog had 1,974 rows stuck in exactly
+  // that state before this fix.
+  //
+  // A model the operator explicitly enables belongs in the chain; disabling does
+  // NOT remove it (that would lose its priority), it just stops being routed.
+  if (d.enabled === true) {
+    const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(id);
+    if (inChain) {
+      // Re-enable an existing row, keeping its position — an archive/unarchive
+      // round-trip must not silently reorder the operator's chain.
+      db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(id);
+    } else {
+      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
+      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(id, maxPriority + 1);
+    }
+  }
+
   // A reset must be visible in this response, not at the next boot.
   if (d.resetModalities === true) {
     applyModalityIndex(db, [id]);
