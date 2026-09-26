@@ -829,6 +829,26 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
     if (keys.length === 0) {
       if (pinMode && preferredModelDbId && entry.model_db_id === preferredModelDbId) {
+        // Distinguish "this platform has NO usable key at all" from "its keys are
+        // all on cooldown". The first is permanent for the life of the config:
+        // retrying cannot help, and the proxy's 1-RPM recovery loop would spin
+        // forever without ever making an upstream call (measured: a pin to a
+        // zero-key platform returned nothing for 30 s+ and held the client
+        // until it gave up). The second is transient — waiting is exactly the
+        // right response — so it keeps the 429/PINNED_MODEL_EXHAUSTED path.
+        //
+        // Narrow on purpose: ONLY a platform with no key row whatsoever is
+        // unrecoverable. A platform whose keys exist but are all DISABLED is
+        // left on the existing 429/PINNED_MODEL_EXHAUSTED path — the operator
+        // can re-enable those without touching the catalog, so it is a
+        // recoverable state and the recovery loop is the honest response
+        // (routing-exhaustion.test.ts pins exactly this distinction).
+        const anyKeyExists = cachedPrepare(
+          'SELECT 1 FROM api_keys WHERE platform = ? LIMIT 1',
+        ).get(entry.platform);
+        if (!anyKeyExists) {
+          throw new PinnedModelNotRoutableError(entry.model_db_id);
+        }
         const pinErr = new Error('Pinned model exhausted — all keys for the requested model are rate-limited or on cooldown.') as any;
         pinErr.code = 'PINNED_MODEL_EXHAUSTED';
         pinErr.status = 429;

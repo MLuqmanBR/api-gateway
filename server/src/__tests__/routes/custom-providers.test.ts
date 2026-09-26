@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, vi } from 'vitest';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb } from '../../db/index.js';
@@ -233,6 +233,68 @@ describe('Custom providers (#230)', () => {
     const row = db.prepare('SELECT display_name FROM custom_providers WHERE slug = ?').get('renamedboth') as any;
     expect(row).toBeDefined();
     expect(row.display_name).toBe('After');
+  });
+
+  it('reviving an archived provider puts its models back in the fallback chain', async () => {
+    // Archive DELETEs every fallback_config row for the platform, and revive
+    // used to re-enable the models without re-inserting them — leaving the whole
+    // platform enabled-but-unroutable. Same defect class as the 1,974-row
+    // `models.enabled=1 AND fallback_config.enabled=0` drift in the live
+    // catalog, one level up.
+    await request(app, 'POST', '/api/custom-providers', {
+      slug: 'revivee', displayName: 'Revivee', baseUrl: 'http://r.example.com/v1',
+    });
+    const { body: created } = await request(app, 'POST', '/api/custom-providers/revivee/models', {
+      modelId: 'r1', displayName: 'R1',
+    });
+    const db = getDb();
+    const modelId = created.id as number;
+    expect(db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelId)).toBeDefined();
+
+    await request(app, 'DELETE', '/api/custom-providers/revivee');
+    expect(db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelId)).toBeUndefined();
+
+    // Revive with the SAME slug and base_url (the same-slug-different-baseUrl
+    // branch renames instead, so it would not exercise this path). syncModels
+    // runs after the transaction; stub it so the test stays offline.
+    // Stub ONLY the outbound catalog fetch. A blanket mock would also swallow
+    // the `request()` helper's own HTTP call to the app under test, so the
+    // assertion would pass against a response the app never produced.
+    const origFetch = global.fetch;
+    const catalogBody = JSON.stringify({ object: 'list', data: [{ id: 'r1' }] });
+    vi.spyOn(global, 'fetch').mockImplementation(async (url: any, init: any) => {
+      const u = typeof url === 'string' ? url : url?.toString?.() ?? '';
+      if (u.includes('127.0.0.1') || u.includes('localhost')) return origFetch(url, init);
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: (h: string) => (h.toLowerCase() === 'content-type' ? 'application/json' : null) },
+        json: () => Promise.resolve(JSON.parse(catalogBody)),
+        text: () => Promise.resolve(catalogBody),
+      } as any;
+    });
+    try {
+      const { status } = await request(app, 'POST', '/api/custom-providers', {
+        slug: 'revivee', displayName: 'Revivee', baseUrl: 'http://r.example.com/v1',
+      });
+      // Revive reuses the existing row, so it returns 200 — 201 is the
+      // create-new-provider path.
+      expect(status).toBe(200);
+    } finally {
+      vi.mocked(global.fetch).mockRestore?.();
+      global.fetch = origFetch;
+    }
+
+    // The invariant: enabled models are in the chain.
+    const stranded = db.prepare(`
+      SELECT COUNT(*) AS n FROM models m
+       WHERE m.platform = 'revivee' AND m.enabled = 1
+         AND NOT EXISTS (SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id)
+    `).get() as { n: number };
+    expect(stranded.n).toBe(0);
+    expect(db.prepare('SELECT archived FROM custom_providers WHERE slug = ?').get('revivee')).toMatchObject({ archived: 0 });
+    expect(db.prepare('SELECT enabled FROM models WHERE id = ?').get(modelId)).toMatchObject({ enabled: 1 });
+    expect(db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(modelId)).toMatchObject({ enabled: 1 });
   });
 
   it('DELETE /api/custom-providers/:slug cascades models + keys + fallback entries', async () => {
@@ -489,6 +551,27 @@ describe('Custom providers (#230)', () => {
     }
   });
 
+  it('discovers models from a valid JSON body even when the header says text/plain', async () => {
+    // The body decides, not the header. Self-hosted and llama.cpp-style
+    // endpoints routinely serve correct JSON under a wrong content-type, and
+    // rejecting on the header alone would regress providers that work today.
+    const realFetch = globalThis.fetch;
+    const realVitest = process.env.VITEST;
+    delete process.env.VITEST;
+    globalThis.fetch = (async () => new Response(
+      JSON.stringify({ data: [{ id: 'mislabelled-but-valid' }] }),
+      { status: 200, headers: { 'Content-Type': 'text/plain' } },
+    )) as typeof fetch;
+    try {
+      const result = await syncModelsFromProvider('http://selfhosted.example.com/v1', 'nvidia');
+      expect(result.error).toBeUndefined();
+      expect(result.added).toContain('mislabelled-but-valid');
+    } finally {
+      globalThis.fetch = realFetch;
+      if (realVitest !== undefined) process.env.VITEST = realVitest; else delete process.env.VITEST;
+    }
+  });
+
   it('syncModelsFromProvider reports a non-JSON catalog by URL instead of leaking a parse error', async () => {
     // Regression, live 2026-09-25: models.github.ai answers `OK` (text/plain,
     // 200) for EVERY path, including a bogus one, so github discovery could
@@ -514,29 +597,36 @@ describe('Custom providers (#230)', () => {
     }
   });
 
-  it('syncModelsFromProvider accepts a bare top-level array with a custom id field', async () => {
-    // Pollinations serves its catalog at the service root as a bare JSON array
-    // of `{name,...}` rows — not OpenAI's `{data:[{id,...}]}`. The provider
-    // declares discoverUrl + discoverIdField for exactly this.
+  it('points pollinations discovery at its OpenAI-shaped catalog, not the inference path', async () => {
+    // Pollinations' inference baseUrl is /openai/v1, but that prefix does NOT
+    // serve a catalog: GET /openai/v1/models returns a prose blog post. The real
+    // list is /openai/models (verified live: {"object":"list","data":[{"id":
+    // "openai-fast",...}]}) — the standard shape this parser already reads, so
+    // no shape adapter is needed. This is the same baseUrl-vs-catalog split as
+    // kilo, whose baseUrl ends /v1 while its model list does not.
+    // Getting this wrong is what made pollinations fail discovery on EVERY run,
+    // with an unhelpful "Unexpected token 'H'".
     const realFetch = globalThis.fetch;
     const realVitest = process.env.VITEST;
     delete process.env.VITEST;
     let requested = '';
     globalThis.fetch = (async (url: string) => {
       requested = String(url);
-      return new Response(JSON.stringify([{ name: 'openai-fast' }, { name: 'brand-new-anon-model' }]), {
-        status: 200, headers: { 'Content-Type': 'application/json' },
-      });
+      // Model the real behaviour: prose on the /v1 path, JSON on the real one.
+      if (requested.includes('/openai/v1/')) {
+        return new Response("Here's the quick low-down to pull the current catalog", {
+          status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        });
+      }
+      return new Response(
+        JSON.stringify({ object: 'list', data: [{ id: 'openai-fast', object: 'model' }] }),
+        { status: 200, headers: { 'Content-Type': 'application/json; charset=utf-8' } },
+      );
     }) as unknown as typeof fetch;
     try {
       const result = await syncModelsFromProvider('https://text.pollinations.ai/openai/v1', 'pollinations');
-      expect(requested).toBe('https://text.pollinations.ai/models');
+      expect(requested).toBe('https://text.pollinations.ai/openai/models');
       expect(result.error).toBeUndefined();
-      expect(result.added).toContain('brand-new-anon-model');
-      const db = getDb();
-      expect(db.prepare(
-        "SELECT 1 FROM models WHERE platform = 'pollinations' AND model_id = 'brand-new-anon-model'",
-      ).get()).toBeDefined();
     } finally {
       globalThis.fetch = realFetch;
       if (realVitest !== undefined) process.env.VITEST = realVitest; else delete process.env.VITEST;

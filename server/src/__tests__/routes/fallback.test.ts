@@ -119,6 +119,39 @@ describe('Fallback API', () => {
     }
   });
 
+  it('PUT /api/fallback cannot strand an enabled model outside the chain', async () => {
+    // Regression for a real, measured failure. This route is a FULL REPLACE, so
+    // it writes whatever chain the client has in memory. A dashboard tab loaded
+    // before some models were enabled sends back `enabled:false` for them and
+    // reverts every enable done since — which is exactly how a 1,230-row drift
+    // reappeared right after it had been repaired by hand.
+    const { getDb } = await import('../../db/index.js');
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id
+       WHERE m.enabled = 1 LIMIT 1
+    `).get() as { id: number } | undefined;
+    expect(row).toBeDefined();
+
+    const { body: chain } = await request(app, 'GET', '/api/fallback');
+    // Exactly what a stale client does: assert the model is OUT of the chain.
+    const stale = chain.map((e: any) => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: false }));
+    const { status } = await request(app, 'PUT', '/api/fallback', stale);
+    expect(status).toBe(200);
+
+    // The operator never disabled these models, so the server must not accept
+    // the stale view: every enabled model is still chain-enabled afterwards.
+    const stranded = (db.prepare(`
+      SELECT COUNT(*) AS n FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id
+       WHERE m.enabled = 1 AND fc.enabled = 0
+    `).get() as { n: number }).n;
+    expect(stranded).toBe(0);
+
+    // Restore priorities so later tests see a sane order.
+    const restore = chain.map((e: any) => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled }));
+    await request(app, 'PUT', '/api/fallback', restore);
+  });
+
   it('POST /api/fallback/sort/speed sorts by speed', async () => {
     const { status } = await request(app, 'POST', '/api/fallback/sort/speed');
     expect(status).toBe(200);

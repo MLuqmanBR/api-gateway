@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
+import { repairChainInvariant } from '../db/chain.js';
 import { getDb } from '../db/index.js';
 import { getAllPenalties, getCustomWeights, getRoutingScores, getRoutingStrategy, setCustomWeights, setRoutingStrategy, getGlobalRetryLimit, setGlobalRetryLimit } from '../services/router.js';
 import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
@@ -147,6 +148,20 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
     for (const entry of parsed.data) {
       update.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
     }
+
+    // Repair the invariant this endpoint can otherwise silently break: a model
+    // the operator has ENABLED must be in the chain.
+    //
+    // This route is a FULL REPLACE, so it writes whatever chain the client had
+    // in memory. A dashboard tab loaded before some models were enabled sends
+    // back `enabled:false` for them and reverts every enable done since — which
+    // is precisely how a 1,230-row drift reappeared immediately after it had
+    // been repaired. The client is not wrong to send its view; the server just
+    // must not let that view strand an enabled model outside the chain.
+    //
+    // Only rows the CLIENT marked disabled AND whose model is enabled get
+    // flipped; a deliberately disabled model (models.enabled=0) stays out.
+    repairChainInvariant(db);
   });
   updateAll();
 

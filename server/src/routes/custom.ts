@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
+import { ensureInChain, ensurePlatformInChain } from '../db/chain.js';
 import { getDb } from '../db/index.js';
 import { clearRateLimitPenalty, clearProviderConfigCache, clearRoundRobinIndex } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
@@ -408,18 +409,23 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
     // fault. (Live 2026-09-25: models.github.ai answers `OK` for EVERY path,
     // including a bogus one, so github discovery can never succeed while that
     // service is in this state.)
+    // Parse FIRST; the content-type only enriches the failure message.
+    //
+    // Rejecting on the header alone would break any endpoint that serves a valid
+    // JSON body under a non-JSON content-type — routine on the self-hosted and
+    // llama.cpp-style servers this project supports — so the body decides.
     const ctype = (res.headers.get('content-type') ?? '').split(';')[0].trim();
-    if (ctype && !ctype.includes('json')) {
-      const msg = `catalog endpoint returned ${ctype}, not JSON — ${catalogUrl}`;
-      console.log(`[Custom] ${slug}: ${msg} (body starts ${JSON.stringify(text.slice(0, 40))})`);
-      return { fetched: 0, added: [], error: msg };
-    }
-
     let body: unknown;
     try {
       body = JSON.parse(text);
     } catch {
-      const msg = `catalog endpoint returned unparseable JSON — ${catalogUrl}`;
+      // Name the URL and what came back. The old message ("Unexpected token 'O',
+      // \"OK\" is not valid JSON") named neither, which is why this class of
+      // failure was hard to diagnose. A non-JSON content type is the usual
+      // signature of an endpoint that wanted credentials or a different path.
+      const msg = ctype && !ctype.includes('json')
+        ? `catalog endpoint returned ${ctype}, not JSON — ${catalogUrl}`
+        : `catalog endpoint returned unparseable JSON — ${catalogUrl}`;
       console.log(`[Custom] ${slug}: ${msg} (body starts ${JSON.stringify(text.slice(0, 40))})`);
       return { fetched: 0, added: [], error: msg };
     }
@@ -577,6 +583,11 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
           .run(displayName.trim(), rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, apiFormat, keyFormat, stickySessionsEnabled ? 1 : 0, slug);
         db.prepare('UPDATE api_keys SET enabled = 1 WHERE platform = ?').run(slug);
         db.prepare('UPDATE models SET enabled = 1 WHERE platform = ?').run(slug);
+        // Archive DELETEs this platform's fallback_config rows; re-enabling the
+        // models alone would leave every one of them enabled-but-unroutable —
+        // exactly the drift this helper exists to prevent. Runs inside the
+        // transaction so a revived provider is never briefly half-restored.
+        ensurePlatformInChain(db, slug);
       });
       tx();
 
@@ -1084,15 +1095,10 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   // A model the operator explicitly enables belongs in the chain; disabling does
   // NOT remove it (that would lose its priority), it just stops being routed.
   if (d.enabled === true) {
-    const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(id);
-    if (inChain) {
-      // Re-enable an existing row, keeping its position — an archive/unarchive
-      // round-trip must not silently reorder the operator's chain.
-      db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(id);
-    } else {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
-      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(id, maxPriority + 1);
-    }
+    // Re-enable an existing row in place (keeping its priority — an
+    // archive/unarchive round-trip must not silently reorder the operator's
+    // chain), or append at the tail when no row survives.
+    ensureInChain(db, id);
   }
 
   // A reset must be visible in this response, not at the next boot.
