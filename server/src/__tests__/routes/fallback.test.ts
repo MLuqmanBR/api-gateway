@@ -119,36 +119,61 @@ describe('Fallback API', () => {
     }
   });
 
-  it('PUT /api/fallback cannot strand an enabled model outside the chain', async () => {
-    // Regression for a real, measured failure. This route is a FULL REPLACE, so
-    // it writes whatever chain the client has in memory. A dashboard tab loaded
-    // before some models were enabled sends back `enabled:false` for them and
-    // reverts every enable done since — which is exactly how a 1,230-row drift
-    // reappeared right after it had been repaired by hand.
+  it('honours an explicit disable while still repairing rows the client never sent', async () => {
+    // The two populations a full replace has to treat differently:
+    //
+    //  (a) rows the client sent as enabled:false  -> the operator's explicit
+    //      choice. It must survive; re-enabling it makes the checkbox a no-op.
+    //  (b) rows the client never sent at all (enabled elsewhere, e.g. the Keys
+    //      page or a PATCH) -> a stale tab would strand them, which is how the
+    //      1,230-row drift reappeared after being repaired.
     const { getDb } = await import('../../db/index.js');
     const db = getDb();
-    const row = db.prepare(`
+
+    const chosen = db.prepare(`
       SELECT m.id FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id
-       WHERE m.enabled = 1 LIMIT 1
+       WHERE m.enabled = 1 ORDER BY m.id LIMIT 1
     `).get() as { id: number } | undefined;
-    expect(row).toBeDefined();
+    expect(chosen).toBeDefined();
+
+    // A model enabled OUTSIDE the chain page, so it is absent from the payload.
+    const offChain = db.prepare(`
+      SELECT m.id FROM models m WHERE m.enabled = 1 AND m.id != ?
+        AND NOT EXISTS (SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id)
+       ORDER BY m.id LIMIT 1
+    `).get(chosen!.id) as { id: number } | undefined;
+    if (offChain) {
+      const maxP = (db.prepare('SELECT COALESCE(MAX(priority),0) AS m FROM fallback_config').get() as { m: number }).m;
+      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 0)').run(offChain.id, maxP + 1);
+    }
 
     const { body: chain } = await request(app, 'GET', '/api/fallback');
-    // Exactly what a stale client does: assert the model is OUT of the chain.
-    const stale = chain.map((e: any) => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: false }));
-    const { status } = await request(app, 'PUT', '/api/fallback', stale);
+    // Send the chain with exactly ONE model disabled — the operator's intent.
+    const payload = chain.map((e: any) => ({
+      modelDbId: e.modelDbId,
+      priority: e.priority,
+      enabled: e.modelDbId !== chosen!.id,
+    }));
+    const { status } = await request(app, 'PUT', '/api/fallback', payload);
     expect(status).toBe(200);
 
-    // The operator never disabled these models, so the server must not accept
-    // the stale view: every enabled model is still chain-enabled afterwards.
-    const stranded = (db.prepare(`
+    // (a) The explicit disable stuck.
+    expect((db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(chosen!.id) as { enabled: number }).enabled).toBe(0);
+
+    // (b) The row nobody mentioned is repaired back into the chain.
+    if (offChain) {
+      expect((db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(offChain.id) as { enabled: number }).enabled).toBe(1);
+    }
+
+    // And nothing that the payload left enabled was disturbed.
+    const missed = db.prepare(`
       SELECT COUNT(*) AS n FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id
        WHERE m.enabled = 1 AND fc.enabled = 0
-    `).get() as { n: number }).n;
-    expect(stranded).toBe(0);
+    `).get() as { n: number };
+    expect(missed.n).toBe(1);
 
-    // Restore priorities so later tests see a sane order.
-    const restore = chain.map((e: any) => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: e.enabled }));
+    // Restore.
+    const restore = chain.map((e: any) => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: true }));
     await request(app, 'PUT', '/api/fallback', restore);
   });
 

@@ -72,17 +72,24 @@ export function ensurePlatformInChain(db: Db, platform: string): number {
 }
 
 /**
- * Repair the whole catalog: re-enable any chain row whose model is enabled.
+ * Repair the catalog: re-enable chain rows that are enabled in the catalog but
+ * switched off in the chain, EXCEPT the ones the caller is deliberately
+ * keeping off.
  *
- * This is the invariant-repair `PUT /api/fallback` runs inside its transaction,
- * where a stale client payload can otherwise strand models wholesale. Returns
- * the number of rows repaired so the route can report it.
+ * `except` is the whole point. A caller that collected a set of model ids the
+ * operator explicitly disabled must pass it, or this function silently undoes
+ * that choice and the control the operator just used does nothing.
+ *
+ * Returns the number of rows repaired.
  */
-export function repairChainInvariant(db: Db): number {
-  const res = db.prepare(`
+export function repairChainInvariant(db: Db, options?: { except?: ReadonlySet<number> }): number {
+  const excluded = [...(options?.except ?? [])];
+  const sql = `
     UPDATE fallback_config SET enabled = 1
      WHERE enabled = 0
        AND model_db_id IN (SELECT id FROM models WHERE enabled = 1)
-  `).run();
+       ${excluded.length ? 'AND model_db_id NOT IN (' + excluded.map(() => '?').join(',') + ')' : ''}
+  `;
+  const res = excluded.length ? db.prepare(sql).run(...excluded) : db.prepare(sql).run();
   return (res as { changes?: number }).changes ?? 0;
 }

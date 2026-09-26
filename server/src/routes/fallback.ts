@@ -149,19 +149,28 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
       update.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
     }
 
-    // Repair the invariant this endpoint can otherwise silently break: a model
-    // the operator has ENABLED must be in the chain.
+    // Honour the operator's disables, then repair the invariant.
     //
-    // This route is a FULL REPLACE, so it writes whatever chain the client had
-    // in memory. A dashboard tab loaded before some models were enabled sends
-    // back `enabled:false` for them and reverts every enable done since — which
-    // is precisely how a 1,230-row drift reappeared immediately after it had
-    // been repaired. The client is not wrong to send its view; the server just
-    // must not let that view strand an enabled model outside the chain.
+    // This route is a FULL REPLACE, so anything the client omitted keeps the
+    // value it already had, and anything it listed as `enabled:false` is
+    // written as disabled. There are two populations in play:
     //
-    // Only rows the CLIENT marked disabled AND whose model is enabled get
-    // flipped; a deliberately disabled model (models.enabled=0) stays out.
-    repairChainInvariant(db);
+    //   - rows the client sent as disabled -> the operator's explicit choice.
+    //     Write it, and do NOT re-enable it below, or the checkbox is a no-op.
+    //   - rows the client omitted (models enabled outside this page, e.g. by
+    //     the Keys page or a PATCH) -> a stale dashboard tab would strand them,
+    //     which is how a 1,230-row drift reappeared right after it was
+    //     repaired. Those are what repairChainInvariant fixes.
+    //
+    // The distinction is "did this request mention it", not "is its model
+    // enabled": models.enabled is the catalog's own enable flag and has no
+    // business deciding this route's outcome. Reading the flag here is exactly
+    // what made 'disable this one' impossible for any model left enabled in the
+    // catalog.
+    const explicitlyDisabled = new Set(
+      parsed.data.filter(e => !e.enabled).map(e => e.modelDbId),
+    );
+    repairChainInvariant(db, { except: explicitlyDisabled });
   });
   updateAll();
 
