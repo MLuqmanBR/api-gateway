@@ -235,7 +235,7 @@ describe('Custom providers (#230)', () => {
     expect(row.display_name).toBe('After');
   });
 
-  it('reviving an archived provider puts its models back in the fallback chain', async () => {
+  it('reviving an archived provider restores its curated chain selection', async () => {
     // Archive DELETEs every fallback_config row for the platform, and revive
     // used to re-enable the models without re-inserting them — leaving the whole
     // platform enabled-but-unroutable. Same defect class as the 1,974-row
@@ -252,7 +252,10 @@ describe('Custom providers (#230)', () => {
     expect(db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelId)).toBeDefined();
 
     await request(app, 'DELETE', '/api/custom-providers/revivee');
-    expect(db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelId)).toBeUndefined();
+    // Archive must NOT delete the chain row: the platform is already unroutable
+    // via models.enabled=0, so deleting it only destroys the operator's
+    // priorities and selection for no routing benefit.
+    expect(db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelId)).toBeDefined();
 
     // Revive with the SAME slug and base_url (the same-slug-different-baseUrl
     // branch renames instead, so it would not exercise this path). syncModels
@@ -291,10 +294,53 @@ describe('Custom providers (#230)', () => {
        WHERE m.platform = 'revivee' AND m.enabled = 1
          AND NOT EXISTS (SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id)
     `).get() as { n: number };
-    expect(stranded.n).toBe(0);
     expect(db.prepare('SELECT archived FROM custom_providers WHERE slug = ?').get('revivee')).toMatchObject({ archived: 0 });
     expect(db.prepare('SELECT enabled FROM models WHERE id = ?').get(modelId)).toMatchObject({ enabled: 1 });
     expect(db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(modelId)).toMatchObject({ enabled: 1 });
+  });
+
+  it('archive -> revive does not re-enable a model the operator had switched off', async () => {
+    // The second route by which a deliberate chain disable used to be undone.
+    // Archive now leaves the rows alone, so a model trimmed out of the chain
+    // must still be off after the provider comes back — that IS the curated
+    // state, and revive is not the operator re-selecting it.
+    await request(app, 'POST', '/api/custom-providers', {
+      slug: 'curated', displayName: 'Curated', baseUrl: 'http://c.example.com/v1',
+    });
+    const { body: created } = await request(app, 'POST', '/api/custom-providers/curated/models', {
+      modelId: 'c1', displayName: 'C1',
+    });
+    const db = getDb();
+    const modelId = created.id as number;
+    // Operator trims it out of the chain.
+    db.prepare('UPDATE fallback_config SET enabled = 0 WHERE model_db_id = ?').run(modelId);
+
+    await request(app, 'DELETE', '/api/custom-providers/curated');
+    const origFetch = global.fetch;
+    vi.spyOn(global, 'fetch').mockImplementation(async (url: any, init: any) => {
+      const u = typeof url === 'string' ? url : url?.toString?.() ?? '';
+      if (u.includes('127.0.0.1') || u.includes('localhost')) return origFetch(url, init);
+      const body = JSON.stringify({ object: 'list', data: [{ id: 'c1' }] });
+      return {
+        ok: true, status: 200,
+        headers: { get: (h: string) => (h.toLowerCase() === 'content-type' ? 'application/json' : null) },
+        json: () => Promise.resolve(JSON.parse(body)),
+        text: () => Promise.resolve(body),
+      } as any;
+    });
+    try {
+      await request(app, 'POST', '/api/custom-providers', {
+        slug: 'curated', displayName: 'Curated', baseUrl: 'http://c.example.com/v1',
+      });
+    } finally {
+      vi.mocked(global.fetch).mockRestore?.();
+      global.fetch = origFetch;
+    }
+
+    // The model is back and routable-by-catalogue...
+    expect(db.prepare('SELECT enabled FROM models WHERE id = ?').get(modelId)).toMatchObject({ enabled: 1 });
+    // ...but the operator's chain selection survived the round trip.
+    expect(db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(modelId)).toMatchObject({ enabled: 0 });
   });
 
   it('DELETE /api/custom-providers/:slug cascades models + keys + fallback entries', async () => {
@@ -323,8 +369,15 @@ describe('Custom providers (#230)', () => {
     expect((db.prepare('SELECT COUNT(*) AS n FROM models WHERE platform = ? AND enabled = 1').get('doomed') as any).n).toBe(0);
     // Keys are disabled, not deleted.
     expect((db.prepare('SELECT COUNT(*) AS n FROM api_keys WHERE platform = ? AND enabled = 1').get('doomed') as any).n).toBe(0);
-    // Fallback rows are cleaned up.
-    expect((db.prepare('SELECT COUNT(*) AS n FROM fallback_config WHERE model_db_id = ?').get(created.id) as any).n).toBe(0);
+    // Fallback rows are PRESERVED, not cleaned up. Archive already stops the
+    // platform routing (the router needs fc.enabled=1 AND m.enabled=1, and
+    // models.enabled is 0 above), so deleting the row would only throw away the
+    // operator's priority and selection for no routing benefit — and revive
+    // could not restore it.
+    const kept = db.prepare('SELECT enabled, priority FROM fallback_config WHERE model_db_id = ?').get(created.id) as { enabled: number; priority: number } | undefined;
+    expect(kept, 'archive must preserve the chain row').toBeDefined();
+    // And the row is genuinely unreachable: the model is disabled in the catalog.
+    expect((db.prepare('SELECT enabled FROM models WHERE id = ?').get(created.id) as { enabled: number }).enabled).toBe(0);
   });
 
   // ── Model CRUD ─────────────────────────────────────────────────────

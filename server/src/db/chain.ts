@@ -1,27 +1,30 @@
 import type { DatabasePort } from './types.js';
 
 /**
- * The chain invariant: a model the operator has ENABLED must be in the fallback
- * chain.
+ * The chain invariant: a model the operator has ENABLED must have a
+ * `fallback_config` ROW.
  *
- * `models.enabled` and `fallback_config.enabled` are two independent columns,
- * and several routes write only one of them. When they drift, the dashboard
- * shows the model as enabled while the router cannot route to it — pinning it
- * returns `400 model_not_routable`, and auto-routing silently skips it. The live
- * catalog reached 1,974 rows in that state.
+ * That is deliberately a statement about MEMBERSHIP, not about the `enabled`
+ * column. Those are two different things and conflating them is what made the
+ * Fallback page's checkboxes no-ops:
  *
- * The writers that can strand a model:
- *   - `PUT /api/fallback` — a full replace, so a stale dashboard tab can write
- *     back an old chain with `enabled: 0` for models that have since been enabled.
- *   - provider archive → revive (`custom.ts`) — archive DELETEs every
- *     `fallback_config` row for the platform, revive re-enables the models but
- *     never re-inserts the rows.
- *   - `PATCH /api/custom-models/:id {enabled:true}` — re-enables the model only.
+ *   - membership  (does a fallback_config row exist)  -> a structural fact the
+ *     server is responsible for. Writers that add an enabled model must create
+ *     the row, or routeRequest's chain (router.ts) can never see the model.
+ *   - fc.enabled   (is that row switched on)         -> the operator's explicit,
+ *     reversible choice. NOTHING in the server may set it back to 1 behind
+ *     their back.
  *
- * Rather than duplicating the repair at each site, they all call the helpers
- * here. Disabling is deliberately NOT symmetric: disabling a model leaves its
- * chain row alone (so its priority survives a re-enable) and simply stops it
- * being routed.
+ * An earlier version of this file repaired the invariant by re-enabling
+ * `fc.enabled = 0` rows whose model was catalog-enabled. That is unsound: a
+ * full-replace PUT that the operator used to narrow the chain is byte-identical
+ * to one sent by a stale tab, so no SQL predicate can tell the two apart. The
+ * repair therefore undid deliberate disables — the user toggles a model off,
+ * saves, and it silently comes back on. The narrower membership form below is
+ * both sufficient and safe.
+ *
+ * Disabling stays asymmetric on purpose: it never removes the row, so the
+ * model's priority survives a re-enable.
  */
 
 // The real port, not a structural stand-in: the native and sql.js backends
@@ -29,20 +32,29 @@ import type { DatabasePort } from './types.js';
 type Db = DatabasePort;
 
 /**
- * Put a single model back in the chain if it is missing.
+ * Put a model in the chain if it has no row yet. INSERT-ONLY.
  *
- * Preserves an existing row's priority when one is present, so an
- * archive/unarchive round-trip does not silently reorder the operator's chain.
- * A model with no row at all is appended at the tail.
+ * It never touches `fc.enabled` on a row that already exists, in any caller and
+ * under any option. `fc.enabled` is the operator's switch; a server-side helper
+ * re-enabling it is the same defect the Fallback page reported ("I disable a
+ * model and it comes straight back on"), just reached through a different
+ * endpoint. A model switched off in the chain must STAY off until the operator
+ * switches it back on or explicitly re-enables the model itself.
  *
- * @returns 'present' if a row already existed, 'appended' if one was created.
+ * This is sufficient rather than a compromise: every path that removes a chain
+ * row (archive) or recreates the catalog (config import) either leaves the row
+ * absent — so this insert is exactly the repair needed — or has its own,
+ * explicit restore.
+ *
+ * @returns 'present' when a row already existed (untouched), 'appended' when
+ *   one was created.
  */
-export function ensureInChain(db: Db, modelDbId: number): 'present' | 'appended' {
+export function ensureInChain(
+  db: Db,
+  modelDbId: number,
+): 'present' | 'appended' {
   const existing = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelDbId);
-  if (existing) {
-    db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(modelDbId);
-    return 'present';
-  }
+  if (existing) return 'present';
   const maxPriority = (db
     .prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config')
     .get() as { m: number }).m;
@@ -52,44 +64,69 @@ export function ensureInChain(db: Db, modelDbId: number): 'present' | 'appended'
 }
 
 /**
- * Put every ENABLED model on a platform back in the chain.
+ * Put every ENABLED model on a platform into the chain if it has no row yet.
  *
  * Used by the provider revive path, where archive has deleted all of the
- * platform's chain rows. Only touches `models.enabled = 1` rows — a model the
- * operator disabled before the archive must stay out.
+ * platform's chain rows. Only `models.enabled = 1` rows are touched — a model
+ * the operator disabled before the archive stays out.
  *
- * @returns the number of models the call had to repair.
+ * @returns the number of models this call had to add a row for.
  */
 export function ensurePlatformInChain(db: Db, platform: string): number {
-  const stranded = db.prepare(`
+  const missing = db.prepare(`
     SELECT m.id FROM models m
      WHERE m.platform = ?
        AND m.enabled = 1
        AND NOT EXISTS (SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id)
   `).all(platform) as Array<{ id: number }>;
-  for (const { id } of stranded) ensureInChain(db, id);
-  return stranded.length;
+  for (const { id } of missing) ensureInChain(db, id);
+  return missing.length;
 }
 
 /**
- * Repair the catalog: re-enable chain rows that are enabled in the catalog but
- * switched off in the chain, EXCEPT the ones the caller is deliberately
- * keeping off.
+ * Membership repair: give every catalog-enabled model a chain row, without
+ * touching `fc.enabled` on any row that already exists.
  *
- * `except` is the whole point. A caller that collected a set of model ids the
- * operator explicitly disabled must pass it, or this function silently undoes
- * that choice and the control the operator just used does nothing.
+ * This is the invariant `PUT /api/fallback` runs inside its transaction. It
+ * repairs models that no page ever showed (added by a PATCH or a discovery run
+ * while a dashboard tab was open) while leaving every deliberate disable
+ * untouched, so an operator can narrow the chain to exactly the models they
+ * want and have that stick.
  *
- * Returns the number of rows repaired.
+ * Inserted rows are `enabled = 1`: a model that is catalog-enabled and has no
+ * chain row at all has never been seen by the operator, so there is no
+ * preference to preserve — and leaving it unroutable is the failure mode this
+ * function exists to prevent.
+ *
+ * @returns the number of rows created.
  */
-export function repairChainInvariant(db: Db, options?: { except?: ReadonlySet<number> }): number {
-  const excluded = [...(options?.except ?? [])];
-  const sql = `
-    UPDATE fallback_config SET enabled = 1
-     WHERE enabled = 0
-       AND model_db_id IN (SELECT id FROM models WHERE enabled = 1)
-       ${excluded.length ? 'AND model_db_id NOT IN (' + excluded.map(() => '?').join(',') + ')' : ''}
-  `;
-  const res = excluded.length ? db.prepare(sql).run(...excluded) : db.prepare(sql).run();
-  return (res as { changes?: number }).changes ?? 0;
+export function ensureCatalogInChain(db: Db): number {
+  const missing = db.prepare(`
+    SELECT m.id FROM models m
+     WHERE m.enabled = 1
+       AND NOT EXISTS (SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id)
+  `).all() as Array<{ id: number }>;
+  if (missing.length === 0) return 0;
+
+  // A single INSERT ... SELECT rather than a loop of individual binds: the set
+  // can be the whole catalog, and this keeps the statement's parameter count at
+  // zero (the previous NOT IN (... 3.9k placeholders) form relied on the SQLite
+  // host parameter limit, which is not guaranteed across backends).
+  //
+  // ROW_NUMBER() must sit in the OUTER select's window. Wrapping it in a scalar
+  // subquery (`? + (SELECT ROW_NUMBER() OVER (ORDER BY m.id))`) makes it
+  // evaluate over a single virtual row, so every inserted model is handed the
+  // SAME priority and they all tie at the tail — verified against SQLite 3.53,
+  // not assumed.
+  const maxPriority = (db
+    .prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config')
+    .get() as { m: number }).m;
+  const res = db.prepare(`
+    INSERT INTO fallback_config (model_db_id, priority, enabled)
+    SELECT m.id, ? + ROW_NUMBER() OVER (ORDER BY m.id), 1
+      FROM models m
+     WHERE m.enabled = 1
+       AND NOT EXISTS (SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id)
+  `).run(maxPriority);
+  return (res as { changes?: number }).changes ?? missing.length;
 }

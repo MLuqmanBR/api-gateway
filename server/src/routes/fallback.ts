@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import { repairChainInvariant } from '../db/chain.js';
 import { getDb } from '../db/index.js';
 import { getAllPenalties, getCustomWeights, getRoutingScores, getRoutingStrategy, setCustomWeights, setRoutingStrategy, getGlobalRetryLimit, setGlobalRetryLimit } from '../services/router.js';
 import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
@@ -149,28 +148,24 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
       update.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
     }
 
-    // Honour the operator's disables, then repair the invariant.
+    // No membership repair here, deliberately.
     //
-    // This route is a FULL REPLACE, so anything the client omitted keeps the
-    // value it already had, and anything it listed as `enabled:false` is
-    // written as disabled. There are two populations in play:
+    // An earlier version re-enabled `fc.enabled = 0` rows whose model was
+    // catalog-enabled, on the theory that the payload might be a stale tab. That
+    // is unsatisfiable in both directions: a full-replace PUT that narrows the
+    // chain to the operator's chosen models is byte-identical to one sent by a
+    // stale tab, so the server can either honour the disable (and strand
+    // anything a stale tab omitted) or override the disable (and make the
+    // Fallback page's checkbox a no-op). It did the latter, and the user
+    // reported exactly that: enable only the models of my choice, keep the rest
+    // disabled — impossible.
     //
-    //   - rows the client sent as disabled -> the operator's explicit choice.
-    //     Write it, and do NOT re-enable it below, or the checkbox is a no-op.
-    //   - rows the client omitted (models enabled outside this page, e.g. by
-    //     the Keys page or a PATCH) -> a stale dashboard tab would strand them,
-    //     which is how a 1,230-row drift reappeared right after it was
-    //     repaired. Those are what repairChainInvariant fixes.
-    //
-    // The distinction is "did this request mention it", not "is its model
-    // enabled": models.enabled is the catalog's own enable flag and has no
-    // business deciding this route's outcome. Reading the flag here is exactly
-    // what made 'disable this one' impossible for any model left enabled in the
-    // catalog.
-    const explicitlyDisabled = new Set(
-      parsed.data.filter(e => !e.enabled).map(e => e.modelDbId),
-    );
-    repairChainInvariant(db, { except: explicitlyDisabled });
+    // It cannot even reach the state it was guarding against: GET /api/fallback
+    // inner-joins fallback_config, so the client only ever receives models that
+    // already have a row, and the UPDATE above is a no-op for one that does not.
+    // The writers that genuinely can strand a model are PATCH-enable,
+    // provider revive, and config import; all three now call an insert-only
+    // helper (db/chain.ts) that never touches fc.enabled.
   });
   updateAll();
 

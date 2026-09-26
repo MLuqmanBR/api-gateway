@@ -17,6 +17,7 @@
 // returning the diff without committing.
 import type { DatabasePort } from '../../db/types.js';
 import { getDb, setSetting, getSetting } from '../../db/index.js';
+import { ensureCatalogInChain } from '../../db/chain.js';
 import { encrypt, decrypt } from '../crypto.js';
 import type { Platform } from '@api-gateway/shared';
 import { hasProvider } from '../../providers/index.js';
@@ -1319,6 +1320,20 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
 
     if (sectionAllow.has('fallback_chain') && env.sections.fallbackChain) {
       applyFallbackChain(db, env.sections.fallbackChain, modelResolution.okModels, eff.mode, summary);
+    } else {
+      // The chain section is optional (schema.ts), and applyModels REPLACE mode
+      // DELETEs every fallback_config row before re-inserting the models with
+      // enabled=1. Importing a config that carries models but no chain therefore
+      // leaves every model enabled-with-no-row: invisible in GET /api/fallback
+      // (which inner-joins the table) and unroutable, so a pin to one returns
+      // model_not_routable. The export cannot prevent it either — it builds the
+      // chain list FROM fallback_config, so a row-less model is absent from the
+      // envelope by construction. This is the one writer that genuinely needs a
+      // membership pass, which is why the helper lives in db/chain.ts.
+      //
+      // insert-only: it cannot re-enable anything the envelope did enable, so a
+      // merge that deliberately trimmed the chain is left alone.
+      ensureCatalogInChain(db);
     }
 
     if (sectionAllow.has('api_keys') && env.sections.apiKeys) {
