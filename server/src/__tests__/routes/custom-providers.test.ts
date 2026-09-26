@@ -489,6 +489,60 @@ describe('Custom providers (#230)', () => {
     }
   });
 
+  it('syncModelsFromProvider reports a non-JSON catalog by URL instead of leaking a parse error', async () => {
+    // Regression, live 2026-09-25: models.github.ai answers `OK` (text/plain,
+    // 200) for EVERY path, including a bogus one, so github discovery could
+    // never succeed. The old code ran JSON.parse on it and surfaced the raw
+    // SyntaxError — `Unexpected token 'O', "OK" is not valid JSON` — which names
+    // neither the endpoint nor the cause.
+    const realFetch = globalThis.fetch;
+    const realVitest = process.env.VITEST;
+    delete process.env.VITEST;
+    globalThis.fetch = (async () => new Response('OK\r\n', {
+      status: 200, headers: { 'Content-Type': 'text/plain' },
+    })) as typeof fetch;
+    try {
+      const result = await syncModelsFromProvider('https://models.github.ai/inference', 'github');
+      expect(result.fetched).toBe(0);
+      expect(result.error).toMatch(/text\/plain, not JSON/);
+      expect(result.error).toMatch(/https:\/\/models\.github\.ai\/inference\/models/);
+      // The old failure mode must not reappear.
+      expect(result.error).not.toMatch(/Unexpected token/);
+    } finally {
+      globalThis.fetch = realFetch;
+      if (realVitest !== undefined) process.env.VITEST = realVitest; else delete process.env.VITEST;
+    }
+  });
+
+  it('syncModelsFromProvider accepts a bare top-level array with a custom id field', async () => {
+    // Pollinations serves its catalog at the service root as a bare JSON array
+    // of `{name,...}` rows — not OpenAI's `{data:[{id,...}]}`. The provider
+    // declares discoverUrl + discoverIdField for exactly this.
+    const realFetch = globalThis.fetch;
+    const realVitest = process.env.VITEST;
+    delete process.env.VITEST;
+    let requested = '';
+    globalThis.fetch = (async (url: string) => {
+      requested = String(url);
+      return new Response(JSON.stringify([{ name: 'openai-fast' }, { name: 'brand-new-anon-model' }]), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      });
+    }) as unknown as typeof fetch;
+    try {
+      const result = await syncModelsFromProvider('https://text.pollinations.ai/openai/v1', 'pollinations');
+      expect(requested).toBe('https://text.pollinations.ai/models');
+      expect(result.error).toBeUndefined();
+      expect(result.added).toContain('brand-new-anon-model');
+      const db = getDb();
+      expect(db.prepare(
+        "SELECT 1 FROM models WHERE platform = 'pollinations' AND model_id = 'brand-new-anon-model'",
+      ).get()).toBeDefined();
+    } finally {
+      globalThis.fetch = realFetch;
+      if (realVitest !== undefined) process.env.VITEST = realVitest; else delete process.env.VITEST;
+    }
+  });
+
   it('DELETE /api/custom-models/:id archives models on built-in providers', async () => {
     const db = getDb();
     const model = db.prepare("SELECT id FROM models WHERE platform = 'cloudflare' AND model_id = 'custom-cloudflare-model'").get() as any;

@@ -165,6 +165,17 @@ export abstract class BaseProvider {
    *  record a per-slug error and write nothing. */
   discoverModels?(): Promise<DiscoveredModel[]>;
 
+  /** Catalog URL when it is NOT `<baseUrl>/models`. Pollinations serves its
+   *  catalog at the service root (`https://text.pollinations.ai/models`) while
+   *  its OpenAI-compatible inference path lives under `/openai/v1`, so the
+   *  default `${baseUrl}/models` 404s/HTMLs. Set this and the generic
+   *  discovery path uses it instead. */
+  discoverUrl?: string;
+
+  /** Response key holding the model array when it is not OpenAI's `data`.
+   *  Pollinations returns a bare top-level JSON array of `{name: ...}` rows. */
+  discoverIdField?: string;
+
   /** One-shot key validation for the health checker. Throwing (transport
    *  failure) is allowed and classifies the key as transiently errored. */
   abstract validateKey(apiKey: string): Promise<boolean>;

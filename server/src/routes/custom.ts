@@ -297,11 +297,17 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
   // Skip auto-discovery in test environments — fake provider URLs won't respond.
   if (process.env.VITEST) return { fetched: 0, added: [] };
 
+  // Providers whose catalog is not at `<baseUrl>/models` declare it explicitly
+  // (pollinations: inference under /openai/v1, catalog at the service root).
+  const provider = hasProvider(slug as never) ? buildProviderFor(slug) : undefined;
+  const catalogUrl = provider?.discoverUrl ?? `${baseUrl}/models`;
+  const idField = provider?.discoverIdField;
+
   // SSRF guard: block cloud-metadata link-local (169.254.0.0/16, e.g.
   // 169.254.169.254) before the server-side GET. RFC1918 / loopback are NOT
   // blocked — LAN Ollama and localhost providers are supported.
   try {
-    const host = new URL(`${baseUrl}/models`).hostname;
+    const host = new URL(catalogUrl).hostname;
     if (/^169\.254\./.test(host)) {
       console.log(`[Custom] ${slug}: refusing metadata-range host ${host}`);
       return { fetched: 0, added: [], error: 'metadata address blocked' };
@@ -344,7 +350,7 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
   const timeout = setTimeout(() => controller.abort(), 15000);
 
   try {
-    const res = await fetch(`${baseUrl}/models`, {
+    const res = await fetch(catalogUrl, {
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
@@ -395,18 +401,44 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
       }
     }
 
-    const body: any = JSON.parse(text);
-    const models = body?.data;
-    if (!Array.isArray(models) || models.length === 0) {
-      console.log(`[Custom] ${slug}: no models in /models response`);
+    // A non-JSON 200 is not a catalog. Report what the endpoint actually served
+    // instead of leaking a raw JSON.parse SyntaxError: the operator sees this
+    // string in the dashboard, and "Unexpected token 'O', \"OK\" is not valid
+    // JSON" says nothing about which URL was wrong or that the provider is at
+    // fault. (Live 2026-09-25: models.github.ai answers `OK` for EVERY path,
+    // including a bogus one, so github discovery can never succeed while that
+    // service is in this state.)
+    const ctype = (res.headers.get('content-type') ?? '').split(';')[0].trim();
+    if (ctype && !ctype.includes('json')) {
+      const msg = `catalog endpoint returned ${ctype}, not JSON — ${catalogUrl}`;
+      console.log(`[Custom] ${slug}: ${msg} (body starts ${JSON.stringify(text.slice(0, 40))})`);
+      return { fetched: 0, added: [], error: msg };
+    }
+
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      const msg = `catalog endpoint returned unparseable JSON — ${catalogUrl}`;
+      console.log(`[Custom] ${slug}: ${msg} (body starts ${JSON.stringify(text.slice(0, 40))})`);
+      return { fetched: 0, added: [], error: msg };
+    }
+
+    // OpenAI shape is `{data: [...]}`; some catalogs are a bare top-level array
+    // (pollinations) with a non-`id` identifying field.
+    const raw = Array.isArray(body) ? body : (body as { data?: unknown })?.data;
+    if (!Array.isArray(raw) || raw.length === 0) {
+      console.log(`[Custom] ${slug}: no models in catalog response`);
       return { fetched: 0, added: [] };
     }
+    const models = raw as Array<Record<string, unknown>>;
 
     // Map OpenAI rows onto the shared DiscoveredModel shape (all scraped
     // fields unknown) and hand off to the shared insert engine, which
     // reproduces the historical defaults/rank behavior for them.
-    const discovered: DiscoveredModel[] = models.map((m: { id?: unknown }) => {
-      const modelId = typeof m.id === 'string' ? m.id.trim() : '';
+    const discovered: DiscoveredModel[] = models.map((m: Record<string, unknown>) => {
+      const rawId = idField ? m[idField] : m.id;
+      const modelId = typeof rawId === 'string' ? rawId.trim() : '';
       return {
         modelId,
         displayName: modelId,
