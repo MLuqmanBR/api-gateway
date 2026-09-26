@@ -149,12 +149,22 @@ register(new OpenAICompatProvider({
 // path is the only recurring-free one left. Anon is queue-limited to 1
 // concurrent request per IP (429 "Queue full" on overlap; live-probed
 // 2026-06-10).
-register(new OpenAICompatProvider({
+// The catalog is NOT under the OpenAI-compatible prefix: /openai/v1/models
+// returns a prose blog-post for /models (live-probed 2026-09-25, text/plain,
+// "Here's the quick low-down to pull the current catalog of OpenAI models…").
+// The real catalog is the service root, a bare JSON array of `{name,...}` rows.
+// Discovery therefore needs both an explicit URL and a non-`data` array shape.
+// Declared inline on the instance (constructor options do not carry these; they
+// are discovery-only hints read off the registered provider).
+const pollinationsProvider = new OpenAICompatProvider({
   platform: 'pollinations',
   name: 'Pollinations',
   baseUrl: 'https://text.pollinations.ai/openai/v1',
   keyless: true,
-}));
+});
+pollinationsProvider.discoverUrl = 'https://text.pollinations.ai/models';
+pollinationsProvider.discoverIdField = 'name';
+register(pollinationsProvider);
 
 // LLM7.io — OpenAI-compatible aggregator. 100 req/hr free; anonymous access
 // also works for basic models. Wraps a handful of upstream models behind one

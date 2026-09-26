@@ -115,9 +115,23 @@ describe('CommandCode catalog scraper', () => {
     expect(rows[0].capsLabel).toBe('Text input, Vision, Reasoning');
   });
 
-  it('throws on a structurally broken CLI page instead of guessing', () => {
-    expect(() => parseCommandCodeCliPage('<h2 class="relative scroll-mt-24" id="deep-seek"><a>DeepSeek</a></h2><table><tr><td>garbage</td></tr></table>')).toThrow(/unparseable row/);
+  it('still throws when the page has NO usable rows', () => {
     expect(() => parseCommandCodeCliPage('<p>nothing here</p>')).toThrow(/no model rows/);
+  });
+
+  it('skips an unrecognized row instead of aborting the whole catalog', () => {
+    // Regression, live 2026-09-25: upstream added a company whose model link is
+    // its OWN site (typesafe/jev -> https://typesafe.ai) rather than
+    // /models/<slug>. The parser threw on that single row and discovery
+    // reported ZERO models, discarding the other 82 perfectly good ones.
+    // One unrecognized row must cost that row, not the catalog.
+    const html = '<h2 class="relative scroll-mt-24" id="deep-seek"><a>DeepSeek</a></h2><table>'
+      + '<tr><td><code>deepseek/v4</code></td><td><a href="https://commandcode.ai/models/deepseek-v4">DeepSeek</a></td><td><span aria-label="Capabilities: Text input, Reasoning">x</span></td></tr>'
+      + '<tr><td><code>typesafe/jev</code></td><td><a href="https://typesafe.ai">TypeSafe</a></td><td><span aria-label="Capabilities: Text input">y</span></td></tr>'
+      + '</table>';
+    const rows = parseCommandCodeCliPage(html);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].modelId).toBe('deepseek/v4');
   });
 
   it('parses overview specs: context multipliers, prices, dashes, Free, not-yet-scored', () => {

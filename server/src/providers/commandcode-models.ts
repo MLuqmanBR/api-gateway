@@ -97,6 +97,7 @@ export function parseCommandCodeCliPage(html: string): CliRow[] {
     /<h2 class="relative scroll-mt-24" id="([a-z0-9-]+)">([\s\S]*?)<\/h2>([\s\S]*?)(?=<h2 |$)/g,
   );
   const rows: CliRow[] = [];
+  const unparseable: Array<{ section: string; reason: string }> = [];
   for (const [, sectionId, h2Inner, body] of sections) {
     if (sectionId === 'next-steps') continue;
     const title = h2Inner.match(/<a[^>]*>([^<]*)<\/a>/);
@@ -108,7 +109,15 @@ export function parseCommandCodeCliPage(html: string): CliRow[] {
       const link = row.match(/href="https:\/\/commandcode\.ai\/models\/([a-z0-9-]+)"/);
       const caps = row.match(/aria-label="Capabilities: ([^"]*)"/);
       if (!code || !link || !caps) {
-        throw new Error(`CommandCode CLI models page: unparseable row in section "${sectionId}"`);
+        // SKIP, never throw. Upstream edits this page continuously — a new
+        // company whose link is its own site (typesafe/jev, added 2026-09-24,
+        // links to https://typesafe.ai) instead of /models/<slug> used to abort
+        // the entire discovery run and report zero models, even though the other
+        // 82 rows were perfectly parseable. One unrecognized row must cost that
+        // row, not the catalog. The `!code` case is still a genuine page-shape
+        // change, so it is logged loudly.
+        unparseable.push({ section: sectionId, reason: !code ? 'no <code> id' : !link ? 'no /models/ link' : 'no Capabilities label' });
+        continue;
       }
       rows.push({
         modelId: decodeEntities(code[1]).trim(),
@@ -121,6 +130,12 @@ export function parseCommandCodeCliPage(html: string): CliRow[] {
   }
   if (rows.length === 0) {
     throw new Error('CommandCode CLI models page: no model rows found');
+  }
+  if (unparseable.length > 0) {
+    console.warn(
+      `[commandcode] skipped ${unparseable.length} unparseable row(s): `
+      + unparseable.map(u => `${u.section}/${u.reason}`).join(', '),
+    );
   }
   return rows;
 }
