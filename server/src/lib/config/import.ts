@@ -1336,7 +1336,17 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
       // construction and a restore can never bring it back — leaving it enabled,
       // invisible in GET /api/fallback, and unroutable (a pin returns
       // model_not_routable).
-      ensureCatalogInChain(db);
+      //
+      // The rows this pass inserts are ordinary chain additions, and no other
+      // code path records them — applyFallbackChain only sees envelope entries.
+      // Without folding the count in, a restore that repairs hundreds of
+      // row-less models reports `fallback_chain 0 / 0 / 0`, and because
+      // runImport returns this same summary for dryRun, the operator's PREVIEW
+      // under-reports the effect of a destructive replace before they commit.
+      const restored = ensureCatalogInChain(db);
+      if (restored > 0) {
+        (summary.fallback_chain ??= emptyDiff()).added += restored;
+      }
     } else {
       // No chain section in the envelope. Replace mode already wiped the table
       // (applyModels: DELETE FROM fallback_config), and "an operator who did not
@@ -1349,7 +1359,15 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
       // imported models unroutable, because membership and chain are distinct and
       // this is the mode where the operator chose to supply neither. Re-running the
       // import with a `fallback_chain` section is the fix; that is the intent.
-      summary.fallback_chain ??= emptyDiff();
+      //
+      // No summary entry is written here on purpose. A section emptied by replace
+      // mode reports nothing across this codebase — applyModels, applyProviders and
+      // applyFallbackChain all wipe and record no removals, and SectionDiff has no
+      // field for it. Materialising a zeroed fallback_chain row would make the UI
+      // assert "nothing changed" for a table that was just wiped, and would inflate
+      // the toast's "across N sections" by one. Recording removals here alone would
+      // make this one section inconsistent with the other four, so it is left out
+      // and the behaviour is documented above instead.
     }
 
     if (sectionAllow.has('api_keys') && env.sections.apiKeys) {

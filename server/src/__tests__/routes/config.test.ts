@@ -635,11 +635,11 @@ describe('Config API', () => {
     expect((env.sections.models ?? []).some(m => m.modelId === 'ghost-1')).toBe(true);
     expect((env.sections.fallbackChain ?? []).some(c => c.modelId === 'ghost-1')).toBe(false);
 
-    const { status } = await request(app, 'POST', '/api/config/import', {
+    const imp = await request(app, 'POST', '/api/config/import', {
       envelope: env,
       options: { mode: 'replace', dryRun: false },
     });
-    expect(status).toBe(200);
+    expect(imp.status).toBe(200);
 
     // Replace mode re-inserts every model, so the rowid from before the import
     // is stale. Re-resolve by natural key.
@@ -651,6 +651,27 @@ describe('Config API', () => {
       .get(ghost!.id) as { enabled: number } | undefined;
     expect(row, 'the membership pass must restore a rowless enabled model').toBeDefined();
     expect(row!.enabled).toBe(1);
+
+    // Id-free cross-check: seedModels() builds a fixture of exactly one model
+    // with one chain row, so after the restore the table must hold exactly two —
+    // the fixture row rebuilt by applyFallbackChain, plus the ghost's row added
+    // by the membership pass. This depends on no rowid, so it cannot be fooled
+    // by replace mode reassigning ids.
+    expect((db.prepare('SELECT COUNT(*) AS n FROM fallback_config').get() as { n: number }).n).toBe(2);
+
+    // And the UI must be told about the row the server inserted on its own.
+    // applyFallbackChain only ever sees envelope entries, so without folding the
+    // count in this restore reports `fallback_chain 0 / 0 / 0` — and since
+    // runImport returns this same summary for dryRun, the operator's preview
+    // under-reports the change before they commit to a destructive replace.
+    // Exact, not ">=": the envelope's single chain entry is added by
+    // applyFallbackChain, and the ghost's row is the SECOND add, contributed by
+    // the membership pass. A ">=" assertion passes even when the count is
+    // discarded, because applyFallbackChain's own add satisfies it — verified by
+    // control.
+    const chainDiff = (imp.body as any).sections?.fallback_chain;
+    expect(chainDiff, 'the summary must report the fallback_chain section').toBeDefined();
+    expect(chainDiff.added).toBe(2);
   });
 
   it('a restore preserves a chain the operator deliberately trimmed', async () => {
@@ -688,6 +709,9 @@ describe('Config API', () => {
     ).get(victim!.platform, victim!.model_id) as { enabled: number } | undefined;
     expect(after, 'the trimmed model must still have a chain row').toBeDefined();
     expect(after!.enabled).toBe(0);
+    // Id-free: one model in the fixture, so exactly one chain row survives — the
+    // membership pass adds nothing because nothing is missing.
+    expect((db.prepare('SELECT COUNT(*) AS n FROM fallback_config').get() as { n: number }).n).toBe(1);
   });
 
   it('M32: replace on custom_providers unlinks dependents of ALL wiped providers', async () => {

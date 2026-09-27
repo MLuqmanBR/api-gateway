@@ -1821,6 +1821,15 @@ function migrateModelsV20KiloFree(db: DatabasePort) {
  * This line is a one-time catalog correction inside the gated block, and the
  * only other writer of that column is PUT /api/fallback, acting on the
  * operator's own explicit request.
+ *
+ * On "idempotent, safe to re-run" — the safety comes from the `user_version`
+ * gate, not from re-runnability. Running it a second time WOULD re-enable both
+ * `models.enabled` and `fallback_config.enabled` for cerebras/zai-glm-4.7, which
+ * is precisely the override the chain doctrine forbids. The gate is what makes
+ * it correct. Both UPDATEs must stay: a fresh database starts at user_version 0,
+ * so the whole chain executes, and V9 disables that model earlier in the same
+ * chain — dropping either one would leave new installs with the model enabled in
+ * the catalog but disabled in the chain, i.e. permanently unroutable.
  */
 function migrateModelsV21PruneDead(db: DatabasePort) {
   const dead: Array<[string, string]> = [
