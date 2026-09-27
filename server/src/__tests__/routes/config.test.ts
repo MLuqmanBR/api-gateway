@@ -586,6 +586,110 @@ describe('Config API', () => {
     expect(n).toBe(1);
   });
 
+  it('a models-only replace import leaves the chain empty, as replace mode documents', async () => {
+    // The counterweight to the membership pass. applyModels REPLACE wipes
+    // fallback_config, the chain section is absent, and the documented contract
+    // is that the chain stays empty. If this ever starts producing a full
+    // chain, a models-only restore has silently become "make every imported
+    // model routable" — a behaviour change on a path the section picker exposes.
+    const db = getDb();
+    const exp = await request(app, 'POST', '/api/config/export', { sections: ['models'] });
+    const env = exp.body as ConfigEnvelope;
+    expect(env.sections.fallbackChain).toBeUndefined();
+
+    const { status } = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(status).toBe(200);
+
+    expect((db.prepare('SELECT COUNT(*) AS n FROM fallback_config').get() as { n: number }).n).toBe(0);
+  });
+
+  it('a models+chain restore gives every enabled model a chain row again', async () => {
+    // The membership pass, and the reason it must run AFTER applyFallbackChain:
+    // in replace mode that function wipes the table a second time, so a pass
+    // placed before it would be discarded on this ordinary full-restore path.
+    //
+    // The export builds its chain list FROM fallback_config, so a model that has
+    // no row is absent from the envelope by construction and can never be
+    // brought back by a plain round trip — which is exactly the state this pass
+    // repairs.
+    const db = getDb();
+    // A model that exists and is enabled but has NO chain row. It must be
+    // present when the envelope is built, so the envelope's `models` section
+    // carries it while its `fallbackChain` section cannot.
+    db.prepare(
+      'INSERT INTO models (platform, model_id, display_name, enabled, intelligence_rank, ' +
+      "speed_rank, size_label, max_output_tokens) VALUES ('ghosthost','ghost-1','Ghost 1',1,1,1,'Medium',4096)",
+    ).run();
+    const before = db.prepare(
+      "SELECT id FROM models WHERE platform = 'ghosthost' AND model_id = 'ghost-1'",
+    ).get() as { id: number };
+    expect(before).toBeDefined();
+    expect(db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(before.id)).toBeUndefined();
+
+    const exp = await request(app, 'POST', '/api/config/export', { sections: ['models', 'fallback_chain'] });
+    const env = exp.body as ConfigEnvelope;
+    // In `models` … but structurally impossible to appear in the chain list.
+    expect((env.sections.models ?? []).some(m => m.modelId === 'ghost-1')).toBe(true);
+    expect((env.sections.fallbackChain ?? []).some(c => c.modelId === 'ghost-1')).toBe(false);
+
+    const { status } = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(status).toBe(200);
+
+    // Replace mode re-inserts every model, so the rowid from before the import
+    // is stale. Re-resolve by natural key.
+    const ghost = db.prepare(
+      "SELECT id FROM models WHERE platform = 'ghosthost' AND model_id = 'ghost-1'",
+    ).get() as { id: number } | undefined;
+    expect(ghost, 'the ghost model must survive the import').toBeDefined();
+    const row = db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?')
+      .get(ghost!.id) as { enabled: number } | undefined;
+    expect(row, 'the membership pass must restore a rowless enabled model').toBeDefined();
+    expect(row!.enabled).toBe(1);
+  });
+
+  it('a restore preserves a chain the operator deliberately trimmed', async () => {
+    // insert-only, in the direction that matters: the pass must not widen a
+    // chain the export recorded as trimmed. Trim a model in the chain, export,
+    // restore, and it must still be off afterwards.
+    const db = getDb();
+    // Identify the victim by natural key — replace mode reassigns every rowid.
+    const victim = db.prepare(
+      'SELECT m.platform, m.model_id FROM fallback_config fc JOIN models m ON m.id = fc.model_db_id' +
+      ' WHERE fc.enabled = 1 AND m.enabled = 1 LIMIT 1',
+    ).get() as { platform: string; model_id: string } | undefined;
+    expect(victim, 'fixture must have at least one chain row').toBeDefined();
+
+    db.prepare(
+      'UPDATE fallback_config SET enabled = 0 WHERE model_db_id =' +
+      ' (SELECT id FROM models WHERE platform = ? AND model_id = ?)',
+    ).run(victim!.platform, victim!.model_id);
+
+    const exp = await request(app, 'POST', '/api/config/export', { sections: ['models', 'fallback_chain'] });
+    const env = exp.body as ConfigEnvelope;
+    expect((env.sections.fallbackChain ?? [])
+      .some(c => c.platform === victim!.platform && c.modelId === victim!.model_id && !c.enabled)).toBe(true);
+
+    const { status } = await request(app, 'POST', '/api/config/import', {
+      envelope: env,
+      options: { mode: 'replace', dryRun: false },
+    });
+    expect(status).toBe(200);
+
+    // Re-resolve through the natural key: the rowid is meaningless after a wipe.
+    const after = db.prepare(
+      'SELECT fc.enabled FROM fallback_config fc JOIN models m ON m.id = fc.model_db_id' +
+      ' WHERE m.platform = ? AND m.model_id = ?',
+    ).get(victim!.platform, victim!.model_id) as { enabled: number } | undefined;
+    expect(after, 'the trimmed model must still have a chain row').toBeDefined();
+    expect(after!.enabled).toBe(0);
+  });
+
   it('M32: replace on custom_providers unlinks dependents of ALL wiped providers', async () => {
     const db = getDb();
     // Destination: two providers, each with a model + fallback + key.

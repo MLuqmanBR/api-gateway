@@ -343,7 +343,7 @@ describe('Custom providers (#230)', () => {
     expect(db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(modelId)).toMatchObject({ enabled: 0 });
   });
 
-  it('DELETE /api/custom-providers/:slug cascades models + keys + fallback entries', async () => {
+  it('DELETE /api/custom-providers/:slug archives the provider and disables its keys + models, preserving chain rows', async () => {
     await request(app, 'POST', '/api/custom-providers', {
       slug: 'doomed', displayName: 'Doomed', baseUrl: 'http://d.example.com/v1',
     });

@@ -347,8 +347,9 @@ function applyModels(
     // INCLUDING the built-in catalog, is GONE. Operators who want to keep
     // built-ins must export them or use 'overwrite' mode. The
     // fallback_chain section is wiped+rebuilt by its own apply* function;
-    // if the operator didn't include it in this import, the chain will be
-    // empty (which is the documented behavior of replace mode).
+    // if the operator didn't include it in this import, the chain stays
+    // empty (documented behavior of replace mode) — see the note at the
+    // applyFallbackChain call site for what that means for routing.
     db.prepare('DELETE FROM fallback_config').run();
     db.prepare('DELETE FROM models').run();
   }
@@ -1320,20 +1321,35 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
 
     if (sectionAllow.has('fallback_chain') && env.sections.fallbackChain) {
       applyFallbackChain(db, env.sections.fallbackChain, modelResolution.okModels, eff.mode, summary);
-    } else {
-      // The chain section is optional (schema.ts), and applyModels REPLACE mode
-      // DELETEs every fallback_config row before re-inserting the models with
-      // enabled=1. Importing a config that carries models but no chain therefore
-      // leaves every model enabled-with-no-row: invisible in GET /api/fallback
-      // (which inner-joins the table) and unroutable, so a pin to one returns
-      // model_not_routable. The export cannot prevent it either — it builds the
-      // chain list FROM fallback_config, so a row-less model is absent from the
-      // envelope by construction. This is the one writer that genuinely needs a
-      // membership pass, which is why the helper lives in db/chain.ts.
+      // Membership pass, AFTER the chain is rebuilt — not after applyModels.
+      // In replace mode applyModels wipes fallback_config and applyFallbackChain
+      // wipes it a SECOND time before rebuilding from the envelope, so a pass
+      // placed between the two would be discarded on the ordinary full-restore
+      // path. Running last is also what makes it safe: any model the envelope
+      // deliberately left out of the chain gets a row, and every model the
+      // envelope DID list keeps exactly the priority and enabled value written
+      // above. insert-only means a chain the operator trimmed on purpose comes
+      // back trimmed, not silently widened.
       //
-      // insert-only: it cannot re-enable anything the envelope did enable, so a
-      // merge that deliberately trimmed the chain is left alone.
+      // This corrects a real gap: the export builds its chain list FROM
+      // fallback_config, so a model with no row is absent from the envelope by
+      // construction and a restore can never bring it back — leaving it enabled,
+      // invisible in GET /api/fallback, and unroutable (a pin returns
+      // model_not_routable).
       ensureCatalogInChain(db);
+    } else {
+      // No chain section in the envelope. Replace mode already wiped the table
+      // (applyModels: DELETE FROM fallback_config), and "an operator who did not
+      // include the chain gets an empty chain" is the documented contract of
+      // replace mode — so it STAYS empty. Adding rows here would quietly turn a
+      // models-only restore into "every imported model is routable", which is a
+      // behaviour change on a path the section picker exposes to users.
+      //
+      // Consequence, stated plainly: a models-only replace import leaves the
+      // imported models unroutable, because membership and chain are distinct and
+      // this is the mode where the operator chose to supply neither. Re-running the
+      // import with a `fallback_chain` section is the fix; that is the intent.
+      summary.fallback_chain ??= emptyDiff();
     }
 
     if (sectionAllow.has('api_keys') && env.sections.apiKeys) {

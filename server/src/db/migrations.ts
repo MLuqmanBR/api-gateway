@@ -1811,8 +1811,16 @@ function migrateModelsV20KiloFree(db: DatabasePort) {
  *     404 "no endpoints found" (delisted / moved to paid).
  *
  * Re-enabled: cerebras/zai-glm-4.7 (V9 disabled it; live-probed 200 free again).
- * These ids are re-inserted by their original migrations on each boot, so this
- * later DELETE is what keeps them out. Idempotent, safe to re-run.
+ * This reverses V9's disable once; it is NOT a per-boot override and must not be
+ * read as one. The whole data-migration block below runs exactly once per
+ * database, guarded by `user_version < CURRENT_DATA_VERSION` (1), so against any
+ * database already at version 1 this function never executes again.
+ *
+ * That is the audit conclusion worth stating explicitly: after the chain helpers
+ * became insert-only, no code flips `fallback_config.enabled` on a routine path.
+ * This line is a one-time catalog correction inside the gated block, and the
+ * only other writer of that column is PUT /api/fallback, acting on the
+ * operator's own explicit request.
  */
 function migrateModelsV21PruneDead(db: DatabasePort) {
   const dead: Array<[string, string]> = [

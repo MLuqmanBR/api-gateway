@@ -41,10 +41,10 @@ type Db = DatabasePort;
  * endpoint. A model switched off in the chain must STAY off until the operator
  * switches it back on or explicitly re-enables the model itself.
  *
- * This is sufficient rather than a compromise: every path that removes a chain
- * row (archive) or recreates the catalog (config import) either leaves the row
- * absent — so this insert is exactly the repair needed — or has its own,
- * explicit restore.
+ * This is sufficient rather than a compromise: every path that can end up
+ * with a missing row either leaves it absent — so this insert is exactly the
+ * repair needed — or has its own, explicit restore. See
+ * ensurePlatformInChain and ensureCatalogInChain for those two.
  *
  * @returns 'present' when a row already existed (untouched), 'appended' when
  *   one was created.
@@ -66,9 +66,19 @@ export function ensureInChain(
 /**
  * Put every ENABLED model on a platform into the chain if it has no row yet.
  *
- * Used by the provider revive path, where archive has deleted all of the
- * platform's chain rows. Only `models.enabled = 1` rows are touched — a model
- * the operator disabled before the archive stays out.
+ * Called by the provider revive path, and needed for two states that a current
+ * database can still be in:
+ *   - a provider archived by an OLDER build, which deleted the platform's chain
+ *     rows outright. Those rows are gone and this restores them.
+ *   - models discovered or added while the platform was archived, which never
+ *     had a row to begin with.
+ *
+ * Archive no longer deletes chain rows (see routes/custom.ts): it only sets
+ * `models.enabled = 0`, which already makes the platform unroutable and already
+ * preserves the operator's priorities and selection across an archive/revive
+ * round trip. So on a current build this is normally a no-op — which is the
+ * point. A model the operator switched OFF stays off, because this only ever
+ * inserts rows for models that have none.
  *
  * @returns the number of models this call had to add a row for.
  */

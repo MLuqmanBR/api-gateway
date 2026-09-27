@@ -449,7 +449,10 @@ export class CommandCodeProvider extends BaseProvider {
   // to POST a real /alpha/generate and each such probe spends one of the
   // account's plan credits. Measured: a boot-time sweep charged three probes
   // (one per key) against a finite weekly pool. A health sweep must never cost
-  // money, so the checker skips this platform (see checkKeyHealth).
+  // money, so the scheduled sweep skips this platform (see checkAllKeys in
+  // services/health.ts). The skip is deliberately NOT in checkKeyHealth, which
+  // backs the Keys page's per-key "test" button — an explicit user action is
+  // exactly where one billable probe is justified.
   readonly validateCostsQuota = true;
 
   readonly platform = 'commandcode' as const;
