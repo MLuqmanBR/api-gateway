@@ -152,6 +152,18 @@ export abstract class BaseProvider {
    * the platform "configured", and the provider omits the Authorization header
    * on outgoing requests. Defaults to false; set by subclasses. */
   keyless = false;
+  /** True when the ONLY way this provider can confirm a key is live is to spend
+   * a real, billable inference request. CommandCode is the case in point: every
+   * GET route 404s, so `validateKey` must POST /alpha/generate, and each probe
+   * consumes one of the account's plan credits.
+   *
+   * A background health sweep must not spend the operator's quota, so
+   * `checkKeyHealth` skips the probe entirely for these providers and records
+   * the honest answer instead: `unknown` - nothing was verified. `unknown`
+   * stays inside the router's pre-filter (unlike `rate_limited`), so the key
+   * remains routable and a real chat request is what decides whether it works.
+   * Defaults to false; set by subclasses. */
+  validateCostsQuota = false;
   /** Providers whose models endpoint follows the OpenAI /v1/models convention
    * can expose their base URL so the custom-model auto-discovery route knows
    * where to probe. Providers that construct the URL from key contents (e.g.
@@ -165,11 +177,12 @@ export abstract class BaseProvider {
    *  record a per-slug error and write nothing. */
   discoverModels?(): Promise<DiscoveredModel[]>;
 
-  /** Catalog URL when it is NOT `<baseUrl>/models`. Pollinations serves its
-   *  catalog at the service root (`https://text.pollinations.ai/models`) while
-   *  its OpenAI-compatible inference path lives under `/openai/v1`, so the
-   *  default `${baseUrl}/models` 404s/HTMLs. Set this and the generic
-   *  discovery path uses it instead. */
+  /** Catalog URL when it is NOT `<baseUrl>/models`. Pollinations keeps its
+   *  [OI]-shaped catalog at `https://text.pollinations.ai/openai/models`, which
+   *  is neither the inference base URL (`/openai/v1`, whose `/models` serves a
+   *  prose blog post) nor the service root (`/models`, a human-facing array
+   *  keyed `name`). The default `${baseUrl}/models` therefore returns prose.
+   *  Set this and the generic discovery path uses it instead. */
   discoverUrl?: string;
 
   /** Response key holding the model array when it is not OpenAI's `data`.

@@ -162,8 +162,13 @@ const pollinationsProvider = new OpenAICompatProvider({
   baseUrl: 'https://text.pollinations.ai/openai/v1',
   keyless: true,
 });
-pollinationsProvider.discoverUrl = 'https://text.pollinations.ai/models';
-pollinationsProvider.discoverIdField = 'name';
+// /openai/models — NOT the /openai/v1/models the inference baseUrl would imply
+// (/openai/v1/models serves a prose blog post), and NOT the bare root /models
+// (a human-facing array keyed `name`). /openai/models returns the standard
+// {"object":"list","data":[{"id":...}]} shape the shared parser already reads,
+// so no shape adapter is needed. Same baseUrl-vs-catalog-URL split as kilo,
+// whose baseUrl ends /v1 while its model list does not.
+pollinationsProvider.discoverUrl = 'https://text.pollinations.ai/openai/models';
 register(pollinationsProvider);
 
 // LLM7.io — OpenAI-compatible aggregator. 100 req/hr free; anonymous access

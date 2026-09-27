@@ -1811,8 +1811,25 @@ function migrateModelsV20KiloFree(db: DatabasePort) {
  *     404 "no endpoints found" (delisted / moved to paid).
  *
  * Re-enabled: cerebras/zai-glm-4.7 (V9 disabled it; live-probed 200 free again).
- * These ids are re-inserted by their original migrations on each boot, so this
- * later DELETE is what keeps them out. Idempotent, safe to re-run.
+ * This reverses V9's disable once; it is NOT a per-boot override and must not be
+ * read as one. The whole data-migration block below runs exactly once per
+ * database, guarded by `user_version < CURRENT_DATA_VERSION` (1), so against any
+ * database already at version 1 this function never executes again.
+ *
+ * That is the audit conclusion worth stating explicitly: after the chain helpers
+ * became insert-only, no code flips `fallback_config.enabled` on a routine path.
+ * This line is a one-time catalog correction inside the gated block, and the
+ * only other writer of that column is PUT /api/fallback, acting on the
+ * operator's own explicit request.
+ *
+ * On "idempotent, safe to re-run" — the safety comes from the `user_version`
+ * gate, not from re-runnability. Running it a second time WOULD re-enable both
+ * `models.enabled` and `fallback_config.enabled` for cerebras/zai-glm-4.7, which
+ * is precisely the override the chain doctrine forbids. The gate is what makes
+ * it correct. Both UPDATEs must stay: a fresh database starts at user_version 0,
+ * so the whole chain executes, and V9 disables that model earlier in the same
+ * chain — dropping either one would leave new installs with the model enabled in
+ * the catalog but disabled in the chain, i.e. permanently unroutable.
  */
 function migrateModelsV21PruneDead(db: DatabasePort) {
   const dead: Array<[string, string]> = [

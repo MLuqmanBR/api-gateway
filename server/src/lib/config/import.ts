@@ -17,6 +17,7 @@
 // returning the diff without committing.
 import type { DatabasePort } from '../../db/types.js';
 import { getDb, setSetting, getSetting } from '../../db/index.js';
+import { ensureCatalogInChain } from '../../db/chain.js';
 import { encrypt, decrypt } from '../crypto.js';
 import type { Platform } from '@api-gateway/shared';
 import { hasProvider } from '../../providers/index.js';
@@ -346,8 +347,9 @@ function applyModels(
     // INCLUDING the built-in catalog, is GONE. Operators who want to keep
     // built-ins must export them or use 'overwrite' mode. The
     // fallback_chain section is wiped+rebuilt by its own apply* function;
-    // if the operator didn't include it in this import, the chain will be
-    // empty (which is the documented behavior of replace mode).
+    // if the operator didn't include it in this import, the chain stays
+    // empty (documented behavior of replace mode) — see the note at the
+    // applyFallbackChain call site for what that means for routing.
     db.prepare('DELETE FROM fallback_config').run();
     db.prepare('DELETE FROM models').run();
   }
@@ -1319,6 +1321,53 @@ export function runImport({ envelope, options }: RunImportOptions): RunImportRes
 
     if (sectionAllow.has('fallback_chain') && env.sections.fallbackChain) {
       applyFallbackChain(db, env.sections.fallbackChain, modelResolution.okModels, eff.mode, summary);
+      // Membership pass, AFTER the chain is rebuilt — not after applyModels.
+      // In replace mode applyModels wipes fallback_config and applyFallbackChain
+      // wipes it a SECOND time before rebuilding from the envelope, so a pass
+      // placed between the two would be discarded on the ordinary full-restore
+      // path. Running last is also what makes it safe: any model the envelope
+      // deliberately left out of the chain gets a row, and every model the
+      // envelope DID list keeps exactly the priority and enabled value written
+      // above. insert-only means a chain the operator trimmed on purpose comes
+      // back trimmed, not silently widened.
+      //
+      // This corrects a real gap: the export builds its chain list FROM
+      // fallback_config, so a model with no row is absent from the envelope by
+      // construction and a restore can never bring it back — leaving it enabled,
+      // invisible in GET /api/fallback, and unroutable (a pin returns
+      // model_not_routable).
+      //
+      // The rows this pass inserts are ordinary chain additions, and no other
+      // code path records them — applyFallbackChain only sees envelope entries.
+      // Without folding the count in, a restore that repairs hundreds of
+      // row-less models reports `fallback_chain 0 / 0 / 0`, and because
+      // runImport returns this same summary for dryRun, the operator's PREVIEW
+      // under-reports the effect of a destructive replace before they commit.
+      const restored = ensureCatalogInChain(db);
+      if (restored > 0) {
+        (summary.fallback_chain ??= emptyDiff()).added += restored;
+      }
+    } else {
+      // No chain section in the envelope. Replace mode already wiped the table
+      // (applyModels: DELETE FROM fallback_config), and "an operator who did not
+      // include the chain gets an empty chain" is the documented contract of
+      // replace mode — so it STAYS empty. Adding rows here would quietly turn a
+      // models-only restore into "every imported model is routable", which is a
+      // behaviour change on a path the section picker exposes to users.
+      //
+      // Consequence, stated plainly: a models-only replace import leaves the
+      // imported models unroutable, because membership and chain are distinct and
+      // this is the mode where the operator chose to supply neither. Re-running the
+      // import with a `fallback_chain` section is the fix; that is the intent.
+      //
+      // No summary entry is written here on purpose. A section emptied by replace
+      // mode reports nothing across this codebase — applyModels, applyProviders and
+      // applyFallbackChain all wipe and record no removals, and SectionDiff has no
+      // field for it. Materialising a zeroed fallback_chain row would make the UI
+      // assert "nothing changed" for a table that was just wiped, and would inflate
+      // the toast's "across N sections" by one. Recording removals here alone would
+      // make this one section inconsistent with the other four, so it is left out
+      // and the behaviour is documented above instead.
     }
 
     if (sectionAllow.has('api_keys') && env.sections.apiKeys) {

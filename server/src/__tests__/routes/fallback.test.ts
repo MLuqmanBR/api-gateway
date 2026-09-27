@@ -119,6 +119,73 @@ describe('Fallback API', () => {
     }
   });
 
+  it('a deliberate disable survives the save', async () => {
+    // The reported bug: toggle a model off in the Fallback page, save, and it
+    // comes straight back on. The cause was the invariant repair re-enabling
+    // exactly the rows the request had just switched off.
+    //
+    // This replaced an earlier version of itself that asserted the OPPOSITE — it
+    // PUT the whole chain as enabled:false and required the server to override
+    // all of it. That premise is unsatisfiable: a full-replace PUT narrowing the
+    // chain is byte-identical to one sent by a stale tab, so the server cannot
+    // honour the operator's choice AND repair stale state from the payload alone.
+    // PUT no longer repairs anything; membership is repaired by the writers that
+    // can strand a model (see config import).
+    const { getDb } = await import('../../db/index.js');
+    const db = getDb();
+    const off = db.prepare(`
+      SELECT m.id FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id
+       WHERE m.enabled = 1 ORDER BY m.id LIMIT 1
+    `).get() as { id: number };
+
+    const { body: chain } = await request(app, 'GET', '/api/fallback');
+    const payload = chain.map((e: any) => ({
+      modelDbId: e.modelDbId,
+      priority: e.priority,
+      enabled: e.modelDbId !== off.id,
+    }));
+    const { status } = await request(app, 'PUT', '/api/fallback', payload);
+    expect(status).toBe(200);
+
+    // The operator's disable STICKS. This is the bug being fixed.
+    expect((db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(off.id) as { enabled: number }).enabled).toBe(0);
+
+    // Nothing else was disturbed.
+    const others = db.prepare(`
+      SELECT COUNT(*) AS n FROM fallback_config fc
+       WHERE fc.enabled = 0 AND fc.model_db_id != ?
+    `).get(off.id) as { n: number };
+    expect(others.n).toBe(0);
+
+    const restore = chain.map((e: any) => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: true }));
+    await request(app, 'PUT', '/api/fallback', restore);
+  });
+
+  it('PUT /api/fallback re-enables a model when the operator turns it back on', async () => {
+    // The inverse direction must still work, otherwise "fixing" the disable
+    // would have made the control one-way.
+    const { getDb } = await import('../../db/index.js');
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT m.id FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id
+       WHERE m.enabled = 1 ORDER BY m.id LIMIT 1
+    `).get() as { id: number };
+    db.prepare('UPDATE fallback_config SET enabled = 0 WHERE model_db_id = ?').run(row.id);
+
+    const { body: chain } = await request(app, 'GET', '/api/fallback');
+    const payload = chain.map((e: any) => ({
+      modelDbId: e.modelDbId,
+      priority: e.priority,
+      enabled: e.modelDbId === row.id,
+    }));
+    await request(app, 'PUT', '/api/fallback', payload);
+
+    expect((db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(row.id) as { enabled: number }).enabled).toBe(1);
+
+    const restore = chain.map((e: any) => ({ modelDbId: e.modelDbId, priority: e.priority, enabled: true }));
+    await request(app, 'PUT', '/api/fallback', restore);
+  });
+
   it('POST /api/fallback/sort/speed sorts by speed', async () => {
     const { status } = await request(app, 'POST', '/api/fallback/sort/speed');
     expect(status).toBe(200);

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
+import { ensureInChain, ensurePlatformInChain } from '../db/chain.js';
 import { getDb } from '../db/index.js';
 import { clearRateLimitPenalty, clearProviderConfigCache, clearRoundRobinIndex } from '../services/router.js';
 import { clearPlatformCaches } from '../services/ratelimit.js';
@@ -408,18 +409,23 @@ export async function syncModelsFromProvider(baseUrl: string, slug: string): Pro
     // fault. (Live 2026-09-25: models.github.ai answers `OK` for EVERY path,
     // including a bogus one, so github discovery can never succeed while that
     // service is in this state.)
+    // Parse FIRST; the content-type only enriches the failure message.
+    //
+    // Rejecting on the header alone would break any endpoint that serves a valid
+    // JSON body under a non-JSON content-type — routine on the self-hosted and
+    // llama.cpp-style servers this project supports — so the body decides.
     const ctype = (res.headers.get('content-type') ?? '').split(';')[0].trim();
-    if (ctype && !ctype.includes('json')) {
-      const msg = `catalog endpoint returned ${ctype}, not JSON — ${catalogUrl}`;
-      console.log(`[Custom] ${slug}: ${msg} (body starts ${JSON.stringify(text.slice(0, 40))})`);
-      return { fetched: 0, added: [], error: msg };
-    }
-
     let body: unknown;
     try {
       body = JSON.parse(text);
     } catch {
-      const msg = `catalog endpoint returned unparseable JSON — ${catalogUrl}`;
+      // Name the URL and what came back. The old message ("Unexpected token 'O',
+      // \"OK\" is not valid JSON") named neither, which is why this class of
+      // failure was hard to diagnose. A non-JSON content type is the usual
+      // signature of an endpoint that wanted credentials or a different path.
+      const msg = ctype && !ctype.includes('json')
+        ? `catalog endpoint returned ${ctype}, not JSON — ${catalogUrl}`
+        : `catalog endpoint returned unparseable JSON — ${catalogUrl}`;
       console.log(`[Custom] ${slug}: ${msg} (body starts ${JSON.stringify(text.slice(0, 40))})`);
       return { fetched: 0, added: [], error: msg };
     }
@@ -577,6 +583,13 @@ customRouter.post('/api/custom-providers', async (req: Request, res: Response) =
           .run(displayName.trim(), rpmLimit ?? null, rpdLimit ?? null, tpmLimit ?? null, tpdLimit ?? null, maxParallelRequests ?? null, keyless ? 1 : 0, apiFormat, keyFormat, stickySessionsEnabled ? 1 : 0, slug);
         db.prepare('UPDATE api_keys SET enabled = 1 WHERE platform = ?').run(slug);
         db.prepare('UPDATE models SET enabled = 1 WHERE platform = ?').run(slug);
+        // Archive no longer touches fallback_config, so the platform's rows and
+        // the operator's priorities/selection are all still here. This call
+        // therefore only covers rows that predate that change or were dropped by
+        // a config import — a no-op in the normal case, and harmless when it
+        // isn't. Runs inside the transaction so a revived provider is never
+        // briefly half-restored.
+        ensurePlatformInChain(db, slug);
       });
       tx();
 
@@ -779,10 +792,18 @@ customRouter.delete('/api/custom-providers/:slug', (req: Request, res: Response)
     return;
   }
 
-  // Soft-delete: remove from fallback chain, disable keys and models,
-  // archive the provider row. Analytics retains historical request data.
+  // Soft-delete: disable keys and models, archive the provider row. Analytics
+  // retains historical request data.
+  //
+  // The fallback_config rows are deliberately LEFT ALONE. Deleting them (or
+  // disabling them) destroys the operator's curated selection and priorities:
+  // archive a 20-model platform you had trimmed to 3 and revive it, and the
+  // selection is gone. `models.enabled = 0` below is already sufficient to make
+  // the platform unroutable — the router requires fc.enabled=1 AND
+  // m.enabled=1 — and GET /api/fallback hides those rows through its own
+  // m.enabled=1 join. So the rows are unreachable either way, and keeping them
+  // means revive restores exactly what the operator had.
   const tx = db.transaction(() => {
-    db.prepare('DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = ?)').run(slug);
     db.prepare('UPDATE custom_providers SET archived = 1 WHERE slug = ?').run(slug);
     db.prepare('UPDATE api_keys SET enabled = 0 WHERE platform = ?').run(slug);
     db.prepare('UPDATE models SET enabled = 0 WHERE platform = ?').run(slug);
@@ -1084,15 +1105,12 @@ customRouter.patch('/api/custom-models/:id', (req: Request, res: Response) => {
   // A model the operator explicitly enables belongs in the chain; disabling does
   // NOT remove it (that would lose its priority), it just stops being routed.
   if (d.enabled === true) {
-    const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(id);
-    if (inChain) {
-      // Re-enable an existing row, keeping its position — an archive/unarchive
-      // round-trip must not silently reorder the operator's chain.
-      db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(id);
-    } else {
-      const maxPriority = (db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number }).m;
-      db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(id, maxPriority + 1);
-    }
+    // Ensure the model CAN be in the chain: append a row if one is missing
+    // (e.g. config import rebuilt the catalog without one). An existing row is
+    // left completely alone — enabling the model in the catalog is a different
+    // switch from enabling it in the chain, and flipping the second one here
+    // would undo the operator's chain selection from the Models page.
+    ensureInChain(db, id);
   }
 
   // A reset must be visible in this response, not at the next boot.

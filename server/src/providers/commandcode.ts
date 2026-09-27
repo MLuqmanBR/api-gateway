@@ -444,6 +444,17 @@ const retractedParams = new Set<string>();
 // ── Provider ─────────────────────────────────────────────────────────────
 
 export class CommandCodeProvider extends BaseProvider {
+  // CommandCode exposes no free auth-check route - every GET (models, me,
+  // usage, credits, balance, plan, health) answers 404, so `validateKey` has
+  // to POST a real /alpha/generate and each such probe spends one of the
+  // account's plan credits. Measured: a boot-time sweep charged three probes
+  // (one per key) against a finite weekly pool. A health sweep must never cost
+  // money, so the scheduled sweep skips this platform (see checkAllKeys in
+  // services/health.ts). The skip is deliberately NOT in checkKeyHealth, which
+  // backs the Keys page's per-key "test" button — an explicit user action is
+  // exactly where one billable probe is justified.
+  readonly validateCostsQuota = true;
+
   readonly platform = 'commandcode' as const;
   readonly name = 'CommandCode';
   // baseUrl left undefined — CommandCode has no OpenAI /models endpoint, so

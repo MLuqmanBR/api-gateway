@@ -193,10 +193,18 @@ describe('Modality-aware routing (audio + video)', () => {
     // The guard must not reject legitimate pins. Re-enable the row the previous
     // test disabled and confirm the same pin now routes.
     const db = getDb();
+    // This fixture seeds no api_keys, and a pin to a platform with ZERO key rows
+    // is now rejected as unroutable by design (router.ts) — so seed one for the
+    // chosen platform. Otherwise this test would assert the keyless fast-fail
+    // path while claiming to assert the ordinary routed path.
     const row = db.prepare(
       'SELECT m.id, m.platform, m.model_id FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id LIMIT 1',
     ).get() as { id: number; platform: string; model_id: string } | undefined;
     expect(row).toBeTruthy();
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, 'vision-pin-test', '00', '00', '00', 'healthy', 1)
+    `).run(row!.platform);
     db.prepare('UPDATE fallback_config SET enabled = 1 WHERE model_db_id = ?').run(row!.id);
 
     const { status, body } = await post(app, '/v1/chat/completions', {

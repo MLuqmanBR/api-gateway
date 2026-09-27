@@ -103,9 +103,25 @@ const CHECK_CONCURRENCY = Math.max(
   parseInt(process.env.HEALTH_CHECK_CONCURRENCY ?? '', 10) || DEFAULT_CHECK_CONCURRENCY,
 );
 
-export async function checkAllKeys(): Promise<void> {
+/**
+ * @param allowPaidValidation when false (the default), keys whose ONLY key-check
+ *   path spends a real inference request (provider.validateCostsQuota — e.g.
+ *   CommandCode, whose every GET route 404s so validateKey must POST
+ *   /alpha/generate) are skipped instead of probed. The scheduled sweep uses the
+ *   default: at the 5-minute default interval that flag alone accounts for up to
+ *   288 paid generations per key per day burned on health bookkeeping. The
+ *   dashboard's "Check all" button passes true, because an operator clicking it
+ *   explicitly asked for a real verdict on every key.
+ *
+ * Skipped keys are left completely untouched — status and last_checked_at
+ * included. A sweep that verified nothing must not stamp anything: writing
+ * 'unknown' would silently downgrade a confirmed 'invalid' key, and since
+ * routeRequest accepts 'unknown' that would resurrect a revoked token on every
+ * cycle. Their status evolves only from real chat requests and explicit checks.
+ */
+export async function checkAllKeys(allowPaidValidation = false): Promise<void> {
   const db = getDb();
-  const keys = db.prepare('SELECT id, platform FROM api_keys WHERE enabled = 1').all() as { id: number; platform: string }[];
+  const keys = db.prepare('SELECT id, platform, status FROM api_keys WHERE enabled = 1').all() as { id: number; platform: string; status: KeyStatus }[];
 
   // Synthetic `id` per emission so the event satisfies LiveEventBase.id
   // on the client. Health events aren't request-scoped — they describe a
@@ -128,6 +144,7 @@ export async function checkAllKeys(): Promise<void> {
     at: Date.now(),
   });
 
+  skippedPaidValidation = 0;
   let completed = 0;
   let next = 0;
   // Bounded-pool worker. Each worker pulls the next index, validates it,
@@ -140,6 +157,28 @@ export async function checkAllKeys(): Promise<void> {
       const i = next++;
       if (i >= keys.length) return;
       const key = keys[i];
+
+      if (!allowPaidValidation) {
+        const provider = buildProviderFor(key.platform);
+        if (provider?.validateCostsQuota) {
+          skippedPaidValidation++;
+          completed++;
+          // Report the status already on the row. Nothing was verified, so
+          // nothing is written — see checkAllKeys' doc comment.
+          publish({
+            type: 'health.check.progress',
+            id: syntheticId(),
+            keyId: key.id,
+            platform: key.platform,
+            status: key.status,
+            completed,
+            total: keys.length,
+            at: Date.now(),
+          });
+          continue;
+        }
+      }
+
       const status = await checkKeyHealth(key.id);
       completed++;
       publish({
@@ -158,8 +197,40 @@ export async function checkAllKeys(): Promise<void> {
     Array.from({ length: Math.min(CHECK_CONCURRENCY, keys.length) }, () => worker()),
   );
 
-  console.log(`[Health] Check complete (${completed}/${keys.length}).`);
+  console.log(`[Health] Check complete (${completed}/${keys.length}).`
+    + (skippedPaidValidation > 0
+      ? ` Skipped ${skippedPaidValidation} key(s) without probing: their only validation path spends a paid request.`
+      : ''));
   publish({ type: 'health.check.done', id: syntheticId(), total: keys.length, at: Date.now() });
+}
+
+// Keys skipped during the current sweep because validating them would spend a
+// paid request. Counted (not logged per key) so a normal 5-minute deployment
+// does not fill the log with one line per key per cycle.
+let skippedPaidValidation = 0;
+
+/** Pass-through so callers can opt into paid validation (see checkAllKeys). */
+let checkRunning = false;
+
+/**
+ * Run checkAllKeys unless a sweep is already in flight. Returns false when
+ * skipped-because-running. Both the scheduled interval and the manual
+ * /check-all route go through this so they share the same in-flight flag.
+ *
+ * `allowPaidValidation` is forwarded to checkAllKeys: the scheduler leaves it false
+ * so a background cycle never spends the operator's quota, while the dashboard's
+ * /check-all route passes true because that click is a deliberate request for a real
+ * verdict on every key.
+ */
+export async function runCheckAllGuarded(allowPaidValidation = false): Promise<boolean> {
+  if (checkRunning) return false;
+  checkRunning = true;
+  try {
+    await checkAllKeys(allowPaidValidation);
+  } finally {
+    checkRunning = false;
+  }
+  return true;
 }
 
 let intervalId: ReturnType<typeof setInterval> | null = null;
@@ -182,24 +253,6 @@ export function resetErrorStatuses(): void {
   if (result.changes > 0) {
     console.log(`[Health] Reset ${result.changes} key(s) from 'error' to 'unknown' on startup`);
   }
-}
-
-let checkRunning = false;
-
-/**
- * Run checkAllKeys unless a sweep is already in flight. Returns false when
- * skipped-because-running. Both the scheduled interval and the manual
- * /check-all route go through this so they share the same in-flight flag.
- */
-export async function runCheckAllGuarded(): Promise<boolean> {
-  if (checkRunning) return false;
-  checkRunning = true;
-  try {
-    await checkAllKeys();
-  } finally {
-    checkRunning = false;
-  }
-  return true;
 }
 
 export function startHealthChecker(): void {

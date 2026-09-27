@@ -70,7 +70,12 @@ healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
 healthRouter.post('/check-all', async (_req: Request, res: Response) => {
   // Shares the scheduled sweep's in-flight flag so a manual trigger can't
   // overlap a running sweep (#40).
-  const ran = await runCheckAllGuarded();
+  //
+  // allowPaidValidation=true: the scheduler must never spend quota probing keys
+  // whose only check path is a real inference request, but an operator clicking
+  // "Check all" explicitly asked for a live verdict on every key. Inheriting the
+  // false default would silently skip precisely the keys they most want checked.
+  const ran = await runCheckAllGuarded(true);
   if (!ran) {
     res.status(409).json({ error: { message: 'A health check sweep is already running' } });
     return;

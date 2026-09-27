@@ -465,6 +465,49 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
     expect(typeof sw.toKeyId).toBe('number');
     expect(sw.fromKeyId).not.toBe(sw.toKeyId);
   });
+  it('fails a pin to a KEYLESS platform immediately instead of looping for minutes', { timeout: 10000 }, async () => {
+    // Measured live 2026-09-26: pinning api-gateway/github/gpt-4o (0 enabled
+    // keys for that platform) returned NOTHING for 30 s+ and only ended when
+    // curl gave up. Cause: the router conflated "no keys exist" with "all keys
+    // are on cooldown". The former is permanent, so the proxy's 1-RPM recovery
+    // loop spun forever without making a single upstream call; the latter is
+    // transient, where waiting is correct.
+    //
+    // The distinction is observable: a keyless platform has no api_keys row at
+    // all, while a cooled-down one has rows that just failed the status filter.
+    const db = getDb();
+    const target = db.prepare(`
+      SELECT m.platform, m.model_id, m.id FROM models m
+       WHERE m.enabled = 1
+         AND NOT EXISTS (SELECT 1 FROM api_keys k WHERE k.platform = m.platform AND k.enabled = 1)
+         AND EXISTS (SELECT 1 FROM fallback_config fc WHERE fc.model_db_id = m.id AND fc.enabled = 1)
+       LIMIT 1
+    `).get() as { platform: string; model_id: string; id: number } | undefined;
+    expect(target).toBeDefined();
+
+    const origFetch = global.fetch;
+    const calls: string[] = [];
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      calls.push(typeof url === 'string' ? url : url.toString());
+      return origFetch(url as never, init as never);
+    });
+
+    const started = Date.now();
+    const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
+      model: `${target!.platform}/${target!.model_id}`,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, authHeaders());
+    const elapsed = Date.now() - started;
+
+    // A clear client error, quickly — not a hang.
+    expect(status).toBe(400);
+    expect(body.error.code).toBe('model_not_routable');
+    // No upstream attempt is possible, so none should be made.
+    expect(calls.filter(u => u.includes(target!.platform))).toEqual([]);
+    // The old failure mode took tens of seconds; this must be near-instant.
+    expect(elapsed).toBeLessThan(5000);
+  });
+
   it('cycles through ALL keys for a pinned model when every key is on cooldown (#256)', { timeout: 15000 }, async () => {
     // Reproduces the user's nvidia scenario: every key for the pinned model
     // is on cooldown, so the router's pre-filter would normally reject them

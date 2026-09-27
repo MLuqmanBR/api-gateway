@@ -147,6 +147,25 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
     for (const entry of parsed.data) {
       update.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
     }
+
+    // No membership repair here, deliberately.
+    //
+    // An earlier version re-enabled `fc.enabled = 0` rows whose model was
+    // catalog-enabled, on the theory that the payload might be a stale tab. That
+    // is unsatisfiable in both directions: a full-replace PUT that narrows the
+    // chain to the operator's chosen models is byte-identical to one sent by a
+    // stale tab, so the server can either honour the disable (and strand
+    // anything a stale tab omitted) or override the disable (and make the
+    // Fallback page's checkbox a no-op). It did the latter, and the user
+    // reported exactly that: enable only the models of my choice, keep the rest
+    // disabled — impossible.
+    //
+    // It cannot even reach the state it was guarding against: GET /api/fallback
+    // inner-joins fallback_config, so the client only ever receives models that
+    // already have a row, and the UPDATE above is a no-op for one that does not.
+    // The writers that genuinely can strand a model are PATCH-enable,
+    // provider revive, and config import; all three now call an insert-only
+    // helper (db/chain.ts) that never touches fc.enabled.
   });
   updateAll();
 
