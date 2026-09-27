@@ -664,14 +664,17 @@ describe('Config API', () => {
     // count in this restore reports `fallback_chain 0 / 0 / 0` — and since
     // runImport returns this same summary for dryRun, the operator's preview
     // under-reports the change before they commit to a destructive replace.
-    // Exact, not ">=": the envelope's single chain entry is added by
-    // applyFallbackChain, and the ghost's row is the SECOND add, contributed by
-    // the membership pass. A ">=" assertion passes even when the count is
-    // discarded, because applyFallbackChain's own add satisfies it — verified by
-    // control.
+    // Derived from the envelope rather than hard-coded, so it stays right if the
+    // fixture's model count changes: every entry the envelope carried, plus
+    // exactly one row for the ghost that only the membership pass can add.
+    //
+    // A ">= 1" assertion is satisfied by the envelope-driven insert alone —
+    // replace mode wipes the table, so the fixture's chain row is itself an
+    // INSERT — and therefore passes even when the pass's count is discarded.
+    // Control-verified: with the count discarded this reports one less.
     const chainDiff = (imp.body as any).sections?.fallback_chain;
     expect(chainDiff, 'the summary must report the fallback_chain section').toBeDefined();
-    expect(chainDiff.added).toBe(2);
+    expect(chainDiff.added).toBe((env.sections.fallbackChain ?? []).length + 1);
   });
 
   it('a restore preserves a chain the operator deliberately trimmed', async () => {
