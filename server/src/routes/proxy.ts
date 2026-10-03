@@ -5,7 +5,7 @@ import { z } from 'zod';
 import type { ChatMessage, ModelListRow } from '@api-gateway/shared/types.js';
 import { classifyError, type ErrorClass } from '../lib/error-class.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledModelFor, NO_MODEL_ERROR_CODE, ModalityMismatchError, PinnedModelNotRoutableError, type RouteResult, getGlobalRetryLimit } from '../services/router.js';
-import { markExhausted, clearExhausted } from '../services/key-exhaustion.js';
+import { markExhausted, clearExhausted, getSoonestResetAtMs, hasExhaustedKeyWithoutReset } from '../services/key-exhaustion.js';
 import { recordRequest, recordTokens, setCooldown, computeRetryCooldownMs } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { isCacheEnabled, isCacheableTemp, isCacheBypassed, computeCacheKey, getCachedResponse, setCachedResponse, synthesizeSSE } from '../services/cache.js';
@@ -604,6 +604,46 @@ export function isPaymentRequiredError(err: any): boolean {
     || msg.includes('insufficient balance');
 }
 
+/** Account/key-level quota exhaustion — the plan window is spent or the credit
+ *  balance is empty, so THIS key cannot serve any model until it resets or is
+ *  topped up. Distinct from a transient rate limit (the same key recovers in
+ *  seconds) and from a dead turn (the model, not the key, rejected the
+ *  request). Observed live 2026-10-01 on selora/gpt-6-astra as an in-band SSE
+ *  frame: "Your 4-hour session plan usage limit is reached and your API credit
+ *  balance is empty. Top up API credits to continue pay-as-you-go, or wait for
+ *  the window to reset. Plan usage resumes at …". */
+export function isKeyQuotaExhaustedError(err: unknown): boolean {
+  const raw = (err as { message?: unknown } | null | undefined)?.message;
+  const msg = (typeof raw === 'string' ? raw : '').toLowerCase();
+  return /\busage limit\b/.test(msg)
+    || /\bcredit balance\b/.test(msg)
+    || /\bout of credits?\b/.test(msg)
+    || /\binsufficient (?:credits?|balance|quota|funds)\b/.test(msg)
+    || /\bquota (?:exceeded|exhausted|reached)\b/.test(msg)
+    || /\btop up\b/.test(msg);
+}
+
+/** Parse the moment a provider says an exhausted account's window resumes.
+ *  Phrasings seen in the wild: "Plan usage resumes at 2026-10-01T11:38:00Z",
+ *  "Your limit resets at 2026-07-07T22:52:49.619Z", "available in 30 minutes".
+ *  Returns null when the message carries no usable time; callers then keep the
+ *  existing fixed-interval recovery poll instead of guessing. Only ever called
+ *  on a message already classified by isKeyQuotaExhaustedError. */
+export function parseQuotaResetAtMs(message: string): number | null {
+  const text = String(message ?? '');
+  const iso = text.match(/\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?/);
+  if (iso) {
+    const parsed = Date.parse(iso[0].replace(' ', 'T'));
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  const rel = text.match(/\bin\s+(\d+)\s*(second|minute|hour|day)s?\b/i);
+  if (rel) {
+    const unitMs: Record<string, number> = { second: 1000, minute: 60_000, hour: 3_600_000, day: 86_400_000 };
+    return Date.now() + Number(rel[1]) * unitMs[rel[2].toLowerCase()];
+  }
+  return null;
+}
+
 // Genuine upstream rate-limit 429 (structured status first, message
 // heuristic fallback). Shared by the proxy's keyRetry backoff and the
 // responses retry loop so both paths classify identically.
@@ -1131,10 +1171,27 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // ---- 1 RPM throttling ----
     if (inOneRPMMode && lastRequestTime > 0) {
       const elapsed = Date.now() - lastRequestTime;
-      if (elapsed < 60_000) {
-        // Abortable: a client disconnect during the 60s wait rejects
-        // immediately instead of running out the clock. (#292)
-        await abortableSleep(60_000 - elapsed, abortSignal);
+      // Quota-reset aware: when an exhausted key told us exactly when its plan
+      // window resumes, wait for THAT moment instead of polling every 60 s, so
+      // the retry lands when the key is usable again. Pinned requests wait for
+      // their own model's soonest key; auto requests wait for the soonest known
+      // reset anywhere in the exhausted set. An exhausted key with NO stated
+      // reset (a 429 burn, say) may come back long before another key's stated
+      // window, so the sleep is capped at the normal 60 s poll in that case —
+      // never a tight loop either way.
+      const scope = isPinned ? preferredModel : undefined;
+      const resetAt = getSoonestResetAtMs(scope);
+      let waitMs = 0;
+      if (resetAt != null && resetAt > Date.now()) {
+        waitMs = resetAt - Date.now();
+        if (hasExhaustedKeyWithoutReset(scope)) waitMs = Math.min(waitMs, Math.max(0, 60_000 - elapsed));
+      } else if (elapsed < 60_000) {
+        waitMs = 60_000 - elapsed;
+      }
+      if (waitMs > 0) {
+        // Abortable: a client disconnect during the wait rejects immediately
+        // instead of running out the clock. (#292)
+        await abortableSleep(waitMs, abortSignal);
       }
     }
 
@@ -1160,6 +1217,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         if (shouldMarkExhausted(route.platform, route.modelId, route.keyId)) {
           markExhausted(route.keyId, route.platform, route.modelId);
         }
+        // In 1-RPM recovery the router deliberately ignores skipKeys (it must
+        // be free to retry exhausted keys), so a skipped key is handed straight
+        // back on the next iteration. Without stamping the clock here the loop
+        // spins hot at ~100k iterations/s — no upstream call, no sleep — until
+        // the client gives up. Stamping engages the loop-top throttle, which
+        // sleeps until the soonest stated quota reset (or the 60 s poll).
+        if (inOneRPMMode) lastRequestTime = Date.now();
         continue outerLoop;
       }
 
@@ -1355,6 +1419,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
     // ---- Per-key retry: up to PER_KEY_RETRIES immediate attempts ----
     let keySucceeded = false;
+    // Set when this attempt's error was an account-quota exhaustion carrying a
+    // stated reset moment; handed to markExhausted below so the recovery loop
+    // can wait for that moment instead of polling. Reset every outer-loop turn.
+    let quotaResetAtMs: number | null = null;
     keyRetry: for (let keyAttempt = 0; keyAttempt < PER_KEY_RETRIES; keyAttempt++) {
       try {
       // F9: acquire per-provider concurrency slot before the upstream call.
@@ -1924,6 +1992,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
 
       if (isRetryableError(err)) {
+        // Account/key-level quota exhaustion (in-band frames included) is a KEY
+        // failure, not a dead turn: the model is fine — the account behind THIS
+        // key is out of budget until its window resets, so a sibling key can
+        // serve the request. Burn the key on the FIRST probe (the same shape as
+        // the 402 branch below) so the router rotates to the next key. Without
+        // this the in-band error takes the pinned dead-turn 502 — which never
+        // marks the key exhausted, so every later request re-picks the same
+        // key — or the auto-mode model skip, which leaves the sibling key idle.
+        // Rate-limit-shaped errors are excluded: a 429 whose message says
+        // "quota" is usually a per-minute limit where the same key recovers in
+        // seconds and the existing backoff path is right.
+        if (!isRateLimitError(err) && isKeyQuotaExhaustedError(err)) {
+          lastError = err;
+          quotaResetAtMs = parseQuotaResetAtMs(String(err.message ?? ''));
+          break keyRetry;
+        }
         // Dead-turn errors (in-band error, empty completion, stream stall,
         // unparseable dialect): in-band error means the key WORKS but this
         // specific model can't handle the request. Skip the model, not the
@@ -2053,7 +2137,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     // F10: record circuit breaker failure for this (platform, model, keyId).
     recordCircuitFailure(route.platform, route.modelId, route.keyId);
 
-    markExhausted(route.keyId, route.platform, route.modelId);
+    markExhausted(
+      route.keyId,
+      route.platform,
+      route.modelId,
+      quotaResetAtMs != null ? { resetAtMs: quotaResetAtMs, modelDbId: route.modelDbId } : undefined,
+    );
     const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
     skipKeys.add(skipId);
     setCooldown(

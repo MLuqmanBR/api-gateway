@@ -299,4 +299,53 @@ describe('Routing Key Exhaustion', () => {
         .toThrow(/Pinned model exhausted/);
     });
   });
+
+  // Quota reset tracking: the recovery loop waits for the soonest moment an
+  // exhausted key says its plan window resumes, but must NOT sleep past the
+  // normal 60 s poll when some exhausted key in scope has no stated reset —
+  // that key may come back much sooner than another key's far-away window.
+  describe('quota reset tracking', () => {
+    beforeEach(async () => {
+      getDb().prepare('DELETE FROM rate_limit_cooldowns').run();
+      const { rebuildExhaustionFromDB } = await import('../../services/key-exhaustion.js');
+      rebuildExhaustionFromDB();
+    });
+
+    it('reports the soonest stated reset, scoped by model row', async () => {
+      const { markExhausted, getSoonestResetAtMs } = await import('../../services/key-exhaustion.js');
+      const db = getDb();
+      const keys = db.prepare('SELECT id FROM api_keys ORDER BY id').all() as Array<{ id: number }>;
+      const proId = db.prepare("SELECT id FROM models WHERE model_id = 'gemini-1.5-pro'").get() as { id: number };
+      const soon = Date.now() + 60_000;
+      const later = Date.now() + 3_600_000;
+
+      markExhausted(keys[0].id, 'google', 'gemini-1.5-pro', { resetAtMs: later, modelDbId: proId.id });
+      markExhausted(keys[1].id, 'google', 'gemini-1.5-pro', { resetAtMs: soon, modelDbId: proId.id });
+
+      expect(getSoonestResetAtMs()).toBe(soon);
+      expect(getSoonestResetAtMs(proId.id)).toBe(soon);
+      // A model with no exhausted keys reports nothing → caller keeps the poll.
+      expect(getSoonestResetAtMs(proId.id + 999)).toBeNull();
+    });
+
+    it('flags an exhausted key with no stated reset, so the wait is capped', async () => {
+      const { markExhausted, hasExhaustedKeyWithoutReset, getSoonestResetAtMs } = await import('../../services/key-exhaustion.js');
+      const db = getDb();
+      const keys = db.prepare('SELECT id FROM api_keys ORDER BY id').all() as Array<{ id: number }>;
+      const proId = db.prepare("SELECT id FROM models WHERE model_id = 'gemini-1.5-pro'").get() as { id: number };
+      const later = Date.now() + 3_600_000;
+
+      markExhausted(keys[0].id, 'google', 'gemini-1.5-pro', { resetAtMs: later, modelDbId: proId.id });
+      expect(hasExhaustedKeyWithoutReset()).toBe(false);
+      expect(hasExhaustedKeyWithoutReset(proId.id)).toBe(false);
+
+      // A 429-burn style exhaustion carries no quota info at all.
+      markExhausted(keys[1].id, 'google', 'gemini-1.5-pro');
+      expect(hasExhaustedKeyWithoutReset()).toBe(true);
+      // Scope-less entries count in every scope — they carry no model row.
+      expect(hasExhaustedKeyWithoutReset(proId.id)).toBe(true);
+      // The stated reset is still reported; the cap is the caller's job.
+      expect(getSoonestResetAtMs()).toBe(later);
+    });
+  });
 });
