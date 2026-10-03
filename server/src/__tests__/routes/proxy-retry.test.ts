@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isRetryableError, isPaymentRequiredError } from '../../routes/proxy.js';
+import { isRetryableError, isPaymentRequiredError, isKeyQuotaExhaustedError, parseQuotaResetAtMs } from '../../routes/proxy.js';
 
 describe('isRetryableError', () => {
   describe('413 Payload Too Large', () => {
@@ -145,5 +145,42 @@ describe('isRetryableError', () => {
       // pinned by the 404 block above.
       expect(isRetryableError(new Error('required field not found'))).toBe(true);
     });
+  });
+});
+
+describe('isKeyQuotaExhaustedError', () => {
+  const live = 'in-band provider error from GPT 6 Astra (SLR): Your 4-hour session plan usage limit is reached and your API credit balance is empty. Top up API credits to continue pay-as-you-go, or wait for the window to reset. Plan usage resumes at 2026-10-01T11:38:00Z.';
+
+  it('matches the live selora quota frame and other account-level phrasings', () => {
+    expect(isKeyQuotaExhaustedError(new Error(live))).toBe(true);
+    expect(isKeyQuotaExhaustedError(new Error('API error 400: You have insufficient credits to make this request.'))).toBe(true);
+    expect(isKeyQuotaExhaustedError(new Error('Quota exceeded for quota metric "Generate requests per minute"'))).toBe(true);
+    // The gate it must pass to reach the retry loop at all.
+    expect(isRetryableError(new Error(live))).toBe(true);
+  });
+
+  it('leaves the dead-turn and stream-integrity classes alone', () => {
+    expect(isKeyQuotaExhaustedError(new Error('in-band provider error from GPT 6 Astra (SLR): Internal server error from GPT 6 Astra (SLR)'))).toBe(false);
+    expect(isKeyQuotaExhaustedError(new Error('empty completion from X'))).toBe(false);
+    expect(isKeyQuotaExhaustedError(new Error('stream stalled'))).toBe(false);
+  });
+});
+
+describe('parseQuotaResetAtMs', () => {
+  it('parses an absolute ISO reset time', () => {
+    expect(parseQuotaResetAtMs('Plan usage resumes at 2026-10-01T11:38:00Z.')).toBe(Date.parse('2026-10-01T11:38:00Z'));
+    expect(parseQuotaResetAtMs('Your limit resets at 2026-07-07T22:52:49.619Z.')).toBe(Date.parse('2026-07-07T22:52:49.619Z'));
+  });
+
+  it('parses a relative window', () => {
+    const before = Date.now();
+    const got = parseQuotaResetAtMs('Your quota resets in 30 minutes.');
+    expect(got).not.toBeNull();
+    expect(got! - before).toBeGreaterThan(29 * 60_000);
+    expect(got! - before).toBeLessThan(31 * 60_000);
+  });
+
+  it('returns null when the message carries no time', () => {
+    expect(parseQuotaResetAtMs('Your API credit balance is empty. Top up to continue.')).toBeNull();
   });
 });

@@ -887,7 +887,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     let keyOrder: KeyRow[];
     if (oneRPM) {
       const exhaustedOrder = getExhaustedKeysForModel(entry.platform, entry.model_id);
-      const exhaustedMap = new Map(exhaustedOrder.map(e => [e.keyId, e.exhaustedAt]));
+      const exhaustedMap = new Map(exhaustedOrder.map(e => [e.keyId, e]));
       const unexhausted: KeyRow[] = [];
       const exhausted: KeyRow[] = [];
       for (const k of keys) {
@@ -897,8 +897,12 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
           unexhausted.push(k);
         }
       }
-      // Earliest-exhausted first within the exhausted bucket.
-      exhausted.sort((a, b) => exhaustedMap.get(a.id)! - exhaustedMap.get(b.id)!);
+      // Soonest-resetting key first: when a key told us when its quota window
+      // resumes, that is the key worth probing. Keys with no reported reset
+      // fall back to the earliest-exhausted ordering that was here before.
+      exhausted.sort((a, b) =>
+        ((exhaustedMap.get(a.id)!.resetAtMs ?? Number.POSITIVE_INFINITY) - (exhaustedMap.get(b.id)!.resetAtMs ?? Number.POSITIVE_INFINITY))
+        || (exhaustedMap.get(a.id)!.exhaustedAt - exhaustedMap.get(b.id)!.exhaustedAt));
       // Shuffle unexhausted so every recovery cycle doesn't bias toward
       // the same key via DB insertion order.
       for (let i = unexhausted.length - 1; i > 0; i--) {

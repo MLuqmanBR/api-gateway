@@ -289,13 +289,20 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
     const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
       model: `${pinnedPlatform}/${pinnedModelName}`,
       messages: [{ role: 'user', content: 'hi' }],
-      stream: false,
+      stream: true,
     }, authHeaders());
 
     // Strict pinning must surface the in-band error to the user, not fall
     // through. The proxy returns a 502 with the pinned model's name.
     expect(status).toBe(502);
     expect(body?.error?.message).toMatch(new RegExp(pinnedDisplayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    // Prove the in-band branch actually ran: with stream:false the proxy takes
+    // the non-streaming path and dies on the mock's missing res.json(), which
+    // produces a 502 that matches the assertion above for the wrong reason.
+    const errRow = getDb().prepare(
+      "SELECT error FROM requests WHERE status = 'error' ORDER BY id DESC LIMIT 1",
+    ).get();
+    expect(errRow && 'error' in errRow ? String(errRow.error) : '').toMatch(/in-band provider error from/);
 
     // The fallback platform's fetch URL must NOT appear in the call log.
     const fbHits = calls.filter(u => u.includes(fallbackPlatform));
@@ -339,12 +346,17 @@ describe('strict pinning (no silent fallback on pinned-model errors)', () => {
     const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
       model: `${pinnedPlatform}/${pinnedModelName}`,
       messages: [{ role: 'user', content: 'hi' }],
-      stream: false,
+      stream: true,
     }, authHeaders());
 
     // Pinned in-band error surfaces as 502 with the model's name.
     expect(status).toBe(502);
     expect(body?.error?.message).toMatch(new RegExp(pinnedDisplayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    // Prove the in-band branch actually ran (see the previous test).
+    const errRow = getDb().prepare(
+      "SELECT error FROM requests WHERE status = 'error' ORDER BY id DESC LIMIT 1",
+    ).get();
+    expect(errRow && 'error' in errRow ? String(errRow.error) : '').toMatch(/in-band provider error from/);
 
     // CRUCIAL: only ONE key's worth of upstream calls happened (PER_KEY_RETRIES
     // = 3 attempts on the first key). The second key must NOT be rotated to —

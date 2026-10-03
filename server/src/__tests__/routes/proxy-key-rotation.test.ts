@@ -27,6 +27,7 @@ const { encrypt } = await import('../../lib/crypto.js');
 const { setRoutingStrategy, setGlobalRetryLimit, clearRoundRobinIndex } = await import('../../services/router.js');
 const { clearExhaustedForKey } = await import('../../services/key-exhaustion.js');
 const { clearKeyRuntimeState } = await import('../../services/ratelimit.js');
+const { resetAllCircuits } = await import('../../services/circuit-breaker.js');
 
 async function post(app: Express, path: string, body: any, key: string) {
   const server = app.listen(0);
@@ -92,6 +93,10 @@ describe('Proxy key rotation on per-key 400 failures (#293)', () => {
     // The round-robin cursor points at whichever key last succeeded; reset it
     // so each test deterministically starts on the first (dead) key.
     clearRoundRobinIndex('groq');
+    // Circuit breaker state is also in-memory and survives between tests in
+    // this file — a key left OPEN by an earlier test would be skipped by the
+    // router before any upstream call, defeating the rotation assertions.
+    resetAllCircuits();
     setGlobalRetryLimit(20);
   });
 
@@ -223,5 +228,188 @@ describe('Proxy key rotation on per-key 400 failures (#293)', () => {
     expect(second.body.choices[0].message.content).toBe('answer from the healthy key');
     const deadCallsAfter = chatCompletion.mock.calls.filter((c: unknown[]) => c[0] === 'dead-key').length;
     expect(deadCallsAfter).toBe(1); // not re-probed once cooled
+  });
+
+  // Account-level quota exhaustion that arrives as an IN-BAND error (a 200 SSE
+  // frame whose message says the plan window is spent / the balance is empty).
+  // Key #1's account is broke until its window resets; key #2 is funded.
+  // Before the fix the in-band class took the dead-turn path: pinned requests
+  // returned 502 without ever benching key #1 (so every later request re-picked
+  // it), auto requests skipped the MODEL and left key #2 idle.
+  const QUOTA_INBAND_MESSAGE = (iso: string) =>
+    'in-band provider error from fake: Your 4-hour session plan usage limit is reached and ' +
+    'your API credit balance is empty. Top up API credits to continue pay-as-you-go, or wait ' +
+    `for the window to reset. Plan usage resumes at ${iso}.`;
+  const quotaError = (iso: string) => new Error(QUOTA_INBAND_MESSAGE(iso));
+
+  // Narrow the chain to ONE groq model so the exercise is exactly
+  // "same model, next KEY" and the router cannot hop models instead. The model
+  // must be enabled in the catalog AND in the enabled fallback chain, or
+  // pinning it fails with model_not_routable.
+  const narrowToSingleGroqModel = () => {
+    const row = getDb().prepare(`
+      SELECT m.model_id FROM models m JOIN fallback_config fc ON fc.model_db_id = m.id
+       WHERE m.platform = 'groq' AND m.enabled = 1 AND fc.enabled = 1
+       ORDER BY fc.priority ASC LIMIT 1
+    `).get();
+    if (!row || typeof row !== 'object' || !('model_id' in row) || typeof row.model_id !== 'string') {
+      throw new Error('test setup: no enabled groq model in the fallback chain');
+    }
+    const onlyModel = row.model_id;
+    getDb().prepare("UPDATE models SET enabled = 0 WHERE platform = 'groq' AND model_id != ?").run(onlyModel);
+    return onlyModel;
+  };
+
+  it('rotates to the next key when an in-band ACCOUNT-QUOTA error burns the first key (auto routing)', async () => {
+    narrowToSingleGroqModel();
+    chatCompletion.mockImplementation(async (apiKey: string) => {
+      if (apiKey === 'dead-key') throw quotaError(new Date(Date.now() + 3_600_000).toISOString());
+      return GOOD_RESULT;
+    });
+
+    const { status, body } = await post(app, '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    expect(status).toBe(200);
+    expect(body.choices[0].message.content).toBe('answer from the healthy key');
+    // The broke key is probed AT MOST ONCE per (key, model) pair — never the
+    // PER_KEY_RETRIES burst on an account that cannot recover mid-request.
+    const perPair = new Map<string, number>();
+    for (const c of chatCompletion.mock.calls) {
+      const pair = `${String(c[0])}|${String(c[2])}`;
+      perPair.set(pair, (perPair.get(pair) ?? 0) + 1);
+    }
+    for (const [pair, n] of perPair) expect(n, `key|model ${pair} probed ${n} times`).toBe(1);
+    expect(chatCompletion.mock.calls.some(c => c[0] === 'dead-key')).toBe(true);
+    expect(chatCompletion.mock.calls.some(c => c[0] === 'healthy-key')).toBe(true);
+  });
+
+  it('rotates to the next key when a PINNED model returns an in-band ACCOUNT-QUOTA error', async () => {
+    const onlyModel = narrowToSingleGroqModel();
+    chatCompletion.mockImplementation(async (apiKey: string) => {
+      if (apiKey === 'dead-key') throw quotaError(new Date(Date.now() + 3_600_000).toISOString());
+      return GOOD_RESULT;
+    });
+
+    const { status, body } = await post(app, '/v1/chat/completions', {
+      model: `groq/${onlyModel}`,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    // Previously a 502 on the first in-band frame, with key #1 never benched.
+    expect(status).toBe(200);
+    expect(body.choices[0].message.content).toBe('answer from the healthy key');
+    expect(chatCompletion.mock.calls.some(c => c[0] === 'healthy-key')).toBe(true);
+  });
+
+  it('rotates to the next key when a STREAMING request hits an in-band ACCOUNT-QUOTA error', async () => {
+    // Production shape: the client streams, so the error surfaces from the
+    // provider's SSE reader (proxy.ts "in-band provider error" throw) rather
+    // than from a thrown chatCompletion. Same carve-out, streaming path.
+    const onlyModel = narrowToSingleGroqModel();
+    const quotaMsg = QUOTA_INBAND_MESSAGE(new Date(Date.now() + 3_600_000).toISOString());
+    streamChatCompletion.mockImplementation(async function* (apiKey: string) {
+      if (apiKey === 'dead-key') throw new Error(quotaMsg);
+      yield { id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: { content: 'answer from the healthy key' }, finish_reason: null }] };
+      yield { id: 'c1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+    });
+
+    const { status, raw } = await post(app, '/v1/chat/completions', {
+      model: `groq/${onlyModel}`,
+      stream: true,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+
+    expect(status).toBe(200);
+    expect(raw).toContain('answer from the healthy key');
+    // One probe per (key, model) pair, same as the non-streaming path.
+    const perPair = new Map<string, number>();
+    for (const c of streamChatCompletion.mock.calls) {
+      const pair = `${String(c[0])}|${String(c[2])}`;
+      perPair.set(pair, (perPair.get(pair) ?? 0) + 1);
+    }
+    for (const [pair, n] of perPair) expect(n, `key|model ${pair} probed ${n} times`).toBe(1);
+  });
+
+  it('waits for the soonest stated reset and retries that key until it activates (pinned, all keys spent)', { timeout: 15000 }, async () => {
+    setGlobalRetryLimit(0);
+    const onlyModel = narrowToSingleGroqModel();
+    const resetAt = Date.now() + 1500;
+    const resetIso = new Date(resetAt).toISOString();
+    // BOTH keys are quota-dead until the stated moment; after it, the funded
+    // key serves. Before the fix the loop polled every 60 s (and, pinned,
+    // never even entered recovery from this error).
+    chatCompletion.mockImplementation(async (apiKey: string) => {
+      if (Date.now() >= resetAt) return GOOD_RESULT;
+      throw quotaError(resetIso);
+    });
+
+    const started = Date.now();
+    const { status, body } = await post(app, '/v1/chat/completions', {
+      model: `groq/${onlyModel}`,
+      messages: [{ role: 'user', content: 'hi' }],
+    }, key);
+    const elapsed = Date.now() - started;
+
+    expect(status).toBe(200);
+    expect(body.choices[0].message.content).toBe('answer from the healthy key');
+    // The recovery cycle slept until the stated reset instead of polling.
+    expect(elapsed).toBeGreaterThanOrEqual(1400);
+    // The key that came back answered, and it did so after the reset moment.
+    expect(chatCompletion.mock.calls.some(c => c[0] === 'healthy-key')).toBe(true);
+  });
+
+  it('sleeps to the stated reset even when a key circuit is OPEN in 1-RPM recovery', { timeout: 15000 }, async () => {
+    // Regression: the circuit-open branch adds the key to skipKeys and loops,
+    // but the router deliberately ignores skipKeys in 1-RPM mode — so without
+    // stamping lastRequestTime there the loop re-picks the open key with no
+    // sleep and no upstream call (~100k iterations/s, measured) until the
+    // client disconnects. The finite retry limit below is what makes that
+    // observable: a hot spin burns the whole budget instantly and answers 429,
+    // while a throttled loop sleeps to the stated reset and answers 200.
+    setGlobalRetryLimit(50);
+    const { setSetting } = await import('../../db/index.js');
+    setSetting('circuit_breaker_failure_threshold', '1');
+    setSetting('circuit_breaker_cooldown_ms', '200');
+    try {
+      const onlyModel = narrowToSingleGroqModel();
+      const modelRow = getDb().prepare("SELECT id FROM models WHERE platform = 'groq' AND model_id = ?").get(onlyModel);
+      if (!modelRow || typeof modelRow !== 'object' || !('id' in modelRow) || typeof modelRow.id !== 'number') {
+        throw new Error('test setup: model row not found');
+      }
+      const modelId = modelRow.id;
+      const resetAt = Date.now() + 1500;
+      const resetIso = new Date(resetAt).toISOString();
+
+      // Production lead-up: earlier failures already tripped the breaker for
+      // both keys, and the burned key's stated window is on record.
+      const { recordCircuitFailure } = await import('../../services/circuit-breaker.js');
+      const { markExhausted } = await import('../../services/key-exhaustion.js');
+      const keyRows = getDb().prepare('SELECT id FROM api_keys ORDER BY id').all() as Array<{ id: number }>;
+      for (const k of keyRows) recordCircuitFailure('groq', onlyModel, k.id);
+      markExhausted(keyRows[0].id, 'groq', onlyModel, { resetAtMs: resetAt, modelDbId: modelId });
+
+      chatCompletion.mockImplementation(async () => {
+        if (Date.now() >= resetAt) return GOOD_RESULT;
+        throw quotaError(resetIso);
+      });
+
+      const started = Date.now();
+      const { status, body } = await post(app, '/v1/chat/completions', {
+        model: `groq/${onlyModel}`,
+        messages: [{ role: 'user', content: 'hi' }],
+      }, key);
+      const elapsed = Date.now() - started;
+
+      // A hot spin would have exhausted the 50-iteration budget in <1 ms and
+      // returned 429 "Recovery limit reached".
+      expect(status).toBe(200);
+      expect(body.choices[0].message.content).toBe('answer from the healthy key');
+      expect(elapsed).toBeGreaterThanOrEqual(1400);
+    } finally {
+      setSetting('circuit_breaker_failure_threshold', '5');
+      setSetting('circuit_breaker_cooldown_ms', '30000');
+    }
   });
 });
